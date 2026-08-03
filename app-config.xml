@@ -1,0 +1,265 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    OpsTransferTool - Initial Configuration
+
+    This XML file contains the initial setup and configuration for the entire application.
+    It is used by setup.ps1 during installation to configure:
+    - Installation paths
+    - Application settings
+    - Daemon configuration
+    - Default task templates
+    - Logging settings
+
+    Edit this file before running setup.ps1 to customize the installation.
+-->
+<application>
+    <!-- Installation Configuration -->
+    <installation>
+        <!-- Primary installation directory -->
+        <installDir>D:\OpsTools</installDir>
+
+        <!-- Data directory (user profile relative) -->
+        <dataDir>D:\OpsTools\Data</dataDir>
+
+        <!-- JAR file name (relative to install directory) -->
+        <jarName>Monitoring-Tool.jar</jarName>
+
+        <!-- Icon file name (relative to setup script directory) -->
+        <iconName>Icon.ico</iconName>
+
+        <!-- Fallback system icon (if custom icon not found) -->
+        <fallbackIcon>C:\Windows\System32\imageres.dll,19</fallbackIcon>
+    </installation>
+
+    <!-- Application Metadata -->
+    <metadata>
+        <appName>Monitoring tool</appName>
+        <version>1.0</version>
+        <description>One-Click installer for Monitoring tool</description>
+        <vendor>Ops Tools</vendor>
+    </metadata>
+
+    <!-- Java Configuration -->
+    <java>
+        <!-- Minimum Java version required -->
+        <minVersion>11</minVersion>
+
+        <!-- Target Java version (Temurin LTS) -->
+        <targetVersion>21</targetVersion>
+
+        <!-- Java installer file name (must be in same folder as setup.ps1) -->
+        <installerFile>OpenJDK21-jdk.msi</installerFile>
+
+        <!-- JVM Memory settings -->
+        <jvmMemory>
+            <minHeap>512M</minHeap>
+            <maxHeap>2G</maxHeap>
+        </jvmMemory>
+    </java>
+
+    <!-- Third-party Tools Configuration -->
+    <tools>
+        <!-- WinSCP Configuration -->
+        <winSCP>
+            <required>true</required>
+            <installerFile>WinSCP-Setup.exe</installerFile>
+            <installPath32>C:\Program Files (x86)\WinSCP</installPath32>
+            <installPath64>C:\Program Files\WinSCP</installPath64>
+            <executable>WinSCP.com</executable>
+        </winSCP>
+    </tools>
+
+    <!-- Desktop and Start Menu Configuration -->
+    <shortcuts>
+        <!-- Desktop shortcut settings -->
+        <desktop>
+            <enabled>true</enabled>
+            <name>Monitoring tool</name>
+            <description>Monitoring tool</description>
+            <!-- windowStyle: 1=Normal, 3=Maximized, 7=Hidden -->
+            <windowStyle>7</windowStyle>
+            <runAsAdmin>true</runAsAdmin>
+        </desktop>
+
+        <!-- Start Menu shortcut settings -->
+        <startMenu>
+            <enabled>true</enabled>
+            <folder>Ops Tools</folder>
+            <name>Monitoring tool</name>
+            <description>Monitoring tool</description>
+            <!-- windowStyle: 1=Normal, 3=Maximized, 7=Hidden -->
+            <windowStyle>7</windowStyle>
+            <runAsAdmin>true</runAsAdmin>
+        </startMenu>
+    </shortcuts>
+
+    <!-- Daemon/Background Service Configuration -->
+    <daemon>
+        <!-- Enable/disable daemon registration -->
+        <enabled>true</enabled>
+
+        <!-- Scheduled task name in Windows Task Scheduler -->
+        <taskName>Monitoring-Tool-Daemon</taskName>
+
+        <!-- Task description -->
+        <description>Background daemon for Monitoring tool file transfers and tasks</description>
+
+        <!-- Startup trigger configuration -->
+        <startupTrigger>
+            <!-- Enable startup trigger -->
+            <enabled>true</enabled>
+            <!-- Delay after system startup (in minutes) -->
+            <delayMinutes>1</delayMinutes>
+        </startupTrigger>
+
+        <!-- Periodic trigger configuration -->
+        <periodicTrigger>
+            <!-- Enable periodic trigger -->
+            <enabled>true</enabled>
+            <!-- Run every N minutes -->
+            <intervalMinutes>60</intervalMinutes>
+        </periodicTrigger>
+
+        <!-- Task recovery settings -->
+        <recovery>
+            <!-- Restart count on failure -->
+            <restartCount>3</restartCount>
+            <!-- Restart interval in minutes -->
+            <restartIntervalMinutes>5</restartIntervalMinutes>
+        </recovery>
+
+        <!-- Task execution settings -->
+        <execution>
+            <!-- Run as SYSTEM account -->
+            <runAsSystem>true</runAsSystem>
+            <!-- Highest privilege level -->
+            <runLevel>Highest</runLevel>
+            <!-- Allow running on battery -->
+            <allowBattery>true</allowBattery>
+            <!-- Don't stop on low battery -->
+            <dontStopOnBattery>true</dontStopOnBattery>
+        </execution>
+    </daemon>
+
+    <!-- Logging Configuration -->
+    <logging>
+        <!-- Log directory (relative to script directory) -->
+        <logDir>logs</logDir>
+
+        <!-- Setup log prefix -->
+        <setupLogPrefix>opstool-setup</setupLogPrefix>
+
+        <!-- Application log file name -->
+        <appLogFile>app.log</appLogFile>
+
+        <!-- Daemon log file name -->
+        <daemonLogFile>daemon.log</daemonLogFile>
+
+        <!-- Log level (DEBUG, INFO, WARN, ERROR) -->
+        <logLevel>INFO</logLevel>
+
+        <!-- Max log file size in MB before rotation -->
+        <maxLogSizeMB>10</maxLogSizeMB>
+
+        <!-- Number of rotated log files to keep -->
+        <maxLogFiles>5</maxLogFiles>
+    </logging>
+
+    <!-- Feature Flags -->
+    <features>
+        <!-- Enable automatic credential encryption -->
+        <credentialEncryption>false</credentialEncryption>
+
+        <!-- Enable task audit logging -->
+        <auditLogging>true</auditLogging>
+
+        <!-- Enable performance monitoring -->
+        <performanceMonitoring>false</performanceMonitoring>
+
+        <!-- Enable automatic backup of configuration -->
+        <autoBackup>true</autoBackup>
+
+        <!-- Backup interval in hours -->
+        <backupIntervalHours>24</backupIntervalHours>
+    </features>
+
+    <!-- System Requirements Validation -->
+    <systemRequirements>
+        <!-- Minimum Windows version (10 = Windows 10, 11 = Windows 11) -->
+        <minWindowsVersion>10</minWindowsVersion>
+
+        <!-- Require Administrator privileges -->
+        <requireAdmin>true</requireAdmin>
+
+        <!-- Check disk space (in MB) -->
+        <minDiskSpaceMB>500</minDiskSpaceMB>
+
+        <!-- Check available RAM (in MB) -->
+        <minRAMMB>1024</minRAMMB>
+    </systemRequirements>
+
+    <!-- Network and Connectivity Settings -->
+    <network>
+        <!-- Default SFTP port -->
+        <defaultSftpPort>22</defaultSftpPort>
+
+        <!-- Connection timeout in seconds -->
+        <connectionTimeoutSeconds>30</connectionTimeoutSeconds>
+
+        <!-- Read timeout in seconds -->
+        <readTimeoutSeconds>60</readTimeoutSeconds>
+
+        <!-- Retry attempts for failed connections -->
+        <retryAttempts>3</retryAttempts>
+
+        <!-- Retry interval in seconds -->
+        <retryIntervalSeconds>5</retryIntervalSeconds>
+    </network>
+
+    <!-- Prerequisite Files (must be in same folder as setup.ps1) -->
+    <prerequisites>
+        <!-- JAR file -->
+        <file type="jar" name="Monitoring-Tool.jar" required="true">
+            <description>Prebuilt application JAR</description>
+        </file>
+
+        <!-- Java installer -->
+        <file type="installer" name="OpenJDK21-jdk.msi" required="false">
+            <description>Temurin JDK 21 offline installer</description>
+        </file>
+
+        <!-- WinSCP installer -->
+        <file type="installer" name="WinSCP-Setup.exe" required="false">
+            <description>WinSCP offline installer</description>
+        </file>
+
+        <!-- Elevation launcher -->
+        <file type="batch" name="test-elevation.bat" required="true">
+            <description>Elevation test/launcher batch file</description>
+        </file>
+
+        <!-- Application icon (optional) -->
+        <file type="icon" name="Icon.ico" required="false">
+            <description>Application icon for shortcuts</description>
+        </file>
+    </prerequisites>
+
+    <!-- Setup Validation and Checks -->
+    <validation>
+        <!-- Verify all prerequisites exist before proceeding -->
+        <checkPrerequisites>true</checkPrerequisites>
+
+        <!-- Verify Windows is running as Administrator -->
+        <checkAdminPrivileges>true</checkAdminPrivileges>
+
+        <!-- Verify sufficient disk space -->
+        <checkDiskSpace>true</checkDiskSpace>
+
+        <!-- Verify installation path is accessible -->
+        <checkInstallPath>true</checkInstallPath>
+
+        <!-- Create backup of existing installation if found -->
+        <backupExisting>true</backupExisting>
+    </validation>
+</application>
+
