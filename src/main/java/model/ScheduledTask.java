@@ -12,6 +12,7 @@ public class ScheduledTask {
     public enum ScheduleType { RUN_NOW, ONCE, DAILY, WEEKLY, INTERVAL_MINUTES, INTERVAL_SECONDS }
     public enum TransferDirection { OUTBOUND, INBOUND, LOCAL_TO_LOCAL }
     public enum TransferMode { LATEST_ONLY, ENTIRE_FOLDER, SPECIFIC_FILE }
+    public enum MailFetchScope { LATEST_ONLY, ALL_MATCHING }
     
 
 
@@ -35,13 +36,26 @@ public class ScheduledTask {
     // Service fields
     private String serviceName;
 
-    // Outlook / IMAP fields
-    private String imapFolder;
-    private String mailSearchCriteria;
+    // Outlook mail fields — read via Microsoft Graph (see GraphMailService).
+    // NOTE: Graph is a cloud REST API regardless of where the task runs, so the
+    // old "REMOTE vs LOCAL Outlook" distinction from the IMAP implementation
+    // no longer applies; there is only ever one mailbox + one auth path.
+    private String imapFolder;            // mail folder to read (kept name for storage/back-compat)
+    private String mailSearchCriteria;    // IMAP-style criteria string, best-effort mapped to Graph $filter
     private MailFetchMode mailFetchMode;
-    private String mailOutlookLocation;  // "REMOTE" or "LOCAL"
-    private String mailLocalUsername;    // Username for local Outlook IMAP connection
-    private String mailLocalPassword;    // Password for local Outlook IMAP connection
+    private String mailMailboxAddress;    // UPN / email address of the mailbox to read
+    private String mailTenantId;          // Azure AD tenant ID, or "common"
+    private String mailClientId;          // Application (client) ID of the self-registered Azure AD app
+    private MailFetchScope mailFetchScope; // LATEST_ONLY (newest matching message) or ALL_MATCHING (paginated)
+    private int mailMaxResults;            // safety cap for ALL_MATCHING / watcher mode
+
+    // Mail watcher — mirrors the file-transfer watcher's epoch baseline, but keyed
+    // on message receivedDateTime instead of file lastModified. Reuses the shared
+    // watcherEnabled flag above (a task is only ever one TaskType, so no collision).
+    private long mailLastKnownEpoch;       // epoch ms of newest processed message at last successful run
+    private boolean mailMarkAsRead;        // mark fetched messages as read via Graph after processing
+    private boolean mailMoveToFolderEnabled; // move fetched messages to another folder after processing
+    private String mailMoveToFolderName;     // destination folder display name (or well-known name)
 
     // Schedule fields
     private ScheduleType scheduleType;
@@ -74,9 +88,15 @@ public class ScheduledTask {
         this.imapFolder = "INBOX";
         this.mailSearchCriteria = "UNSEEN";
         this.mailFetchMode = MailFetchMode.BODY_ONLY;
-        this.mailOutlookLocation = "REMOTE";  // Default to remote
-        this.mailLocalUsername = "";
-        this.mailLocalPassword = "";
+        this.mailMailboxAddress = "";
+        this.mailTenantId = "common";
+        this.mailClientId = "";
+        this.mailFetchScope = MailFetchScope.LATEST_ONLY;
+        this.mailMaxResults = 50;
+        this.mailLastKnownEpoch = 0L;
+        this.mailMarkAsRead = false;
+        this.mailMoveToFolderEnabled = false;
+        this.mailMoveToFolderName = "";
         this.retryCount = 0;
         this.watcherEnabled = false;
         this.inboundWatcherPollIntervalMinutes = 0;
@@ -131,14 +151,32 @@ public class ScheduledTask {
     public MailFetchMode getMailFetchMode()       { return mailFetchMode; }
     public void setMailFetchMode(MailFetchMode m) { this.mailFetchMode = m; }
 
-    public String getMailOutlookLocation()        { return mailOutlookLocation; }
-    public void   setMailOutlookLocation(String l){ this.mailOutlookLocation = l; }
+    public String getMailMailboxAddress()         { return mailMailboxAddress; }
+    public void   setMailMailboxAddress(String a) { this.mailMailboxAddress = a; }
 
-    public String getMailLocalUsername()         { return mailLocalUsername; }
-    public void   setMailLocalUsername(String u) { this.mailLocalUsername = u; }
+    public String getMailTenantId()               { return mailTenantId; }
+    public void   setMailTenantId(String t)       { this.mailTenantId = t; }
 
-    public String getMailLocalPassword()         { return mailLocalPassword; }
-    public void   setMailLocalPassword(String p) { this.mailLocalPassword = p; }
+    public String getMailClientId()               { return mailClientId; }
+    public void   setMailClientId(String c)       { this.mailClientId = c; }
+
+    public MailFetchScope getMailFetchScope()      { return mailFetchScope; }
+    public void   setMailFetchScope(MailFetchScope s) { this.mailFetchScope = s; }
+
+    public int  getMailMaxResults()               { return mailMaxResults; }
+    public void setMailMaxResults(int m)           { this.mailMaxResults = m; }
+
+    public long getMailLastKnownEpoch()            { return mailLastKnownEpoch; }
+    public void setMailLastKnownEpoch(long e)      { this.mailLastKnownEpoch = e; }
+
+    public boolean isMailMarkAsRead()              { return mailMarkAsRead; }
+    public void    setMailMarkAsRead(boolean b)    { this.mailMarkAsRead = b; }
+
+    public boolean isMailMoveToFolderEnabled()     { return mailMoveToFolderEnabled; }
+    public void    setMailMoveToFolderEnabled(boolean b) { this.mailMoveToFolderEnabled = b; }
+
+    public String getMailMoveToFolderName()        { return mailMoveToFolderName; }
+    public void   setMailMoveToFolderName(String f){ this.mailMoveToFolderName = f; }
 
     public ScheduleType getScheduleType()        { return scheduleType; }
     public void         setScheduleType(ScheduleType s){ this.scheduleType = s; }

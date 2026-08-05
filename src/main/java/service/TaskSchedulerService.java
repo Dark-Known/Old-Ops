@@ -436,7 +436,14 @@ public class TaskSchedulerService {
                     }
                     break;
                 case OUTLOOK_MAIL:
-                    success = transferService.executeImapMailTask(task, line -> emit(task.getId(), line));
+                    try {
+                        success = transferService.executeImapMailTask(task, line -> emit(task.getId(), line));
+                    }
+                    catch (TransferService.WatcherSkipException e) {
+                        emit(task.getId(), "[INFO] Mail watcher skipped run: " + e.getMessage());
+                        success = true;
+                        skipped = true;
+                    }
                     break;
                 case START_SERVICE:
                 case STOP_SERVICE:

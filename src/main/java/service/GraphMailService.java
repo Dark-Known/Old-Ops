@@ -1,0 +1,366 @@
+package service;
+
+import util.MailFetchMode;
+import util.MiniJson;
+
+import java.io.IOException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeFormatterBuilder;
+import java.util.*;
+import java.util.function.Consumer;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+/**
+ * Reads Outlook mail via the Microsoft Graph REST API instead of raw IMAP.
+ *
+ * Why: many Microsoft 365 tenants block legacy protocols (IMAP/POP/SMTP AUTH)
+ * tenant-wide via Conditional Access / authentication policies — regardless
+ * of whether the client authenticates with Basic Auth or OAuth2. Graph is a
+ * plain HTTPS REST API — the same path the Outlook web app and mobile apps
+ * use — so it is unaffected by that policy.
+ *
+ * This service intentionally accepts the *same* task-level search criteria
+ * string the app already collects via {@code SearchCriteriaPanel} (built
+ * from IMAP RFC 3501 syntax) and translates the subset that has a reasonable
+ * Graph equivalent into an OData {@code $filter}. Anything unrecognized is
+ * logged and skipped rather than silently misapplied — Graph's query
+ * language is not a superset of IMAP SEARCH, so a lossy best-effort mapping
+ * is the honest option here.
+ */
+public class GraphMailService {
+
+    private static final String GRAPH_BASE = "https://graph.microsoft.com/v1.0";
+    private final HttpClient http = HttpClient.newHttpClient();
+
+    public static class MailMessage {
+        public final String id;
+        public final String subject;
+        public final String from;
+        public final String receivedDateTime;
+        public final String bodyContent;
+        public final String bodyType; // "html" or "text"
+
+        MailMessage(String id, String subject, String from,
+                    String receivedDateTime, String bodyContent, String bodyType) {
+            this.id = id;
+            this.subject = subject;
+            this.from = from;
+            this.receivedDateTime = receivedDateTime;
+            this.bodyContent = bodyContent;
+            this.bodyType = bodyType;
+        }
+    }
+
+    /**
+     * @param folder          e.g. "INBOX" (mapped to Graph's well-known "inbox" folder);
+     *                        other names are resolved via a display-name lookup
+     * @param searchCriteria  IMAP-style criteria string from the task, best-effort
+     *                        translated to a Graph $filter (see class docs)
+     * @param mode            controls how much of each message body is fetched
+     * @param maxResults      upper bound on how many matching messages to return —
+     *                        pass 1 for "latest only"; for "entire folder" this is a
+     *                        safety cap, not an invitation to fetch unbounded mail —
+     *                        results beyond this are paginated via @odata.nextLink
+     *                        until either the cap or the last page is reached
+     * @param afterEpochMillis  when > 0, only returns messages with receivedDateTime
+     *                        strictly after this instant (watcher mode); pass 0 to disable
+     */
+    public List<MailMessage> fetchMessages(String accessToken, String folder,
+                                           String searchCriteria, MailFetchMode mode,
+                                           int maxResults, long afterEpochMillis,
+                                           Consumer<String> logLine)
+            throws IOException, InterruptedException {
+
+        String folderSegment = resolveFolderSegment(accessToken, folder, logLine);
+        String filter = mapSearchCriteriaToFilter(searchCriteria, logLine);
+
+        if (afterEpochMillis > 0) {
+            String iso = java.time.Instant.ofEpochMilli(afterEpochMillis).toString();
+            String epochClause = "receivedDateTime gt " + iso;
+            filter = (filter == null || filter.isEmpty()) ? epochClause : filter + " and " + epochClause;
+        }
+
+        // Graph pages ~10 messages by default and caps a single page at 999;
+        // request pages sized to what's still needed, up to that cap.
+        int pageSize = Math.min(Math.max(maxResults, 1), 999);
+        String baseUrl = GRAPH_BASE + "/me/mailFolders/" + folderSegment + "/messages"
+                + "?$top=" + pageSize
+                + "&$select=id,subject,from,receivedDateTime";
+        String filterParam = (filter != null && !filter.isEmpty()) ? "&$filter=" + urlEnc(filter) : "";
+
+        // NOTE: Microsoft Graph rejects some $filter + $orderby combinations on the
+        // /messages collection (a documented quirk, not something this code can
+        // predict in advance without calling the API). Try with $orderby first
+        // since it gives cleanest "newest first" ordering; if Graph rejects the
+        // combination, retry once without it and log that ordering may be off.
+        String nextUrl = baseUrl + "&$orderby=receivedDateTime desc" + filterParam;
+        List<Map<String, Object>> items = new ArrayList<>();
+        boolean orderByDropped = false;
+
+        while (nextUrl != null && items.size() < maxResults) {
+            Map<String, Object> page;
+            try {
+                page = graphGetJson(accessToken, nextUrl);
+            } catch (IOException ex) {
+                if (!orderByDropped && nextUrl.contains("$orderby=")) {
+                    logLine.accept("[WARN] Graph rejected $orderby combined with the current filter — "
+                            + "retrying without it (" + ex.getMessage() + ")");
+                    orderByDropped = true;
+                    nextUrl = baseUrl + filterParam;
+                    continue;
+                }
+                throw ex;
+            }
+            List<Object> pageItems = MiniJson.getArray(page, "value");
+            if (pageItems != null) {
+                for (Object o : pageItems) {
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> m = (Map<String, Object>) o;
+                    items.add(m);
+                    if (items.size() >= maxResults) break;
+                }
+            }
+            nextUrl = (items.size() < maxResults)
+                    ? MiniJson.getString(page, "@odata.nextLink", null)
+                    : null;
+        }
+
+        if (items.isEmpty()) {
+            logLine.accept("[INFO] No messages matched criteria '" + searchCriteria
+                    + "' in folder '" + folder + "'.");
+            return Collections.emptyList();
+        }
+        logLine.accept("[INFO] Fetched " + items.size() + " message(s) (cap=" + maxResults + ").");
+
+        List<MailMessage> results = new ArrayList<>();
+        // Oldest-first among the fetched batch, mirroring the previous IMAP FETCH ordering.
+        for (int i = items.size() - 1; i >= 0; i--) {
+            Map<String, Object> item = items.get(i);
+
+            String id       = MiniJson.getString(item, "id", "");
+            String subject  = MiniJson.getString(item, "subject", "");
+            String received = MiniJson.getString(item, "receivedDateTime", "");
+
+            String from = "";
+            Map<String, Object> fromObj = MiniJson.getObject(item, "from");
+            if (fromObj != null) {
+                Map<String, Object> addr = MiniJson.getObject(fromObj, "emailAddress");
+                if (addr != null) from = MiniJson.getString(addr, "address", "");
+            }
+
+            String bodyContent;
+            String bodyType = "text";
+
+            if (mode == MailFetchMode.FULL_MESSAGE) {
+                // Raw RFC 2822 MIME — closest analog to the old IMAP BODY[] fetch.
+                bodyContent = graphGetRaw(accessToken, GRAPH_BASE + "/me/messages/" + id + "/$value");
+            } else {
+                Map<String, Object> full = graphGetJson(accessToken,
+                        GRAPH_BASE + "/me/messages/" + id + "?$select=body");
+                Map<String, Object> body = MiniJson.getObject(full, "body");
+                if (body != null) {
+                    bodyContent = MiniJson.getString(body, "content", "");
+                    bodyType    = MiniJson.getString(body, "contentType", "text");
+                } else {
+                    bodyContent = "";
+                }
+            }
+
+            results.add(new MailMessage(id, subject, from, received, bodyContent, bodyType));
+        }
+        return results;
+    }
+
+    // ─── Folder resolution ──────────────────────────────────────────────────
+
+    private String resolveFolderSegment(String accessToken, String folder, Consumer<String> logLine)
+            throws IOException, InterruptedException {
+        if (folder == null || folder.trim().isEmpty() || folder.equalsIgnoreCase("INBOX")) return "inbox";
+        switch (folder.trim().toUpperCase(Locale.ROOT)) {
+            case "SENT":
+            case "SENTITEMS":    return "sentitems";
+            case "DRAFTS":       return "drafts";
+            case "DELETED":
+            case "TRASH":        return "deleteditems";
+            case "JUNK":
+            case "SPAM":         return "junkemail";
+            case "ARCHIVE":      return "archive";
+            default: {
+                String url = GRAPH_BASE + "/me/mailFolders?$filter="
+                        + urlEnc("displayName eq '" + folder.trim().replace("'", "''") + "'");
+                Map<String, Object> resp = graphGetJson(accessToken, url);
+                List<Object> arr = MiniJson.getArray(resp, "value");
+                if (arr != null && !arr.isEmpty()) {
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> first = (Map<String, Object>) arr.get(0);
+                    return MiniJson.getString(first, "id", "inbox");
+                }
+                logLine.accept("[WARN] Folder '" + folder + "' not found via Graph — defaulting to Inbox.");
+                return "inbox";
+            }
+        }
+    }
+
+    // ─── Search criteria translation (IMAP-string -> Graph $filter) ─────────
+
+    private static final DateTimeFormatter IMAP_DATE_FMT = new DateTimeFormatterBuilder()
+            .appendPattern("dd-MMM-yyyy")
+            .toFormatter(Locale.ENGLISH);
+
+    private static final Pattern TEXT_CRITERION =
+            Pattern.compile("(FROM|TO|CC|BCC|SUBJECT)\\s+\"([^\"]*)\"", Pattern.CASE_INSENSITIVE);
+    private static final Pattern DATE_CRITERION =
+            Pattern.compile("(SINCE|BEFORE|ON)\\s+(\\d{1,2}-[A-Za-z]{3}-\\d{4})", Pattern.CASE_INSENSITIVE);
+
+    /**
+     * Best-effort mapping of the app's IMAP-style search criteria string to a
+     * Graph OData $filter. Recognized: ALL, UNSEEN, SEEN, FROM/TO/CC/BCC/SUBJECT
+     * "value", SINCE/BEFORE/ON dd-MMM-yyyy. Anything else is logged and dropped
+     * rather than guessed at, since a wrong filter is worse than no filter.
+     */
+    private String mapSearchCriteriaToFilter(String criteria, Consumer<String> logLine) {
+        if (criteria == null || criteria.trim().isEmpty()) return null;
+        String c = criteria.trim();
+
+        if (c.equalsIgnoreCase("ALL")) return null;
+
+        List<String> clauses = new ArrayList<>();
+        String remaining = c;
+
+        if (containsToken(remaining, "UNSEEN")) {
+            clauses.add("isRead eq false");
+            remaining = stripToken(remaining, "UNSEEN");
+        } else if (containsToken(remaining, "SEEN")) {
+            clauses.add("isRead eq true");
+            remaining = stripToken(remaining, "SEEN");
+        }
+
+        Matcher tm = TEXT_CRITERION.matcher(remaining);
+        while (tm.find()) {
+            String field = tm.group(1).toUpperCase(Locale.ROOT);
+            String value = tm.group(2).replace("'", "''");
+            switch (field) {
+                case "SUBJECT": clauses.add("contains(subject,'" + value + "')"); break;
+                case "FROM":    clauses.add("from/emailAddress/address eq '" + value + "'"); break;
+                // Graph's default /me/messages doesn't expose simple TO/CC/BCC filter
+                // properties the way IMAP does; skip with a note rather than silently
+                // returning unfiltered results under a filter that looks like it applied.
+                default:
+                    logLine.accept("[WARN] Search criterion '" + field
+                            + "' has no direct Graph equivalent here — skipped.");
+            }
+            remaining = remaining.replace(tm.group(), "");
+        }
+
+        Matcher dm = DATE_CRITERION.matcher(remaining);
+        while (dm.find()) {
+            String op = dm.group(1).toUpperCase(Locale.ROOT);
+            String isoDate = java.time.LocalDate.parse(dm.group(2), IMAP_DATE_FMT) + "T00:00:00Z";
+            switch (op) {
+                case "SINCE":  clauses.add("receivedDateTime ge " + isoDate); break;
+                case "BEFORE": clauses.add("receivedDateTime lt " + isoDate); break;
+                case "ON":     clauses.add("receivedDateTime ge " + isoDate
+                        + " and receivedDateTime lt " + isoDate.replace("T00:00:00Z", "T23:59:59Z"));
+                    break;
+            }
+            remaining = remaining.replace(dm.group(), "");
+        }
+
+        remaining = remaining.trim();
+        if (!remaining.isEmpty()) {
+            logLine.accept("[WARN] Unrecognized portion of search criteria ignored: '" + remaining + "'");
+        }
+
+        if (clauses.isEmpty()) return null;
+        return String.join(" and ", clauses);
+    }
+
+    private boolean containsToken(String s, String token) {
+        return Pattern.compile("(?i)(^|\\s)" + token + "(\\s|$)").matcher(s).find();
+    }
+
+    private String stripToken(String s, String token) {
+        return Pattern.compile("(?i)(^|\\s)" + token + "(\\s|$)").matcher(s).replaceFirst(" ").trim();
+    }
+
+    // ─── Post-processing: mark as read / move to another folder ─────────────
+
+    /** Marks a single message as read. Call before {@link #moveMessage} if doing both — move changes the message ID. */
+    public void markAsRead(String accessToken, String messageId) throws IOException, InterruptedException {
+        graphPatch(accessToken, GRAPH_BASE + "/me/messages/" + messageId, "{\"isRead\":true}");
+    }
+
+    /**
+     * Moves a message into another folder. Graph's move endpoint returns a *new*
+     * message resource with a different ID in the destination folder — the
+     * original ID becomes invalid immediately after this call, so any other
+     * per-message action (e.g. {@link #markAsRead}) must happen first.
+     */
+    public void moveMessage(String accessToken, String messageId, String destinationFolder,
+                            Consumer<String> logLine) throws IOException, InterruptedException {
+        String destId = resolveFolderSegment(accessToken, destinationFolder, logLine);
+        String body = "{\"destinationId\":\"" + MiniJson.escapeString(destId) + "\"}";
+        graphPost(accessToken, GRAPH_BASE + "/me/messages/" + messageId + "/move", body);
+    }
+
+    // ─── HTTP helpers ────────────────────────────────────────────────────────
+
+    private Map<String, Object> graphGetJson(String accessToken, String url)
+            throws IOException, InterruptedException {
+        return MiniJson.parseObject(graphGetRaw(accessToken, url));
+    }
+
+    private String graphGetRaw(String accessToken, String url) throws IOException, InterruptedException {
+        HttpRequest req = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .header("Authorization", "Bearer " + accessToken)
+                .GET()
+                .build();
+        HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+        if (resp.statusCode() != 200) {
+            throw new IOException("Graph API call failed (" + resp.statusCode() + ") for " + url
+                    + ": " + resp.body());
+        }
+        return resp.body();
+    }
+
+    private void graphPatch(String accessToken, String url, String jsonBody)
+            throws IOException, InterruptedException {
+        HttpRequest req = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .header("Authorization", "Bearer " + accessToken)
+                .header("Content-Type", "application/json")
+                .method("PATCH", HttpRequest.BodyPublishers.ofString(jsonBody, StandardCharsets.UTF_8))
+                .build();
+        HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+        if (resp.statusCode() < 200 || resp.statusCode() >= 300) {
+            throw new IOException("Graph PATCH failed (" + resp.statusCode() + ") for " + url
+                    + ": " + resp.body());
+        }
+    }
+
+    private void graphPost(String accessToken, String url, String jsonBody)
+            throws IOException, InterruptedException {
+        HttpRequest req = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .header("Authorization", "Bearer " + accessToken)
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(jsonBody, StandardCharsets.UTF_8))
+                .build();
+        HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+        if (resp.statusCode() < 200 || resp.statusCode() >= 300) {
+            throw new IOException("Graph POST failed (" + resp.statusCode() + ") for " + url
+                    + ": " + resp.body());
+        }
+    }
+
+    private String urlEnc(String s) {
+        return java.net.URLEncoder.encode(s, StandardCharsets.UTF_8);
+    }
+}

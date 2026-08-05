@@ -9,8 +9,6 @@ import model.ScheduledTask.TransferMode;
 import service.RemoteFileMetadataServiceFactory.ManagedMetadataService;
 import util.MailFetchMode;
 
-import javax.net.ssl.SSLSocket;
-import javax.net.ssl.SSLSocketFactory;
 import java.io.*;
 import java.net.InetAddress;
 import java.nio.file.*;
@@ -77,6 +75,11 @@ public class TransferService {
     private final RemoteFileMetadataServiceFactory metadataServiceFactory;
     private String winScpPath;
 
+    // Outlook mail is read via Microsoft Graph (see class docs on executeImapMailTask).
+    private static final String GRAPH_MAIL_SCOPE = "https://graph.microsoft.com/Mail.ReadWrite offline_access";
+    private final OAuth2TokenService oauthService = new OAuth2TokenService();
+    private final GraphMailService graphMailService = new GraphMailService();
+
     private final ConcurrentMap<String, Process> activeProcesses = new ConcurrentHashMap<>();
 
     public TransferService(XmlStorageService storage) {
@@ -84,6 +87,9 @@ public class TransferService {
         this.metadataServiceFactory = new RemoteFileMetadataServiceFactory(storage);
         this.winScpPath             = detectWinScp();
     }
+
+    /** Exposed so the UI's "Authorize Mailbox" flow can enroll without duplicating OAuth logic. */
+    public OAuth2TokenService getOAuthService() { return oauthService; }
 
     public void   setWinScpPath(String path) { this.winScpPath = path; }
     public String getWinScpPath()            { return winScpPath; }
@@ -1102,35 +1108,95 @@ public class TransferService {
         }
     }
 
-    // ─── Mail / IMAP ──────────────────────────────────────────────────────────
+    // ─── Mail / Outlook (Microsoft Graph) ────────────────────────────────────
+    //
+    // Originally implemented as raw IMAP socket commands (LOGIN, SELECT,
+    // SEARCH, FETCH). That approach stopped working for two independent
+    // reasons on modern Microsoft 365 tenants:
+    //   1. Microsoft disabled Basic Authentication for IMAP tenant-wide, so
+    //      "LOGIN user pass" is rejected regardless of how correct the
+    //      credentials are.
+    //   2. Many tenants additionally block the IMAP protocol itself (along
+    //      with POP/SMTP AUTH) via Conditional Access / authentication
+    //      policies, allowing only "modern", HTTPS-based clients — which
+    //      OAuth2 alone does not bypass, because the block happens at the
+    //      protocol layer before authentication is evaluated.
+    //
+    // Microsoft Graph (see GraphMailService) is a plain HTTPS REST API — the
+    // same path the Outlook web app and mobile apps use — so it is
+    // unaffected by both restrictions. Auth uses the OAuth2 device-code grant
+    // (see OAuth2TokenService): a person authorizes once via a browser, and
+    // every scheduled run after that silently exchanges a cached refresh
+    // token for a new access token with no further interaction.
 
-    public boolean executeImapMailTask(ScheduledTask task, Consumer<String> logLine) {
-        boolean isLocalOutlook = "LOCAL".equals(task.getMailOutlookLocation());
-        String host, username, password;
+    // ─── Mail / Outlook (Microsoft Graph) ────────────────────────────────────
+    //
+    // Originally implemented as raw IMAP socket commands (LOGIN, SELECT,
+    // SEARCH, FETCH). That approach stopped working for two independent
+    // reasons on modern Microsoft 365 tenants:
+    //   1. Microsoft disabled Basic Authentication for IMAP tenant-wide, so
+    //      "LOGIN user pass" is rejected regardless of how correct the
+    //      credentials are.
+    //   2. Many tenants additionally block the IMAP protocol itself (along
+    //      with POP/SMTP AUTH) via Conditional Access / authentication
+    //      policies, allowing only "modern", HTTPS-based clients — which
+    //      OAuth2 alone does not bypass, because the block happens at the
+    //      protocol layer before authentication is evaluated.
+    //
+    // Microsoft Graph (see GraphMailService) is a plain HTTPS REST API — the
+    // same path the Outlook web app and mobile apps use — so it is
+    // unaffected by both restrictions. Auth uses the OAuth2 device-code grant
+    // (see OAuth2TokenService): a person authorizes once via a browser, and
+    // every scheduled run after that silently exchanges a cached refresh
+    // token for a new access token with no further interaction.
+    //
+    // ── Mail watcher ──────────────────────────────────────────────────────
+    // Reuses the task-level watcherEnabled flag (also used by file-transfer
+    // watchers — safe, since a task is only ever one TaskType). When enabled,
+    // the configured Fetch Scope is overridden: every run fetches ALL messages
+    // with receivedDateTime strictly after the last successful run's newest
+    // processed message (capped by Max Messages as a safety limit), mirroring
+    // the file-transfer watcher's epoch-baseline approach. An empty result
+    // throws WatcherSkipException so the scheduler marks the run SKIPPED
+    // rather than a bare (and slightly misleading) SUCCESS.
+    //
+    // ── Mark as read / move to folder ─────────────────────────────────────
+    // Optional per-task post-processing, applied to each successfully fetched
+    // message: mark as read (Graph PATCH), then optionally move to another
+    // folder (Graph POST .../move — done *after* marking read, since a move
+    // invalidates the original message ID). Both are best-effort per message:
+    // one message's failure is logged and does not fail the whole run.
 
-        if (isLocalOutlook) {
-            host     = getLocalHostname();
-            username = task.getMailLocalUsername();
-            password = task.getMailLocalPassword();
-            if (username == null || username.trim().isEmpty()) {
-                logLine.accept("[ERROR] Local Outlook username is required.");
-                return false;
-            }
-            if (password == null || password.isEmpty()) {
-                logLine.accept("[ERROR] Local Outlook password is required.");
-                return false;
-            }
-            logLine.accept("[INFO] Using local Outlook IMAP via " + host + ":993 as " + username);
-        } else {
-            Credential target = resolveTargetCredential(task, logLine);
-            if (target == null) return false;
-            host     = target.getHost();
-            username = target.getUsername();
-            password = target.getPassword();
-            if (host == null || host.isEmpty()) {
-                logLine.accept("[ERROR] IMAP host is not configured for the selected credential.");
-                return false;
-            }
+    public boolean executeImapMailTask(ScheduledTask task, Consumer<String> logLine)
+            throws WatcherSkipException {
+        String mailbox = nvl(task.getMailMailboxAddress(), "");
+        if (mailbox.isEmpty()) {
+            logLine.accept("[ERROR] Mailbox address is required for Outlook Mail tasks.");
+            return false;
+        }
+
+        String tenantId = nvl(task.getMailTenantId(), "common");
+        String clientId = nvl(task.getMailClientId(), "");
+        if (clientId.isEmpty()) {
+            logLine.accept("[ERROR] Azure AD Client ID is not configured on this task. "
+                    + "Register a public-client app in Azure AD (see README) and set it "
+                    + "in the Mail/Outlook tab, then click \"Authorize Mailbox\" once.");
+            return false;
+        }
+
+        if (!oauthService.isEnrolled(mailbox)) {
+            logLine.accept("[ERROR] Mailbox '" + mailbox + "' has not been authorized yet. "
+                    + "Open this task in the editor and click \"Authorize Mailbox\" to complete "
+                    + "one-time sign-in — after that this task runs unattended.");
+            return false;
+        }
+
+        String accessToken;
+        try {
+            accessToken = oauthService.getValidAccessToken(mailbox, tenantId, clientId, GRAPH_MAIL_SCOPE);
+        } catch (IOException ex) {
+            logLine.accept("[ERROR] OAuth2 token refresh failed: " + ex.getMessage());
+            return false;
         }
 
         String folder   = nvl(task.getImapFolder(),         "INBOX");
@@ -1138,181 +1204,98 @@ public class TransferService {
         MailFetchMode mode = task.getMailFetchMode() != null
                 ? task.getMailFetchMode() : MailFetchMode.BODY_ONLY;
 
-        logLine.accept("[INFO] Connecting to IMAP server " + host + ":993 as " + username);
-        try (SSLSocket socket = createSslSocket(host, 993)) {
-            BufferedInputStream bis    = new BufferedInputStream(socket.getInputStream());
-            BufferedWriter      writer = new BufferedWriter(
-                    new OutputStreamWriter(socket.getOutputStream(), "UTF-8"));
+        boolean watcherOn = task.isWatcherEnabled();
+        long afterEpoch = watcherOn ? task.getMailLastKnownEpoch() : 0L;
 
-            String greet = readImapLine(bis);
-            logLine.accept("[DEBUG] IMAP greeting: " + greet);
-            if (greet == null || !greet.contains("OK")) {
-                logLine.accept("[ERROR] Unexpected IMAP greeting."); return false;
-            }
+        ScheduledTask.MailFetchScope scope = task.getMailFetchScope() != null
+                ? task.getMailFetchScope() : ScheduledTask.MailFetchScope.LATEST_ONLY;
+        int cap = Math.max(1, task.getMailMaxResults() > 0 ? task.getMailMaxResults() : 50);
+        // Watcher mode always means "everything new since last run" (capped),
+        // overriding LATEST_ONLY/ALL_MATCHING the same way the file-transfer
+        // watcher overrides manual TransferMode selection while it's active.
+        int maxResults = watcherOn ? cap
+                : (scope == ScheduledTask.MailFetchScope.LATEST_ONLY ? 1 : cap);
 
-            if (sendImapCommand(writer, bis,
-                    "A001 LOGIN " + quoteImapString(username) + " " + quoteImapString(password),
-                    "A001", logLine) == null) return false;
-            if (sendImapCommand(writer, bis,
-                    "A002 SELECT " + quoteImapString(folder), "A002", logLine) == null) return false;
+        logLine.accept("[INFO] Reading mail via Microsoft Graph — mailbox: " + mailbox
+                + " | folder: " + folder + " | criteria: " + criteria + " | mode: " + mode
+                + (watcherOn
+                        ? " | watcher: ON (after " + (afterEpoch > 0 ? Instant.ofEpochMilli(afterEpoch) : "epoch") + ", max " + maxResults + ")"
+                        : " | scope: " + scope + (scope == ScheduledTask.MailFetchScope.ALL_MATCHING ? " (max " + maxResults + ")" : "")));
 
-            logLine.accept("[INFO] Searching folder " + folder + " with criteria: " + criteria);
-            List<String> searchResponse = sendImapCommand(writer, bis,
-                    "A003 SEARCH " + criteria, "A003", logLine);
-            if (searchResponse == null) return false;
-
-            List<Integer> ids = parseSearchIds(searchResponse);
-            if (ids.isEmpty()) {
-                logLine.accept("[INFO] No messages matched the search criteria.");
-                return true;
-            }
-
-            int fetchCount = Math.min(ids.size(), 5);
-            List<Integer> toFetch = ids.subList(ids.size() - fetchCount, ids.size());
-            for (int id : toFetch) {
-                String fetchCmd;
-                switch (mode) {
-                    case FULL_MESSAGE:     fetchCmd = "A004 FETCH " + id + " BODY.PEEK[]"; break;
-                    case HEADERS_AND_BODY: fetchCmd = "A004 FETCH " + id + " (BODY.PEEK[HEADER] BODY.PEEK[TEXT])"; break;
-                    default:               fetchCmd = "A004 FETCH " + id + " BODY.PEEK[TEXT]"; break;
-                }
-                logLine.accept("[INFO] Fetching mail ID " + id + " (" + mode.name() + ")");
-                List<String> fetchResponse = sendImapCommand(writer, bis, fetchCmd, "A004", logLine);
-                if (fetchResponse == null) return false;
-                String payload = extractImapPayload(fetchResponse, mode);
-                if (payload.isEmpty()) {
-                    logLine.accept("[WARN] No payload returned for message " + id);
-                } else {
-                    logLine.accept("[MAIL MESSAGE " + id + "]");
-                    for (String ln : payload.split("\r?\n")) logLine.accept(ln);
-                    logLine.accept("[END MAIL MESSAGE " + id + "]");
-                }
-            }
-            sendImapCommand(writer, bis, "A005 LOGOUT", "A005", logLine);
-            return true;
-        } catch (Exception e) {
-            logLine.accept("[ERROR] IMAP task failed: " + e.getMessage());
+        List<GraphMailService.MailMessage> messages;
+        try {
+            messages = graphMailService.fetchMessages(
+                    accessToken, folder, criteria, mode, maxResults, afterEpoch, logLine);
+        } catch (IOException | InterruptedException ex) {
+            if (ex instanceof InterruptedException) Thread.currentThread().interrupt();
+            logLine.accept("[ERROR] Graph mail task failed: " + ex.getMessage());
             return false;
         }
-    }
 
-    // ─── IMAP helpers ─────────────────────────────────────────────────────────
-
-    private SSLSocket createSslSocket(String host, int port) throws IOException {
-        SSLSocket socket = (SSLSocket) ((SSLSocketFactory) SSLSocketFactory.getDefault())
-                .createSocket(host, port);
-        socket.setSoTimeout(30000);
-        socket.startHandshake();
-        return socket;
-    }
-
-    private List<String> sendImapCommand(BufferedWriter writer, BufferedInputStream bis,
-                                         String command, String tag,
-                                         Consumer<String> logLine) throws IOException {
-        writer.write(command + "\r\n");
-        writer.flush();
-        List<String> response = readImapResponse(bis, tag);
-        boolean ok = response.stream().anyMatch(ln -> ln.startsWith(tag + " OK"));
-        response.forEach(ln -> logLine.accept("[DEBUG] " + ln));
-        if (!ok) { logLine.accept("[ERROR] IMAP command failed: " + command); return null; }
-        return response;
-    }
-
-    private List<String> readImapResponse(BufferedInputStream bis, String tag) throws IOException {
-        List<String> lines = new ArrayList<>();
-        while (true) {
-            String line = readImapLine(bis);
-            if (line == null) break;
-            lines.add(line);
-            int literal = parseLiteralLength(line);
-            if (literal > 0) lines.add(readImapLiteral(bis, literal));
-            if (line.startsWith(tag + " ")) break;
+        if (messages.isEmpty()) {
+            if (watcherOn) {
+                String skipMsg = "Watcher skipped: no messages received after "
+                        + (afterEpoch > 0 ? Instant.ofEpochMilli(afterEpoch) : "the configured baseline") + ".";
+                logLine.accept("[INFO] " + skipMsg);
+                throw new WatcherSkipException(skipMsg);
+            }
+            return true; // nothing matched — not a failure outside watcher mode
         }
-        return lines;
-    }
 
-    private String readImapLine(BufferedInputStream bis) throws IOException {
-        ByteArrayOutputStream buf = new ByteArrayOutputStream();
-        int b;
-        while ((b = bis.read()) != -1) {
-            if (b == '\r') {
-                int next = bis.read();
-                if (next == '\n' || next == -1) break;
-                buf.write(b); buf.write(next);
-            } else { buf.write(b); }
-        }
-        if (buf.size() == 0 && b == -1) return null;
-        return buf.toString("UTF-8");
-    }
+        boolean markRead = task.isMailMarkAsRead();
+        boolean moveEnabled = task.isMailMoveToFolderEnabled()
+                && task.getMailMoveToFolderName() != null && !task.getMailMoveToFolderName().trim().isEmpty();
 
-    private int parseLiteralLength(String line) {
-        int idx = line.lastIndexOf('{'), end = line.lastIndexOf('}');
-        if (idx < 0 || end < idx) return 0;
-        try { return Integer.parseInt(line.substring(idx + 1, end)); }
-        catch (NumberFormatException e) { return 0; }
-    }
+        long newestEpoch = 0L;
+        for (GraphMailService.MailMessage m : messages) {
+            logLine.accept("[MAIL MESSAGE] " + m.subject + " | from=" + m.from
+                    + " | received=" + m.receivedDateTime);
+            if (m.bodyContent == null || m.bodyContent.isEmpty()) {
+                logLine.accept("[WARN] No payload returned for message id=" + m.id);
+            } else {
+                for (String ln : m.bodyContent.split("\r?\n")) logLine.accept(ln);
+            }
+            logLine.accept("[END MAIL MESSAGE]");
 
-    private String readImapLiteral(BufferedInputStream bis, int count) throws IOException {
-        byte[] buffer = new byte[count];
-        int read = 0;
-        while (read < count) {
-            int n = bis.read(buffer, read, count - read);
-            if (n == -1) throw new IOException("Unexpected end of IMAP literal");
-            read += n;
-        }
-        bis.mark(2);
-        int c1 = bis.read(), c2 = bis.read();
-        if (c1 != '\r' || c2 != '\n') bis.reset();
-        return new String(buffer, "UTF-8");
-    }
+            try {
+                long ts = Instant.parse(m.receivedDateTime).toEpochMilli();
+                if (ts > newestEpoch) newestEpoch = ts;
+            } catch (Exception ignored) {
+                // Unparseable timestamp — skip baseline consideration for this message only.
+            }
 
-    private List<Integer> parseSearchIds(List<String> response) {
-        for (String line : response) {
-            if (line.startsWith("* SEARCH")) {
-                List<Integer> ids = new ArrayList<>();
-                String[] parts = line.split(" ");
-                for (int i = 2; i < parts.length; i++) {
-                    try { ids.add(Integer.parseInt(parts[i])); }
-                    catch (NumberFormatException ignored) {}
+            // Mark-as-read must happen before move — moving invalidates the message ID.
+            if (markRead) {
+                try {
+                    graphMailService.markAsRead(accessToken, m.id);
+                    logLine.accept("[INFO] Marked as read: " + m.subject);
+                } catch (Exception ex) {
+                    logLine.accept("[WARN] Failed to mark message as read (" + m.subject + "): " + ex.getMessage());
                 }
-                return ids;
+            }
+            if (moveEnabled) {
+                try {
+                    graphMailService.moveMessage(accessToken, m.id, task.getMailMoveToFolderName(), logLine);
+                    logLine.accept("[INFO] Moved to folder '" + task.getMailMoveToFolderName() + "': " + m.subject);
+                } catch (Exception ex) {
+                    logLine.accept("[WARN] Failed to move message (" + m.subject + "): " + ex.getMessage());
+                }
             }
         }
-        return new ArrayList<>();
-    }
 
-    private String extractImapPayload(List<String> response, MailFetchMode mode) {
-        StringBuilder result = new StringBuilder();
-        if      (mode == MailFetchMode.FULL_MESSAGE)     result.append(extractFirstLiteral(response, "BODY[]"));
-        else if (mode == MailFetchMode.HEADERS_AND_BODY) {
-            String h = extractFirstLiteral(response, "BODY[HEADER]");
-            String b = extractFirstLiteral(response, "BODY[TEXT]");
-            if (!h.isEmpty()) result.append(h).append("\r\n\r\n");
-            if (!b.isEmpty()) result.append(b);
-        } else result.append(extractFirstLiteral(response, "BODY[TEXT]"));
-        if (result.length() == 0) {
-            for (String line : response) {
-                if (!line.startsWith("*") && !line.startsWith("A"))
-                    result.append(line).append("\r\n");
-            }
+        if (watcherOn && newestEpoch > 0) {
+            task.setMailLastKnownEpoch(newestEpoch);
+            storage.saveTask(task);
+            String readable = Instant.ofEpochMilli(newestEpoch)
+                    .atZone(java.time.ZoneId.systemDefault())
+                    .format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+            logLine.accept("[INFO] Mail watcher baseline updated \u2192 epoch=" + newestEpoch
+                    + " (" + readable + " local) | task saved, ID=" + task.getId());
         }
-        return result.toString().trim();
+
+        return true;
     }
 
-    private String extractFirstLiteral(List<String> response, String marker) {
-        for (int i = 0; i < response.size() - 1; i++) {
-            if (response.get(i).contains(marker)) {
-                String next = response.get(i + 1);
-                if (!next.startsWith("*") && !next.startsWith("A")) return next;
-            }
-        }
-        return "";
-    }
-
-    private String quoteImapString(String value) {
-        if (value == null) value = "";
-        return '"' + value.replace("\\", "\\\\").replace("\"", "\\\"") + '"';
-    }
 
     // ─── Cancellation ─────────────────────────────────────────────────────────
 

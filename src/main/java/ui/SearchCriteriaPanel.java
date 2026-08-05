@@ -9,14 +9,24 @@ import java.awt.*;
 import java.awt.event.ActionListener;
 import java.util.*;
 import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
- * UI Panel for building IMAP search criteria with a hybrid approach:
+ * UI Panel for building mail search criteria with a hybrid approach:
  * - Quick preset dropdowns for common criteria
  * - Additional criteria type selection
  * - Argument input fields
  * - Display of selected criteria as removable tags
- * - Advanced text field for custom criteria
+ *
+ * NOTE: the criteria strings this panel builds use IMAP RFC 3501 tokens
+ * (FROM/SUBJECT/SINCE/etc.) for continuity with the existing type/value
+ * builder below, but they are consumed by GraphMailService's best-effort
+ * translator to a Microsoft Graph $filter — not sent as literal IMAP. There
+ * used to be a free-text "raw IMAP" box here; it was removed because typing
+ * arbitrary IMAP syntax that Graph doesn't understand was misleading (Graph
+ * is not IMAP and doesn't support the full RFC 3501 grammar). Use the
+ * builder above for anything beyond the quick presets.
  */
 public class SearchCriteriaPanel extends JPanel {
 
@@ -25,7 +35,6 @@ public class SearchCriteriaPanel extends JPanel {
     private JTextField tfArgument;
     private JButton btnAdd;
     private JPanel pnlCriteria;
-    private JTextArea taCustom;
     private List<CriterionTag> selectedCriteria = new ArrayList<>();
     private ActionListener onCriteriaChanged;
 
@@ -85,24 +94,8 @@ public class SearchCriteriaPanel extends JPanel {
         spCriteria.setPreferredSize(new Dimension(0, 50));
         pnlBuilder.add(spCriteria, BorderLayout.CENTER);
 
-        // ── Custom criteria field ─────────────────────────────────────────────
-        JPanel pnlCustom = new JPanel(new BorderLayout(5, 5));
-        pnlCustom.setBorder(BorderFactory.createTitledBorder("Custom/Advanced (Raw IMAP)"));
-        taCustom = new JTextArea(3, 40);
-        taCustom.setLineWrap(true);
-        taCustom.setWrapStyleWord(true);
-        taCustom.setFont(new Font("Monospaced", Font.PLAIN, 11));
-        taCustom.setBorder(new EmptyBorder(3, 3, 3, 3));
-        JScrollPane spCustom = new JScrollPane(taCustom);
-        pnlCustom.add(new JLabel("<html><i>Enter raw IMAP criteria or leave blank to use selected criteria above</i></html>"), BorderLayout.NORTH);
-        pnlCustom.add(spCustom, BorderLayout.CENTER);
-
         add(pnlPresets, BorderLayout.NORTH);
-        
-        JPanel center = new JPanel(new BorderLayout(5, 5));
-        center.add(pnlBuilder, BorderLayout.NORTH);
-        center.add(pnlCustom, BorderLayout.CENTER);
-        add(center, BorderLayout.CENTER);
+        add(pnlBuilder, BorderLayout.CENTER);
     }
 
     private void populateAdvancedTypeCombo() {
@@ -194,15 +187,9 @@ public class SearchCriteriaPanel extends JPanel {
     }
 
     public String getCriteria() {
-        String customCriteria = taCustom.getText().trim();
-        if (!customCriteria.isEmpty()) {
-            return customCriteria;
-        }
-
         if (selectedCriteria.isEmpty()) {
             return "ALL";
         }
-
         StringBuilder sb = new StringBuilder();
         for (CriterionTag tag : selectedCriteria) {
             if (sb.length() > 0) sb.append(" ");
@@ -211,38 +198,73 @@ public class SearchCriteriaPanel extends JPanel {
         return sb.toString();
     }
 
+    /**
+     * Reconstructs tags from a previously-saved criteria string. Handles the
+     * common single-token case (e.g. "UNSEEN") directly, and best-effort
+     * parses compound strings (e.g. {@code FROM "x" SINCE 01-Jan-2024}) built
+     * by earlier saves or the Advanced Criteria Builder. Any leftover text
+     * that doesn't match a known criterion is dropped — there's no raw text
+     * box anymore to fall back to, so unrecognized fragments simply won't be
+     * re-displayed (use the Advanced Criteria Builder above to re-add them).
+     */
     public void setCriteria(String criteria) {
-        if (criteria == null || criteria.trim().isEmpty() || "UNSEEN".equals(criteria)) {
-            clearCriteria();
-            return;
-        }
+        clearCriteria();
+        if (criteria == null || criteria.trim().isEmpty()) return;
 
-        // Try to parse standard criteria; if it's complex, put in custom field
-        if (isComplexCriteria(criteria)) {
-            taCustom.setText(criteria);
-        } else {
-            // Try to parse as simple criteria
-            clearCriteria();
-            for (SimpleCriteria sc : SimpleCriteria.values()) {
-                if (criteria.equals(sc.getCriterion())) {
-                    addSimpleCriteria(sc);
-                    return;
+        String remaining = " " + criteria.trim() + " ";
+
+        // FROM/TO/CC/BCC/SUBJECT/BODY/TEXT "value"
+        Matcher tm = Pattern.compile("\\b(FROM|TO|CC|BCC|SUBJECT|BODY|TEXT)\\s+\"([^\"]*)\"",
+                Pattern.CASE_INSENSITIVE).matcher(remaining);
+        while (tm.find()) {
+            for (TextCriteria tc : TextCriteria.values()) {
+                if (tc.getCriterion().equalsIgnoreCase(tm.group(1))) {
+                    addCriteriaTag(tc.getCriterion() + " \"" + tm.group(2) + "\"",
+                            tc.getDescription() + ": " + tm.group(2));
                 }
             }
-            // If not recognized, put in custom field
-            taCustom.setText(criteria);
+            remaining = remaining.replace(tm.group(), " ");
         }
-    }
 
-    private boolean isComplexCriteria(String criteria) {
-        // Check if criteria contains multiple keywords or special characters
-        return criteria.contains(" ") || criteria.contains("\"") || criteria.contains("(");
+        // BEFORE/SINCE/ON/SENTBEFORE/SENTSINCE/SENTON <date>
+        Matcher dm = Pattern.compile("\\b(BEFORE|SINCE|ON|SENTBEFORE|SENTSINCE|SENTON)\\s+(\\S+)",
+                Pattern.CASE_INSENSITIVE).matcher(remaining);
+        while (dm.find()) {
+            for (DateCriteria dc : DateCriteria.values()) {
+                if (dc.getCriterion().equalsIgnoreCase(dm.group(1))) {
+                    addCriteriaTag(dc.getCriterion() + " " + dm.group(2),
+                            dc.getDescription() + ": " + dm.group(2));
+                }
+            }
+            remaining = remaining.replace(dm.group(), " ");
+        }
+
+        // LARGER/SMALLER <bytes>
+        Matcher sm = Pattern.compile("\\b(LARGER|SMALLER)\\s+(\\d+)", Pattern.CASE_INSENSITIVE).matcher(remaining);
+        while (sm.find()) {
+            for (SizeCriteria sc : SizeCriteria.values()) {
+                if (sc.getCriterion().equalsIgnoreCase(sm.group(1))) {
+                    addCriteriaTag(sc.getCriterion() + " " + sm.group(2),
+                            sc.getDescription() + ": " + sm.group(2));
+                }
+            }
+            remaining = remaining.replace(sm.group(), " ");
+        }
+
+        // Whatever single-word flags are left (UNSEEN, SEEN, ALL, FLAGGED, ...)
+        for (String token : remaining.trim().split("\\s+")) {
+            if (token.isEmpty()) continue;
+            for (SimpleCriteria sc : SimpleCriteria.values()) {
+                if (token.equalsIgnoreCase(sc.getCriterion())) {
+                    addSimpleCriteria(sc);
+                }
+            }
+        }
     }
 
     public void clearCriteria() {
         selectedCriteria.clear();
         pnlCriteria.removeAll();
-        taCustom.setText("");
         cbSimpleCriteria.setSelectedIndex(0);
         cbAdvancedType.setSelectedIndex(0);
         tfArgument.setText("");

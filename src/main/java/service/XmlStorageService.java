@@ -152,6 +152,31 @@ public class XmlStorageService {
                         String fetchMode = child(e, "mailFetchMode");
                         if (fetchMode == null || fetchMode.isEmpty()) fetchMode = "BODY_ONLY";
                         t.setMailFetchMode(MailFetchMode.valueOf(fetchMode));
+                        t.setMailMailboxAddress(child(e, "mailMailboxAddress"));
+                        String mailTenant = child(e, "mailTenantId");
+                        t.setMailTenantId(mailTenant != null && !mailTenant.isEmpty() ? mailTenant : "common");
+                        t.setMailClientId(child(e, "mailClientId"));
+                        String fetchScope = child(e, "mailFetchScope");
+                        t.setMailFetchScope(fetchScope != null && !fetchScope.isEmpty()
+                                ? ScheduledTask.MailFetchScope.valueOf(fetchScope)
+                                : ScheduledTask.MailFetchScope.LATEST_ONLY);
+                        String maxResults = child(e, "mailMaxResults");
+                        try {
+                            t.setMailMaxResults(maxResults != null && !maxResults.isEmpty()
+                                    ? Integer.parseInt(maxResults) : 50);
+                        } catch (NumberFormatException nfe) {
+                            t.setMailMaxResults(50);
+                        }
+                        String mailEpoch = child(e, "mailLastKnownEpoch");
+                        try {
+                            t.setMailLastKnownEpoch(mailEpoch != null && !mailEpoch.isEmpty()
+                                    ? Long.parseLong(mailEpoch) : 0L);
+                        } catch (NumberFormatException nfe) {
+                            t.setMailLastKnownEpoch(0L);
+                        }
+                        t.setMailMarkAsRead("true".equalsIgnoreCase(child(e, "mailMarkAsRead")));
+                        t.setMailMoveToFolderEnabled("true".equalsIgnoreCase(child(e, "mailMoveToFolderEnabled")));
+                        t.setMailMoveToFolderName(child(e, "mailMoveToFolderName"));
                         String direction = child(e, "transferDirection");
                         if (direction == null || direction.isEmpty()) direction = "OUTBOUND";
                         t.setTransferDirection(TransferDirection.valueOf(direction));
@@ -304,6 +329,17 @@ public class XmlStorageService {
                     addChild(doc, e, "mailSearchCriteria", t.getMailSearchCriteria());
                     addChild(doc, e, "mailFetchMode", t.getMailFetchMode() != null
                             ? t.getMailFetchMode().name() : MailFetchMode.BODY_ONLY.name());
+                    addChild(doc, e, "mailMailboxAddress", t.getMailMailboxAddress());
+                    addChild(doc, e, "mailTenantId", t.getMailTenantId() != null ? t.getMailTenantId() : "common");
+                    addChild(doc, e, "mailClientId", t.getMailClientId());
+                    addChild(doc, e, "mailFetchScope", t.getMailFetchScope() != null
+                            ? t.getMailFetchScope().name() : ScheduledTask.MailFetchScope.LATEST_ONLY.name());
+                    addChild(doc, e, "mailMaxResults", String.valueOf(
+                            t.getMailMaxResults() > 0 ? t.getMailMaxResults() : 50));
+                    addChild(doc, e, "mailLastKnownEpoch", String.valueOf(t.getMailLastKnownEpoch()));
+                    addChild(doc, e, "mailMarkAsRead", String.valueOf(t.isMailMarkAsRead()));
+                    addChild(doc, e, "mailMoveToFolderEnabled", String.valueOf(t.isMailMoveToFolderEnabled()));
+                    addChild(doc, e, "mailMoveToFolderName", t.getMailMoveToFolderName());
                     addChild(doc, e, "scheduleType", t.getScheduleType().name());
                     addChild(doc, e, "scheduledAt", t.getScheduledAt() != null ? t.getScheduledAt().format(DT_FMT) : "");
                     addChild(doc, e, "intervalMinutes", String.valueOf(t.getIntervalMinutes()));

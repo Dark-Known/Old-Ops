@@ -94,15 +94,34 @@ public class TaskDialog extends JDialog {
     // ── Service panel ─────────────────────────────────────────────────────────
     private JTextField  tfServiceName;
 
-    // ── Outlook / IMAP mail ───────────────────────────────────────────────────
+    // ── Outlook mail (Microsoft Graph) ─────────────────────────────────────────
     private JPanel      mailPanel;
-    private JComboBox<String> cbMailOutlookLocation;
-    private JTextField  tfMailLocalUsername;
-    private JPasswordField pfMailLocalPassword;
-    private JPanel      mailLocalCredsPanel;
+    private JTextField  tfMailMailboxAddress;
+    private JTextField  tfMailTenantId;
+    private JTextField  tfMailClientId;
+    private JButton      btnAuthorizeMailbox;
+    private JLabel        lblMailAuthStatus;
     private JTextField  tfImapFolder;
     private SearchCriteriaPanel pnlMailSearchCriteria;
     private JComboBox<String> cbMailFetchMode;
+    private JComboBox<String> cbMailFetchScope;
+    private JTextField tfMailMaxResults;
+    private JLabel   lblMailMaxResults;
+    private JLabel   lblMailFetchScopeNote;
+
+    // ── Mail watcher (baseline = newest processed message's receivedDateTime) ──
+    private JCheckBox cbMailWatcherEnabled;
+    private JLabel     lblMailWatcherStatus;
+    private JButton    btnResetMailBaseline;
+    private JPanel     mailWatcherStatusRow;
+    private boolean mailWatcherEpochShouldReset = false;
+
+    // ── Post-processing: mark as read / move to another folder ─────────────────
+    private JCheckBox cbMailMarkAsRead;
+    private JCheckBox cbMailMoveEnabled;
+    private JLabel     lblMailMoveFolder;
+    private JTextField tfMailMoveFolder;
+    private JLabel     lblMailMoveFolderHint;
 
     // ── Schedule ──────────────────────────────────────────────────────────────
     private JComboBox<String> cbScheduleType;
@@ -306,62 +325,138 @@ public class TaskDialog extends JDialog {
         addRow(servicePanel, "Service Name *", tfServiceName, 0);
         addRow(servicePanel, "", hint("Windows service name, e.g.  Spooler,  W3SVC"), 1);
 
-        // ── Mail / IMAP panel ─────────────────────────────────────────────────
-        mailPanel = titledPanel("Outlook Mail / IMAP");
+        // ── Mail / Outlook panel (Microsoft Graph) ────────────────────────────
+        // Reads mail via Microsoft Graph rather than IMAP: Microsoft has disabled
+        // Basic Auth for IMAP tenant-wide, and many tenants additionally block
+        // legacy protocols entirely via Conditional Access (OAuth2 over IMAP does
+        // not bypass that). Graph is the same HTTPS path the Outlook web/mobile
+        // apps use, so it works under those policies. See README for the one-time
+        // Azure AD app registration steps (no tenant admin required in most orgs).
+        mailPanel = titledPanel("Outlook Mail (Microsoft Graph)");
 
-        cbMailOutlookLocation = makeCombo(new JComboBox<>(new String[]{"REMOTE", "LOCAL"}));
-        cbMailOutlookLocation.setSelectedItem(
-                existing != null && existing.getMailOutlookLocation() != null
-                        ? existing.getMailOutlookLocation() : "REMOTE");
-        addRow(mailPanel, "Outlook Location *", cbMailOutlookLocation, 0);
+        tfMailMailboxAddress = makeField(new JTextField(
+                existing != null && existing.getMailMailboxAddress() != null
+                        ? existing.getMailMailboxAddress() : "", 28));
+        addRow(mailPanel, "Mailbox Address *", tfMailMailboxAddress, 0);
 
-        mailLocalCredsPanel = new JPanel(new GridBagLayout());
-        mailLocalCredsPanel.setOpaque(false);
+        tfMailTenantId = makeField(new JTextField(
+                existing != null && existing.getMailTenantId() != null && !existing.getMailTenantId().isEmpty()
+                        ? existing.getMailTenantId() : "common", 28));
+        addRow(mailPanel, "Azure AD Tenant ID *", tfMailTenantId, 1);
+        addRow(mailPanel, "", hint("Your organization's Directory (tenant) ID, or \"common\" for any org/personal account."), 2);
 
-        tfMailLocalUsername = makeField(new JTextField(
-                existing != null && existing.getMailLocalUsername() != null
-                        ? existing.getMailLocalUsername() : "", 28));
-        pfMailLocalPassword = makePasswordField(new JPasswordField(28));
-        if (existing != null && existing.getMailLocalPassword() != null)
-            pfMailLocalPassword.setText(existing.getMailLocalPassword());
+        tfMailClientId = makeField(new JTextField(
+                existing != null && existing.getMailClientId() != null
+                        ? existing.getMailClientId() : "", 28));
+        addRow(mailPanel, "Azure AD Client ID *", tfMailClientId, 3);
+        addRow(mailPanel, "", hint("Application (client) ID from a self-registered Azure AD app — see README \u201cOutlook Mail setup\u201d."), 4);
 
-        GridBagConstraints lc = new GridBagConstraints();
-        lc.fill = GridBagConstraints.HORIZONTAL;
-        lc.insets = new Insets(4, 4, 4, 4);
+        JPanel authRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
+        authRow.setOpaque(false);
+        btnAuthorizeMailbox = new JButton("Authorize Mailbox\u2026");
+        lblMailAuthStatus = new JLabel();
+        authRow.add(btnAuthorizeMailbox);
+        authRow.add(lblMailAuthStatus);
+        addRow(mailPanel, "", authRow, 5);
+        addRow(mailPanel, "", hint("One-time sign-in per mailbox. After this, scheduled runs are unattended."), 6);
 
-        lc.gridx = 0; lc.gridy = 0; lc.weightx = 0;
-        mailLocalCredsPanel.add(new JLabel("Local Outlook Username *"), lc);
-        lc.gridx = 1; lc.weightx = 1;
-        mailLocalCredsPanel.add(tfMailLocalUsername, lc);
-
-        lc.gridx = 0; lc.gridy = 1; lc.weightx = 0;
-        mailLocalCredsPanel.add(new JLabel("Local Outlook Password *"), lc);
-        lc.gridx = 1; lc.weightx = 1;
-        mailLocalCredsPanel.add(pfMailLocalPassword, lc);
-
-        addRow(mailPanel, "", mailLocalCredsPanel, 1);
+        btnAuthorizeMailbox.addActionListener(e -> onAuthorizeMailboxClicked());
+        tfMailMailboxAddress.getDocument().addDocumentListener(new javax.swing.event.DocumentListener() {
+            public void insertUpdate (javax.swing.event.DocumentEvent e) { updateMailAuthStatus(); }
+            public void removeUpdate (javax.swing.event.DocumentEvent e) { updateMailAuthStatus(); }
+            public void changedUpdate(javax.swing.event.DocumentEvent e) { updateMailAuthStatus(); }
+        });
 
         tfImapFolder = makeField(new JTextField(
                 existing != null && existing.getImapFolder() != null
                         ? existing.getImapFolder() : "INBOX", 28));
-        addRow(mailPanel, "IMAP Folder *", tfImapFolder, 2);
+        addRow(mailPanel, "Mail Folder *", tfImapFolder, 7);
 
         pnlMailSearchCriteria = new SearchCriteriaPanel();
         if (existing != null && existing.getMailSearchCriteria() != null)
             pnlMailSearchCriteria.setCriteria(existing.getMailSearchCriteria());
 
         GridBagConstraints gcCriteria = new GridBagConstraints();
-        gcCriteria.gridx = 0; gcCriteria.gridy = 3; gcCriteria.gridwidth = 2;
+        gcCriteria.gridx = 0; gcCriteria.gridy = 8; gcCriteria.gridwidth = 2;
         gcCriteria.fill = GridBagConstraints.BOTH;
         gcCriteria.weightx = 1; gcCriteria.weighty = 1;
         gcCriteria.insets = new Insets(4, 4, 4, 4);
         mailPanel.add(pnlMailSearchCriteria, gcCriteria);
+        addRow(mailPanel, "", hint("Best-effort mapping to Graph: UNSEEN/SEEN, FROM/SUBJECT \"text\", SINCE/BEFORE/ON dd-MMM-yyyy. Unsupported criteria are logged and skipped at run time."), 9);
 
         cbMailFetchMode = makeCombo(new JComboBox<>(
                 new String[]{"BODY_ONLY", "HEADERS_AND_BODY", "FULL_MESSAGE"}));
         if (existing != null && existing.getMailFetchMode() != null)
             cbMailFetchMode.setSelectedItem(existing.getMailFetchMode().name());
-        addRow(mailPanel, "Fetch Mode *", cbMailFetchMode, 4);
+        addRow(mailPanel, "Fetch Mode *", cbMailFetchMode, 10);
+
+        cbMailFetchScope = makeCombo(new JComboBox<>(new String[]{"LATEST_ONLY", "ALL_MATCHING"}));
+        cbMailFetchScope.setSelectedItem(
+                existing != null && existing.getMailFetchScope() != null
+                        ? existing.getMailFetchScope().name() : "LATEST_ONLY");
+        addRow(mailPanel, "Fetch Scope *", cbMailFetchScope, 11);
+        addRow(mailPanel, "", hint("LATEST_ONLY = newest matching message. ALL_MATCHING = every matching message, up to the cap below (paginated)."), 12);
+
+        lblMailMaxResults = new JLabel("Max Messages (ALL_MATCHING / watcher cap)");
+        tfMailMaxResults = makeField(new JTextField(
+                String.valueOf(existing != null && existing.getMailMaxResults() > 0
+                        ? existing.getMailMaxResults() : 50), 6));
+        addRow(mailPanel, lblMailMaxResults, tfMailMaxResults, 13);
+
+        lblMailFetchScopeNote = hint("Watcher is enabled below \u2014 Fetch Scope is overridden: every run fetches all messages newer than the last successful run, up to the Max Messages cap.");
+        addRow(mailPanel, "", lblMailFetchScopeNote, 14);
+
+        // ── Mail watcher ────────────────────────────────────────────────────
+        cbMailWatcherEnabled = new JCheckBox("Enable watcher (only fetch messages newer than last successful run)");
+        if (existing != null) cbMailWatcherEnabled.setSelected(existing.isWatcherEnabled());
+        addRow(mailPanel, "", cbMailWatcherEnabled, 15);
+
+        lblMailWatcherStatus = new JLabel();
+        lblMailWatcherStatus.setFont(lblMailWatcherStatus.getFont().deriveFont(Font.PLAIN, 11f));
+        btnResetMailBaseline = new JButton("Reset Baseline");
+        btnResetMailBaseline.setFont(btnResetMailBaseline.getFont().deriveFont(Font.PLAIN, 11f));
+        btnResetMailBaseline.setToolTipText(
+                "Clears the stored baseline so the watcher treats the next run as a first run "
+                        + "(fetches everything currently matching, up to the cap).");
+        btnResetMailBaseline.addActionListener(e -> {
+            mailWatcherEpochShouldReset = true;
+            lblMailWatcherStatus.setText(
+                    "<html><i style='color:#E65100'>Baseline will be cleared on Save.</i></html>");
+            btnResetMailBaseline.setEnabled(false);
+        });
+        mailWatcherStatusRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
+        mailWatcherStatusRow.setOpaque(false);
+        mailWatcherStatusRow.add(lblMailWatcherStatus);
+        mailWatcherStatusRow.add(btnResetMailBaseline);
+        addRow(mailPanel, "Watcher baseline", mailWatcherStatusRow, 16);
+        refreshMailWatcherStatusLabel(existing);
+
+        // ── Post-processing ─────────────────────────────────────────────────
+        cbMailMarkAsRead = new JCheckBox("Mark fetched messages as read");
+        if (existing != null) cbMailMarkAsRead.setSelected(existing.isMailMarkAsRead());
+        addRow(mailPanel, "", cbMailMarkAsRead, 17);
+
+        cbMailMoveEnabled = new JCheckBox("Move processed messages to another folder");
+        if (existing != null) cbMailMoveEnabled.setSelected(existing.isMailMoveToFolderEnabled());
+        addRow(mailPanel, "", cbMailMoveEnabled, 18);
+
+        tfMailMoveFolder = makeField(new JTextField(
+                existing != null && existing.getMailMoveToFolderName() != null
+                        ? existing.getMailMoveToFolderName() : "", 28));
+        lblMailMoveFolder = new JLabel("Destination Folder");
+        addRow(mailPanel, lblMailMoveFolder, tfMailMoveFolder, 19);
+        lblMailMoveFolderHint = hint("Any folder name (e.g. \"Processed\") or a well-known name: SENT, DRAFTS, DELETED, JUNK, ARCHIVE. Applied after mark-as-read, since moving changes the message's ID.");
+        addRow(mailPanel, "", lblMailMoveFolderHint, 20);
+
+        cbMailMoveEnabled.addActionListener(e -> updateMailMoveFieldsVisibility());
+        updateMailMoveFieldsVisibility();
+
+        cbMailWatcherEnabled.addActionListener(e -> updateMailFetchScopeVisibility());
+
+        cbMailFetchScope.addActionListener(e -> updateMailFetchScopeVisibility());
+        updateMailFetchScopeVisibility();
+
+        updateMailAuthStatus();
 
         // ── Retry panel ───────────────────────────────────────────────────────
         JPanel retryPanel = titledPanel("Failure Retry");
@@ -495,11 +590,10 @@ public class TaskDialog extends JDialog {
 
         cbTaskType.addActionListener(e -> {
             updateVisibility();
-            updateMailOutlookLocationVisibility();
+            updateMailFieldsVisibility();
         });
 
         cbScheduleType.addActionListener(e -> updateScheduleDetails());
-        cbMailOutlookLocation.addActionListener(e -> updateMailOutlookLocationVisibility());
 
         tfTargetFolder.getDocument().addDocumentListener(new javax.swing.event.DocumentListener() {
             public void insertUpdate (javax.swing.event.DocumentEvent e) { checkTargetFolderChanged(existing); }
@@ -512,7 +606,7 @@ public class TaskDialog extends JDialog {
         updateLocalToLocalBanner();
         updateVisibility();
         updateScheduleDetails();
-        updateMailOutlookLocationVisibility();
+        updateMailFieldsVisibility();
 
         uiFullyLoaded = true;
 
@@ -753,15 +847,88 @@ public class TaskDialog extends JDialog {
         }
     }
 
-    private void updateMailOutlookLocationVisibility() {
-        boolean isLocal = "LOCAL".equals(cbMailOutlookLocation.getSelectedItem());
-        boolean isMail  = "OUTLOOK_MAIL".equals(cbTaskType.getSelectedItem());
-        mailLocalCredsPanel.setVisible(isLocal);
+    /**
+     * Mail tasks read via Microsoft Graph, which is a cloud REST API regardless
+     * of where the task runs — there is no "target credential" concept for it,
+     * so the Target tab is simply disabled whenever the task type is mail.
+     */
+    private void updateMailFieldsVisibility() {
+        boolean isMail = "OUTLOOK_MAIL".equals(cbTaskType.getSelectedItem());
         if (targetPanel != null && tabbedPane != null)
-            enableTabIfPresent(targetPanel, !isMail || !isLocal);
+            enableTabIfPresent(targetPanel, !isMail);
         if (tabbedPane != null) { tabbedPane.revalidate(); tabbedPane.repaint(); }
-        targetPanel.revalidate(); targetPanel.repaint();
+        if (targetPanel != null) { targetPanel.revalidate(); targetPanel.repaint(); }
         revalidate(); repaint();
+    }
+
+    /** Max Messages only matters when fetching everything that matches, or when the watcher is on. */
+    private void updateMailFetchScopeVisibility() {
+        boolean watcherOn = cbMailWatcherEnabled != null && cbMailWatcherEnabled.isSelected();
+        boolean isAll = "ALL_MATCHING".equals(cbMailFetchScope.getSelectedItem());
+        cbMailFetchScope.setEnabled(!watcherOn);
+        lblMailFetchScopeNote.setVisible(watcherOn);
+        lblMailMaxResults.setVisible(isAll || watcherOn);
+        tfMailMaxResults.setVisible(isAll || watcherOn);
+        mailPanel.revalidate();
+        mailPanel.repaint();
+    }
+
+    /** The destination folder field only matters when "move to another folder" is checked. */
+    private void updateMailMoveFieldsVisibility() {
+        boolean moveOn = cbMailMoveEnabled.isSelected();
+        lblMailMoveFolder.setVisible(moveOn);
+        tfMailMoveFolder.setVisible(moveOn);
+        tfMailMoveFolder.setEnabled(moveOn);
+        lblMailMoveFolderHint.setVisible(moveOn);
+        mailPanel.revalidate();
+        mailPanel.repaint();
+    }
+
+    /**
+     * Populates lblMailWatcherStatus / btnResetMailBaseline based on the task's
+     * stored mail watcher baseline (mirrors refreshWatcherStatusLabel for files).
+     */
+    private void refreshMailWatcherStatusLabel(ScheduledTask existing) {
+        if (existing == null || existing.getMailLastKnownEpoch() <= 0) {
+            lblMailWatcherStatus.setText(
+                    "<html><i style='color:#757575'>No baseline stored \u2014 first run will fetch up to the cap.</i></html>");
+            if (btnResetMailBaseline != null) btnResetMailBaseline.setVisible(false);
+            return;
+        }
+        String dateStr = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
+                .format(new java.util.Date(existing.getMailLastKnownEpoch()));
+        lblMailWatcherStatus.setText(
+                "<html><i style='color:#2E7D32'>Last seen: " + dateStr + "</i></html>");
+        if (btnResetMailBaseline != null) btnResetMailBaseline.setVisible(true);
+    }
+
+    /** Reflects whether the entered mailbox is already authorized (cached refresh token present). */
+    private void updateMailAuthStatus() {
+        if (lblMailAuthStatus == null) return;
+        String mailbox = tfMailMailboxAddress.getText().trim();
+        if (mailbox.isEmpty()) {
+            lblMailAuthStatus.setText("<html><i style='color:#888888'>Enter a mailbox address first.</i></html>");
+            return;
+        }
+        boolean enrolled = new service.OAuth2TokenService().isEnrolled(mailbox);
+        lblMailAuthStatus.setText(enrolled
+                ? "<html><span style='color:#2E7D32'>&#10003; Authorized</span></html>"
+                : "<html><span style='color:#E65100'>Not authorized yet</span></html>");
+    }
+
+    /** Runs the OAuth2 device-code enrollment in the background and shows the sign-in prompt. */
+    private void onAuthorizeMailboxClicked() {
+        String mailbox  = tfMailMailboxAddress.getText().trim();
+        String tenantId = tfMailTenantId.getText().trim();
+        String clientId = tfMailClientId.getText().trim();
+
+        if (mailbox.isEmpty())  { msg("Enter the mailbox address first.");        return; }
+        if (tenantId.isEmpty()) { msg("Enter the Azure AD Tenant ID first (or \"common\")."); return; }
+        if (clientId.isEmpty()) { msg("Enter the Azure AD Client ID first — see README \u201cOutlook Mail setup\u201d."); return; }
+
+        new OAuthAuthorizeDialog((Frame) getOwner(), mailbox, tenantId, clientId,
+                success -> updateMailAuthStatus())
+                .setVisible(true);
     }
 
     // ── Watcher epoch reset helpers ───────────────────────────────────────────
@@ -815,8 +982,6 @@ public class TaskDialog extends JDialog {
 
         boolean isTransfer  = "FILE_TRANSFER".equals(cbTaskType.getSelectedItem());
         boolean isMail      = "OUTLOOK_MAIL".equals(cbTaskType.getSelectedItem());
-        String  outlookLoc  = (String) cbMailOutlookLocation.getSelectedItem();
-        boolean isMailLocal = isMail && "LOCAL".equals(outlookLoc);
 
         // For local→local FILE_TRANSFER tasks credentials are not required.
         boolean isLocalToLocal = isTransfer
@@ -828,7 +993,8 @@ public class TaskDialog extends JDialog {
         String targetUser = tfTargetUser.getText().trim();
         String targetPass = new String(pfTargetPass.getPassword());
 
-        if (!isMailLocal && !isLocalToLocal) {
+        // Mail tasks use Microsoft Graph (OAuth2), never the SFTP-style target credential.
+        if (!isMail && !isLocalToLocal) {
             if (targetHost.isEmpty()) { msg("Target hostname / IP is required."); return; }
             if (targetUser.isEmpty()) { msg("Target username is required.");       return; }
             if (targetPass.isEmpty()) { msg("Target password is required.");       return; }
@@ -872,25 +1038,44 @@ public class TaskDialog extends JDialog {
             }
 
         } else if (isMail) {
-            if (tfImapFolder.getText().trim().isEmpty()) { msg("IMAP folder is required."); return; }
+            String mailbox  = tfMailMailboxAddress.getText().trim();
+            String tenantId = tfMailTenantId.getText().trim();
+            String clientId = tfMailClientId.getText().trim();
+            if (mailbox.isEmpty())  { msg("Mailbox address is required.");        return; }
+            if (tenantId.isEmpty()) { msg("Azure AD Tenant ID is required (or \"common\")."); return; }
+            if (clientId.isEmpty()) { msg("Azure AD Client ID is required — see README \u201cOutlook Mail setup\u201d."); return; }
+            if (tfImapFolder.getText().trim().isEmpty()) { msg("Mail folder is required."); return; }
             if (pnlMailSearchCriteria.getCriteria().trim().isEmpty()) {
                 msg("Search criteria is required."); return;
             }
-            if (isMailLocal) {
-                if (tfMailLocalUsername.getText().trim().isEmpty()) {
-                    msg("Local Outlook username is required."); return;
-                }
-                if (new String(pfMailLocalPassword.getPassword()).isEmpty()) {
-                    msg("Local Outlook password is required."); return;
-                }
+            int mailMaxResults;
+            try {
+                mailMaxResults = Integer.parseInt(tfMailMaxResults.getText().trim());
+            } catch (NumberFormatException nfe) {
+                msg("Max Messages must be a whole number."); return;
+            }
+            if (mailMaxResults < 1 || mailMaxResults > 5000) {
+                msg("Max Messages must be between 1 and 5000."); return;
+            }
+            if (!new service.OAuth2TokenService().isEnrolled(mailbox)) {
+                int choice = JOptionPane.showConfirmDialog(this,
+                        "Mailbox '" + mailbox + "' has not completed the one-time \"Authorize Mailbox\" "
+                                + "sign-in yet. The task will fail when it runs until this is done.\n\n"
+                                + "Save anyway?",
+                        "Mailbox not yet authorized", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
+                if (choice != JOptionPane.YES_OPTION) return;
+            }
+            if (cbMailMoveEnabled.isSelected() && tfMailMoveFolder.getText().trim().isEmpty()) {
+                msg("Enter the destination folder name, or uncheck \"Move processed messages\".");
+                return;
             }
         } else {
             if (tfServiceName.getText().trim().isEmpty()) { msg("Service name is required."); return; }
         }
 
         // ── Persist credential file creds_<username>.xml ──────────────────────
-        // Skipped for local→local and mail-local tasks (no network credential needed)
-        if (!isMailLocal && !isLocalToLocal && !targetUser.isEmpty()) {
+        // Skipped for mail (uses OAuth2, not a stored credential) and local→local tasks.
+        if (!isMail && !isLocalToLocal && !targetUser.isEmpty()) {
             Credential cred = storage.loadCredentialByUsername(targetUser);
             if (cred == null) cred = new Credential();
             if (cred.getId() == null) cred.setId(UUID.randomUUID().toString());
@@ -916,9 +1101,10 @@ public class TaskDialog extends JDialog {
         t.setTaskType(TaskType.valueOf((String) cbTaskType.getSelectedItem()));
         if (existing == null) t.setStatus(TaskStatus.PENDING);
 
-        // For local→local tasks targetUsername is left blank so the factory
-        // correctly routes to LocalFileMetadataService (null credential → local).
-        t.setTargetUsername(!isMailLocal && !isLocalToLocal ? targetUser : "");
+        // For local→local and mail tasks targetUsername is left blank — mail uses
+        // OAuth2/Graph and local→local routes to LocalFileMetadataService via a
+        // null credential, per resolveTargetCredential()/isLocalToLocalTask().
+        t.setTargetUsername(!isMail && !isLocalToLocal ? targetUser : "");
         t.setSourceCredentialId(
                 tfSourceUser.getText().trim() + "@" + tfSourceHost.getText().trim());
 
@@ -943,13 +1129,17 @@ public class TaskDialog extends JDialog {
             t.setImapFolder(tfImapFolder.getText().trim());
             t.setMailSearchCriteria(pnlMailSearchCriteria.getCriteria());
             t.setMailFetchMode(MailFetchMode.valueOf((String) cbMailFetchMode.getSelectedItem()));
-            t.setMailOutlookLocation(outlookLoc);
-            if ("LOCAL".equals(outlookLoc)) {
-                t.setMailLocalUsername(tfMailLocalUsername.getText().trim());
-                t.setMailLocalPassword(new String(pfMailLocalPassword.getPassword()));
-            } else {
-                t.setMailLocalUsername("");
-                t.setMailLocalPassword("");
+            t.setMailFetchScope(ScheduledTask.MailFetchScope.valueOf((String) cbMailFetchScope.getSelectedItem()));
+            t.setMailMaxResults(Integer.parseInt(tfMailMaxResults.getText().trim()));
+            t.setMailMailboxAddress(tfMailMailboxAddress.getText().trim());
+            t.setMailTenantId(tfMailTenantId.getText().trim());
+            t.setMailClientId(tfMailClientId.getText().trim());
+            t.setWatcherEnabled(cbMailWatcherEnabled.isSelected());
+            t.setMailMarkAsRead(cbMailMarkAsRead.isSelected());
+            t.setMailMoveToFolderEnabled(cbMailMoveEnabled.isSelected());
+            t.setMailMoveToFolderName(tfMailMoveFolder.getText().trim());
+            if (mailWatcherEpochShouldReset) {
+                t.setMailLastKnownEpoch(0L);
             }
         } else {
             t.setServiceName(tfServiceName.getText().trim());
