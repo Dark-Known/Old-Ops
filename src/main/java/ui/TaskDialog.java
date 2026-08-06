@@ -615,6 +615,14 @@ public class TaskDialog extends JDialog {
         // Allow horizontal scrollbar when content cannot fit; better than truncating UI.
         scroll.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_AS_NEEDED);
         scroll.getVerticalScrollBar().setUnitIncrement(16);
+        // A JScrollPane's preferred size defaults to its view's full preferred
+        // size, which defeats scrolling during pack() — with the expanded
+        // Mail/IMAP tab, that let pack() blow the whole dialog up taller than
+        // the screen and push the Cancel/Save row off-screen. Capping the
+        // scroll pane's own preferred size keeps the dialog at its original
+        // ~700x560 footprint; any tab taller than that now scrolls internally
+        // instead of growing the window.
+        scroll.setPreferredSize(new Dimension(680, 480));
         add(scroll, BorderLayout.CENTER);
 
         // ── Buttons ───────────────────────────────────────────────────────────
@@ -1224,7 +1232,12 @@ public class TaskDialog extends JDialog {
     }
 
     private JLabel hint(String text) {
-        JLabel l = new JLabel("<html><i style='color:gray'>" + text + "</i></html>");
+        // Wrap in a fixed-width div so long sentences wrap onto multiple lines
+        // instead of rendering as one unbroken line. Without this, a JLabel's
+        // HTML content sizes to its full unwrapped text width, which stretches
+        // the GridBagLayout "field" column (weightx=1) — and every text field/
+        // combo box sharing that column — far wider than intended.
+        JLabel l = new JLabel("<html><div style='width:360px'><i style='color:gray'>" + text + "</i></div></html>");
         l.setFont(l.getFont().deriveFont(Font.PLAIN, 11f));
         return l;
     }

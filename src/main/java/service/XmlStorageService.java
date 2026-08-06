@@ -177,6 +177,7 @@ public class XmlStorageService {
                         t.setMailMarkAsRead("true".equalsIgnoreCase(child(e, "mailMarkAsRead")));
                         t.setMailMoveToFolderEnabled("true".equalsIgnoreCase(child(e, "mailMoveToFolderEnabled")));
                         t.setMailMoveToFolderName(child(e, "mailMoveToFolderName"));
+                        t.setMailOutputFolder(child(e, "mailOutputFolder"));
                         String direction = child(e, "transferDirection");
                         if (direction == null || direction.isEmpty()) direction = "OUTBOUND";
                         t.setTransferDirection(TransferDirection.valueOf(direction));
@@ -340,6 +341,7 @@ public class XmlStorageService {
                     addChild(doc, e, "mailMarkAsRead", String.valueOf(t.isMailMarkAsRead()));
                     addChild(doc, e, "mailMoveToFolderEnabled", String.valueOf(t.isMailMoveToFolderEnabled()));
                     addChild(doc, e, "mailMoveToFolderName", t.getMailMoveToFolderName());
+                    addChild(doc, e, "mailOutputFolder", t.getMailOutputFolder());
                     addChild(doc, e, "scheduleType", t.getScheduleType().name());
                     addChild(doc, e, "scheduledAt", t.getScheduledAt() != null ? t.getScheduledAt().format(DT_FMT) : "");
                     addChild(doc, e, "intervalMinutes", String.valueOf(t.getIntervalMinutes()));

@@ -12,6 +12,7 @@ import util.MailFetchMode;
 import java.io.*;
 import java.net.InetAddress;
 import java.nio.file.*;
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
@@ -1191,6 +1192,20 @@ public class TransferService {
             return false;
         }
 
+        String outputFolder = nvl(task.getMailOutputFolder(), "");
+        if (outputFolder.isEmpty()) {
+            logLine.accept("[ERROR] Output Folder is not configured on this task — "
+                    + "each fetched message is written there as a .RCV file.");
+            return false;
+        }
+        Path outputDir = Paths.get(outputFolder);
+        try {
+            Files.createDirectories(outputDir);
+        } catch (IOException ex) {
+            logLine.accept("[ERROR] Cannot create/access Output Folder '" + outputFolder + "': " + ex.getMessage());
+            return false;
+        }
+
         String accessToken;
         try {
             accessToken = oauthService.getValidAccessToken(mailbox, tenantId, clientId, GRAPH_MAIL_SCOPE);
@@ -1258,6 +1273,14 @@ public class TransferService {
             logLine.accept("[END MAIL MESSAGE]");
 
             try {
+                Path rcvFile = outputDir.resolve(buildRcvFileName(m));
+                Files.write(rcvFile, buildRcvFileContent(m, mode).getBytes(StandardCharsets.UTF_8));
+                logLine.accept("[INFO] Wrote " + rcvFile.getFileName());
+            } catch (IOException ex) {
+                logLine.accept("[WARN] Failed to write .RCV file for '" + m.subject + "': " + ex.getMessage());
+            }
+
+            try {
                 long ts = Instant.parse(m.receivedDateTime).toEpochMilli();
                 if (ts > newestEpoch) newestEpoch = ts;
             } catch (Exception ignored) {
@@ -1296,6 +1319,44 @@ public class TransferService {
         return true;
     }
 
+    // ─── .RCV file output ─────────────────────────────────────────────────────
+
+    /**
+     * Builds a unique, filesystem-safe filename for a fetched message:
+     * {@code <timestamp>_<sanitized subject>_<id suffix>.RCV}
+     */
+    private String buildRcvFileName(GraphMailService.MailMessage m) {
+        String subject = (m.subject == null || m.subject.trim().isEmpty()) ? "no_subject" : m.subject.trim();
+        String safeSubject = subject.replaceAll("[\\\\/:*?\"<>|]", "_").replaceAll("\\s+", "_");
+        if (safeSubject.length() > 60) safeSubject = safeSubject.substring(0, 60);
+
+        String ts = java.time.LocalDateTime.now()
+                .format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"));
+        String idSuffix = (m.id != null && m.id.length() >= 6)
+                ? m.id.substring(m.id.length() - 6)
+                : String.format("%06d", Math.abs((long) (Math.random() * 1_000_000)));
+
+        return ts + "_" + safeSubject + "_" + idSuffix + ".RCV";
+    }
+
+    /**
+     * Builds the .RCV file content. FULL_MESSAGE mode already returns raw
+     * RFC 2822 MIME (headers included) from Graph, so it's written as-is;
+     * BODY_ONLY / HEADERS_AND_BODY only return the body, so a small metadata
+     * header is prepended for context.
+     */
+    private String buildRcvFileContent(GraphMailService.MailMessage m, MailFetchMode mode) {
+        if (mode == MailFetchMode.FULL_MESSAGE) {
+            return m.bodyContent != null ? m.bodyContent : "";
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.append("Subject: ").append(m.subject != null ? m.subject : "").append("\r\n");
+        sb.append("From: ").append(m.from != null ? m.from : "").append("\r\n");
+        sb.append("Received: ").append(m.receivedDateTime != null ? m.receivedDateTime : "").append("\r\n");
+        sb.append("\r\n");
+        sb.append(m.bodyContent != null ? m.bodyContent : "");
+        return sb.toString();
+    }
 
     // ─── Cancellation ─────────────────────────────────────────────────────────
 

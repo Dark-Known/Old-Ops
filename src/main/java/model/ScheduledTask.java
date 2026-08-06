@@ -56,6 +56,7 @@ public class ScheduledTask {
     private boolean mailMarkAsRead;        // mark fetched messages as read via Graph after processing
     private boolean mailMoveToFolderEnabled; // move fetched messages to another folder after processing
     private String mailMoveToFolderName;     // destination folder display name (or well-known name)
+    private String mailOutputFolder;         // local directory where each fetched message is written as a .RCV file
 
     // Schedule fields
     private ScheduleType scheduleType;
@@ -97,6 +98,7 @@ public class ScheduledTask {
         this.mailMarkAsRead = false;
         this.mailMoveToFolderEnabled = false;
         this.mailMoveToFolderName = "";
+        this.mailOutputFolder = "";
         this.retryCount = 0;
         this.watcherEnabled = false;
         this.inboundWatcherPollIntervalMinutes = 0;
@@ -177,6 +179,9 @@ public class ScheduledTask {
 
     public String getMailMoveToFolderName()        { return mailMoveToFolderName; }
     public void   setMailMoveToFolderName(String f){ this.mailMoveToFolderName = f; }
+
+    public String getMailOutputFolder()            { return mailOutputFolder; }
+    public void   setMailOutputFolder(String f)    { this.mailOutputFolder = f; }
 
     public ScheduleType getScheduleType()        { return scheduleType; }
     public void         setScheduleType(ScheduleType s){ this.scheduleType = s; }
