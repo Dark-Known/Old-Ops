@@ -55,6 +55,7 @@ AdminElevation.class
 ui\TaskDialog.class
 util\ImapSearchCriteria$Builder.class
 ui\MainWindow$1.class
+service\TransferService$MarkerMatch.class
 service\GraphMailService.class
 service\TaskSchedulerService.class
 ui\MainWindow.class
@@ -63,5 +64,6 @@ service\LocalFileMetadataService.class
 service\TaskSchedulerService$1.class
 ui\OAuthAuthorizeDialog$1.class
 ui\CredentialManagerPanel.class
+service\GraphMailService$AttachmentBundle.class
 model\ScheduledTask$TaskStatus.class
 util\ImapSearchCriteria.class

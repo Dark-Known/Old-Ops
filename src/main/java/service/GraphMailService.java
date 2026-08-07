@@ -45,15 +45,20 @@ public class GraphMailService {
         public final String receivedDateTime;
         public final String bodyContent;
         public final String bodyType; // "html" or "text"
+        public final String attachmentText;    // combined text of parseable text attachments, "" if none
+        public final List<String> attachmentNames; // names of the attachments attachmentText was built from
 
         MailMessage(String id, String subject, String from,
-                    String receivedDateTime, String bodyContent, String bodyType) {
+                    String receivedDateTime, String bodyContent, String bodyType,
+                    String attachmentText, List<String> attachmentNames) {
             this.id = id;
             this.subject = subject;
             this.from = from;
             this.receivedDateTime = receivedDateTime;
             this.bodyContent = bodyContent;
             this.bodyType = bodyType;
+            this.attachmentText = attachmentText != null ? attachmentText : "";
+            this.attachmentNames = attachmentNames != null ? attachmentNames : Collections.emptyList();
         }
     }
 
@@ -99,7 +104,7 @@ public class GraphMailService {
         // predict in advance without calling the API). Try with $orderby first
         // since it gives cleanest "newest first" ordering; if Graph rejects the
         // combination, retry once without it and log that ordering may be off.
-        String nextUrl = baseUrl + "&$orderby=receivedDateTime desc" + filterParam;
+        String nextUrl = baseUrl + "&$orderby=" + urlEnc("receivedDateTime desc") + filterParam;
         List<Map<String, Object>> items = new ArrayList<>();
         boolean orderByDropped = false;
 
@@ -156,9 +161,13 @@ public class GraphMailService {
 
             String bodyContent;
             String bodyType = "text";
+            String attachmentText = "";
+            List<String> attachmentNames = Collections.emptyList();
 
             if (mode == MailFetchMode.FULL_MESSAGE) {
                 // Raw RFC 2822 MIME — closest analog to the old IMAP BODY[] fetch.
+                // Attachments are already embedded in the MIME itself, so no
+                // separate attachment fetch/preference logic applies here.
                 bodyContent = graphGetRaw(accessToken, GRAPH_BASE + "/me/messages/" + id + "/$value");
             } else {
                 Map<String, Object> full = graphGetJson(accessToken,
@@ -170,11 +179,85 @@ public class GraphMailService {
                 } else {
                     bodyContent = "";
                 }
+
+                AttachmentBundle bundle = fetchTextAttachments(accessToken, id, logLine);
+                attachmentText = bundle.text;
+                attachmentNames = bundle.names;
             }
 
-            results.add(new MailMessage(id, subject, from, received, bodyContent, bodyType));
+            results.add(new MailMessage(id, subject, from, received, bodyContent, bodyType,
+                    attachmentText, attachmentNames));
         }
         return results;
+    }
+
+    // ─── Attachments ─────────────────────────────────────────────────────────
+
+    private static class AttachmentBundle {
+        final String text;
+        final List<String> names;
+        AttachmentBundle(String text, List<String> names) { this.text = text; this.names = names; }
+    }
+
+    /**
+     * Fetches a message's non-inline attachments and returns the combined text
+     * of the ones that are actually parseable as text (text/plain, text/csv,
+     * or a .txt/.csv/.log/.rcv filename — Graph's contentType is sometimes a
+     * generic octet-stream for these, so the filename is checked too).
+     * Anything else (PDFs, images, Office docs, etc.) is skipped and logged —
+     * this app has no document-parsing library, so pretending to read them
+     * would be worse than honestly not reading them.
+     */
+    private AttachmentBundle fetchTextAttachments(String accessToken, String messageId, Consumer<String> logLine)
+            throws IOException, InterruptedException {
+        Map<String, Object> resp;
+        try {
+            resp = graphGetJson(accessToken, GRAPH_BASE + "/me/messages/" + messageId
+                    + "/attachments?$select=name,contentType,isInline,contentBytes,size");
+        } catch (IOException ex) {
+            logLine.accept("[WARN] Could not fetch attachments for message " + messageId + ": " + ex.getMessage());
+            return new AttachmentBundle("", Collections.emptyList());
+        }
+
+        List<Object> arr = MiniJson.getArray(resp, "value");
+        if (arr == null || arr.isEmpty()) return new AttachmentBundle("", Collections.emptyList());
+
+        StringBuilder combined = new StringBuilder();
+        List<String> names = new ArrayList<>();
+        for (Object o : arr) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> att = (Map<String, Object>) o;
+
+            if (MiniJson.getBoolean(att, "isInline", false)) continue; // embedded images etc., not real attachments
+
+            String name = MiniJson.getString(att, "name", "");
+            String contentType = MiniJson.getString(att, "contentType", "");
+            if (!isTextAttachment(name, contentType)) {
+                logLine.accept("[INFO] Skipping non-text attachment '" + name + "' (" + contentType
+                        + ") — no parser available for this type.");
+                continue;
+            }
+
+            String b64 = MiniJson.getString(att, "contentBytes", null);
+            if (b64 == null || b64.isEmpty()) continue;
+            try {
+                byte[] raw = Base64.getDecoder().decode(b64);
+                String text = new String(raw, StandardCharsets.UTF_8);
+                if (combined.length() > 0) combined.append("\n\n");
+                combined.append(text);
+                names.add(name);
+            } catch (IllegalArgumentException ex) {
+                logLine.accept("[WARN] Could not decode attachment '" + name + "' — skipped.");
+            }
+        }
+        return new AttachmentBundle(combined.toString(), names);
+    }
+
+    private boolean isTextAttachment(String name, String contentType) {
+        String ct = contentType == null ? "" : contentType.toLowerCase(Locale.ROOT);
+        if (ct.startsWith("text/")) return true;
+        String lower = name == null ? "" : name.toLowerCase(Locale.ROOT);
+        return lower.endsWith(".txt") || lower.endsWith(".csv") || lower.endsWith(".log") || lower.endsWith(".rcv");
     }
 
     // ─── Folder resolution ──────────────────────────────────────────────────

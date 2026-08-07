@@ -8,6 +8,7 @@ import model.ScheduledTask.TransferDirection;
 import model.ScheduledTask.TransferMode;
 import service.RemoteFileMetadataServiceFactory.ManagedMetadataService;
 import util.MailFetchMode;
+import util.MiniJson;
 
 import java.io.*;
 import java.net.InetAddress;
@@ -17,13 +18,18 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.function.Consumer;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
@@ -1274,7 +1280,7 @@ public class TransferService {
 
             try {
                 Path rcvFile = outputDir.resolve(buildRcvFileName(m));
-                Files.write(rcvFile, buildRcvFileContent(m, mode).getBytes(StandardCharsets.UTF_8));
+                Files.write(rcvFile, buildRcvFileContent(m, mode, logLine).getBytes(StandardCharsets.UTF_8));
                 logLine.accept("[INFO] Wrote " + rcvFile.getFileName());
             } catch (IOException ex) {
                 logLine.accept("[WARN] Failed to write .RCV file for '" + m.subject + "': " + ex.getMessage());
@@ -1341,21 +1347,465 @@ public class TransferService {
 
     /**
      * Builds the .RCV file content. FULL_MESSAGE mode already returns raw
-     * RFC 2822 MIME (headers included) from Graph, so it's written as-is;
-     * BODY_ONLY / HEADERS_AND_BODY only return the body, so a small metadata
-     * header is prepended for context.
+     * RFC 2822 MIME (headers included) from Graph, so it's written as-is.
+     *
+     * Content source preference: a message's own (non-inline) attachment text
+     * takes priority over its body when a parseable text attachment exists
+     * (see GraphMailService#fetchTextAttachments) — the structured content
+     * these tasks care about is more often carried in an attached .txt/.csv
+     * than typed into the body. Falls back to the body when there's no
+     * usable attachment.
+     *
+     * BODY_ONLY and HEADERS_AND_BODY previously produced identical output —
+     * both prepended Subject/From/Received regardless of mode, so "BODY_ONLY"
+     * never actually meant body-only. Fixed to a real three-tier distinction:
+     *   BODY_ONLY        → the message content: HTML converted to plain text,
+     *                       automated banners (Outlook "first contact" /
+     *                       external-sender warnings) removed, truncated to
+     *                       start at the LDM/MVT/PTM marker, then
+     *                       signatures/sign-offs, footers/disclaimers, and
+     *                       quoted reply history stripped out (best-effort).
+     *                       When an LDM/MVT/PTM marker is found, a SITA-style
+     *                       =HEADER/=PRIORITY/... block (see
+     *                       buildSitaHeaderBlock) is prepended.
+     *   HEADERS_AND_BODY → Subject/From/Received + the full content as plain
+     *                       text, untouched (signatures/quotes kept, no SITA
+     *                       header — that block is specific to BODY_ONLY).
+     *   FULL_MESSAGE     → raw MIME from Graph, as before.
      */
-    private String buildRcvFileContent(GraphMailService.MailMessage m, MailFetchMode mode) {
+    private String buildRcvFileContent(GraphMailService.MailMessage m, MailFetchMode mode, Consumer<String> logLine) {
         if (mode == MailFetchMode.FULL_MESSAGE) {
+            // Raw MIME — left completely untouched. A blank line here is
+            // structurally meaningful (it's what separates the MIME headers
+            // from the body per RFC 2822), so blank-line removal must never
+            // be applied to this branch.
             return m.bodyContent != null ? m.bodyContent : "";
         }
+
+        boolean useAttachment = m.attachmentText != null && !m.attachmentText.trim().isEmpty();
+        String sourceText = useAttachment ? m.attachmentText : toPlainText(m.bodyContent, m.bodyType);
+
+        if (mode == MailFetchMode.BODY_ONLY) {
+            String bannerStripped = removeAutomatedBanners(sourceText);
+            MarkerMatch marker = findMessageTypeMarker(bannerStripped);
+            String messageBody = marker != null ? bannerStripped.substring(marker.index) : bannerStripped;
+            messageBody = removeBlankLines(stripSignatureAndQuotedContent(messageBody));
+
+            if (marker == null) {
+                // Not an LDM/MVT/PTM message — no SITA header applies.
+                return messageBody;
+            }
+
+            String originCode = null;
+            String destinationCode = null;
+            if ("LDM".equals(marker.type)) {
+                originCode = extractLdmOriginCode(bannerStripped, messageBody);
+                destinationCode = extractLdmDestinationCode(messageBody);
+            } else {
+                // No extraction rules have been specified yet for MVT/PTM —
+                // the configured default address is used for both fields.
+                logLine.accept("[INFO] No origin/destination extraction rule configured for " + marker.type
+                        + " messages yet — falling back to the configured default SITA address.");
+            }
+
+            String originAddress = resolveStationAddress(originCode, marker.type, "ORIGIN", logLine);
+            String destinationAddress = resolveStationAddress(destinationCode, marker.type, "DESTINATION TYPE B", logLine);
+
+            String header = buildSitaHeaderBlock(marker.type, originAddress, destinationAddress, nextMessageId());
+            return header + messageBody;
+        }
+
+        // HEADERS_AND_BODY
         StringBuilder sb = new StringBuilder();
         sb.append("Subject: ").append(m.subject != null ? m.subject : "").append("\r\n");
         sb.append("From: ").append(m.from != null ? m.from : "").append("\r\n");
         sb.append("Received: ").append(m.receivedDateTime != null ? m.receivedDateTime : "").append("\r\n");
+        if (useAttachment && !m.attachmentNames.isEmpty()) {
+            sb.append("Source: attachment (").append(String.join(", ", m.attachmentNames)).append(")\r\n");
+        }
         sb.append("\r\n");
-        sb.append(m.bodyContent != null ? m.bodyContent : "");
+        sb.append(removeBlankLines(sourceText));
         return sb.toString();
+    }
+
+    // ─── SITA-style header block (LDM / MVT / PTM) ─────────────────────────
+
+    private static final DateTimeFormatter RCV_HEADER_DATE_FMT = DateTimeFormatter.ofPattern("yyyy/MM/dd HH:mm");
+
+    /**
+     * Builds the fixed-format routing header prepended to LDM/MVT/PTM
+     * message content:
+     *   =HEADER
+     *   RCV,<yyyy/MM/dd HH:mm>
+     *   =PRIORITY
+     *   QU (LDM/MVT) or QN (PTM)
+     *   =DESTINATION TYPE B
+     *   STX,<destination SITA address>
+     *   =ORIGIN
+     *   <origin SITA address>
+     *   =MSGID
+     *   <5-digit sequential id>
+     *   =SMI
+     * The template is identical across all three message types — only the
+     * field values differ. Missing origin/destination addresses (extraction
+     * or lookup failure) are left blank rather than guessed; a WARN is
+     * already logged by the caller in that case.
+     */
+    private String buildSitaHeaderBlock(String messageType, String originAddress,
+                                         String destinationAddress, String msgId) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("=HEADER\n");
+        sb.append("RCV,").append(LocalDateTime.now().format(RCV_HEADER_DATE_FMT)).append("\n");
+        sb.append("=PRIORITY\n");
+        sb.append("PTM".equals(messageType) ? "QN" : "QU").append("\n");
+        sb.append("=DESTINATION TYPE B\n");
+        sb.append("STX,").append(destinationAddress != null ? destinationAddress : "").append("\n");
+        sb.append("=ORIGIN\n");
+        sb.append(originAddress != null ? originAddress : "").append("\n");
+        sb.append("=MSGID\n");
+        sb.append(msgId).append("\n");
+        sb.append("=SMI\n");
+        return sb.toString();
+    }
+
+    // ─── LDM origin / destination extraction ───────────────────────────────
+
+    // Second line of the raw message packet: a dot, a 7-letter SITA address
+    // (3-letter station + 4-letter org code), a space, then a 6-digit
+    // date-time group. Captures the 3-letter station code.
+    private static final Pattern LDM_ORIGIN_SECOND_LINE =
+            Pattern.compile("^\\.([A-Z]{3})[A-Z]{4}\\s+\\d{6}");
+    // An isolated line of exactly 3 uppercase letters immediately followed by
+    // a baggage (B) or cargo (C) distribution line starting with a dot.
+    private static final Pattern LDM_ORIGIN_BEFORE_DISTRIBUTION =
+            Pattern.compile("^([A-Z]{3})\\s*$\\R^(?:B|C)\\s+\\.", Pattern.MULTILINE);
+    // First run of 3 capital letters right after a '-' on the same line.
+    private static final Pattern LDM_DESTINATION_AFTER_DASH =
+            Pattern.compile("-\\s*([A-Z]{3})");
+
+    /**
+     * Origin station code for an LDM message. Tries the "second line of the
+     * packet" SITA-address convention first (against the untouched, pre-
+     * truncation body, since that addressing line precedes the LDM marker);
+     * falls back to the "isolated line before a B/C distribution line"
+     * convention (against the LDM-truncated body) if the first doesn't match.
+     */
+    private String extractLdmOriginCode(String fullBodyText, String ldmBody) {
+        if (fullBodyText != null) {
+            String[] lines = fullBodyText.split("\n", -1);
+            if (lines.length > 1) {
+                Matcher m = LDM_ORIGIN_SECOND_LINE.matcher(lines[1].trim());
+                if (m.find()) return m.group(1);
+            }
+        }
+        if (ldmBody != null) {
+            Matcher m = LDM_ORIGIN_BEFORE_DISTRIBUTION.matcher(ldmBody);
+            if (m.find()) return m.group(1);
+        }
+        return null;
+    }
+
+    /**
+     * Destination Type B station code for an LDM message: only the first
+     * line containing a '-' is checked (per spec) — if that line's dash
+     * isn't immediately followed by 3 capital letters, extraction fails
+     * rather than scanning further lines.
+     */
+    private String extractLdmDestinationCode(String ldmBody) {
+        if (ldmBody == null) return null;
+        for (String line : ldmBody.split("\n", -1)) {
+            int dash = line.indexOf('-');
+            if (dash < 0) continue;
+            Matcher m = LDM_DESTINATION_AFTER_DASH.matcher(line.substring(dash));
+            return m.find() ? m.group(1) : null;
+        }
+        return null;
+    }
+
+    // ─── Station code → full SITA address lookup (app-config.xml / JSON) ──
+
+    private Map<String, Object> stationCodeCache;
+    private String defaultStationAddressCache;
+    private boolean defaultStationAddressLoaded = false;
+
+    /**
+     * Loads and caches the station-code → 7-character SITA address map from
+     * the JSON file whose path is configured in app-config.xml under
+     * <sitaMessaging><stationCodesFile>. Missing config/file/JSON just
+     * yields an empty map (best-effort — lookups then fail through to the
+     * configured default rather than the app crashing).
+     */
+    private synchronized Map<String, Object> loadStationCodes() {
+        if (stationCodeCache != null) return stationCodeCache;
+        stationCodeCache = new HashMap<>();
+        try {
+            String path = readAppConfigValue("stationCodesFile");
+            if (path == null || path.isEmpty()) return stationCodeCache;
+            File f = new File(path);
+            if (!f.exists()) return stationCodeCache;
+            String json = Files.readString(f.toPath(), StandardCharsets.UTF_8);
+            Map<String, Object> parsed = MiniJson.parseObject(json);
+            if (parsed != null) stationCodeCache.putAll(parsed);
+        } catch (Exception ignored) {
+            // best-effort; missing/invalid config just means codes won't expand
+        }
+        return stationCodeCache;
+    }
+
+    /** Reads a single top-level-named element's text from app-config.xml. */
+    private String readAppConfigValue(String tagName) {
+        try {
+            File configFile = new File("app-config.xml");
+            if (!configFile.exists()) return null;
+            javax.xml.parsers.DocumentBuilder builder =
+                    javax.xml.parsers.DocumentBuilderFactory.newInstance().newDocumentBuilder();
+            org.w3c.dom.Document doc = builder.parse(configFile);
+            org.w3c.dom.NodeList nodes = doc.getElementsByTagName(tagName);
+            if (nodes.getLength() > 0) {
+                String val = nodes.item(0).getTextContent().trim();
+                if (!val.isEmpty()) return val;
+            }
+        } catch (Exception ignored) {}
+        return null;
+    }
+
+    private synchronized String getDefaultStationAddress() {
+        if (!defaultStationAddressLoaded) {
+            defaultStationAddressCache = readAppConfigValue("defaultStationAddress");
+            defaultStationAddressLoaded = true;
+        }
+        return defaultStationAddressCache;
+    }
+
+    /**
+     * Resolves a station code to its full SITA address via the JSON lookup,
+     * falling back to the <sitaMessaging><defaultStationAddress> configured
+     * in app-config.xml when the code couldn't be extracted from the message
+     * at all, or couldn't be found in the lookup — so =ORIGIN and
+     * =DESTINATION TYPE B are never left blank as long as a default is set.
+     */
+    private String resolveStationAddress(String code, String messageType, String fieldName, Consumer<String> logLine) {
+        if (code != null) {
+            Object v = loadStationCodes().get(code);
+            if (v != null) return v.toString();
+            logLine.accept("[WARN] " + messageType + ": no SITA address configured for station code '" + code
+                    + "' (needed for =" + fieldName + ") — check stationCodesFile in app-config.xml.");
+        }
+        String fallback = getDefaultStationAddress();
+        if (fallback != null && !fallback.isEmpty()) {
+            logLine.accept("[INFO] " + messageType + ": using configured default SITA address '" + fallback
+                    + "' for =" + fieldName + ".");
+            return fallback;
+        }
+        return null;
+    }
+
+    // ─── Sequential 5-digit message id ──────────────────────────────────────
+
+    private final Object msgIdLock = new Object();
+
+    /**
+     * Persistent, sequential 5-digit =MSGID, shared across all LDM/MVT/PTM
+     * messages regardless of task. Stored as a plain counter file in the
+     * app's data directory so it survives restarts; wraps from 99999 back to
+     * 00001. Best-effort: if the counter file can't be read/written, a value
+     * is still returned for the current message rather than failing the run.
+     */
+    private String nextMessageId() {
+        synchronized (msgIdLock) {
+            File counterFile = new File(storage.getDataDir(), "msgid-counter.txt");
+            int next = 1;
+            try {
+                if (counterFile.exists()) {
+                    String s = Files.readString(counterFile.toPath(), StandardCharsets.UTF_8).trim();
+                    int current = Integer.parseInt(s);
+                    next = (current % 99999) + 1;
+                }
+            } catch (Exception ignored) {
+                next = 1;
+            }
+            try {
+                Files.writeString(counterFile.toPath(), String.valueOf(next), StandardCharsets.UTF_8);
+            } catch (IOException ignored) {
+                // best-effort persistence; still return a value for this run
+            }
+            return String.format("%05d", next);
+        }
+    }
+
+    /**
+     * Drops every blank/whitespace-only line so the .RCV file has no gaps
+     * between lines of actual content — HTML paragraph/line breaks and the
+     * earlier cleanup passes leave behind blank lines (collapsed to at most
+     * one), which this removes entirely.
+     */
+    private String removeBlankLines(String text) {
+        if (text == null || text.isEmpty()) return "";
+        String[] lines = text.split("\n", -1);
+        StringBuilder sb = new StringBuilder();
+        for (String line : lines) {
+            if (line.trim().isEmpty()) continue;
+            if (sb.length() > 0) sb.append("\n");
+            sb.append(line);
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Converts a Graph message body to plain text. Graph returns bodyType
+     * "html" for the vast majority of real-world mail — writing that raw
+     * markup into a .RCV file isn't usable as "body text", so block-level
+     * tags are turned into line breaks, all remaining tags are stripped, and
+     * the handful of entities that actually show up in mail are decoded.
+     * bodyType "text" is returned as-is.
+     */
+    private String toPlainText(String content, String bodyType) {
+        if (content == null) return "";
+        if (!"html".equalsIgnoreCase(bodyType)) return content;
+
+        String html = content;
+        html = html.replaceAll("(?is)<(script|style|head)[^>]*>.*?</\\1>", "");
+        html = html.replaceAll("(?i)<br\\s*/?>", "\n");
+        html = html.replaceAll("(?i)</(p|div|tr|li|h[1-6])>", "\n");
+        html = html.replaceAll("(?i)<(p|div|li)[^>]*>", "\n");
+        html = html.replaceAll("(?s)<[^>]+>", "");
+        html = html.replace("&nbsp;", " ")
+                .replace("&amp;", "&")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&quot;", "\"")
+                .replace("&#39;", "'")
+                .replace("&apos;", "'");
+        html = html.replaceAll("[ \\t]+\\n", "\n");
+        html = html.replaceAll("\\n{3,}", "\n\n");
+        return html.trim();
+    }
+
+    /**
+     * Strips automated banners that mail gateways/clients inject into the
+     * body — Outlook's "first contact" safety tip and generic external-sender
+     * warnings — since they're not part of the actual message. Applied
+     * wherever the banner appears in the text, not just at the start, since
+     * some gateways insert it inline rather than as a strict prefix.
+     */
+    private String removeAutomatedBanners(String text) {
+        if (text == null || text.isEmpty()) return "";
+        String result = text;
+        for (Pattern p : BANNER_REMOVAL_PATTERNS) {
+            result = p.matcher(result).replaceAll("");
+        }
+        return result.replaceAll("\\n{3,}", "\n\n").trim();
+    }
+
+    private static final Pattern[] BANNER_REMOVAL_PATTERNS = new Pattern[] {
+            // Outlook's "You don't often get email from X. Learn why this is
+            // important" safety tip — X varies per message, so match the fixed
+            // wrapper text around it rather than a literal sender.
+            Pattern.compile("(?is)you don't often get email from .*?learn why this is important\\.?"),
+            // "** EXTERNAL EMAIL - Please verify the sender ... **" style banners.
+            Pattern.compile("(?is)\\*\\*\\s*external email\\s*-.*?\\*\\*"),
+            // Common Office 365 default external-sender banner text.
+            Pattern.compile("(?is)this message originated from outside your organization\\.?\\s*"
+                    + "(do not click links or open attachments unless you recognize the sender[^.\\n]*\\.)?"),
+            // "[EXTERNAL]" tag some gateways prepend to the subject/body.
+            Pattern.compile("(?i)^\\s*\\[external]\\s*", Pattern.MULTILINE),
+            Pattern.compile("(?i)^caution:\\s*this email originated from outside.*$", Pattern.MULTILINE),
+    };
+
+    /**
+     * Company convention for these mailboxes: the substantive message content
+     * begins at a literal "LDM" / "MVT" / "PTM" marker in the body — whichever
+     * one starts the actual message — and everything before it (banners,
+     * greetings, etc.) is boilerplate that gets discarded. The marker found
+     * also identifies the message type, which drives the =PRIORITY value and
+     * whether/how origin+destination are extracted. If none of the three
+     * markers are present, no marker is returned and the text is left as-is
+     * (not an LDM/MVT/PTM message, so no SITA header is generated for it).
+     */
+    private static final String[] MESSAGE_TYPE_MARKERS = {"LDM", "MVT", "PTM"};
+
+    private static class MarkerMatch {
+        final String type;
+        final int index;
+        MarkerMatch(String type, int index) { this.type = type; this.index = index; }
+    }
+
+    private MarkerMatch findMessageTypeMarker(String text) {
+        if (text == null) return null;
+        MarkerMatch best = null;
+        for (String type : MESSAGE_TYPE_MARKERS) {
+            int idx = text.indexOf(type);
+            if (idx >= 0 && (best == null || idx < best.index)) {
+                best = new MarkerMatch(type, idx);
+            }
+        }
+        return best;
+    }
+
+    // Lines matching any of these mark the start of a signature, footer/
+    // disclaimer, or quoted reply history — everything from the first match
+    // onward is dropped. Best-effort: real-world mail signature formats
+    // vary too much to catch every case, but this covers the common ones
+    // (Outlook/Gmail/mobile clients, RFC 3676 "-- " delimiter, disclaimers).
+    private static final Pattern[] BODY_CUTOFF_PATTERNS = new Pattern[] {
+            Pattern.compile("^-- ?$"),
+            Pattern.compile("^_{5,}$"),
+            Pattern.compile("(?i)^-{3,}\\s*original message\\s*-{3,}$"),
+            Pattern.compile("(?i)^on .{5,120} wrote:\\s*$"),
+            Pattern.compile("^from:\\s+\\S.*$", Pattern.CASE_INSENSITIVE),
+            Pattern.compile("^>.*$"),
+            Pattern.compile("(?i)^sent from my (iphone|android|mobile|samsung|ipad).*$"),
+            Pattern.compile("(?i)^get outlook for (ios|android).*$"),
+            Pattern.compile("(?i)^(confidentiality notice|disclaimer)\\b.*$"),
+            // Common sign-off lines — "Thanks & Regards", "Best Regards,", etc.
+            // Anchored to a line containing (at most) a short trailing name/
+            // title so it doesn't accidentally match the phrase mid-sentence.
+            Pattern.compile("(?i)^thanks\\s*(&|and)\\s*regards\\s*,?\\s*$"),
+            Pattern.compile("(?i)^(best|warm|kind|many)\\s+regards\\s*,?\\s*$"),
+            Pattern.compile("(?i)^regards\\s*,?\\s*$"),
+            Pattern.compile("(?i)^(thank\\s*you|thanks)\\s*,?\\s*$"),
+            Pattern.compile("(?i)^(best|sincerely|cheers|respectfully)\\s*,?\\s*$"),
+            Pattern.compile("(?i)^this (e-?mail|message)( and any (attachments|files))?"
+                    + " (is|are|contains|may contain).*confidential.*$"),
+    };
+
+    private String stripSignatureAndQuotedContent(String text) {
+        if (text == null || text.isEmpty()) return "";
+        String[] lines = text.split("\n", -1);
+        int cutoff = lines.length;
+
+        outer:
+        for (int i = 0; i < lines.length; i++) {
+            String line = lines[i].trim();
+            if (line.isEmpty()) continue;
+            for (Pattern p : BODY_CUTOFF_PATTERNS) {
+                if (!p.matcher(line).matches()) continue;
+                // A bare "From:" line is ambiguous on its own (could be body text
+                // someone typed) — only treat it as a quoted-reply header block
+                // when a Sent:/Date: line follows shortly after, matching the
+                // Outlook "From: / Sent: / To: / Subject:" quote-block pattern.
+                if (line.toLowerCase().startsWith("from:")) {
+                    boolean looksLikeQuoteBlock = false;
+                    for (int j = i + 1; j < Math.min(i + 4, lines.length); j++) {
+                        String next = lines[j].trim().toLowerCase();
+                        if (next.startsWith("sent:") || next.startsWith("date:")) {
+                            looksLikeQuoteBlock = true;
+                            break;
+                        }
+                    }
+                    if (!looksLikeQuoteBlock) continue;
+                }
+                cutoff = i;
+                break outer;
+            }
+        }
+
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < cutoff; i++) {
+            sb.append(lines[i]);
+            if (i < cutoff - 1) sb.append("\n");
+        }
+        return sb.toString().trim();
     }
 
     // ─── Cancellation ─────────────────────────────────────────────────────────

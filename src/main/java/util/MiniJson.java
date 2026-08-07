@@ -254,6 +254,13 @@ public final class MiniJson {
         return def;
     }
 
+    public static boolean getBoolean(Map<String, Object> obj, String key, boolean def) {
+        Object v = obj.get(key);
+        if (v instanceof Boolean) return (Boolean) v;
+        if (v instanceof String) return Boolean.parseBoolean((String) v);
+        return def;
+    }
+
     @SuppressWarnings("unchecked")
     public static List<Object> getArray(Map<String, Object> obj, String key) {
         Object v = obj.get(key);

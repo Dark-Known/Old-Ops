@@ -122,6 +122,7 @@ public class TaskDialog extends JDialog {
     private JLabel     lblMailMoveFolder;
     private JTextField tfMailMoveFolder;
     private JLabel     lblMailMoveFolderHint;
+    private JTextField tfMailOutputFolder;
 
     // ── Schedule ──────────────────────────────────────────────────────────────
     private JComboBox<String> cbScheduleType;
@@ -447,6 +448,13 @@ public class TaskDialog extends JDialog {
         addRow(mailPanel, lblMailMoveFolder, tfMailMoveFolder, 19);
         lblMailMoveFolderHint = hint("Any folder name (e.g. \"Processed\") or a well-known name: SENT, DRAFTS, DELETED, JUNK, ARCHIVE. Applied after mark-as-read, since moving changes the message's ID.");
         addRow(mailPanel, "", lblMailMoveFolderHint, 20);
+
+        // ── Output folder (.RCV files) ──────────────────────────────────────
+        tfMailOutputFolder = makeField(new JTextField(
+                existing != null && existing.getMailOutputFolder() != null
+                        ? existing.getMailOutputFolder() : "", 28));
+        addRow(mailPanel, "Output Folder *", tfMailOutputFolder, 21);
+        addRow(mailPanel, "", hint("Local directory where each fetched message is written as a .RCV file. Created automatically if it doesn't exist yet."), 22);
 
         cbMailMoveEnabled.addActionListener(e -> updateMailMoveFieldsVisibility());
         updateMailMoveFieldsVisibility();
@@ -1053,6 +1061,10 @@ public class TaskDialog extends JDialog {
             if (tenantId.isEmpty()) { msg("Azure AD Tenant ID is required (or \"common\")."); return; }
             if (clientId.isEmpty()) { msg("Azure AD Client ID is required — see README \u201cOutlook Mail setup\u201d."); return; }
             if (tfImapFolder.getText().trim().isEmpty()) { msg("Mail folder is required."); return; }
+            if (tfMailOutputFolder.getText().trim().isEmpty()) {
+                msg("Output Folder is required — each fetched message is written there as a .RCV file.");
+                return;
+            }
             if (pnlMailSearchCriteria.getCriteria().trim().isEmpty()) {
                 msg("Search criteria is required."); return;
             }
@@ -1146,6 +1158,7 @@ public class TaskDialog extends JDialog {
             t.setMailMarkAsRead(cbMailMarkAsRead.isSelected());
             t.setMailMoveToFolderEnabled(cbMailMoveEnabled.isSelected());
             t.setMailMoveToFolderName(tfMailMoveFolder.getText().trim());
+            t.setMailOutputFolder(tfMailOutputFolder.getText().trim());
             if (mailWatcherEpochShouldReset) {
                 t.setMailLastKnownEpoch(0L);
             }

@@ -166,10 +166,19 @@ public class SearchCriteriaPanel extends JPanel {
 
         tfArgument.setText("");
         cbAdvancedType.setSelectedIndex(0);
-        notifyCriteriaChanged();
     }
 
     private void addCriteriaTag(String criterion, String display) {
+        // "Selected Criteria" is the single source of truth for what's actually
+        // applied. Previously, adding via Quick Presets never notified listeners
+        // (only the Advanced Builder path did) and nothing stopped the same
+        // criterion being added twice (e.g. picking the same preset again),
+        // which let the two panels drift out of sync. Both are fixed here:
+        // every successful add notifies, and duplicates are silently ignored.
+        boolean alreadyPresent = selectedCriteria.stream().anyMatch(t -> t.criterion.equals(criterion));
+        if (alreadyPresent) {
+            return;
+        }
         final CriterionTag[] tagHolder = new CriterionTag[1];
         tagHolder[0] = new CriterionTag(criterion, display, () -> {
             CriterionTag tag = tagHolder[0];
@@ -184,6 +193,7 @@ public class SearchCriteriaPanel extends JPanel {
         pnlCriteria.add(tag);
         pnlCriteria.revalidate();
         pnlCriteria.repaint();
+        notifyCriteriaChanged();
     }
 
     public String getCriteria() {

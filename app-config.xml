@@ -216,6 +216,21 @@
         <retryIntervalSeconds>5</retryIntervalSeconds>
     </network>
 
+    <!-- SITA-style Header Generation for LDM / MVT / PTM mail messages -->
+    <sitaMessaging>
+        <!-- Path to a JSON file mapping 3-letter station codes (origin and
+             destination) to their full 7-character SITA address, e.g.:
+               { "BLR": "BLRGMXH", "VTZ": "VTZGMXH" }
+             Used to build the =ORIGIN and =DESTINATION TYPE B fields of the
+             header prepended to parsed LDM/MVT/PTM message content. -->
+        <stationCodesFile>D:\OpsTools\Data\station-codes.json</stationCodesFile>
+
+        <!-- Fallback SITA address used for =ORIGIN and/or =DESTINATION TYPE B
+             whenever the station code can't be extracted from the message,
+             or the extracted code has no entry in stationCodesFile. -->
+        <defaultStationAddress>VTZGMXH</defaultStationAddress>
+    </sitaMessaging>
+
     <!-- Prerequisite Files (must be in same folder as setup.ps1) -->
     <prerequisites>
         <!-- JAR file -->
@@ -262,4 +277,3 @@
         <backupExisting>true</backupExisting>
     </validation>
 </application>
-
