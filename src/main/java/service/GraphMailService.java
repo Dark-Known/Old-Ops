@@ -212,8 +212,16 @@ public class GraphMailService {
             throws IOException, InterruptedException {
         Map<String, Object> resp;
         try {
+            // contentBytes only exists on the derived fileAttachment type, not
+            // the base "attachment" type the plain /attachments collection
+            // returns — selecting it there fails with "Could not find a
+            // property named 'contentBytes' on type 'microsoft.graph.attachment'".
+            // The /microsoft.graph.fileAttachment cast segment narrows the
+            // collection to that derived type first, making contentBytes (and
+            // size) valid to select. Item/reference attachments (which have no
+            // contentBytes anyway) are simply excluded by the cast.
             resp = graphGetJson(accessToken, GRAPH_BASE + "/me/messages/" + messageId
-                    + "/attachments?$select=name,contentType,isInline,contentBytes,size");
+                    + "/attachments/microsoft.graph.fileAttachment?$select=name,contentType,isInline,contentBytes,size");
         } catch (IOException ex) {
             logLine.accept("[WARN] Could not fetch attachments for message " + messageId + ": " + ex.getMessage());
             return new AttachmentBundle("", Collections.emptyList());
@@ -297,15 +305,54 @@ public class GraphMailService {
             .toFormatter(Locale.ENGLISH);
 
     private static final Pattern TEXT_CRITERION =
-            Pattern.compile("(FROM|TO|CC|BCC|SUBJECT)\\s+\"([^\"]*)\"", Pattern.CASE_INSENSITIVE);
+            Pattern.compile("(FROM|TO|CC|BCC|SUBJECT|BODY|TEXT)\\s+\"([^\"]*)\"", Pattern.CASE_INSENSITIVE);
     private static final Pattern DATE_CRITERION =
-            Pattern.compile("(SINCE|BEFORE|ON)\\s+(\\d{1,2}-[A-Za-z]{3}-\\d{4})", Pattern.CASE_INSENSITIVE);
+            Pattern.compile("(SINCE|BEFORE|ON|SENTSINCE|SENTBEFORE|SENTON)\\s+(\\d{1,2}-[A-Za-z]{3}-\\d{4})", Pattern.CASE_INSENSITIVE);
+    private static final Pattern SIZE_CRITERION =
+            Pattern.compile("(LARGER|SMALLER)\\s+(\\d+)", Pattern.CASE_INSENSITIVE);
+    private static final Pattern KEYWORD_CRITERION =
+            Pattern.compile("(KEYWORD|UNKEYWORD)\\s+(\\S+)", Pattern.CASE_INSENSITIVE);
+    private static final Pattern HEADER_CRITERION =
+            Pattern.compile("HEADER\\s+\\S+\\s+\"([^\"]*)\"", Pattern.CASE_INSENSITIVE);
+    private static final Pattern UID_CRITERION =
+            Pattern.compile("UID\\s+\\S+", Pattern.CASE_INSENSITIVE);
+
+    // Simple (no-argument) IMAP flags that map directly to a Graph $filter
+    // clause. NEW has no true Graph equivalent (it means "\Recent and
+    // \Unseen", and Graph has no session-based \Recent concept) — approximated
+    // as unread, which is the closest useful behavior, not an exact match.
+    private static final Map<String, String> SIMPLE_CRITERIA_FILTERS = new LinkedHashMap<>();
+    static {
+        SIMPLE_CRITERIA_FILTERS.put("UNSEEN", "isRead eq false");
+        SIMPLE_CRITERIA_FILTERS.put("SEEN", "isRead eq true");
+        SIMPLE_CRITERIA_FILTERS.put("DRAFT", "isDraft eq true");
+        SIMPLE_CRITERIA_FILTERS.put("UNDRAFT", "isDraft eq false");
+        SIMPLE_CRITERIA_FILTERS.put("FLAGGED", "flag/flagStatus eq 'flagged'");
+        SIMPLE_CRITERIA_FILTERS.put("UNFLAGGED", "flag/flagStatus eq 'notFlagged'");
+        SIMPLE_CRITERIA_FILTERS.put("NEW", "isRead eq false");
+    }
+
+    // Simple flags with genuinely no Graph mail API equivalent — flagged with
+    // a specific reason rather than falling through to the generic
+    // "unrecognized portion" warning, so it's clear this isn't a typo/gap in
+    // parsing but an actual capability Graph doesn't expose.
+    private static final Map<String, String> SIMPLE_CRITERIA_UNSUPPORTED = new LinkedHashMap<>();
+    static {
+        SIMPLE_CRITERIA_UNSUPPORTED.put("ANSWERED", "Graph has no \\Answered-equivalent property on messages");
+        SIMPLE_CRITERIA_UNSUPPORTED.put("UNANSWERED", "Graph has no \\Answered-equivalent property on messages");
+        SIMPLE_CRITERIA_UNSUPPORTED.put("DELETED", "Graph has no per-message deleted flag — deletion just moves the message to Deleted Items");
+        SIMPLE_CRITERIA_UNSUPPORTED.put("UNDELETED", "Graph has no per-message deleted flag — deletion just moves the message to Deleted Items");
+        SIMPLE_CRITERIA_UNSUPPORTED.put("RECENT", "Graph has no session-based \\Recent concept");
+        SIMPLE_CRITERIA_UNSUPPORTED.put("OLD", "Graph has no session-based \\Recent concept");
+    }
 
     /**
      * Best-effort mapping of the app's IMAP-style search criteria string to a
-     * Graph OData $filter. Recognized: ALL, UNSEEN, SEEN, FROM/TO/CC/BCC/SUBJECT
-     * "value", SINCE/BEFORE/ON dd-MMM-yyyy. Anything else is logged and dropped
-     * rather than guessed at, since a wrong filter is worse than no filter.
+     * Graph OData $filter. Every token in util.ImapSearchCriteria is handled
+     * one of three ways: mapped to a real Graph filter clause, explicitly
+     * flagged as unsupported (with the specific reason), or — only for
+     * genuinely unknown text — logged as an unrecognized portion. A wrong
+     * filter is worse than no filter, so nothing here is guessed at.
      */
     private String mapSearchCriteriaToFilter(String criteria, Consumer<String> logLine) {
         if (criteria == null || criteria.trim().isEmpty()) return null;
@@ -316,12 +363,17 @@ public class GraphMailService {
         List<String> clauses = new ArrayList<>();
         String remaining = c;
 
-        if (containsToken(remaining, "UNSEEN")) {
-            clauses.add("isRead eq false");
-            remaining = stripToken(remaining, "UNSEEN");
-        } else if (containsToken(remaining, "SEEN")) {
-            clauses.add("isRead eq true");
-            remaining = stripToken(remaining, "SEEN");
+        for (Map.Entry<String, String> e : SIMPLE_CRITERIA_FILTERS.entrySet()) {
+            if (containsToken(remaining, e.getKey())) {
+                clauses.add(e.getValue());
+                remaining = stripToken(remaining, e.getKey());
+            }
+        }
+        for (Map.Entry<String, String> e : SIMPLE_CRITERIA_UNSUPPORTED.entrySet()) {
+            if (containsToken(remaining, e.getKey())) {
+                logLine.accept("[WARN] Search criterion '" + e.getKey() + "' skipped — " + e.getValue() + ".");
+                remaining = stripToken(remaining, e.getKey());
+            }
         }
 
         Matcher tm = TEXT_CRITERION.matcher(remaining);
@@ -331,12 +383,19 @@ public class GraphMailService {
             switch (field) {
                 case "SUBJECT": clauses.add("contains(subject,'" + value + "')"); break;
                 case "FROM":    clauses.add("from/emailAddress/address eq '" + value + "'"); break;
-                // Graph's default /me/messages doesn't expose simple TO/CC/BCC filter
-                // properties the way IMAP does; skip with a note rather than silently
-                // returning unfiltered results under a filter that looks like it applied.
-                default:
+                case "TO":      clauses.add("toRecipients/any(r:r/emailAddress/address eq '" + value + "')"); break;
+                case "CC":      clauses.add("ccRecipients/any(r:r/emailAddress/address eq '" + value + "')"); break;
+                case "BCC":     clauses.add("bccRecipients/any(r:r/emailAddress/address eq '" + value + "')"); break;
+                // Graph's $filter has no contains() support for message body —
+                // only a handful of properties (subject among them) are
+                // filterable that way; body text needs $search, which isn't
+                // wired up here. Skip with a note rather than send a filter
+                // Graph will reject and fail the whole request over.
+                case "BODY":
+                case "TEXT":
                     logLine.accept("[WARN] Search criterion '" + field
-                            + "' has no direct Graph equivalent here — skipped.");
+                            + "' skipped — Graph's $filter doesn't support body text search (would need $search, not implemented).");
+                    break;
             }
             remaining = remaining.replace(tm.group(), "");
         }
@@ -345,14 +404,50 @@ public class GraphMailService {
         while (dm.find()) {
             String op = dm.group(1).toUpperCase(Locale.ROOT);
             String isoDate = java.time.LocalDate.parse(dm.group(2), IMAP_DATE_FMT) + "T00:00:00Z";
+            String prop = op.startsWith("SENT") ? "sentDateTime" : "receivedDateTime";
             switch (op) {
-                case "SINCE":  clauses.add("receivedDateTime ge " + isoDate); break;
-                case "BEFORE": clauses.add("receivedDateTime lt " + isoDate); break;
-                case "ON":     clauses.add("receivedDateTime ge " + isoDate
-                        + " and receivedDateTime lt " + isoDate.replace("T00:00:00Z", "T23:59:59Z"));
+                case "SINCE":
+                case "SENTSINCE":
+                    clauses.add(prop + " ge " + isoDate); break;
+                case "BEFORE":
+                case "SENTBEFORE":
+                    clauses.add(prop + " lt " + isoDate); break;
+                case "ON":
+                case "SENTON":
+                    clauses.add(prop + " ge " + isoDate
+                        + " and " + prop + " lt " + isoDate.replace("T00:00:00Z", "T23:59:59Z"));
                     break;
             }
             remaining = remaining.replace(dm.group(), "");
+        }
+
+        Matcher km = KEYWORD_CRITERION.matcher(remaining);
+        while (km.find()) {
+            boolean negate = km.group(1).equalsIgnoreCase("UNKEYWORD");
+            String value = km.group(2).replace("'", "''");
+            // Graph's "categories" feature is the closest analog to IMAP
+            // custom keyword flags.
+            clauses.add((negate ? "not " : "") + "categories/any(c:c eq '" + value + "')");
+            remaining = remaining.replace(km.group(), "");
+        }
+
+        Matcher sm = SIZE_CRITERION.matcher(remaining);
+        while (sm.find()) {
+            logLine.accept("[WARN] Search criterion '" + sm.group(1).toUpperCase(Locale.ROOT)
+                    + "' skipped — Graph's message resource has no filterable size property.");
+            remaining = remaining.replace(sm.group(), "");
+        }
+
+        Matcher hm = HEADER_CRITERION.matcher(remaining);
+        while (hm.find()) {
+            logLine.accept("[WARN] Search criterion 'HEADER' skipped — Graph's $filter has no arbitrary-header search.");
+            remaining = remaining.replace(hm.group(), "");
+        }
+
+        Matcher um = UID_CRITERION.matcher(remaining);
+        while (um.find()) {
+            logLine.accept("[WARN] Search criterion 'UID' skipped — IMAP UIDs don't correspond to anything in Graph's id scheme.");
+            remaining = remaining.replace(um.group(), "");
         }
 
         remaining = remaining.trim();

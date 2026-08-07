@@ -8,11 +8,14 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
 
 /**
@@ -134,50 +137,99 @@ public class OAuth2TokenService {
     /**
      * Silently exchanges the cached refresh token for a fresh access token.
      * Intended for unattended/scheduled use — throws if no enrollment exists yet.
+     *
+     * Caches the access token in memory until shortly before it expires, so
+     * repeated calls in quick succession (e.g. a task polling every 30s)
+     * don't hit the refresh-token endpoint every time. This also shrinks the
+     * window for a cross-process race: the GUI's in-app scheduler and the
+     * standalone Daemon are both designed to be able to run at the same time
+     * against the same tasks (see Daemon.java), and Microsoft commonly
+     * rotates the refresh token on each exchange — invalidating the previous
+     * one. If two overlapping calls read the same refresh token and submit
+     * it concurrently, the loser gets an invalid_grant/401 even though the
+     * winner succeeded and already rotated the token on disk (explaining a
+     * run failing with "not authorized" while the very next run — which
+     * picks up the winner's newly-rotated token — works fine). The file lock
+     * below serializes the whole read-refresh-write sequence across
+     * processes so only one refresh happens at a time per account.
      */
     public String getValidAccessToken(String accountKey, String tenantId, String clientId, String scope)
             throws IOException {
 
-        String refreshToken = loadRefreshToken(accountKey);
-        if (refreshToken == null) {
-            throw new IOException("Mailbox '" + accountKey + "' is not authorized yet. "
-                    + "Use the \"Authorize Mailbox\" button in the task editor to complete one-time sign-in.");
+        CachedToken cached = accessTokenCache.get(accountKey);
+        if (cached != null && System.currentTimeMillis() < cached.expiresAtEpochMs) {
+            return cached.accessToken;
         }
 
-        HttpRequest req = HttpRequest.newBuilder()
-                .uri(URI.create(AUTH_BASE + tenantId + "/oauth2/v2.0/token"))
-                .header("Content-Type", "application/x-www-form-urlencoded")
-                .POST(HttpRequest.BodyPublishers.ofString(
-                        "grant_type=refresh_token"
-                                + "&client_id=" + urlEnc(clientId)
-                                + "&refresh_token=" + urlEnc(refreshToken)
-                                + "&scope=" + urlEnc(scope)))
-                .build();
+        Path lockFile = tokenDir.resolve(safeName(accountKey) + ".lock");
+        try (FileChannel channel = FileChannel.open(lockFile,
+                    StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+             FileLock fileLock = channel.lock()) {
 
-        HttpResponse<String> resp;
-        try {
-            resp = http.send(req, HttpResponse.BodyHandlers.ofString());
-        } catch (InterruptedException ie) {
-            Thread.currentThread().interrupt();
-            throw new IOException("Interrupted while refreshing OAuth2 token", ie);
+            // Re-check after acquiring the lock — another thread/process may
+            // have just refreshed while we were waiting for it.
+            cached = accessTokenCache.get(accountKey);
+            if (cached != null && System.currentTimeMillis() < cached.expiresAtEpochMs) {
+                return cached.accessToken;
+            }
+
+            String refreshToken = loadRefreshToken(accountKey);
+            if (refreshToken == null) {
+                throw new IOException("Mailbox '" + accountKey + "' is not authorized yet. "
+                        + "Use the \"Authorize Mailbox\" button in the task editor to complete one-time sign-in.");
+            }
+
+            HttpRequest req = HttpRequest.newBuilder()
+                    .uri(URI.create(AUTH_BASE + tenantId + "/oauth2/v2.0/token"))
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .POST(HttpRequest.BodyPublishers.ofString(
+                            "grant_type=refresh_token"
+                                    + "&client_id=" + urlEnc(clientId)
+                                    + "&refresh_token=" + urlEnc(refreshToken)
+                                    + "&scope=" + urlEnc(scope)))
+                    .build();
+
+            HttpResponse<String> resp;
+            try {
+                resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Interrupted while refreshing OAuth2 token", ie);
+            }
+
+            Map<String, Object> body = MiniJson.parseObject(resp.body());
+            if (resp.statusCode() != 200) {
+                throw new IOException("Token refresh failed for '" + accountKey + "': "
+                        + MiniJson.getString(body, "error_description", resp.body())
+                        + " — the cached refresh token may be expired or revoked; re-run \"Authorize Mailbox\".");
+            }
+
+            String accessToken = MiniJson.getString(body, "access_token", null);
+            if (accessToken == null) throw new IOException("Token response missing access_token: " + resp.body());
+
+            // Microsoft frequently rotates the refresh token — re-cache it if a new one came back.
+            String newRefresh = MiniJson.getString(body, "refresh_token", null);
+            if (newRefresh != null) saveRefreshToken(accountKey, newRefresh);
+
+            int expiresIn = MiniJson.getInt(body, "expires_in", 3600);
+            // Refresh a little early (60s buffer) rather than cutting it exactly at expiry.
+            long expiresAt = System.currentTimeMillis() + Math.max(0, expiresIn - 60) * 1000L;
+            accessTokenCache.put(accountKey, new CachedToken(accessToken, expiresAt));
+
+            return accessToken;
         }
-
-        Map<String, Object> body = MiniJson.parseObject(resp.body());
-        if (resp.statusCode() != 200) {
-            throw new IOException("Token refresh failed for '" + accountKey + "': "
-                    + MiniJson.getString(body, "error_description", resp.body())
-                    + " — the cached refresh token may be expired or revoked; re-run \"Authorize Mailbox\".");
-        }
-
-        String accessToken = MiniJson.getString(body, "access_token", null);
-        if (accessToken == null) throw new IOException("Token response missing access_token: " + resp.body());
-
-        // Microsoft frequently rotates the refresh token — re-cache it if a new one came back.
-        String newRefresh = MiniJson.getString(body, "refresh_token", null);
-        if (newRefresh != null) saveRefreshToken(accountKey, newRefresh);
-
-        return accessToken;
     }
+
+    private static class CachedToken {
+        final String accessToken;
+        final long expiresAtEpochMs;
+        CachedToken(String accessToken, long expiresAtEpochMs) {
+            this.accessToken = accessToken;
+            this.expiresAtEpochMs = expiresAtEpochMs;
+        }
+    }
+
+    private final Map<String, CachedToken> accessTokenCache = new ConcurrentHashMap<>();
 
     /** Removes the cached authorization for this mailbox (forces re-enrollment). */
     public void revoke(String accountKey) {
@@ -218,8 +270,11 @@ public class OAuth2TokenService {
     }
 
     private Path tokenFile(String accountKey) {
-        String safe = accountKey.replaceAll("[^a-zA-Z0-9._@-]", "_");
-        return tokenDir.resolve(safe + ".oauth");
+        return tokenDir.resolve(safeName(accountKey) + ".oauth");
+    }
+
+    private String safeName(String accountKey) {
+        return accountKey.replaceAll("[^a-zA-Z0-9._@-]", "_");
     }
 
     private String urlEnc(String s) {

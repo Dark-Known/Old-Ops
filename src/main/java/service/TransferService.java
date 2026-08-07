@@ -1388,8 +1388,16 @@ public class TransferService {
         if (mode == MailFetchMode.BODY_ONLY) {
             String bannerStripped = removeAutomatedBanners(sourceText);
             MarkerMatch marker = findMessageTypeMarker(bannerStripped);
-            String messageBody = marker != null ? bannerStripped.substring(marker.index) : bannerStripped;
-            messageBody = removeBlankLines(stripSignatureAndQuotedContent(messageBody));
+            String markerBody = marker != null ? bannerStripped.substring(marker.index) : bannerStripped;
+
+            // For LDM/PTM, the literal marker is immediately followed by an
+            // "=TEXT" tag line marking the start of the free-text content,
+            // matching the =FIELD convention used by the rest of the header.
+            if (marker != null && ("LDM".equals(marker.type) || "PTM".equals(marker.type))) {
+                markerBody = marker.type + "\n=TEXT" + markerBody.substring(marker.type.length());
+            }
+
+            String messageBody = removeBlankLines(stripSignatureAndQuotedContent(markerBody));
 
             if (marker == null) {
                 // Not an LDM/MVT/PTM message — no SITA header applies.
@@ -1401,8 +1409,12 @@ public class TransferService {
             if ("LDM".equals(marker.type)) {
                 originCode = extractLdmOriginCode(bannerStripped, messageBody);
                 destinationCode = extractLdmDestinationCode(messageBody);
+            } else if ("PTM".equals(marker.type)) {
+                String[] od = extractPtmOriginDestination(messageBody);
+                originCode = od[0];
+                destinationCode = od[1];
             } else {
-                // No extraction rules have been specified yet for MVT/PTM —
+                // No extraction rule has been specified yet for MVT —
                 // the configured default address is used for both fields.
                 logLine.accept("[INFO] No origin/destination extraction rule configured for " + marker.type
                         + " messages yet — falling back to the configured default SITA address.");
@@ -1520,6 +1532,25 @@ public class TransferService {
             return m.find() ? m.group(1) : null;
         }
         return null;
+    }
+
+    // ─── PTM origin / destination extraction ───────────────────────────────
+
+    // Flight designator + departure date line, e.g. "SV753/06AUG HYDJED":
+    // 2-3 char airline code + 1-4 digit flight number, "/", 2-digit day +
+    // 3-letter month, then a run of 6 capital letters split into two 3-letter
+    // station codes — origin (where these passengers boarded) then the
+    // immediate/transit destination (where they disembark).
+    private static final Pattern PTM_FLIGHT_ORIGIN_DEST =
+            Pattern.compile("^[A-Z0-9]{2,3}\\d{1,4}/\\d{2}[A-Z]{3}\\s+([A-Z]{3})([A-Z]{3})", Pattern.MULTILINE);
+
+    /** Returns {origin, destination} station codes for a PTM message, or {null, null} if not found. */
+    private String[] extractPtmOriginDestination(String ptmBody) {
+        if (ptmBody != null) {
+            Matcher m = PTM_FLIGHT_ORIGIN_DEST.matcher(ptmBody);
+            if (m.find()) return new String[]{m.group(1), m.group(2)};
+        }
+        return new String[]{null, null};
     }
 
     // ─── Station code → full SITA address lookup (app-config.xml / JSON) ──
