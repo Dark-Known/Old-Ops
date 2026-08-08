@@ -8,6 +8,10 @@
 #    OpenJDK21-jdk.msi           -- Temurin JDK 21 offline installer
 #    WinSCP-Setup.exe            -- WinSCP offline installer
 #    test-elevation.bat          -- Elevation test/launcher batch file
+#    rcedit.exe                  -- OPTIONAL: renames the daemon process as
+#                                    it appears in Task Manager (otherwise it
+#                                    shows as "OpenJDK Platform Binary"). Get
+#                                    it from https://github.com/electron/rcedit/releases
 #
 #  This script will:
 #    1. Check / install Temurin JDK 21 (includes javac)
@@ -34,7 +38,40 @@ $ScriptRoot = if ($PSCommandPath) {
     Get-Location
 }
 
-# -- XML Configuration Loader ------------------------------------------------
+function Log($msg) {
+    $line = "$(Get-Date -Format 'HH:mm:ss')  $msg"
+    Write-Host $line
+    Add-Content -Path $LogFile -Value $line
+}
+
+function Step($msg) {
+    Write-Host ""
+    Write-Host "------------------------------------------" -ForegroundColor DarkGray
+    Write-Host "  $msg" -ForegroundColor Cyan
+    Write-Host "------------------------------------------" -ForegroundColor DarkGray
+}
+
+function OK($msg)   { Write-Host "  v  $msg" -ForegroundColor Green }
+function SKIP($msg) { Write-Host "  -  $msg" -ForegroundColor Yellow }
+
+function FAIL($msg) {
+    Write-Host ""
+    Write-Host "  x  ERROR: $msg" -ForegroundColor Red
+    Write-Host "     See log: $LogFile"
+    Write-Host ""
+    Read-Host "Press Enter to exit"
+    exit 1
+}
+
+# Bootstrap log file so Log/FAIL already work while app-config.xml is being
+# loaded below (Load-XmlConfig calls Log on a missing/bad config file, and
+# at that point the config-driven log path further down hasn't been read
+# yet). Once the config is loaded, $LogDir/$LogFile are recomputed from it
+# and everything after that point respects the configured logDir; only the
+# handful of bootstrap-phase lines above stay in this default-location file.
+$LogDir  = Join-Path $ScriptRoot "logs"
+if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
+$LogFile = Join-Path $LogDir "opstool-setup_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
 
 function Load-XmlConfig {
     $configFile = Join-Path $ScriptRoot "app-config.xml"
@@ -70,21 +107,15 @@ function Get-ConfigValue {
             }
         }
     } catch {
-        # Fall through to return default
     }
     return $defaultValue
 }
 
-# -- Config -------------------------------------------------------------------
-
-# Load XML configuration
 $xmlConfig = Load-XmlConfig
 
-# Installation paths
 $InstallDir   = Get-ConfigValue $xmlConfig "/application/installation/installDir" "C:\OpsTools"
 $JarName      = Get-ConfigValue $xmlConfig "/application/installation/jarName" "Monitoring-Tool.jar"
 
-# *** OFFLINE: all files must sit next to setup.ps1 ***
 $JavaMsi      = Join-Path $ScriptRoot (Get-ConfigValue $xmlConfig "/application/java/installerFile" "OpenJDK21-jdk.msi")
 $WinScpExe    = Join-Path $ScriptRoot (Get-ConfigValue $xmlConfig "/application/tools/winSCP/installerFile" "WinSCP-Setup.exe")
 $SourceJar    = Join-Path $ScriptRoot $JarName
@@ -111,40 +142,12 @@ if (-not (Test-Path $IconSource)) {
     $IconLocation = $fallbackIcon
 }
 
-# Logging
+# Re-point logging at the configured logDir (falls back to the same "logs"
+# folder used for bootstrap above if app-config.xml didn't specify one).
 $logDir = Get-ConfigValue $xmlConfig "/application/logging/logDir" "logs"
 $LogDir  = Join-Path $ScriptRoot $logDir
 if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
 $LogFile = Join-Path $LogDir "opstool-setup_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
-
-# -- Helpers ------------------------------------------------------------------
-
-function Log($msg) {
-    $line = "$(Get-Date -Format 'HH:mm:ss')  $msg"
-    Write-Host $line
-    Add-Content -Path $LogFile -Value $line
-}
-
-function Step($msg) {
-    Write-Host ""
-    Write-Host "------------------------------------------" -ForegroundColor DarkGray
-    Write-Host "  $msg" -ForegroundColor Cyan
-    Write-Host "------------------------------------------" -ForegroundColor DarkGray
-}
-
-function OK($msg)   { Write-Host "  v  $msg" -ForegroundColor Green }
-function SKIP($msg) { Write-Host "  -  $msg" -ForegroundColor Yellow }
-
-function FAIL($msg) {
-    Write-Host ""
-    Write-Host "  x  ERROR: $msg" -ForegroundColor Red
-    Write-Host "     See log: $LogFile"
-    Write-Host ""
-    Read-Host "Press Enter to exit"
-    exit 1
-}
-
-# -- Java JDK discovery -------------------------------------------------------
 
 function Find-JavaBin {
     if ($env:JAVA_HOME) {
@@ -209,8 +212,6 @@ function Get-JavaMajorVersion($binDir) {
     return 0
 }
 
-# -- Banner -------------------------------------------------------------------
-
 Clear-Host
 Write-Host ""
 Write-Host "  +======================================================+" -ForegroundColor Cyan
@@ -229,10 +230,6 @@ Write-Host ""
 $confirm = Read-Host "Continue? [Y/n]"
 if ($confirm -match "^[Nn]") { exit 0 }
 
-# -- 1. Locate prebuilt JAR ---------------------------------------------------
-
-Step "Locating prebuilt JAR"
-
 if (-not (Test-Path $SourceJar)) {
     FAIL "$JarName not found next to setup.ps1.`n     Place $JarName in the same folder as setup.ps1 and re-run."
 }
@@ -241,18 +238,10 @@ $jarSize = (Get-Item $SourceJar).Length
 Log "Found prebuilt JAR: $SourceJar ($jarSize bytes)"
 OK "JAR ready: $SourceJar"
 
-# -- 1b. Verify test-elevation.bat is present ---------------------------------
-
-Step "Verifying test-elevation.bat"
-
 if (-not (Test-Path $ElevationBat)) {
     FAIL "test-elevation.bat not found in: $ScriptRoot`n     Place it in the same folder as setup.ps1 and re-run."
 }
 OK "Found: $ElevationBat"
-
-# -- 2. Java JDK --------------------------------------------------------------
-
-Step "Checking Java JDK (required to run the application)"
 
 $javaBin = Find-JavaBin
 
@@ -325,10 +314,6 @@ if (-not $javaBin) {
 $JavawExe = Join-Path $javaBin "javaw.exe"
 if (-not (Test-Path $JavawExe)) { $JavawExe = Join-Path $javaBin "java.exe" }
 
-# -- 3. WinSCP ----------------------------------------------------------------
-
-Step "Checking WinSCP"
-
 $resolvedWinScp = $null
 if (Test-Path $WinScpCom)   { $resolvedWinScp = $WinScpCom }
 if (Test-Path $WinScpCom64) { $resolvedWinScp = $WinScpCom64 }
@@ -356,10 +341,6 @@ if ($resolvedWinScp) {
 
     OK "WinSCP installed: $resolvedWinScp"
 }
-
-# -- 4. Deploy to C:\OpsTools -------------------------------------------------
-
-Step "Deploying to $InstallDir"
 
 if (-not (Test-Path $InstallDir)) {
     New-Item -ItemType Directory -Path $InstallDir | Out-Null
@@ -400,16 +381,11 @@ if (Test-Path $IconSource) {
     $IconLocation = "C:\Windows\System32\imageres.dll,19"
 }
 
-# -- 5. Create shortcuts ------------------------------------------------------
-
-Step "Creating shortcuts"
-
 $psArgs = "-WindowStyle Hidden -ExecutionPolicy Bypass -Command " +
           "`"Start-Process -FilePath '$destBat' -Verb RunAs -WindowStyle Hidden`""
 
 $WshShell = New-Object -ComObject WScript.Shell
 
-# -- Desktop shortcut (all users) --
 $desktopPath = [Environment]::GetFolderPath("CommonDesktopDirectory")
 $desktopLink = Join-Path $desktopPath "$ShortcutName.lnk"
 
@@ -432,7 +408,6 @@ try {
     OK "Desktop shortcut created: $desktopLink"
 }
 
-# -- Start Menu shortcut (all users) --
 $startMenuDir = Join-Path ([Environment]::GetFolderPath("CommonPrograms")) "Ops Tools"
 if (-not (Test-Path $startMenuDir)) {
     New-Item -ItemType Directory -Path $startMenuDir | Out-Null
@@ -458,11 +433,6 @@ try {
     OK "Start Menu shortcut created: $startMenuLink"
 }
 
-# -- 6. Register daemon -------------------------------------------------------
-
-Step "Registering background daemon"
-
-# Load daemon configuration from XML
 $daemonEnabled = Get-ConfigValue $xmlConfig "/application/daemon/enabled" "true"
 if ($daemonEnabled -ne "true") {
     SKIP "Daemon registration disabled in configuration"
@@ -480,7 +450,30 @@ if ($daemonEnabled -ne "true") {
     $restartIntervalMinutes = Get-ConfigValue $xmlConfig "/application/daemon/recovery/restartIntervalMinutes" "5"
 
     try {
-        # Unregister old task if it exists
+        # Stop any already-running daemon process before touching the task
+        # registration. Unregister-ScheduledTask below only removes the task
+        # definition - it does NOT terminate a process the task already
+        # spawned, so without this, every redeploy orphans the previous
+        # daemon process while starting a new one, and they accumulate
+        # across redeploys. Matched by full command line (jar path + "Daemon"
+        # argument) rather than process name alone, so this never touches
+        # unrelated java.exe processes that might be running on the machine
+        # for other reasons. Checks both "java.exe" (older installs, or if
+        # the renamed-copy step below ever falls back to it) and
+        # "MonitoringToolDaemon.exe" (the renamed copy used going forward -
+        # see the daemon launcher section below).
+        try {
+            $daemonProcs = Get-CimInstance Win32_Process -Filter "Name = 'java.exe' OR Name = 'MonitoringToolDaemon.exe'" -ErrorAction SilentlyContinue |
+                Where-Object { $_.CommandLine -and $_.CommandLine -like "*$destJar*" -and $_.CommandLine -like "*Daemon*" }
+            foreach ($proc in $daemonProcs) {
+                Log "Stopping existing daemon process (PID $($proc.ProcessId))"
+                Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
+            }
+            if ($daemonProcs) { Start-Sleep -Milliseconds 500 }
+        } catch {
+            Log "WARNING: could not enumerate/stop existing daemon processes: $($_.Exception.Message)"
+        }
+
         $existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
         if ($existingTask) {
             Log "Removing old scheduled task: $taskName"
@@ -490,7 +483,6 @@ if ($daemonEnabled -ne "true") {
 
         Log "Registering background daemon task: $taskName"
         $javaExe = Join-Path $javaBin "java.exe"
-        Log "Daemon command: $javaExe -cp `"$destJar`" Daemon `"$dataDir`""
         if (-not (Test-Path $javaExe)) {
             Log "WARNING: java.exe not found at expected path: $javaExe"
             Log "Falling back to PATH search for java.exe..."
@@ -501,20 +493,58 @@ if ($daemonEnabled -ne "true") {
             Log "Found java.exe at: $javaExe"
         }
 
-        # Create task action with working directory set to installation directory
+        # Task Manager's "Name" column for java.exe is read from the
+        # FileDescription field in the exe's own embedded version resource
+        # ("OpenJDK Platform Binary" for every stock OpenJDK build) - it is
+        # NOT derived from the command line or filename, so simply renaming
+        # a copy of java.exe would still show "OpenJDK Platform Binary"
+        # unless that embedded metadata is actually patched.
+        #
+        # The copy must live in the SAME bin directory as the real java.exe:
+        # the launcher locates jvm.dll and the rest of the JDK via a path
+        # relative to its own location, so copying it elsewhere (e.g. into
+        # $InstallDir) would break it at startup.
+        $daemonExeName = "MonitoringToolDaemon.exe"
+        $daemonExe = Join-Path $javaBin $daemonExeName
+        try {
+            Copy-Item -Path $javaExe -Destination $daemonExe -Force
+            Log "Created daemon launcher copy: $daemonExe"
+
+            # rcedit (https://github.com/electron/rcedit) is the standard
+            # tool for patching a Windows exe's version resource. It's an
+            # OPTIONAL local prerequisite (same offline-only convention as
+            # the rest of this installer) - if it isn't present, the copy is
+            # still used (so the kill-before-redeploy logic above has a
+            # single, precisely-matchable target), it just keeps showing
+            # "OpenJDK Platform Binary" in Task Manager until rcedit.exe is
+            # dropped alongside this script and setup is re-run.
+            $rceditExe = Join-Path $ScriptRoot "rcedit.exe"
+            if (Test-Path $rceditExe) {
+                & $rceditExe $daemonExe --set-version-string "FileDescription" "Monitoring Tool Daemon"
+                & $rceditExe $daemonExe --set-version-string "ProductName" "Monitoring Tool Daemon"
+                & $rceditExe $daemonExe --set-version-string "OriginalFilename" $daemonExeName
+                & $rceditExe $daemonExe --set-version-string "InternalName" "MonitoringToolDaemon"
+                Log "Patched daemon launcher version info via rcedit - Task Manager will show 'Monitoring Tool Daemon'"
+            } else {
+                Log "NOTE: rcedit.exe not found next to this script - daemon process will still show as 'OpenJDK Platform Binary' in Task Manager. Download it from https://github.com/electron/rcedit/releases, place rcedit.exe alongside setup.ps1, and re-run setup to fix this."
+            }
+        } catch {
+            Log "WARNING: could not create/patch daemon launcher copy ($($_.Exception.Message)) - falling back to java.exe directly."
+            $daemonExe = $javaExe
+        }
+
+        Log "Daemon command: $daemonExe -cp `"$destJar`" Daemon `"$dataDir`""
+
         $taskAction = New-ScheduledTaskAction `
-            -Execute $javaExe `
+            -Execute $daemonExe `
             -Argument "-cp `"$destJar`" Daemon `"$dataDir`"" `
             -WorkingDirectory $InstallDir
 
-        # Startup trigger (configurable delay to allow system to stabilize)
         $trigStart = New-ScheduledTaskTrigger -AtStartup
         $trigStart.Delay = "PT${startupDelayMinutes}M"
 
-        # Hourly trigger for redundancy (configurable interval)
         $trigHourly = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes $periodicIntervalMinutes)
 
-        # Task settings with restart recovery
         $settings = New-ScheduledTaskSettingsSet `
             -ExecutionTimeLimit ([TimeSpan]::Zero) `
             -RestartCount $restartCount `
@@ -524,7 +554,6 @@ if ($daemonEnabled -ne "true") {
             -DontStopIfGoingOnBatteries `
             -StartWhenAvailable
 
-        # Register the scheduled task
         Register-ScheduledTask -TaskName $taskName `
                               -Action $taskAction `
                               -Trigger $trigStart, $trigHourly `
@@ -539,7 +568,6 @@ if ($daemonEnabled -ne "true") {
         Log "Account: SYSTEM (no user login required)"
         Log "Working directory: $InstallDir"
 
-        # Verify task was registered
         Start-Sleep -Milliseconds 1000
         $registeredTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
         if ($registeredTask) {
@@ -550,7 +578,6 @@ if ($daemonEnabled -ne "true") {
             Log "This might be normal; task should appear shortly"
         }
 
-        # Start daemon now (with delay to allow task to fully register)
         Log "Starting daemon task now..."
         Start-Sleep -Milliseconds 1000
         try {
@@ -569,10 +596,6 @@ if ($daemonEnabled -ne "true") {
         Log "  powershell -Command `".\setup.ps1`" (re-run this script)"
     }
 }
-
-# -- 7. Summary ---------------------------------------------------------------
-
-Step "Installation Complete!"
 
 Write-Host ""
 Write-Host "  v Java JDK installed/verified"

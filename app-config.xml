@@ -229,6 +229,13 @@
              whenever the station code can't be extracted from the message,
              or the extracted code has no entry in stationCodesFile. -->
         <defaultStationAddress>VTZGMXH</defaultStationAddress>
+
+        <!-- Mailbox folders processed messages are automatically moved to,
+             based on message content — replaces the old manual "move to
+             folder" task setting. -->
+        <ldmFolder>LDM</ldmFolder>
+        <ptmFolder>PTM</ptmFolder>
+        <othersFolder>Others</othersFolder>
     </sitaMessaging>
 
     <!-- Prerequisite Files (must be in same folder as setup.ps1) -->

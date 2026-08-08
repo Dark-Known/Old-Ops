@@ -43,6 +43,7 @@ model\ScheduledTask$ScheduleType.class
 ui\TaskDialog$4.class
 ui\SettingsPanel$1.class
 util\ImapSearchCriteria$SimpleCriteria.class
+util\AppConfig.class
 service\SftpRemoteFileMetadataService.class
 util\MiniJson$Parser.class
 model\ScheduledTask$TaskType.class
