@@ -25,6 +25,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.function.Consumer;
 import java.util.concurrent.ConcurrentHashMap;
@@ -85,7 +86,7 @@ public class TransferService {
 
     // Outlook mail is read via Microsoft Graph (see class docs on executeImapMailTask).
     private static final String GRAPH_MAIL_SCOPE = "https://graph.microsoft.com/Mail.ReadWrite offline_access";
-    private final OAuth2TokenService oauthService = new OAuth2TokenService();
+    private final OAuth2TokenService oauthService;
     private final GraphMailService graphMailService = new GraphMailService();
 
     private final ConcurrentMap<String, Process> activeProcesses = new ConcurrentHashMap<>();
@@ -94,6 +95,11 @@ public class TransferService {
         this.storage                = storage;
         this.metadataServiceFactory = new RemoteFileMetadataServiceFactory(storage);
         this.winScpPath             = detectWinScp();
+        // Shared dataDir-based path, NOT the per-user-home default — the
+        // Daemon runs as SYSTEM (see app-config.xml <runAsSystem>) while the
+        // GUI runs as the logged-in user, so a user-home-based token path
+        // would put them in two different, mutually invisible directories.
+        this.oauthService           = new OAuth2TokenService(OAuth2TokenService.sharedTokenDir(storage.getDataDir()));
     }
 
     /** Exposed so the UI's "Authorize Mailbox" flow can enroll without duplicating OAuth logic. */
@@ -1306,7 +1312,7 @@ public class TransferService {
             // message is now routed automatically by content: LDM/PTM
             // messages go to their respective configured folder, anything
             // else goes to the configured "Others" folder.
-            String destinationFolder = resolveMoveFolderName(classifyMessageType(m));
+            String destinationFolder = resolveMoveFolderName(classifyForFolderRouting(m));
             try {
                 graphMailService.moveMessage(accessToken, m.id, destinationFolder, logLine);
                 logLine.accept("[INFO] Moved to folder '" + destinationFolder + "': " + m.subject);
@@ -1771,16 +1777,29 @@ public class TransferService {
     }
 
     /**
-     * Classifies a message as "LDM", "PTM", "MVT", or null (none of the
-     * three), the same way buildRcvFileContent does for the SITA header —
-     * used to decide which folder the message gets moved to after
-     * processing (see resolveMoveFolderName).
+     * Classifies a message for automatic post-processing folder routing:
+     * checks Subject, attachment text, and body TOGETHER, case-insensitively
+     * ("LDM", "Ldm", "LDm", etc. all count), for "LDM" or "PTM" — checked in
+     * that order, so a message containing both (unlikely) routes as LDM.
+     *
+     * Deliberately separate from findMessageTypeMarker (used for the SITA
+     * header): that one is a strict, single-source, case-sensitive match
+     * against the structured message content, because getting the header
+     * wrong has real consequences. This one is a looser "does this message
+     * relate to LDM/PTM at all" check across everywhere that word could
+     * appear, since misrouting a message to the wrong folder because of a
+     * stray lowercase letter or because the word only appeared in the
+     * subject is the actual reported problem.
      */
-    private String classifyMessageType(GraphMailService.MailMessage m) {
-        boolean useAttachment = m.attachmentText != null && !m.attachmentText.trim().isEmpty();
-        String sourceText = useAttachment ? m.attachmentText : toPlainText(m.bodyContent, m.bodyType);
-        MarkerMatch marker = findMessageTypeMarker(removeAutomatedBanners(sourceText));
-        return marker != null ? marker.type : null;
+    private String classifyForFolderRouting(GraphMailService.MailMessage m) {
+        String subject = m.subject != null ? m.subject : "";
+        String attachment = m.attachmentText != null ? m.attachmentText : "";
+        String body = toPlainText(m.bodyContent, m.bodyType);
+
+        String combined = (subject + "\n" + attachment + "\n" + body).toUpperCase(Locale.ROOT);
+        if (combined.contains("LDM")) return "LDM";
+        if (combined.contains("PTM")) return "PTM";
+        return null;
     }
 
     /**

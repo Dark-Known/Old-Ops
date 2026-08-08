@@ -6,6 +6,7 @@ import javax.swing.*;
 import javax.swing.border.EmptyBorder;
 import java.awt.*;
 import java.awt.datatransfer.StringSelection;
+import java.io.File;
 import java.util.function.Consumer;
 
 /**
@@ -29,7 +30,7 @@ public class OAuthAuthorizeDialog extends JDialog {
     private String currentCode = null;
 
     public OAuthAuthorizeDialog(Frame parent, String mailbox, String tenantId, String clientId,
-                                Consumer<Boolean> onFinished) {
+                                File dataDir, Consumer<Boolean> onFinished) {
         super(parent, "Authorize Mailbox", true);
         setSize(480, 320);
         setLocationRelativeTo(parent);
@@ -81,12 +82,17 @@ public class OAuthAuthorizeDialog extends JDialog {
 
         add(content, BorderLayout.CENTER);
 
-        startEnrollment(mailbox, tenantId, clientId, onFinished);
+        startEnrollment(mailbox, tenantId, clientId, dataDir, onFinished);
     }
 
     private void startEnrollment(String mailbox, String tenantId, String clientId,
-                                 Consumer<Boolean> onFinished) {
-        OAuth2TokenService oauthService = new OAuth2TokenService();
+                                 File dataDir, Consumer<Boolean> onFinished) {
+        // Shared dataDir-based path (same as TransferService) — NOT the
+        // per-user-home default, which would make a mailbox authorized here
+        // invisible to the Daemon (it runs as SYSTEM, a different account
+        // with its own separate home directory; see app-config.xml
+        // <runAsSystem>).
+        OAuth2TokenService oauthService = new OAuth2TokenService(OAuth2TokenService.sharedTokenDir(dataDir));
 
         SwingWorker<Void, String> worker = new SwingWorker<>() {
             private volatile boolean succeeded = false;

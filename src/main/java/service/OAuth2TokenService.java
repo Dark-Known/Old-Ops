@@ -3,6 +3,7 @@ package service;
 import util.CryptoUtil;
 import util.MiniJson;
 
+import java.io.File;
 import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -47,6 +48,20 @@ public class OAuth2TokenService {
     private final HttpClient http = HttpClient.newHttpClient();
     private final Path tokenDir;
 
+    /**
+     * @deprecated stores tokens under the current OS user's home directory
+     * ({@code user.home}), which differs between the GUI (runs as the logged-
+     * in user) and the Daemon (runs as SYSTEM per app-config.xml's
+     * {@code <runAsSystem>}) — so a mailbox authorized via the GUI was
+     * invisible to the Daemon and vice versa. Whichever process happened to
+     * poll a due task first determined success/failure, producing exactly
+     * "fails once, immediately succeeds on the next run" when both are
+     * running. Use {@link #OAuth2TokenService(Path)} with
+     * {@link #sharedTokenDir} (the app's shared dataDir) instead, so every
+     * process — regardless of which account runs it — reads/writes the same
+     * token files.
+     */
+    @Deprecated
     public OAuth2TokenService() {
         this(Paths.get(System.getProperty("user.home"), ".opstool", "oauth"));
     }
@@ -54,6 +69,11 @@ public class OAuth2TokenService {
     public OAuth2TokenService(Path tokenDir) {
         this.tokenDir = tokenDir;
         try { Files.createDirectories(tokenDir); } catch (IOException ignored) {}
+    }
+
+    /** Token storage location shared by every process (GUI, Daemon) regardless of which OS account runs it. */
+    public static Path sharedTokenDir(File dataDir) {
+        return dataDir.toPath().resolve("oauth");
     }
 
     // ─── Public API ─────────────────────────────────────────────────────────

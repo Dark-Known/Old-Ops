@@ -475,10 +475,16 @@ public class GraphMailService {
     }
 
     /**
-     * Moves a message into another folder. Graph's move endpoint returns a *new*
-     * message resource with a different ID in the destination folder — the
-     * original ID becomes invalid immediately after this call, so any other
-     * per-message action (e.g. {@link #markAsRead}) must happen first.
+     * Moves a message into another folder. By default Graph's move endpoint
+     * returns a *new* message resource with a different ID in the destination
+     * folder, invalidating the original ID immediately — this is what caused
+     * intermittent "ErrorItemNotFound" 404s on subsequent per-message calls
+     * (e.g. the attachment fetch in {@link #fetchTextAttachments}) when a
+     * message was moved/re-indexed between this app's own calls. All requests
+     * in this class now send {@code Prefer: IdType="ImmutableId"}, which keeps
+     * a message's ID stable across folder moves, so IDs captured earlier in a
+     * run remain valid afterward. Marking as read before moving is still the
+     * safer order regardless.
      */
     public void moveMessage(String accessToken, String messageId, String destinationFolder,
                             Consumer<String> logLine) throws IOException, InterruptedException {
@@ -498,6 +504,7 @@ public class GraphMailService {
         HttpRequest req = HttpRequest.newBuilder()
                 .uri(URI.create(url))
                 .header("Authorization", "Bearer " + accessToken)
+                .header("Prefer", "IdType=\"ImmutableId\"")
                 .GET()
                 .build();
         HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
@@ -514,6 +521,7 @@ public class GraphMailService {
                 .uri(URI.create(url))
                 .header("Authorization", "Bearer " + accessToken)
                 .header("Content-Type", "application/json")
+                .header("Prefer", "IdType=\"ImmutableId\"")
                 .method("PATCH", HttpRequest.BodyPublishers.ofString(jsonBody, StandardCharsets.UTF_8))
                 .build();
         HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
@@ -529,6 +537,7 @@ public class GraphMailService {
                 .uri(URI.create(url))
                 .header("Authorization", "Bearer " + accessToken)
                 .header("Content-Type", "application/json")
+                .header("Prefer", "IdType=\"ImmutableId\"")
                 .POST(HttpRequest.BodyPublishers.ofString(jsonBody, StandardCharsets.UTF_8))
                 .build();
         HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());

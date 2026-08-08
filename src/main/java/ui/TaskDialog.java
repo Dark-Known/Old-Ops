@@ -922,7 +922,7 @@ public class TaskDialog extends JDialog {
         if (clientId.isEmpty()) { msg("Enter the Azure AD Client ID first — see README \u201cOutlook Mail setup\u201d."); return; }
 
         new OAuthAuthorizeDialog((Frame) getOwner(), mailbox, tenantId, clientId,
-                success -> updateMailAuthStatus())
+                storage.getDataDir(), success -> updateMailAuthStatus())
                 .setVisible(true);
     }
 

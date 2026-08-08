@@ -366,6 +366,29 @@ try {
     FAIL "Failed to copy test-elevation.bat to $InstallDir : $_"
 }
 
+# app-config.xml was only ever read from $ScriptRoot (this installer
+# package's own folder) - it was never actually deployed to $InstallDir.
+# That's harmless for settings baked into the scheduled task's command line
+# at install time (dataDir), but every setting the running app reads live
+# from app-config.xml at runtime (SITA station-code lookup, default station
+# address, LDM/PTM/Others folder names, etc.) was silently unreadable in
+# production: neither the GUI nor the Daemon had a copy of this file
+# anywhere they'd look for it, so those always fell back to hardcoded
+# defaults regardless of what was actually configured here.
+$destConfigFile = Join-Path $InstallDir "app-config.xml"
+$sourceConfigFile = Join-Path $ScriptRoot "app-config.xml"
+if (Test-Path $sourceConfigFile) {
+    try {
+        Copy-Item -Path $sourceConfigFile -Destination $destConfigFile -Force
+        Log "Copied app-config.xml to: $destConfigFile"
+        OK "Deployed: $destConfigFile"
+    } catch {
+        Log "WARNING: Failed to copy app-config.xml to $InstallDir : $_"
+    }
+} else {
+    Log "WARNING: app-config.xml not found at $sourceConfigFile - runtime settings (station codes, default address, LDM/PTM folder names) will use hardcoded defaults."
+}
+
 if (Test-Path $IconSource) {
     try {
         Copy-Item -Path $IconSource -Destination $InstalledIcon -Force
@@ -535,36 +558,44 @@ if ($daemonEnabled -ne "true") {
 
         Log "Daemon command: $daemonExe -cp `"$destJar`" Daemon `"$dataDir`""
 
-        $taskAction = New-ScheduledTaskAction `
-            -Execute $daemonExe `
-            -Argument "-cp `"$destJar`" Daemon `"$dataDir`"" `
-            -WorkingDirectory $InstallDir
+        $daemonArgument = '-cp "' + $destJar + '" Daemon "' + $dataDir + '"'
+        $taskActionParams = @{
+            Execute          = $daemonExe
+            Argument         = $daemonArgument
+            WorkingDirectory = $InstallDir
+        }
+        $taskAction = New-ScheduledTaskAction @taskActionParams
 
         $trigStart = New-ScheduledTaskTrigger -AtStartup
         $trigStart.Delay = "PT${startupDelayMinutes}M"
 
         $trigHourly = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes $periodicIntervalMinutes)
 
-        $settings = New-ScheduledTaskSettingsSet `
-            -ExecutionTimeLimit ([TimeSpan]::Zero) `
-            -RestartCount $restartCount `
-            -RestartInterval (New-TimeSpan -Minutes $restartIntervalMinutes) `
-            -MultipleInstances IgnoreNew `
-            -AllowStartIfOnBatteries `
-            -DontStopIfGoingOnBatteries `
-            -StartWhenAvailable
+        $settingsParams = @{
+            ExecutionTimeLimit        = [TimeSpan]::Zero
+            RestartCount               = $restartCount
+            RestartInterval             = (New-TimeSpan -Minutes $restartIntervalMinutes)
+            MultipleInstances          = "IgnoreNew"
+            AllowStartIfOnBatteries    = $true
+            DontStopIfGoingOnBatteries = $true
+            StartWhenAvailable         = $true
+        }
+        $settings = New-ScheduledTaskSettingsSet @settingsParams
 
-        Register-ScheduledTask -TaskName $taskName `
-                              -Action $taskAction `
-                              -Trigger $trigStart, $trigHourly `
-                              -Settings $settings `
-                              -RunLevel Highest `
-                              -User "SYSTEM" `
-                              -Force | Out-Null
+        $registerParams = @{
+            TaskName = $taskName
+            Action   = $taskAction
+            Trigger  = @($trigStart, $trigHourly)
+            Settings = $settings
+            RunLevel = "Highest"
+            User     = "SYSTEM"
+            Force    = $true
+        }
+        Register-ScheduledTask @registerParams | Out-Null
 
         OK "Daemon registered as Windows Scheduled Task: $taskName"
-        Log "Trigger 1: At startup (${startupDelayMinutes} minute delay)"
-        Log "Trigger 2: Every ${periodicIntervalMinutes} minutes (redundancy)"
+        Log "Trigger 1: At startup ($startupDelayMinutes minute delay)"
+        Log "Trigger 2: Every $periodicIntervalMinutes minutes (redundancy)"
         Log "Account: SYSTEM (no user login required)"
         Log "Working directory: $InstallDir"
 
