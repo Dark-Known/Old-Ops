@@ -47,10 +47,19 @@ public class GraphMailService {
         public final String bodyType; // "html" or "text"
         public final String attachmentText;    // combined text of parseable text attachments, "" if none
         public final List<String> attachmentNames; // names of the attachments attachmentText was built from
+        public final List<AttachmentFile> attachmentFiles; // ALL non-inline file attachments, raw bytes, for saving to disk
 
         MailMessage(String id, String subject, String from,
                     String receivedDateTime, String bodyContent, String bodyType,
                     String attachmentText, List<String> attachmentNames) {
+            this(id, subject, from, receivedDateTime, bodyContent, bodyType,
+                    attachmentText, attachmentNames, Collections.emptyList());
+        }
+
+        MailMessage(String id, String subject, String from,
+                    String receivedDateTime, String bodyContent, String bodyType,
+                    String attachmentText, List<String> attachmentNames,
+                    List<AttachmentFile> attachmentFiles) {
             this.id = id;
             this.subject = subject;
             this.from = from;
@@ -59,6 +68,20 @@ public class GraphMailService {
             this.bodyType = bodyType;
             this.attachmentText = attachmentText != null ? attachmentText : "";
             this.attachmentNames = attachmentNames != null ? attachmentNames : Collections.emptyList();
+            this.attachmentFiles = attachmentFiles != null ? attachmentFiles : Collections.emptyList();
+        }
+    }
+
+    /** A single downloadable (non-inline, file-type) attachment's raw content. */
+    public static class AttachmentFile {
+        public final String name;
+        public final String contentType;
+        public final byte[] bytes;
+
+        AttachmentFile(String name, String contentType, byte[] bytes) {
+            this.name = name != null ? name : "attachment";
+            this.contentType = contentType != null ? contentType : "";
+            this.bytes = bytes != null ? bytes : new byte[0];
         }
     }
 
@@ -163,6 +186,7 @@ public class GraphMailService {
             String bodyType = "text";
             String attachmentText = "";
             List<String> attachmentNames = Collections.emptyList();
+            List<AttachmentFile> attachmentFiles = Collections.emptyList();
 
             if (mode == MailFetchMode.FULL_MESSAGE) {
                 // Raw RFC 2822 MIME — closest analog to the old IMAP BODY[] fetch.
@@ -183,10 +207,11 @@ public class GraphMailService {
                 AttachmentBundle bundle = fetchTextAttachments(accessToken, id, logLine);
                 attachmentText = bundle.text;
                 attachmentNames = bundle.names;
+                attachmentFiles = bundle.files;
             }
 
             results.add(new MailMessage(id, subject, from, received, bodyContent, bodyType,
-                    attachmentText, attachmentNames));
+                    attachmentText, attachmentNames, attachmentFiles));
         }
         return results;
     }
@@ -196,69 +221,96 @@ public class GraphMailService {
     private static class AttachmentBundle {
         final String text;
         final List<String> names;
-        AttachmentBundle(String text, List<String> names) { this.text = text; this.names = names; }
+        final List<AttachmentFile> files;
+        AttachmentBundle(String text, List<String> names, List<AttachmentFile> files) {
+            this.text = text;
+            this.names = names;
+            this.files = files;
+        }
     }
 
     /**
-     * Fetches a message's non-inline attachments and returns the combined text
-     * of the ones that are actually parseable as text (text/plain, text/csv,
-     * or a .txt/.csv/.log/.rcv filename — Graph's contentType is sometimes a
-     * generic octet-stream for these, so the filename is checked too).
-     * Anything else (PDFs, images, Office docs, etc.) is skipped and logged —
-     * this app has no document-parsing library, so pretending to read them
-     * would be worse than honestly not reading them.
+     * Fetches a message's non-inline, file-type attachments: returns both
+     * the combined text of the ones that are actually parseable as text
+     * (text/plain, text/csv, or a .txt/.csv/.log/.rcv filename — Graph's
+     * contentType is sometimes a generic octet-stream for these, so the
+     * filename is checked too) AND the raw bytes of every non-inline file
+     * attachment (text or binary) so callers can save them to disk as-is.
+     *
+     * Fetches the plain /attachments collection with NO $select and NO
+     * type-cast path segment. Combining an OData cast (e.g.
+     * ".../microsoft.graph.fileAttachment") with $select is unreliable on
+     * this endpoint — Graph sometimes still validates the $select list
+     * against the base "attachment" type (which has no contentBytes) and
+     * rejects the whole request with a 400:
+     *   "Could not find a property named 'contentBytes' on type
+     *    'microsoft.graph.attachment'"
+     * even though the cast should have narrowed the type first. Fetching
+     * the untouched collection sidesteps the bug: Graph returns each
+     * attachment with all of its real (derived-type) properties — including
+     * contentBytes for file attachments — and an "@odata.type" field that's
+     * used here to distinguish file attachments from item/reference ones
+     * client-side instead.
      */
     private AttachmentBundle fetchTextAttachments(String accessToken, String messageId, Consumer<String> logLine)
             throws IOException, InterruptedException {
         Map<String, Object> resp;
         try {
-            // contentBytes only exists on the derived fileAttachment type, not
-            // the base "attachment" type the plain /attachments collection
-            // returns — selecting it there fails with "Could not find a
-            // property named 'contentBytes' on type 'microsoft.graph.attachment'".
-            // The /microsoft.graph.fileAttachment cast segment narrows the
-            // collection to that derived type first, making contentBytes (and
-            // size) valid to select. Item/reference attachments (which have no
-            // contentBytes anyway) are simply excluded by the cast.
-            resp = graphGetJson(accessToken, GRAPH_BASE + "/me/messages/" + messageId
-                    + "/attachments/microsoft.graph.fileAttachment?$select=name,contentType,isInline,contentBytes,size");
+            resp = graphGetJson(accessToken, GRAPH_BASE + "/me/messages/" + messageId + "/attachments");
         } catch (IOException ex) {
             logLine.accept("[WARN] Could not fetch attachments for message " + messageId + ": " + ex.getMessage());
-            return new AttachmentBundle("", Collections.emptyList());
+            return new AttachmentBundle("", Collections.emptyList(), Collections.emptyList());
         }
 
         List<Object> arr = MiniJson.getArray(resp, "value");
-        if (arr == null || arr.isEmpty()) return new AttachmentBundle("", Collections.emptyList());
+        if (arr == null || arr.isEmpty()) return new AttachmentBundle("", Collections.emptyList(), Collections.emptyList());
 
         StringBuilder combined = new StringBuilder();
-        List<String> names = new ArrayList<>();
+        List<String> textNames = new ArrayList<>();
+        List<AttachmentFile> files = new ArrayList<>();
         for (Object o : arr) {
             @SuppressWarnings("unchecked")
             Map<String, Object> att = (Map<String, Object>) o;
 
             if (MiniJson.getBoolean(att, "isInline", false)) continue; // embedded images etc., not real attachments
 
-            String name = MiniJson.getString(att, "name", "");
-            String contentType = MiniJson.getString(att, "contentType", "");
-            if (!isTextAttachment(name, contentType)) {
-                logLine.accept("[INFO] Skipping non-text attachment '" + name + "' (" + contentType
-                        + ") — no parser available for this type.");
+            // Only file attachments carry contentBytes; item attachments
+            // (forwarded emails) and reference attachments (e.g. a
+            // SharePoint/OneDrive link) don't — skip those, there is
+            // nothing to download.
+            String odataType = MiniJson.getString(att, "@odata.type", "");
+            String name = MiniJson.getString(att, "name", "(unnamed)");
+            if (!"#microsoft.graph.fileAttachment".equals(odataType)) {
+                logLine.accept("[INFO] Skipping non-file attachment '" + name + "' (" + odataType
+                        + ") — no downloadable content.");
                 continue;
             }
 
+            String contentType = MiniJson.getString(att, "contentType", "");
             String b64 = MiniJson.getString(att, "contentBytes", null);
-            if (b64 == null || b64.isEmpty()) continue;
+            if (b64 == null || b64.isEmpty()) {
+                logLine.accept("[WARN] Attachment '" + name + "' has no contentBytes — skipped.");
+                continue;
+            }
+
+            byte[] raw;
             try {
-                byte[] raw = Base64.getDecoder().decode(b64);
+                raw = Base64.getDecoder().decode(b64);
+            } catch (IllegalArgumentException ex) {
+                logLine.accept("[WARN] Could not decode attachment '" + name + "' — skipped.");
+                continue;
+            }
+
+            files.add(new AttachmentFile(name, contentType, raw));
+
+            if (isTextAttachment(name, contentType)) {
                 String text = new String(raw, StandardCharsets.UTF_8);
                 if (combined.length() > 0) combined.append("\n\n");
                 combined.append(text);
-                names.add(name);
-            } catch (IllegalArgumentException ex) {
-                logLine.accept("[WARN] Could not decode attachment '" + name + "' — skipped.");
+                textNames.add(name);
             }
         }
-        return new AttachmentBundle(combined.toString(), names);
+        return new AttachmentBundle(combined.toString(), textNames, files);
     }
 
     private boolean isTextAttachment(String name, String contentType) {

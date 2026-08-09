@@ -46,6 +46,7 @@ util\ImapSearchCriteria$SimpleCriteria.class
 util\AppConfig.class
 service\SftpRemoteFileMetadataService.class
 util\MiniJson$Parser.class
+service\GraphMailService$AttachmentFile.class
 model\ScheduledTask$TaskType.class
 model\ScheduledTask$TransferDirection.class
 ui\OAuthAuthorizeDialog.class

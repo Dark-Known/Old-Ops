@@ -4,6 +4,12 @@ import model.ScheduledTask.*;
 import model.ScheduledTask;
 import service.TaskLogService;
 
+import java.io.IOException;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
@@ -415,6 +421,44 @@ public class TaskSchedulerService {
     private void executeTask(ScheduledTask task) {
         final long startNanos = System.nanoTime();
         final long startCpuNanos = THREAD_BEAN.isCurrentThreadCpuTimeSupported() ? THREAD_BEAN.getCurrentThreadCpuTime() : 0L;
+
+        // ─── Cross-process execution lock ───────────────────────────────────
+        // The GUI's in-app scheduler and the standalone Daemon each poll
+        // tasks.xml independently and can both decide the same task is due
+        // at nearly the same moment (especially INTERVAL_SECONDS tasks).
+        // Without this, BOTH processes actually execute the task — for a
+        // mail task that means fetching/marking-as-read/moving the same
+        // messages twice, and racing each other for the OAuth2 refresh
+        // token (Microsoft rotates it on every exchange, so whichever
+        // process loses the race reads a token that's already been
+        // invalidated by the winner) — producing exactly the "fails once
+        // with 'not authorized', succeeds on the very next run" pattern.
+        // A non-blocking file lock, held for the whole execution and
+        // released when it finishes, ensures only one process ever runs a
+        // given task at a time; the loser cleanly skips instead of racing.
+        Path lockPath = storage.getDataDir().toPath().resolve("task-locks").resolve(task.getId() + ".lock");
+        FileChannel lockChannel = null;
+        FileLock fileLock = null;
+        try {
+            Files.createDirectories(lockPath.getParent());
+            lockChannel = FileChannel.open(lockPath,
+                    StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+            fileLock = lockChannel.tryLock();
+        } catch (Exception e) {
+            emit(task.getId(), "[WARN] Could not set up cross-process task lock (" + e.getMessage()
+                    + ") — proceeding without it.");
+        }
+
+        if (lockChannel != null && fileLock == null) {
+            // Another process (GUI or Daemon) already holds the lock for this task.
+            emit(task.getId(), "[INFO] Skipped: task '" + task.getName()
+                    + "' is already running in another process (GUI or Daemon) at this tick.");
+            try { lockChannel.close(); } catch (IOException ignored) {}
+            try { runningTaskFutures.remove(task.getId()); } catch (Exception ignored) {}
+            return;
+        }
+
+        try {
         emit(task.getId(), "=== Starting task: " + task.getName() + " ===");
         emit(task.getId(), "[DEBUG] Task ID: " + task.getId());
         emit(task.getId(), "[DEBUG] Task Type: " + task.getTaskType());
@@ -505,6 +549,16 @@ public class TaskSchedulerService {
         recordMetricsOnComplete(task.getId(), success, durationMs, cpuMs);
         // Clean up running future mapping
         try { runningTaskFutures.remove(task.getId()); } catch (Exception ignored) {}
+        } finally {
+            // Always release the cross-process lock, however this run ended
+            // (normal completion, exception, or the early "retry scheduled" return).
+            if (fileLock != null) {
+                try { fileLock.release(); } catch (IOException ignored) {}
+            }
+            if (lockChannel != null) {
+                try { lockChannel.close(); } catch (IOException ignored) {}
+            }
+        }
     }
 
     private void retryTask(ScheduledTask task) {

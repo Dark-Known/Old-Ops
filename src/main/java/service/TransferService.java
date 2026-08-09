@@ -1291,6 +1291,11 @@ public class TransferService {
                 logLine.accept("[WARN] Failed to write .RCV file for '" + m.subject + "': " + ex.getMessage());
             }
 
+            // Classify once and reuse for both attachment placement and the
+            // mailbox folder move below, so the two stay consistent.
+            String classification = classifyForFolderRouting(m);
+            saveAttachmentsToDisk(m, outputDir, classification, logLine);
+
             try {
                 long ts = Instant.parse(m.receivedDateTime).toEpochMilli();
                 if (ts > newestEpoch) newestEpoch = ts;
@@ -1312,7 +1317,7 @@ public class TransferService {
             // message is now routed automatically by content: LDM/PTM
             // messages go to their respective configured folder, anything
             // else goes to the configured "Others" folder.
-            String destinationFolder = resolveMoveFolderName(classifyForFolderRouting(m));
+            String destinationFolder = resolveMoveFolderName(classification);
             try {
                 graphMailService.moveMessage(accessToken, m.id, destinationFolder, logLine);
                 logLine.accept("[INFO] Moved to folder '" + destinationFolder + "': " + m.subject);
@@ -1332,6 +1337,60 @@ public class TransferService {
         }
 
         return true;
+    }
+
+    // ─── Attachment download ────────────────────────────────────────────────
+
+    /**
+     * Saves every downloadable (non-inline, file-type) attachment of a
+     * message to disk under:
+     *   <outputDir>/Attachments/<LDM|PTM|Others>/<message-scoped subfolder>/<original filename>
+     * using the same LDM/PTM/Others classification that decides which
+     * mailbox folder the message itself gets moved to, so attachments and
+     * their parent message end up filed the same way. Each message gets its
+     * own subfolder (named the same as its .RCV file, minus the extension)
+     * so that attachments from different messages sharing a filename (e.g.
+     * two "report.pdf") never collide or overwrite one another.
+     */
+    private void saveAttachmentsToDisk(GraphMailService.MailMessage m, Path outputDir,
+                                        String classification, Consumer<String> logLine) {
+        if (m.attachmentFiles == null || m.attachmentFiles.isEmpty()) return;
+
+        String bucket = "LDM".equals(classification) ? "LDM"
+                : "PTM".equals(classification) ? "PTM"
+                : "Others";
+
+        String messageFolderName = buildRcvFileName(m);
+        int dot = messageFolderName.lastIndexOf('.');
+        if (dot > 0) messageFolderName = messageFolderName.substring(0, dot);
+
+        Path attachmentsDir = outputDir.resolve("Attachments").resolve(bucket).resolve(messageFolderName);
+        try {
+            Files.createDirectories(attachmentsDir);
+        } catch (IOException ex) {
+            logLine.accept("[WARN] Could not create attachments folder '" + attachmentsDir + "': " + ex.getMessage());
+            return;
+        }
+
+        for (GraphMailService.AttachmentFile file : m.attachmentFiles) {
+            String safeName = (file.name == null || file.name.trim().isEmpty() ? "attachment" : file.name.trim())
+                    .replaceAll("[\\\\/:*?\"<>|]", "_");
+            Path dest = attachmentsDir.resolve(safeName);
+            // Guard against two attachments on the SAME message sharing a name.
+            int suffix = 1;
+            while (Files.exists(dest)) {
+                int extDot = safeName.lastIndexOf('.');
+                String base = extDot > 0 ? safeName.substring(0, extDot) : safeName;
+                String ext  = extDot > 0 ? safeName.substring(extDot) : "";
+                dest = attachmentsDir.resolve(base + "_" + (suffix++) + ext);
+            }
+            try {
+                Files.write(dest, file.bytes);
+                logLine.accept("[INFO] Saved attachment '" + file.name + "' -> " + dest);
+            } catch (IOException ex) {
+                logLine.accept("[WARN] Failed to save attachment '" + file.name + "': " + ex.getMessage());
+            }
+        }
     }
 
     // ─── .RCV file output ─────────────────────────────────────────────────────
