@@ -1221,6 +1221,8 @@ public class TransferService {
 
         String accessToken;
         try {
+//            logLine.accept("[DEBUG] OAuth token cache directory: "
+//                    + OAuth2TokenService.sharedTokenDir(storage.getDataDir()).toAbsolutePath());
             accessToken = oauthService.getValidAccessToken(mailbox, tenantId, clientId, GRAPH_MAIL_SCOPE);
         } catch (IOException ex) {
             logLine.accept("[ERROR] OAuth2 token refresh failed: " + ex.getMessage());

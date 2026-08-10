@@ -193,10 +193,34 @@ public class OAuth2TokenService {
                 return cached.accessToken;
             }
 
-            String refreshToken = loadRefreshToken(accountKey);
+            // Distinguish "genuinely never enrolled" from "token file exists
+            // but couldn't be read" — these used to be silently collapsed
+            // into the same null/"not authorized yet" outcome, which made it
+            // impossible to tell from the logs whether enrollment was real
+            // or something else (wrong data directory, corrupted file, a
+            // read racing a concurrent write, permissions) was going on.
+            Path resolvedTokenFile = tokenFile(accountKey);
+            boolean fileExists = Files.exists(resolvedTokenFile);
+            String refreshToken = fileExists ? loadRefreshToken(accountKey) : null;
+
             if (refreshToken == null) {
-                throw new IOException("Mailbox '" + accountKey + "' is not authorized yet. "
-                        + "Use the \"Authorize Mailbox\" button in the task editor to complete one-time sign-in.");
+                if (!fileExists) {
+                    throw new IOException("Mailbox '" + accountKey + "' is not authorized yet "
+                            + "(no token file at: " + resolvedTokenFile.toAbsolutePath() + "). "
+                            + "Use the \"Authorize Mailbox\" button in the task editor to complete one-time sign-in.");
+                } else {
+                    long size = 0L;
+                    String mtime = "unknown";
+                    try {
+                        size = Files.size(resolvedTokenFile);
+                        mtime = java.time.Instant.ofEpochMilli(Files.getLastModifiedTime(resolvedTokenFile).toMillis()).toString();
+                    } catch (IOException ignored) {}
+                    throw new IOException("Mailbox '" + accountKey + "' has a token file at "
+                            + resolvedTokenFile.toAbsolutePath() + " (size=" + size + " bytes, last modified " + mtime
+                            + ") but it could not be decrypted/parsed — it may be corrupted, from a different "
+                            + "machine-local encryption key, or was read mid-write. Re-run \"Authorize Mailbox\" "
+                            + "to re-enroll if this persists.");
+                }
             }
 
             HttpRequest req = HttpRequest.newBuilder()

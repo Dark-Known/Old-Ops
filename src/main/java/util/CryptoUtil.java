@@ -25,11 +25,29 @@ public class CryptoUtil {
     private static final String MASTER_PASSPHRASE;
 
     static {
-        // Derive a machine-local passphrase from user name + home dir + a fixed app secret
-        // In production you'd store this in OS keystore; this approach avoids external deps
-        String user = System.getProperty("user.name", "ops");
-        String home = System.getProperty("user.home", "C:\\");
-        MASTER_PASSPHRASE = "OpsTool_2024_" + user + "_" + home.hashCode();
+        // Machine-local, but deliberately NOT tied to which Windows account is
+        // running the JVM. The GUI runs as the interactively logged-in user
+        // while the Daemon runs as SYSTEM (per app-config.xml's
+        // <runAsSystem>) — user.name/user.home differ between them, so
+        // deriving the key from those meant a file encrypted by one process
+        // was silently undecryptable by the other. Since Microsoft Graph
+        // rotates the OAuth refresh token on almost every exchange (see
+        // OAuth2TokenService), whichever process last refreshed re-encrypted
+        // the cache with ITS key — so the other process failed to decrypt it
+        // on every read until it got a turn to refresh and re-encrypt it
+        // back with its own key, flip-flopping indefinitely. That surfaced
+        // as an OAuth2 "could not be decrypted" / "not authorized" error,
+        // but the actual bug was here, not in the OAuth flow.
+        // COMPUTERNAME identifies the machine without depending on which
+        // account runs the process, so GUI and Daemon now derive the exact
+        // same key.
+        String machine = System.getenv("COMPUTERNAME");
+        if (machine == null || machine.isEmpty()) machine = System.getenv("HOSTNAME");
+        if (machine == null || machine.isEmpty()) {
+            try { machine = java.net.InetAddress.getLocalHost().getHostName(); } catch (Exception ignored) {}
+        }
+        if (machine == null || machine.isEmpty()) machine = "unknown-host";
+        MASTER_PASSPHRASE = "OpsTool_2024_" + machine;
     }
 
     private static SecretKey deriveKey() throws Exception {
