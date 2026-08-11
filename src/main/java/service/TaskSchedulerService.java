@@ -17,6 +17,7 @@ import java.lang.management.ManagementFactory;
 import java.lang.management.ThreadMXBean;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
+import java.util.ArrayList;
 import java.util.concurrent.*;
 import java.util.function.BiConsumer;
 import java.util.logging.Logger;
@@ -69,6 +70,10 @@ public class TaskSchedulerService {
 
     public TaskLogService getLogService() {
         return logService;
+    }
+
+    public XmlStorageService getStorage() {
+        return storage;
     }
 
     public TaskMetrics getTaskMetrics(String taskId) {
@@ -353,6 +358,36 @@ public class TaskSchedulerService {
             if (transferService != null) transferService.cancelRunningTask(taskId);
         } catch (Exception ignored) {}
         return cancelledAny;
+    }
+
+    /**
+     * IDs of tasks that are actively executing right now (i.e. have a live
+     * future in {@link #runningTaskFutures}). Used by the Settings panel to
+     * offer restarting in-flight tasks when the log level changes, so their
+     * logs come out consistently at the new level for the whole run instead
+     * of switching level partway through.
+     */
+    public List<String> getRunningTaskIds() {
+        return new ArrayList<>(runningTaskFutures.keySet());
+    }
+
+    /**
+     * Cancels a task's in-flight run (if any) and immediately re-executes it
+     * from the beginning, so its log file is generated entirely under
+     * whatever log level is currently configured — rather than starting
+     * with the old level and switching mid-run. Used by the Settings panel's
+     * "restart running tasks?" prompt after a log-level change; also usable
+     * standalone as a general "restart this task" action.
+     */
+    public void restartTask(String taskId) {
+        cancelTask(taskId);
+        List<ScheduledTask> tasks = storage.loadTasks();
+        tasks.stream().filter(t -> t.getId().equals(taskId)).findFirst().ifPresent(t -> {
+            t.setStatus(TaskStatus.PENDING);
+            storage.saveTask(t);
+        });
+        refreshMetrics(taskId, false);
+        runNow(taskId);
     }
 
     private boolean isDue(ScheduledTask task, LocalDateTime now) {

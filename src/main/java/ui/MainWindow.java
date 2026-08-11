@@ -202,7 +202,7 @@ public class MainWindow extends JFrame {
         tabs.addTab("Tasks", iconFor("tasks"), taskPanel);
         tabs.addTab("Credentials", iconFor("creds"), credPanel);
         tabs.addTab("Notifications", iconFor("settings"), notificationPanel);
-        tabs.addTab("Settings", iconFor("settings"), new SettingsPanel(transferService));
+        tabs.addTab("Settings", iconFor("settings"), new SettingsPanel(transferService, scheduler));
 
         // Refresh task panel when switching back from credentials
         tabs.addChangeListener(e -> {

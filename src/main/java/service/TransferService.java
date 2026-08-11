@@ -10,6 +10,7 @@ import service.RemoteFileMetadataServiceFactory.ManagedMetadataService;
 import util.MailFetchMode;
 import util.MiniJson;
 import util.AppConfig;
+import util.AppSettings;
 
 import java.io.*;
 import java.net.InetAddress;
@@ -1346,13 +1347,22 @@ public class TransferService {
     /**
      * Saves every downloadable (non-inline, file-type) attachment of a
      * message to disk under:
-     *   <outputDir>/Attachments/<LDM|PTM|Others>/<message-scoped subfolder>/<original filename>
+     *   <attachmentBase>/<LDM|PTM|Others>/<message-scoped subfolder>/<original filename>
      * using the same LDM/PTM/Others classification that decides which
      * mailbox folder the message itself gets moved to, so attachments and
      * their parent message end up filed the same way. Each message gets its
      * own subfolder (named the same as its .RCV file, minus the extension)
      * so that attachments from different messages sharing a filename (e.g.
      * two "report.pdf") never collide or overwrite one another.
+     *
+     * <p>{@code <attachmentBase>} is
+     * {@link AppSettings#getAttachmentDownloadLocation()} — a single,
+     * independently configurable location (editable live via the Settings
+     * panel, or app-settings.json / app-config.xml's
+     * {@code <sitaMessaging><attachmentDownloadLocation>} on first run) —
+     * so attachments no longer have to land inside each task's own output
+     * directory. If it's unset, the previous behavior (attachments nested
+     * under the task's {@code outputDir}) is kept for backward compatibility.
      */
     private void saveAttachmentsToDisk(GraphMailService.MailMessage m, Path outputDir,
                                         String classification, Consumer<String> logLine) {
@@ -1366,7 +1376,9 @@ public class TransferService {
         int dot = messageFolderName.lastIndexOf('.');
         if (dot > 0) messageFolderName = messageFolderName.substring(0, dot);
 
-        Path attachmentsDir = outputDir.resolve("Attachments").resolve(bucket).resolve(messageFolderName);
+        String configuredBase = AppSettings.getAttachmentDownloadLocation();
+        Path attachmentBaseDir = (configuredBase != null) ? Paths.get(configuredBase) : outputDir.resolve("Attachments");
+        Path attachmentsDir = attachmentBaseDir.resolve(bucket).resolve(messageFolderName);
         try {
             Files.createDirectories(attachmentsDir);
         } catch (IOException ex) {
@@ -1626,30 +1638,40 @@ public class TransferService {
     // ─── Station code → full SITA address lookup (app-config.xml / JSON) ──
 
     private Map<String, Object> stationCodeCache;
-    private String defaultStationAddressCache;
-    private boolean defaultStationAddressLoaded = false;
+    private long stationCodeCacheFileMtime = -1;
+    // (defaultStationAddress is no longer cached here — AppSettings.getDefaultStationAddress()
+    // already does its own cheap mtime-checked caching and stays live-editable.)
 
     /**
      * Loads and caches the station-code → 7-character SITA address map from
      * the JSON file whose path is configured in app-config.xml under
-     * <sitaMessaging><stationCodesFile>. Missing config/file/JSON just
+     * <sitaMessaging><stationCodesFile>. The cache is invalidated whenever
+     * the file's lastModified timestamp changes, so editing the station
+     * codes JSON (by hand, or via a future dedicated editor) takes effect on
+     * the next message processed — no restart needed, same as the other
+     * live settings in {@link AppSettings}. Missing config/file/JSON just
      * yields an empty map (best-effort — lookups then fail through to the
      * configured default rather than the app crashing).
      */
     private synchronized Map<String, Object> loadStationCodes() {
-        if (stationCodeCache != null) return stationCodeCache;
-        stationCodeCache = new HashMap<>();
+        String path = readAppConfigValue("stationCodesFile");
+        if (path == null || path.isEmpty()) return stationCodeCache != null ? stationCodeCache : Collections.emptyMap();
+        File f = new File(path);
+        long mtime = f.exists() ? f.lastModified() : 0L;
+        if (stationCodeCache != null && mtime == stationCodeCacheFileMtime) return stationCodeCache;
+
+        Map<String, Object> loaded = new HashMap<>();
         try {
-            String path = readAppConfigValue("stationCodesFile");
-            if (path == null || path.isEmpty()) return stationCodeCache;
-            File f = new File(path);
-            if (!f.exists()) return stationCodeCache;
-            String json = Files.readString(f.toPath(), StandardCharsets.UTF_8);
-            Map<String, Object> parsed = MiniJson.parseObject(json);
-            if (parsed != null) stationCodeCache.putAll(parsed);
+            if (f.exists()) {
+                String json = Files.readString(f.toPath(), StandardCharsets.UTF_8);
+                Map<String, Object> parsed = MiniJson.parseObject(json);
+                if (parsed != null) loaded.putAll(parsed);
+            }
         } catch (Exception ignored) {
-            // best-effort; missing/invalid config just means codes won't expand
+            // best-effort; invalid JSON just means codes won't expand this read
         }
+        stationCodeCache = loaded;
+        stationCodeCacheFileMtime = mtime;
         return stationCodeCache;
     }
 
@@ -1664,12 +1686,8 @@ public class TransferService {
         return AppConfig.readValue(tagName);
     }
 
-    private synchronized String getDefaultStationAddress() {
-        if (!defaultStationAddressLoaded) {
-            defaultStationAddressCache = readAppConfigValue("defaultStationAddress");
-            defaultStationAddressLoaded = true;
-        }
-        return defaultStationAddressCache;
+    private String getDefaultStationAddress() {
+        return AppSettings.getDefaultStationAddress();
     }
 
     /**
@@ -1732,7 +1750,15 @@ public class TransferService {
      * Drops every blank/whitespace-only line so the .RCV file has no gaps
      * between lines of actual content — HTML paragraph/line breaks and the
      * earlier cleanup passes leave behind blank lines (collapsed to at most
-     * one), which this removes entirely.
+     * one), which this removes entirely. Also strips any leading
+     * whitespace (spaces/tabs) from the start of each remaining line —
+     * HTML-to-plain-text conversion and quoted/indented content upstream
+     * can leave lines indented, which this normalizes back to column 0.
+     * Trailing whitespace is left alone (not part of this request).
+     *
+     * <p>Only used for BODY_ONLY/HEADERS_AND_BODY content — never applied
+     * to FULL_MESSAGE (raw MIME), where leading whitespace is sometimes
+     * structurally significant (RFC 2822 header folding).
      */
     private String removeBlankLines(String text) {
         if (text == null || text.isEmpty()) return "";
@@ -1740,10 +1766,18 @@ public class TransferService {
         StringBuilder sb = new StringBuilder();
         for (String line : lines) {
             if (line.trim().isEmpty()) continue;
+            String stripped = stripLeadingWhitespace(line);
             if (sb.length() > 0) sb.append("\n");
-            sb.append(line);
+            sb.append(stripped);
         }
         return sb.toString();
+    }
+
+    /** Removes only leading spaces/tabs from a single line, leaving the rest of the line untouched. */
+    private static String stripLeadingWhitespace(String line) {
+        int i = 0;
+        while (i < line.length() && (line.charAt(i) == ' ' || line.charAt(i) == '\t')) i++;
+        return line.substring(i);
     }
 
     /**
@@ -1867,21 +1901,15 @@ public class TransferService {
      * Resolves the destination folder name for automatic post-processing
      * move: LDM/PTM messages go to their respective configured folder,
      * anything else (including MVT, until it has its own rule) goes to the
-     * configured "Others" folder. Folder names come from app-config.xml
-     * under <sitaMessaging><ldmFolder>/<ptmFolder>/<othersFolder>, each
-     * falling back to a sensible default (LDM / PTM / Others) if unset.
+     * configured "Others" folder. Folder names come from the live
+     * app-settings.json (see {@link AppSettings}) so a change made in the
+     * Settings panel takes effect on the very next message processed — no
+     * restart needed.
      */
     private String resolveMoveFolderName(String messageType) {
-        if ("LDM".equals(messageType)) {
-            String v = readAppConfigValue("ldmFolder");
-            return v != null && !v.isEmpty() ? v : "LDM";
-        }
-        if ("PTM".equals(messageType)) {
-            String v = readAppConfigValue("ptmFolder");
-            return v != null && !v.isEmpty() ? v : "PTM";
-        }
-        String v = readAppConfigValue("othersFolder");
-        return v != null && !v.isEmpty() ? v : "Others";
+        if ("LDM".equals(messageType)) return AppSettings.getLdmFolder();
+        if ("PTM".equals(messageType)) return AppSettings.getPtmFolder();
+        return AppSettings.getOthersFolder();
     }
 
     // Lines matching any of these mark the start of a signature, footer/

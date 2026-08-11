@@ -1,5 +1,7 @@
 package service;
 
+import util.AppSettings;
+
 import java.io.*;
 import java.nio.file.Files;
 import java.time.LocalDateTime;
@@ -18,7 +20,12 @@ public class TaskLogService {
     private static final DateTimeFormatter DT_FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
     private static final DateTimeFormatter FILE_FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd-HHmmss");
     private static final int MAX_LOG_SIZE_BYTES = 5 * 1024 * 1024; // 5 MB
-    
+
+    // Severity ordering for the app's DEBUG < INFO < WARN < ERROR levels
+    // (see util.AppSettings / the Settings panel). A message whose leading
+    // "[TAG]" ranks below the currently configured level is skipped.
+    private static final List<String> LEVEL_ORDER = List.of("DEBUG", "INFO", "WARN", "ERROR");
+
     private final File logsDir;
     private final Map<String, PrintWriter> openWriters = new HashMap<>();
     
@@ -28,10 +35,20 @@ public class TaskLogService {
     }
     
     /**
-     * Log a message for a specific task.
-     * Automatically rotates logs if they exceed MAX_LOG_SIZE_BYTES.
+     * Log a message for a specific task, filtered by the currently
+     * configured log level (read fresh from {@link AppSettings} on every
+     * call, so a level change in the Settings panel is honored by the very
+     * next line any in-progress task writes — no restart is needed for
+     * lines from that point on).
+     *
+     * <p>The message's level is taken from its leading {@code "[TAG]"}
+     * (e.g. {@code "[DEBUG] ..."}, {@code "[WARN] ..."}) — the convention
+     * already used throughout {@link TransferService}. A message with no
+     * recognized tag is treated as INFO. Automatically rotates logs if they
+     * exceed MAX_LOG_SIZE_BYTES.
      */
     public synchronized void log(String taskId, String message) {
+        if (!meetsConfiguredLevel(message)) return;
         try {
             File taskDir = new File(logsDir, "task-" + taskId);
             taskDir.mkdirs();
@@ -65,6 +82,27 @@ public class TaskLogService {
         } catch (Exception e) {
             System.err.println("Error logging to task " + taskId + ": " + e.getMessage());
         }
+    }
+
+    /** Extracts the leading "[TAG]" (if any) and compares it against the configured level. */
+    private static boolean meetsConfiguredLevel(String message) {
+        String configured = AppSettings.getLogLevel();
+        int configuredRank = LEVEL_ORDER.indexOf(configured);
+        if (configuredRank < 0) configuredRank = LEVEL_ORDER.indexOf("INFO"); // unknown value -> safe default
+
+        String tag = extractTag(message);
+        int msgRank = tag != null ? LEVEL_ORDER.indexOf(tag) : LEVEL_ORDER.indexOf("INFO");
+        if (msgRank < 0) msgRank = LEVEL_ORDER.indexOf("INFO");
+
+        return msgRank >= configuredRank;
+    }
+
+    private static String extractTag(String message) {
+        if (message == null || message.isEmpty() || message.charAt(0) != '[') return null;
+        int close = message.indexOf(']');
+        if (close <= 1) return null;
+        String tag = message.substring(1, close).trim().toUpperCase(Locale.ROOT);
+        return LEVEL_ORDER.contains(tag) ? tag : null;
     }
     
     /**

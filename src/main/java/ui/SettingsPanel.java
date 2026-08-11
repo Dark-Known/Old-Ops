@@ -1,12 +1,15 @@
 package ui;
 
 import service.TransferService;
+import util.AppSettings;
 
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
 import javax.swing.border.TitledBorder;
 import java.awt.*;
 import java.io.*;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.prefs.Preferences;
 
 public class SettingsPanel extends JPanel {
@@ -16,14 +19,40 @@ public class SettingsPanel extends JPanel {
     private static final String TASK_NAME     = "Monitoring-Tool-Daemon";
 
     private final TransferService transferService;
+    private final service.TaskSchedulerService scheduler; // may be null if not wired by caller
     private final Preferences prefs = Preferences.userNodeForPackage(SettingsPanel.class);
     private JTextField tfWinScp;
     private JLabel     lblStatus;
     private JLabel     lblDaemonStatus;
     private javax.swing.JSpinner spinnerPollInterval;
 
+    // Live settings (app-settings.json via util.AppSettings) — see buildRoutingPanel()
+    private JTextField tfLdmFolder;
+    private JTextField tfPtmFolder;
+    private JTextField tfOthersFolder;
+    private JTextField tfDefaultStationAddress;
+    private JTextField tfAttachmentDir;
+    private JComboBox<String> comboLogLevel;
+    private JTextField tfJvmMinHeap;
+    private JTextField tfJvmMaxHeap;
+
     public SettingsPanel(TransferService transferService) {
+        this(transferService, null);
+    }
+
+    /**
+     * @param scheduler used only to detect currently in-flight tasks and
+     *                  offer to restart them when the log level changes, so
+     *                  their logs come out consistently at the new level for
+     *                  the whole run (see {@link #maybeOfferRestartOnLevelChange}).
+     *                  Pass {@code null} if this panel is used somewhere the
+     *                  scheduler isn't available — the log level still saves
+     *                  and still applies live to every future log line, it
+     *                  just won't offer to restart already-running tasks.
+     */
+    public SettingsPanel(TransferService transferService, service.TaskSchedulerService scheduler) {
         this.transferService = transferService;
+        this.scheduler = scheduler;
         setLayout(new BorderLayout(10, 10));
         setBorder(new EmptyBorder(15, 15, 15, 15));
         buildUI();
@@ -71,6 +100,9 @@ public class SettingsPanel extends JPanel {
         hintC.anchor = GridBagConstraints.WEST; hintC.insets = new Insets(0, 4, 4, 0);
         winscpPanel.add(hint, hintC);
         outer.add(winscpPanel);
+        outer.add(Box.createVerticalStrut(12));
+
+        outer.add(buildRoutingPanel());
         outer.add(Box.createVerticalStrut(12));
 
         // Background Daemon section
@@ -151,13 +183,14 @@ public class SettingsPanel extends JPanel {
         // App Info section
         JPanel infoPanel = new JPanel(new GridBagLayout());
         infoPanel.setBorder(new TitledBorder("Application Info"));
-        infoPanel.setMaximumSize(new Dimension(Integer.MAX_VALUE, 130));
+        infoPanel.setMaximumSize(new Dimension(Integer.MAX_VALUE, 155));
 
-        String dataDir = System.getProperty("user.home") + File.separator + ".opstool";
+        String dataDir = resolveActualDataDir();
         addInfoRow(infoPanel, "Data directory:", dataDir, 0);
         addInfoRow(infoPanel, "Tasks file:",     dataDir + File.separator + "tasks.xml", 1);
         addInfoRow(infoPanel, "Credentials:",    dataDir + File.separator + "creds_<username>.xml", 2);
         addInfoRow(infoPanel, "Daemon log:",     dataDir + File.separator + "daemon.log", 3);
+        addInfoRow(infoPanel, "Live settings (JSON):", AppSettings.filePath(), 4);
         outer.add(infoPanel);
         outer.add(Box.createVerticalStrut(12));
 
@@ -193,6 +226,107 @@ public class SettingsPanel extends JPanel {
 
         add(new JScrollPane(outer), BorderLayout.CENTER);
         add(saveRow, BorderLayout.SOUTH);
+    }
+
+    /**
+     * "Message Routing &amp; Attachments" section — the settings backed by
+     * app-settings.json (via {@link AppSettings}) rather than app-config.xml.
+     * Every field here except the two JVM heap fields takes effect
+     * immediately on Save, for both the GUI and the next daemon run — no
+     * restart required, since {@link TransferService} reads them fresh
+     * (with cheap mtime-checked reload) on every message it processes.
+     */
+    private JPanel buildRoutingPanel() {
+        JPanel panel = new JPanel(new GridBagLayout());
+        panel.setBorder(new TitledBorder("Message Routing & Attachments (live — no restart needed)"));
+
+        GridBagConstraints lc = new GridBagConstraints();
+        lc.anchor = GridBagConstraints.WEST; lc.insets = new Insets(4, 4, 4, 8);
+        GridBagConstraints fc = new GridBagConstraints();
+        fc.fill = GridBagConstraints.HORIZONTAL; fc.weightx = 1; fc.insets = new Insets(4, 0, 4, 4);
+        GridBagConstraints bc = new GridBagConstraints();
+        bc.insets = new Insets(4, 0, 4, 4);
+
+        tfLdmFolder = new JTextField(16);
+        tfPtmFolder = new JTextField(16);
+        tfOthersFolder = new JTextField(16);
+        tfDefaultStationAddress = new JTextField(16);
+        tfAttachmentDir = new JTextField(30);
+        JButton btnBrowseAttach = new JButton("Browse...");
+        btnBrowseAttach.addActionListener(e -> {
+            JFileChooser fc2 = new JFileChooser();
+            fc2.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
+            fc2.setDialogTitle("Select Attachment Download Location");
+            if (fc2.showOpenDialog(this) == JFileChooser.APPROVE_OPTION)
+                tfAttachmentDir.setText(fc2.getSelectedFile().getAbsolutePath());
+        });
+        comboLogLevel = new JComboBox<>(new String[]{"DEBUG", "INFO", "WARN", "ERROR"});
+
+        int row = 0;
+        row = addFieldRow(panel, lc, fc, "LDM mailbox folder:", tfLdmFolder, row);
+        row = addFieldRow(panel, lc, fc, "PTM mailbox folder:", tfPtmFolder, row);
+        row = addFieldRow(panel, lc, fc, "Others mailbox folder:", tfOthersFolder, row);
+        row = addFieldRow(panel, lc, fc, "Default SITA station address:", tfDefaultStationAddress, row);
+
+        lc.gridy = fc.gridy = bc.gridy = row; lc.gridx = 0; fc.gridx = 1; bc.gridx = 2;
+        panel.add(new JLabel("Attachment download location:"), lc);
+        panel.add(tfAttachmentDir, fc);
+        panel.add(btnBrowseAttach, bc);
+        row++;
+
+        row = addFieldRow(panel, lc, fc, "Log level:", comboLogLevel, row);
+
+        JLabel hint = new JLabel("<html><i style='color:gray'>Attachments are saved to "
+            + "&lt;location&gt;\\LDM|PTM|Others\\&lt;message&gt;\\&lt;file&gt;. Leave blank to keep "
+            + "saving them inside each task's own output folder instead.</i></html>");
+        GridBagConstraints hc = new GridBagConstraints();
+        hc.gridx = 0; hc.gridy = row++; hc.gridwidth = 3; hc.anchor = GridBagConstraints.WEST;
+        hc.insets = new Insets(0, 4, 8, 0);
+        panel.add(hint, hc);
+
+        // JVM heap — stored in the same file for one consistent place to
+        // edit everything, but genuinely cannot apply to the already-running
+        // JVM; only takes effect the next time the app/daemon process starts.
+        tfJvmMinHeap = new JTextField(8);
+        tfJvmMaxHeap = new JTextField(8);
+        JPanel heapRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
+        heapRow.add(new JLabel("JVM min heap:"));
+        heapRow.add(tfJvmMinHeap);
+        heapRow.add(new JLabel("JVM max heap:"));
+        heapRow.add(tfJvmMaxHeap);
+        JLabel heapHint = new JLabel("  (applies on next app/daemon restart — not live)");
+        heapHint.setFont(heapHint.getFont().deriveFont(Font.ITALIC, 11f));
+        heapHint.setForeground(Color.GRAY);
+        heapRow.add(heapHint);
+        GridBagConstraints heapC = new GridBagConstraints();
+        heapC.gridx = 0; heapC.gridy = row++; heapC.gridwidth = 3; heapC.anchor = GridBagConstraints.WEST;
+        heapC.insets = new Insets(4, 0, 4, 0);
+        panel.add(heapRow, heapC);
+
+        return panel;
+    }
+
+    private int addFieldRow(JPanel panel, GridBagConstraints lc, GridBagConstraints fc, String label, JComponent field, int row) {
+        lc.gridx = 0; lc.gridy = row;
+        fc.gridx = 1; fc.gridy = row; fc.gridwidth = 2;
+        panel.add(new JLabel(label), lc);
+        panel.add(field, fc);
+        fc.gridwidth = 1;
+        return row + 1;
+    }
+
+    /**
+     * Resolves the same real dataDir that MainWindow, Daemon, and AppSettings
+     * all use — app-config.xml's &lt;dataDir&gt;, falling back to
+     * {@code C:\OpsTools\Data} if that can't be read. Used only to display
+     * accurate paths in the "Application Info" section below; previously this
+     * section hardcoded {@code %USERPROFILE%\.opstool} regardless of what
+     * was actually configured, which could point users at the wrong folder
+     * entirely when looking for tasks.xml, daemon.log, or app-settings.json.
+     */
+    private static String resolveActualDataDir() {
+        String val = util.AppConfig.readValue("dataDir");
+        return (val != null && !val.isEmpty()) ? val : "C:\\OpsTools\\Data";
     }
 
     // ── Daemon management ────────────────────────────────────────────────────
@@ -519,16 +653,50 @@ public class SettingsPanel extends JPanel {
         }
         int poll = prefs.getInt(PREF_POLLSEC, 60);
         spinnerPollInterval.setValue(poll);
+
+        // Live settings (app-settings.json) — loaded fresh every time this
+        // panel is built, so it always reflects whatever is currently in
+        // effect (including edits made elsewhere, e.g. by hand).
+        tfLdmFolder.setText(AppSettings.getLdmFolder());
+        tfPtmFolder.setText(AppSettings.getPtmFolder());
+        tfOthersFolder.setText(AppSettings.getOthersFolder());
+        String defaultAddr = AppSettings.getDefaultStationAddress();
+        tfDefaultStationAddress.setText(defaultAddr != null ? defaultAddr : "");
+        String attachDir = AppSettings.getAttachmentDownloadLocation();
+        tfAttachmentDir.setText(attachDir != null ? attachDir : "");
+        comboLogLevel.setSelectedItem(AppSettings.getLogLevel());
+        tfJvmMinHeap.setText(AppSettings.getJvmMinHeap());
+        tfJvmMaxHeap.setText(AppSettings.getJvmMaxHeap());
     }
 
     private void savePrefs() {
         String path = tfWinScp.getText().trim();
+        String previousLogLevel = AppSettings.getLogLevel();
 
         // Always save poll interval, regardless of WinSCP path
         try {
             int poll = (Integer) spinnerPollInterval.getValue();
             prefs.putInt(PREF_POLLSEC, poll);
         } catch (Exception ignored) {}
+
+        // Live settings — one file write, takes effect immediately for both
+        // this process and the daemon's next run.
+        try {
+            Map<String, String> live = new LinkedHashMap<>();
+            live.put(AppSettings.KEY_LDM_FOLDER, tfLdmFolder.getText().trim());
+            live.put(AppSettings.KEY_PTM_FOLDER, tfPtmFolder.getText().trim());
+            live.put(AppSettings.KEY_OTHERS_FOLDER, tfOthersFolder.getText().trim());
+            live.put(AppSettings.KEY_DEFAULT_STATION_ADDR, tfDefaultStationAddress.getText().trim());
+            live.put(AppSettings.KEY_ATTACHMENT_DOWNLOAD_DIR, tfAttachmentDir.getText().trim());
+            live.put(AppSettings.KEY_LOG_LEVEL, String.valueOf(comboLogLevel.getSelectedItem()));
+            live.put(AppSettings.KEY_JVM_MIN_HEAP, tfJvmMinHeap.getText().trim());
+            live.put(AppSettings.KEY_JVM_MAX_HEAP, tfJvmMaxHeap.getText().trim());
+            AppSettings.setAll(live);
+        } catch (Exception ex) {
+            lblStatus.setText("Could not save live settings: " + ex.getMessage());
+            lblStatus.setForeground(Color.RED);
+            return;
+        }
 
         if (!path.isEmpty()) {
             prefs.put(PREF_WINSCP, path);
@@ -538,6 +706,61 @@ public class SettingsPanel extends JPanel {
         } else {
             lblStatus.setText("WinSCP path cannot be empty.");
             lblStatus.setForeground(Color.RED);
+        }
+
+        maybeOfferRestartOnLevelChange(previousLogLevel, String.valueOf(comboLogLevel.getSelectedItem()));
+    }
+
+    /**
+     * The new log level already applies live to every log line written from
+     * this point on — {@link service.TaskLogService} re-reads
+     * {@link AppSettings#getLogLevel()} on every call, no restart required
+     * for that. But a task that's *already running* will have a task.log
+     * that started under the old level and switches partway through, which
+     * is confusing to read back (e.g. missing DEBUG lines for the portion
+     * of the run that already happened). So: if the level actually changed
+     * and any task is currently executing, offer to restart just those
+     * tasks — cancel + immediately re-run from the top — so their log ends
+     * up consistent at the new level for the entire run.
+     */
+    private void maybeOfferRestartOnLevelChange(String previousLevel, String newLevel) {
+        if (scheduler == null) return;
+        if (previousLevel == null || previousLevel.equals(newLevel)) return;
+
+        java.util.List<String> runningIds = scheduler.getRunningTaskIds();
+        if (runningIds.isEmpty()) return;
+
+        java.util.List<model.ScheduledTask> allTasks = null;
+        StringBuilder names = new StringBuilder();
+        try {
+            allTasks = scheduler.getStorage() != null ? scheduler.getStorage().loadTasks() : null;
+        } catch (Exception ignored) {}
+        for (String id : runningIds) {
+            String display = id;
+            if (allTasks != null) {
+                for (model.ScheduledTask t : allTasks) {
+                    if (t.getId().equals(id)) { display = t.getName(); break; }
+                }
+            }
+            if (names.length() > 0) names.append(", ");
+            names.append(display);
+        }
+
+        int choice = JOptionPane.showConfirmDialog(this,
+            "Log level changed from " + previousLevel + " to " + newLevel + ".\n\n"
+            + "The following task(s) are currently running and already have log lines\n"
+            + "written under the old level: " + names + "\n\n"
+            + "Restart them now so their log is generated entirely at the new " + newLevel + " level?\n"
+            + "(Their current run will be cancelled and immediately re-run from the start.)",
+            "Restart running tasks to apply new log level?",
+            JOptionPane.YES_NO_OPTION, JOptionPane.QUESTION_MESSAGE);
+
+        if (choice == JOptionPane.YES_OPTION) {
+            for (String id : runningIds) {
+                try { scheduler.restartTask(id); } catch (Exception ignored) {}
+            }
+            lblStatus.setText("✓  Settings saved. Restarted " + runningIds.size() + " running task(s) for the new log level.");
+            lblStatus.setForeground(new Color(0x2E7D32));
         }
     }
 

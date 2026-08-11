@@ -5,6 +5,7 @@ service\OAuth2TokenService$CachedToken.class
 App.class
 ui\TaskManagerPanel$3.class
 util\CryptoUtil.class
+util\AppSettings.class
 util\ImapSearchCriteria$SizeCriteria.class
 model\ScheduledTask.class
 ui\SearchCriteriaPanel.class

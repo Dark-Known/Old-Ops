@@ -141,9 +141,29 @@ public class Daemon {
                 }
             });
             rootLogger.addHandler(fh);
-            rootLogger.setLevel(Level.INFO);
+            rootLogger.setLevel(parseLevel(util.AppSettings.getLogLevel()));
         } catch (Exception e) {
             System.err.println("Could not configure file logger: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Maps the app's DEBUG/INFO/WARN/ERROR log level (as configured in the
+     * Settings panel / app-settings.json — see {@link util.AppSettings}) to
+     * a {@link Level}. Each daemon run re-reads this at startup (via
+     * {@link #setupLogging}), so a level change made in the Settings panel
+     * takes effect from the daemon's next scheduled run onward — this
+     * process itself doesn't have a live-updating logger, but nothing here
+     * requires a full reinstall/relaunch either.
+     */
+    private static Level parseLevel(String configured) {
+        if (configured == null) return Level.INFO;
+        switch (configured.trim().toUpperCase(java.util.Locale.ROOT)) {
+            case "DEBUG": return Level.FINE;
+            case "WARN":  return Level.WARNING;
+            case "ERROR": return Level.SEVERE;
+            case "INFO":
+            default:      return Level.INFO;
         }
     }
 

@@ -216,26 +216,53 @@
         <retryIntervalSeconds>5</retryIntervalSeconds>
     </network>
 
-    <!-- SITA-style Header Generation for LDM / MVT / PTM mail messages -->
+    <!-- SITA-style Header Generation for LDM / MVT / PTM mail messages
+
+         NOTE ON LIVE EDITING: defaultStationAddress, ldmFolder, ptmFolder,
+         othersFolder, and attachmentDownloadLocation below are read ONCE
+         from here to seed a separate file, <dataDir>\app-settings.json, the
+         first time the app runs after upgrading. From then on those five
+         values live in app-settings.json, are editable from the Settings
+         panel (Message Routing & Attachments tab), and take effect
+         immediately for both the GUI and the background daemon — no
+         restart required. Editing them here after that first run has no
+         effect; use the Settings panel (or edit app-settings.json directly)
+         instead. stationCodesFile stays XML-configured since it's just a
+         path, but the JSON file it points to is itself re-read whenever its
+         contents change, so station-code edits are live too. -->
     <sitaMessaging>
         <!-- Path to a JSON file mapping 3-letter station codes (origin and
              destination) to their full 7-character SITA address, e.g.:
                { "BLR": "BLRGMXH", "VTZ": "VTZGMXH" }
              Used to build the =ORIGIN and =DESTINATION TYPE B fields of the
-             header prepended to parsed LDM/MVT/PTM message content. -->
+             header prepended to parsed LDM/MVT/PTM message content. Changes
+             to the JSON file's contents apply immediately (no restart) —
+             only the path below is XML/install-time configuration. -->
         <stationCodesFile>D:\OpsTools\Data\station-codes.json</stationCodesFile>
 
-        <!-- Fallback SITA address used for =ORIGIN and/or =DESTINATION TYPE B
-             whenever the station code can't be extracted from the message,
-             or the extracted code has no entry in stationCodesFile. -->
+        <!-- First-run default only — see NOTE above. Fallback SITA address
+             used for =ORIGIN and/or =DESTINATION TYPE B whenever the station
+             code can't be extracted from the message, or the extracted code
+             has no entry in stationCodesFile. -->
         <defaultStationAddress>VTZGMXH</defaultStationAddress>
 
-        <!-- Mailbox folders processed messages are automatically moved to,
-             based on message content — replaces the old manual "move to
-             folder" task setting. -->
+        <!-- First-run defaults only — see NOTE above. Mailbox folders
+             processed messages are automatically moved to, based on message
+             content — replaces the old manual "move to folder" task
+             setting. -->
         <ldmFolder>LDM</ldmFolder>
         <ptmFolder>PTM</ptmFolder>
         <othersFolder>Others</othersFolder>
+
+        <!-- First-run default only — see NOTE above. Base folder attachments
+             are downloaded to, as:
+               <attachmentDownloadLocation>\<LDM|PTM|Others>\<message>\<file>
+             Previously attachments were always nested inside each task's own
+             output directory (<outputDir>\Attachments\...); setting this
+             gives attachments one independent, consistently-organized
+             location regardless of which task/mailbox fetched them. Leave
+             blank to keep the old per-task-outputDir behavior. -->
+        <attachmentDownloadLocation>D:\OpsTools\Data\Attachments</attachmentDownloadLocation>
     </sitaMessaging>
 
     <!-- Prerequisite Files (must be in same folder as setup.ps1) -->
