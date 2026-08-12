@@ -16,6 +16,7 @@ util\ImapSearchCriteria$AdvancedCriteria.class
 service\TaskSchedulerService$TaskMetrics.class
 model\ScheduledTask$TransferMode.class
 service\TaskLogService.class
+service\TransferService$DatedFile.class
 service\TransferService.class
 ui\MainWindow$2.class
 service\RemoteFileMetadataServiceFactory.class

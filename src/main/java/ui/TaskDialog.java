@@ -91,8 +91,11 @@ public class TaskDialog extends JDialog {
     // ── Local-to-local banner (shown when target host is local / blank) ───────
     private JLabel lblLocalToLocalBanner;
 
-    // ── Service panel ─────────────────────────────────────────────────────────
-    private JTextField  tfServiceName;
+    // ── Backup panel ──────────────────────────────────────────────────────────
+    private JTextField  tfBackupSourcePath;
+    private JTextField  tfBackupDestinationPath;
+    private JSpinner    spBackupRetentionDays;
+    private JSpinner    spBackupBatchDays;
 
     // ── Outlook mail (Microsoft Graph) ─────────────────────────────────────────
     private JPanel      mailPanel;
@@ -128,7 +131,7 @@ public class TaskDialog extends JDialog {
     private JTextField  tfTime;
 
     private JPanel fileTransferPanel;
-    private JPanel servicePanel;
+    private JPanel backupPanel;
     private JPanel scheduleDetailsPanel;
     private JTabbedPane tabbedPane;
 
@@ -192,8 +195,7 @@ public class TaskDialog extends JDialog {
         general    = titledPanel("General");
         tfName     = makeField(new JTextField(existing != null ? existing.getName() : "", 28));
         cbTaskType = makeCombo(new JComboBox<>(new String[]{
-                "FILE_TRANSFER", "OUTLOOK_MAIL",
-                "START_SERVICE", "STOP_SERVICE", "RESTART_SERVICE"}));
+                "FILE_TRANSFER", "OUTLOOK_MAIL", "BACKUP"}));
         if (existing != null) cbTaskType.setSelectedItem(existing.getTaskType().name());
 
         addRow(general, "Task Name *", tfName,     0);
@@ -218,7 +220,7 @@ public class TaskDialog extends JDialog {
         // ── File Transfer panel ───────────────────────────────────────────────
         fileTransferPanel = titledPanel("File Transfer — Destination");
 
-        cbTransferDirection = makeCombo(new JComboBox<>(new String[]{"OUTBOUND", "INBOUND", "LOCAL_TO_LOCAL"}));
+        cbTransferDirection = makeCombo(new JComboBox<>(new String[]{"OUTBOUND", "INBOUND"}));
         cbTransferDirection.setSelectedItem(
                 existing != null ? existing.getTransferDirection().name() : "OUTBOUND");
 
@@ -315,12 +317,25 @@ public class TaskDialog extends JDialog {
         transferTab.add(Box.createRigidArea(new Dimension(0, 10)));
         transferTab.add(fileTransferPanel);
 
-        // ── Service panel ─────────────────────────────────────────────────────
-        servicePanel  = titledPanel("Service Control");
-        tfServiceName = makeField(new JTextField(
-                existing != null && existing.getServiceName() != null ? existing.getServiceName() : "", 28));
-        addRow(servicePanel, "Service Name *", tfServiceName, 0);
-        addRow(servicePanel, "", hint("Windows service name, e.g.  Spooler,  W3SVC"), 1);
+        // ── Backup panel ──────────────────────────────────────────────────────
+        backupPanel = titledPanel("Backup");
+        tfBackupSourcePath = makeField(new JTextField(
+                existing != null && existing.getBackupSourcePath() != null ? existing.getBackupSourcePath() : "", 28));
+        tfBackupDestinationPath = makeField(new JTextField(
+                existing != null && existing.getBackupDestinationPath() != null ? existing.getBackupDestinationPath() : "", 28));
+        int existingRetention = existing != null && existing.getBackupRetentionDays() > 0
+                ? existing.getBackupRetentionDays() : 3;
+        int existingBatchDays = existing != null && existing.getBackupBatchDays() > 0
+                ? existing.getBackupBatchDays() : 2;
+        spBackupRetentionDays = new JSpinner(new SpinnerNumberModel(existingRetention, 1, 365, 1));
+        spBackupBatchDays     = new JSpinner(new SpinnerNumberModel(existingBatchDays, 1, 365, 1));
+
+        addRow(backupPanel, "Source Folder *",      tfBackupSourcePath, 0);
+        addRow(backupPanel, "Backup Folder *",      tfBackupDestinationPath, 1);
+        addRow(backupPanel, "Days to keep (D..) *", spBackupRetentionDays, 2);
+        addRow(backupPanel, "", hint("If today is D, this many days are kept in the source folder — D, D-1, ... — and everything older becomes eligible for backup."), 3);
+        addRow(backupPanel, "Days per run *",       spBackupBatchDays, 4);
+        addRow(backupPanel, "", hint("How many of the oldest day-buckets to archive each time this task runs. Any remaining backlog is picked up on the next run."), 5);
 
         // ── Mail / Outlook panel (Microsoft Graph) ────────────────────────────
         // Reads mail via Microsoft Graph rather than IMAP: Microsoft has disabled
@@ -561,7 +576,7 @@ public class TaskDialog extends JDialog {
         tabbedPane.setFont(tabbedPane.getFont().deriveFont(Font.PLAIN, 12f));
         tabbedPane.addTab("General",   general);
         tabbedPane.addTab("Transfer",  transferTab);
-        tabbedPane.addTab("Service",   servicePanel);
+        tabbedPane.addTab("Backup",    backupPanel);
         tabbedPane.addTab("Target",    targetPanel);
         tabbedPane.addTab("Mail/IMAP", mailPanel);
         tabbedPane.addTab("Schedule",  sched);
@@ -702,8 +717,7 @@ public class TaskDialog extends JDialog {
         String direction = (String) cbTransferDirection.getSelectedItem();
         boolean inbound     = "INBOUND".equals(direction);
         boolean localTarget = isLocalTargetHost();
-        boolean localToLocal = "LOCAL_TO_LOCAL".equals(direction);
-        boolean show        = inbound && localTarget && !localToLocal;
+        boolean show        = inbound && localTarget;
         lblLocalToLocalBanner.setVisible(show);
 
         if (show && lblSourcePath != null) {
@@ -731,10 +745,10 @@ public class TaskDialog extends JDialog {
         String type        = (String) cbTaskType.getSelectedItem();
         boolean isTransfer = "FILE_TRANSFER".equals(type);
         boolean isMail     = "OUTLOOK_MAIL".equals(type);
-        boolean isService  = !isTransfer && !isMail;
+        boolean isBackup   = "BACKUP".equals(type);
 
         enableTabIfPresent(transferTab,   isTransfer);
-        enableTabIfPresent(servicePanel,  isService);
+        enableTabIfPresent(backupPanel,   isBackup);
         enableTabIfPresent(mailPanel,     isMail);
 
         if (tabbedPane != null) {
@@ -755,28 +769,19 @@ public class TaskDialog extends JDialog {
     private void updateTransferDirectionLabels() {
         String direction = (String) cbTransferDirection.getSelectedItem();
         boolean inbound = "INBOUND".equals(direction);
-        boolean localToLocal = "LOCAL_TO_LOCAL".equals(direction);
 
-        if (localToLocal) {
-            lblSourcePath.setText("Source Folder *");
-            lblTargetFolder.setText("Destination Folder *");
-        } else if (!isLocalTargetHost()) {
+        if (!isLocalTargetHost()) {
             lblSourcePath.setText(inbound ? "Local Destination Path *" : "Source Path *");
             lblTargetFolder.setText(inbound ? "Remote Source Folder *" : "Destination Folder *");
         }
 
-        if (localToLocal) {
-            lblSourceHint.setText("<html><i style='color:gray'>Local source folder containing files to transfer.</i></html>");
-            lblTargetHint.setText("<html><i style='color:gray'>Local destination folder where files will be copied.</i></html>");
-        } else {
-            lblSourceHint.setText(inbound
-                    ? "<html><i style='color:gray'>Local path where files retrieved from the target will be saved.</i></html>"
-                    : "<html><i style='color:gray'>Local file or folder to send to the target server.</i></html>");
-            lblTargetHint.setText(inbound
-                    ? "<html><i style='color:gray'>Remote source file or folder path on the target server "
-                    + "(or local source folder for local→local copies).</i></html>"
-                    : "<html><i style='color:gray'>Remote destination folder on the target server.</i></html>");
-        }
+        lblSourceHint.setText(inbound
+                ? "<html><i style='color:gray'>Local path where files retrieved from the target will be saved.</i></html>"
+                : "<html><i style='color:gray'>Local file or folder to send to the target server.</i></html>");
+        lblTargetHint.setText(inbound
+                ? "<html><i style='color:gray'>Remote source file or folder path on the target server "
+                + "(or local source folder for local→local copies).</i></html>"
+                : "<html><i style='color:gray'>Remote destination folder on the target server.</i></html>");
 
         // Watcher checkbox is available for both directions (watching is supported for inbound and outbound
         // transfers). Keep the checkbox visible whenever the Transfer tab is shown.
@@ -845,10 +850,10 @@ public class TaskDialog extends JDialog {
 
     private void updateTransferTabVisibility() {
         if (tabbedPane == null) return;
-        boolean localToLocal = "LOCAL_TO_LOCAL".equals(cbTransferDirection.getSelectedItem());
-        enableTabIfPresent(targetPanel, !localToLocal);
-        if (localToLocal && tabbedPane.getSelectedComponent() == targetPanel) {
-            tabbedPane.setSelectedComponent(transferTab);
+        boolean isBackup = "BACKUP".equals(cbTaskType.getSelectedItem());
+        enableTabIfPresent(targetPanel, !isBackup);
+        if (isBackup && tabbedPane.getSelectedComponent() == targetPanel) {
+            tabbedPane.setSelectedComponent(backupPanel);
         }
     }
 
@@ -978,18 +983,20 @@ public class TaskDialog extends JDialog {
         boolean isTransfer  = "FILE_TRANSFER".equals(cbTaskType.getSelectedItem());
         boolean isMail      = "OUTLOOK_MAIL".equals(cbTaskType.getSelectedItem());
 
-        // For local→local FILE_TRANSFER tasks credentials are not required.
+        boolean isBackup    = "BACKUP".equals(cbTaskType.getSelectedItem());
+
+        // For local→local FILE_TRANSFER tasks (auto-detected via a blank/local target host)
+        // credentials are not required.
         boolean isLocalToLocal = isTransfer
-                && ("INBOUND".equals(cbTransferDirection.getSelectedItem())
-                    || "LOCAL_TO_LOCAL".equals(cbTransferDirection.getSelectedItem()))
+                && "INBOUND".equals(cbTransferDirection.getSelectedItem())
                 && isLocalTargetHost();
 
         String targetHost = tfTargetHost.getText().trim();
         String targetUser = tfTargetUser.getText().trim();
         String targetPass = new String(pfTargetPass.getPassword());
 
-        // Mail tasks use Microsoft Graph (OAuth2), never the SFTP-style target credential.
-        if (!isMail && !isLocalToLocal) {
+        // Mail and Backup tasks don't use the SFTP-style target credential.
+        if (!isMail && !isBackup && !isLocalToLocal) {
             if (targetHost.isEmpty()) { msg("Target hostname / IP is required."); return; }
             if (targetUser.isEmpty()) { msg("Target username is required.");       return; }
             if (targetPass.isEmpty()) { msg("Target password is required.");       return; }
@@ -1064,13 +1071,14 @@ public class TaskDialog extends JDialog {
                         "Mailbox not yet authorized", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
                 if (choice != JOptionPane.YES_OPTION) return;
             }
-        } else {
-            if (tfServiceName.getText().trim().isEmpty()) { msg("Service name is required."); return; }
+        } else if (isBackup) {
+            if (tfBackupSourcePath.getText().trim().isEmpty()) { msg("Backup source folder is required."); return; }
+            if (tfBackupDestinationPath.getText().trim().isEmpty()) { msg("Backup destination folder is required."); return; }
         }
 
         // ── Persist credential file creds_<username>.xml ──────────────────────
-        // Skipped for mail (uses OAuth2, not a stored credential) and local→local tasks.
-        if (!isMail && !isLocalToLocal && !targetUser.isEmpty()) {
+        // Skipped for mail (uses OAuth2, not a stored credential), backup, and local→local tasks.
+        if (!isMail && !isBackup && !isLocalToLocal && !targetUser.isEmpty()) {
             Credential cred = storage.loadCredentialByUsername(targetUser);
             if (cred == null) cred = new Credential();
             if (cred.getId() == null) cred.setId(UUID.randomUUID().toString());
@@ -1099,7 +1107,7 @@ public class TaskDialog extends JDialog {
         // For local→local and mail tasks targetUsername is left blank — mail uses
         // OAuth2/Graph and local→local routes to LocalFileMetadataService via a
         // null credential, per resolveTargetCredential()/isLocalToLocalTask().
-        t.setTargetUsername(!isMail && !isLocalToLocal ? targetUser : "");
+        t.setTargetUsername(!isMail && !isBackup && !isLocalToLocal ? targetUser : "");
         t.setSourceCredentialId(
                 tfSourceUser.getText().trim() + "@" + tfSourceHost.getText().trim());
 
@@ -1135,8 +1143,11 @@ public class TaskDialog extends JDialog {
             if (mailWatcherEpochShouldReset) {
                 t.setMailLastKnownEpoch(0L);
             }
-        } else {
-            t.setServiceName(tfServiceName.getText().trim());
+        } else if (isBackup) {
+            t.setBackupSourcePath(tfBackupSourcePath.getText().trim());
+            t.setBackupDestinationPath(tfBackupDestinationPath.getText().trim());
+            t.setBackupRetentionDays((Integer) spBackupRetentionDays.getValue());
+            t.setBackupBatchDays((Integer) spBackupBatchDays.getValue());
         }
 
         t.setRetryCount((Integer) spinnerRetryCount.getValue());

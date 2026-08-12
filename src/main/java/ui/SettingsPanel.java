@@ -35,6 +35,7 @@ public class SettingsPanel extends JPanel {
     private JComboBox<String> comboLogLevel;
     private JTextField tfJvmMinHeap;
     private JTextField tfJvmMaxHeap;
+    private javax.swing.JSpinner spinnerTransferBatchSize;
 
     public SettingsPanel(TransferService transferService) {
         this(transferService, null);
@@ -189,7 +190,7 @@ public class SettingsPanel extends JPanel {
         addInfoRow(infoPanel, "Data directory:", dataDir, 0);
         addInfoRow(infoPanel, "Tasks file:",     dataDir + File.separator + "tasks.xml", 1);
         addInfoRow(infoPanel, "Credentials:",    dataDir + File.separator + "creds_<username>.xml", 2);
-        addInfoRow(infoPanel, "Daemon log:",     dataDir + File.separator + "daemon.log", 3);
+        addInfoRow(infoPanel, "Daemon log:",     dataDir + File.separator + resolveDaemonLogFileName(), 3);
         addInfoRow(infoPanel, "Live settings (JSON):", AppSettings.filePath(), 4);
         outer.add(infoPanel);
         outer.add(Box.createVerticalStrut(12));
@@ -276,6 +277,18 @@ public class SettingsPanel extends JPanel {
 
         row = addFieldRow(panel, lc, fc, "Log level:", comboLogLevel, row);
 
+        spinnerTransferBatchSize = new javax.swing.JSpinner(
+                new javax.swing.SpinnerNumberModel(50, 1, 100000, 1));
+        row = addFieldRow(panel, lc, fc, "Transfer batch size:", spinnerTransferBatchSize, row);
+
+        JLabel batchHint = new JLabel("<html><i style='color:gray'>When any transfer (any mode/direction) "
+            + "would move more files than this in one go, it is split into sequential batches of at "
+            + "most this many files.</i></html>");
+        GridBagConstraints bhc = new GridBagConstraints();
+        bhc.gridx = 0; bhc.gridy = row++; bhc.gridwidth = 3; bhc.anchor = GridBagConstraints.WEST;
+        bhc.insets = new Insets(0, 4, 8, 0);
+        panel.add(batchHint, bhc);
+
         JLabel hint = new JLabel("<html><i style='color:gray'>Attachments are saved to "
             + "&lt;location&gt;\\LDM|PTM|Others\\&lt;message&gt;\\&lt;file&gt;. Leave blank to keep "
             + "saving them inside each task's own output folder instead.</i></html>");
@@ -329,12 +342,24 @@ public class SettingsPanel extends JPanel {
         return (val != null && !val.isEmpty()) ? val : "C:\\OpsTools\\Data";
     }
 
+    /** Mirrors Daemon.daemonLogFileName() — see note in openDaemonLog(). */
+    private static String resolveDaemonLogFileName() {
+        String name = util.AppConfig.readValue("daemonLogFile");
+        return (name != null && !name.trim().isEmpty()) ? name.trim() : "daemon.log";
+    }
+
     // ── Daemon management ────────────────────────────────────────────────────
 
     private void registerDaemon() {
         String jarPath = getJarPath();
         String javaExe = getJavaExe();
-        String dataDir = System.getProperty("user.home") + File.separator + ".opstool";
+        // FIX: previously hardcoded %USERPROFILE%\.opstool, which is NOT where
+        // the rest of the app (MainWindow, AppSettings, tasks.xml) actually
+        // lives — that's app-config.xml's <dataDir>. Since the scheduled task
+        // runs as SYSTEM, %USERPROFILE% there resolves to SYSTEM's own profile
+        // too, so the daemon was silently reading/writing an entirely
+        // different, invisible folder. Use the same real dataDir everywhere.
+        String dataDir = resolveActualDataDir();
 
         if (jarPath == null) {
             showError("Cannot locate OpsTransferTool.jar.\n"
@@ -545,8 +570,14 @@ public class SettingsPanel extends JPanel {
     }
 
     private void openDaemonLog() {
-        String logPath = System.getProperty("user.home") + File.separator
-            + ".opstool" + File.separator + "daemon.log";
+        // FIX: previously hardcoded %USERPROFILE%\.opstool\daemon.log, which
+        // is not where the daemon actually writes (see registerDaemon()
+        // above) — resolve the same real dataDir + log filename the running
+        // daemon uses, both sourced from app-config.xml. (Daemon.java lives
+        // in the default package and can't be imported from here, so this
+        // mirrors its daemonLogFileName() lookup directly — same as
+        // resolveActualDataDir() already mirrors Daemon's dataDir lookup.)
+        String logPath = resolveActualDataDir() + File.separator + resolveDaemonLogFileName();
         File logFile = new File(logPath);
         if (!logFile.exists()) {
             showInfo("No daemon log found yet.\nExpected: " + logPath
@@ -667,6 +698,7 @@ public class SettingsPanel extends JPanel {
         comboLogLevel.setSelectedItem(AppSettings.getLogLevel());
         tfJvmMinHeap.setText(AppSettings.getJvmMinHeap());
         tfJvmMaxHeap.setText(AppSettings.getJvmMaxHeap());
+        spinnerTransferBatchSize.setValue(AppSettings.getTransferBatchSize());
     }
 
     private void savePrefs() {
@@ -691,6 +723,8 @@ public class SettingsPanel extends JPanel {
             live.put(AppSettings.KEY_LOG_LEVEL, String.valueOf(comboLogLevel.getSelectedItem()));
             live.put(AppSettings.KEY_JVM_MIN_HEAP, tfJvmMinHeap.getText().trim());
             live.put(AppSettings.KEY_JVM_MAX_HEAP, tfJvmMaxHeap.getText().trim());
+            live.put(AppSettings.KEY_TRANSFER_BATCH_SIZE,
+                    String.valueOf((Integer) spinnerTransferBatchSize.getValue()));
             AppSettings.setAll(live);
         } catch (Exception ex) {
             lblStatus.setText("Could not save live settings: " + ex.getMessage());

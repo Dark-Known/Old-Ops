@@ -146,7 +146,24 @@ public class XmlStorageService {
                         t.setTargetCredentialId(child(e, "targetCredentialId"));
                         t.setSourcePath(child(e, "sourcePath"));
                         t.setTargetPath(child(e, "targetPath"));
-                        t.setServiceName(child(e, "serviceName"));
+                        t.setBackupSourcePath(child(e, "backupSourcePath"));
+                        t.setBackupDestinationPath(child(e, "backupDestinationPath"));
+                        String backupRetention = child(e, "backupRetentionDays");
+                        if (backupRetention != null && !backupRetention.isEmpty()) {
+                            try {
+                                t.setBackupRetentionDays(Integer.parseInt(backupRetention));
+                            } catch (NumberFormatException ignored) {
+                                t.setBackupRetentionDays(3);
+                            }
+                        }
+                        String backupBatch = child(e, "backupBatchDays");
+                        if (backupBatch != null && !backupBatch.isEmpty()) {
+                            try {
+                                t.setBackupBatchDays(Integer.parseInt(backupBatch));
+                            } catch (NumberFormatException ignored) {
+                                t.setBackupBatchDays(2);
+                            }
+                        }
                         t.setImapFolder(child(e, "imapFolder"));
                         t.setMailSearchCriteria(child(e, "mailSearchCriteria"));
                         String fetchMode = child(e, "mailFetchMode");
@@ -325,7 +342,10 @@ public class XmlStorageService {
                             ? t.getTransferMode().name() : TransferMode.ENTIRE_FOLDER.name());
                     addChild(doc, e, "sourcePath", t.getSourcePath());
                     addChild(doc, e, "targetPath", t.getTargetPath());
-                    addChild(doc, e, "serviceName", t.getServiceName());
+                    addChild(doc, e, "backupSourcePath", t.getBackupSourcePath());
+                    addChild(doc, e, "backupDestinationPath", t.getBackupDestinationPath());
+                    addChild(doc, e, "backupRetentionDays", String.valueOf(t.getBackupRetentionDays()));
+                    addChild(doc, e, "backupBatchDays", String.valueOf(t.getBackupBatchDays()));
                     addChild(doc, e, "imapFolder", t.getImapFolder());
                     addChild(doc, e, "mailSearchCriteria", t.getMailSearchCriteria());
                     addChild(doc, e, "mailFetchMode", t.getMailFetchMode() != null

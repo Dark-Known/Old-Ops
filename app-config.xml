@@ -198,6 +198,17 @@
         <minRAMMB>1024</minRAMMB>
     </systemRequirements>
 
+    <!-- File Transfer Settings -->
+    <transfer>
+        <!-- First-run default only. From then on this value lives in
+             app-settings.json (key "transferBatchSize"), is editable from the
+             Settings panel with no restart required, and is re-read on every
+             transfer. When a transfer (of any mode/direction) would move more
+             files than this in one go, it is split into sequential batches of
+             at most this many files. -->
+        <transferBatchSize>50</transferBatchSize>
+    </transfer>
+
     <!-- Network and Connectivity Settings -->
     <network>
         <!-- Default SFTP port -->

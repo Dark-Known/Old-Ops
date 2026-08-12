@@ -7,10 +7,10 @@ import util.*;
 
 public class ScheduledTask {
     //TODO: consider splitting enums into separate files if they grow too large or need additional methods/fields in the future
-    public enum TaskType   { FILE_TRANSFER, OUTLOOK_MAIL,START_SERVICE, STOP_SERVICE, RESTART_SERVICE }
+    public enum TaskType   { FILE_TRANSFER, OUTLOOK_MAIL, BACKUP }
     public enum TaskStatus  { PENDING, RUNNING, RETRYING, SUCCESS, FAILED, DISABLED }
     public enum ScheduleType { RUN_NOW, ONCE, DAILY, WEEKLY, INTERVAL_MINUTES, INTERVAL_SECONDS }
-    public enum TransferDirection { OUTBOUND, INBOUND, LOCAL_TO_LOCAL }
+    public enum TransferDirection { OUTBOUND, INBOUND }
     public enum TransferMode { LATEST_ONLY, ENTIRE_FOLDER, SPECIFIC_FILE }
     public enum MailFetchScope { LATEST_ONLY, ALL_MATCHING }
     
@@ -33,8 +33,13 @@ public class ScheduledTask {
     private String sourcePath;
     private String targetPath;
 
-    // Service fields
-    private String serviceName;
+    // Backup fields ("D" = today; retention keeps D, D-1 ... D-(retentionDays-1) untouched
+    // in the source folder, and each run archives up to batchDays of the oldest
+    // remaining day-buckets into the destination folder).
+    private String backupSourcePath;
+    private String backupDestinationPath;
+    private int backupRetentionDays;   // how many most-recent days to KEEP in place (D..D-(n-1))
+    private int backupBatchDays;       // how many old day-buckets to back up per run
 
     // Outlook mail fields — read via Microsoft Graph (see GraphMailService).
     // NOTE: Graph is a cloud REST API regardless of where the task runs, so the
@@ -103,6 +108,8 @@ public class ScheduledTask {
         this.watcherEnabled = false;
         this.inboundWatcherPollIntervalMinutes = 0;
         this.inboundWatcherMaxAgeMinutes = 0;
+        this.backupRetentionDays = 3;
+        this.backupBatchDays = 2;
     }
 
     // ── Getters / Setters ────────────────────────────────────────────────────
@@ -141,8 +148,17 @@ public class ScheduledTask {
     public String getTargetPath()                { return targetPath; }
     public void   setTargetPath(String s)        { this.targetPath = s; }
 
-    public String getServiceName()               { return serviceName; }
-    public void   setServiceName(String s)       { this.serviceName = s; }
+    public String getBackupSourcePath()          { return backupSourcePath; }
+    public void   setBackupSourcePath(String s)  { this.backupSourcePath = s; }
+
+    public String getBackupDestinationPath()     { return backupDestinationPath; }
+    public void   setBackupDestinationPath(String s) { this.backupDestinationPath = s; }
+
+    public int  getBackupRetentionDays()         { return backupRetentionDays; }
+    public void setBackupRetentionDays(int d)    { this.backupRetentionDays = d; }
+
+    public int  getBackupBatchDays()             { return backupBatchDays; }
+    public void setBackupBatchDays(int d)        { this.backupBatchDays = d; }
 
     public String getImapFolder()                { return imapFolder; }
     public void   setImapFolder(String s)        { this.imapFolder = s; }

@@ -530,10 +530,8 @@ public class TaskSchedulerService {
                         skipped = true;
                     }
                     break;
-                case START_SERVICE:
-                case STOP_SERVICE:
-                case RESTART_SERVICE:
-                    success = transferService.executeServiceAction(task, line -> emit(task.getId(), line));
+                case BACKUP:
+                    success = transferService.executeBackup(task, line -> emit(task.getId(), line));
                     break;
                 default:
                     emit(task.getId(), "[ERROR] Unknown task type: " + task.getTaskType());

@@ -57,6 +57,7 @@ public final class AppSettings {
     public static final String KEY_LOG_LEVEL              = "logLevel";
     public static final String KEY_JVM_MIN_HEAP           = "jvmMinHeap";
     public static final String KEY_JVM_MAX_HEAP           = "jvmMaxHeap";
+    public static final String KEY_TRANSFER_BATCH_SIZE     = "transferBatchSize";
 
     // Built-in fallbacks, used only if neither app-settings.json nor
     // app-config.xml has a value (keeps behavior identical to before this
@@ -71,6 +72,7 @@ public final class AppSettings {
         HARD_DEFAULTS.put(KEY_LOG_LEVEL, "INFO");
         HARD_DEFAULTS.put(KEY_JVM_MIN_HEAP, "512M");
         HARD_DEFAULTS.put(KEY_JVM_MAX_HEAP, "2G");
+        HARD_DEFAULTS.put(KEY_TRANSFER_BATCH_SIZE, "50");
     }
 
     // app-config.xml tag each key is seeded from on first run.
@@ -84,6 +86,7 @@ public final class AppSettings {
         XML_SEED_TAG.put(KEY_LOG_LEVEL, "logLevel");
         XML_SEED_TAG.put(KEY_JVM_MIN_HEAP, "minHeap");
         XML_SEED_TAG.put(KEY_JVM_MAX_HEAP, "maxHeap");
+        XML_SEED_TAG.put(KEY_TRANSFER_BATCH_SIZE, "transferBatchSize");
     }
 
     private static final Object LOCK = new Object();
@@ -190,6 +193,21 @@ public final class AppSettings {
     public static String getJvmMinHeap()             { return get(KEY_JVM_MIN_HEAP); }
     /** Applies only on the JVM's NEXT start — see class javadoc. */
     public static String getJvmMaxHeap()             { return get(KEY_JVM_MAX_HEAP); }
+
+    /**
+     * Max number of files sent per WinSCP session (or per local-copy progress
+     * chunk) when a transfer would otherwise move more files than this in one
+     * go. Read live on every transfer — editable from the Settings panel or
+     * by hand-editing app-settings.json, no restart required.
+     */
+    public static int getTransferBatchSize() {
+        try {
+            int v = Integer.parseInt(get(KEY_TRANSFER_BATCH_SIZE));
+            return v > 0 ? v : Integer.parseInt(HARD_DEFAULTS.get(KEY_TRANSFER_BATCH_SIZE));
+        } catch (Exception e) {
+            return Integer.parseInt(HARD_DEFAULTS.get(KEY_TRANSFER_BATCH_SIZE));
+        }
+    }
 
     // ─── Public write API ────────────────────────────────────────────────────
 

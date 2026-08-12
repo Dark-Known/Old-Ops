@@ -48,7 +48,7 @@ public class Daemon {
         new File(dataDir).mkdirs();
 
         // ── Set up file logging ──────────────────────────────────────────────
-        String logPath = dataDir + File.separator + "daemon.log";
+        String logPath = dataDir + File.separator + daemonLogFileName();
         setupLogging(logPath, dataDir);
 
         log("Ops Transfer Tool Daemon starting");
@@ -116,6 +116,17 @@ public class Daemon {
         String defaultDir = "C:\\OpsTools\\Data";
         String val = util.AppConfig.readValue("dataDir");
         return val != null ? val : defaultDir;
+    }
+
+    /**
+     * Daemon log file name, sourced from app-config.xml's
+     * &lt;logging&gt;&lt;daemonLogFile&gt; tag so the running daemon and the
+     * Settings panel's "View Daemon Log" viewer always agree on where the
+     * real log lives. Falls back to "daemon.log" if unset/unreadable.
+     */
+    public static String daemonLogFileName() {
+        String name = util.AppConfig.readValue("daemonLogFile");
+        return (name != null && !name.trim().isEmpty()) ? name.trim() : "daemon.log";
     }
 
     // ── Logging helpers ──────────────────────────────────────────────────────
