@@ -200,13 +200,28 @@
 
     <!-- File Transfer Settings -->
     <transfer>
-        <!-- First-run default only. From then on this value lives in
-             app-settings.json (key "transferBatchSize"), is editable from the
-             Settings panel with no restart required, and is re-read on every
-             transfer. When a transfer (of any mode/direction) would move more
-             files than this in one go, it is split into sequential batches of
-             at most this many files. -->
-        <transferBatchSize>50</transferBatchSize>
+        <!-- First-run defaults only. From then on these values live in
+             app-settings.json, are editable from the Settings panel with no
+             restart required, and are re-read on every transfer/backup run.
+
+             Batching is now SIZE-based rather than file-count based: when a
+             transfer or backup would move more total bytes than the batch
+             cap in one go, it is split into sequential batches, pausing
+             <transferBatchIntervalSeconds> between each one.
+
+             The batch byte cap is derived as:
+                 transferAssumedThroughputMBps * 1024 * 1024 * transferBatchTargetSeconds
+             i.e. by default, aim for each batch to complete in roughly
+             transferBatchTargetSeconds seconds assuming a link speed of
+             transferAssumedThroughputMBps. Tune transferAssumedThroughputMBps
+             to your real-world link speed for an accurate batch size, or set
+             transferBatchMaxBytes directly (>0) to bypass the derivation
+             entirely and use an explicit byte cap. -->
+        <transferBatchTargetSeconds>5</transferBatchTargetSeconds>
+        <transferAssumedThroughputMBps>5</transferAssumedThroughputMBps>
+        <!-- 0 = derive from the two settings above; set >0 to override directly (bytes) -->
+        <transferBatchMaxBytes>0</transferBatchMaxBytes>
+        <transferBatchIntervalSeconds>5</transferBatchIntervalSeconds>
     </transfer>
 
     <!-- Network and Connectivity Settings -->

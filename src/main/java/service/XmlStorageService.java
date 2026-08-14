@@ -156,14 +156,8 @@ public class XmlStorageService {
                                 t.setBackupRetentionDays(3);
                             }
                         }
-                        String backupBatch = child(e, "backupBatchDays");
-                        if (backupBatch != null && !backupBatch.isEmpty()) {
-                            try {
-                                t.setBackupBatchDays(Integer.parseInt(backupBatch));
-                            } catch (NumberFormatException ignored) {
-                                t.setBackupBatchDays(2);
-                            }
-                        }
+                        t.setBackupSourceUsername(child(e, "backupSourceUsername"));
+                        t.setBackupDestinationUsername(child(e, "backupDestinationUsername"));
                         t.setImapFolder(child(e, "imapFolder"));
                         t.setMailSearchCriteria(child(e, "mailSearchCriteria"));
                         String fetchMode = child(e, "mailFetchMode");
@@ -278,6 +272,14 @@ public class XmlStorageService {
                             }
                         }
                         list.add(t);
+                    } catch (IllegalArgumentException enumEx) {
+                        // Most commonly a stored enum value (e.g. an old taskType such as
+                        // a removed "STOP_SERVICE" service-task type from a previous
+                        // version) that no longer exists in this build. This is expected
+                        // when upgrading in place — the task is simply skipped rather than
+                        // aborting the whole load; no stack trace needed for this case.
+                        System.err.println("[WARN] Skipping legacy/unrecognized task at index " + i
+                                + " — no longer supported by this version: " + enumEx.getMessage());
                     } catch (Exception taskEx) {
                         // Log and skip only this task — don't let one corrupt
                         // <task> element wipe out every other task on save.
@@ -345,7 +347,8 @@ public class XmlStorageService {
                     addChild(doc, e, "backupSourcePath", t.getBackupSourcePath());
                     addChild(doc, e, "backupDestinationPath", t.getBackupDestinationPath());
                     addChild(doc, e, "backupRetentionDays", String.valueOf(t.getBackupRetentionDays()));
-                    addChild(doc, e, "backupBatchDays", String.valueOf(t.getBackupBatchDays()));
+                    addChild(doc, e, "backupSourceUsername", t.getBackupSourceUsername());
+                    addChild(doc, e, "backupDestinationUsername", t.getBackupDestinationUsername());
                     addChild(doc, e, "imapFolder", t.getImapFolder());
                     addChild(doc, e, "mailSearchCriteria", t.getMailSearchCriteria());
                     addChild(doc, e, "mailFetchMode", t.getMailFetchMode() != null

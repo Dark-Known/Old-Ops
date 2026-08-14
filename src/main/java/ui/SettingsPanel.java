@@ -35,7 +35,10 @@ public class SettingsPanel extends JPanel {
     private JComboBox<String> comboLogLevel;
     private JTextField tfJvmMinHeap;
     private JTextField tfJvmMaxHeap;
-    private javax.swing.JSpinner spinnerTransferBatchSize;
+    private javax.swing.JSpinner spinnerBatchTargetSeconds;
+    private javax.swing.JSpinner spinnerBatchThroughputMBps;
+    private javax.swing.JSpinner spinnerBatchIntervalSeconds;
+    private JTextField tfBatchMaxBytesOverride;
 
     public SettingsPanel(TransferService transferService) {
         this(transferService, null);
@@ -277,13 +280,28 @@ public class SettingsPanel extends JPanel {
 
         row = addFieldRow(panel, lc, fc, "Log level:", comboLogLevel, row);
 
-        spinnerTransferBatchSize = new javax.swing.JSpinner(
-                new javax.swing.SpinnerNumberModel(50, 1, 100000, 1));
-        row = addFieldRow(panel, lc, fc, "Transfer batch size:", spinnerTransferBatchSize, row);
+        spinnerBatchTargetSeconds = new javax.swing.JSpinner(
+                new javax.swing.SpinnerNumberModel(5, 1, 3600, 1));
+        row = addFieldRow(panel, lc, fc, "Batch target duration (sec):", spinnerBatchTargetSeconds, row);
 
-        JLabel batchHint = new JLabel("<html><i style='color:gray'>When any transfer (any mode/direction) "
-            + "would move more files than this in one go, it is split into sequential batches of at "
-            + "most this many files.</i></html>");
+        spinnerBatchThroughputMBps = new javax.swing.JSpinner(
+                new javax.swing.SpinnerNumberModel(5, 1, 10000, 1));
+        row = addFieldRow(panel, lc, fc, "Assumed link speed (MB/s):", spinnerBatchThroughputMBps, row);
+
+        spinnerBatchIntervalSeconds = new javax.swing.JSpinner(
+                new javax.swing.SpinnerNumberModel(5, 0, 3600, 1));
+        row = addFieldRow(panel, lc, fc, "Interval between batches (sec):", spinnerBatchIntervalSeconds, row);
+
+        tfBatchMaxBytesOverride = new JTextField(12);
+        row = addFieldRow(panel, lc, fc, "Batch size override (bytes, 0=auto):", tfBatchMaxBytesOverride, row);
+
+        JLabel batchHint = new JLabel("<html><i style='color:gray'>Transfers and backups (any mode/"
+            + "direction) are split by total FILE SIZE, not file count: each batch is capped so it "
+            + "should complete in roughly the target duration above, given the assumed link speed "
+            + "(cap = target seconds &times; link speed). A single file larger than the cap is still "
+            + "sent alone in its own batch. Between batches the run pauses for the configured "
+            + "interval. Set the override above (&gt;0 bytes) to bypass the derived cap and use an "
+            + "exact byte limit instead.</i></html>");
         GridBagConstraints bhc = new GridBagConstraints();
         bhc.gridx = 0; bhc.gridy = row++; bhc.gridwidth = 3; bhc.anchor = GridBagConstraints.WEST;
         bhc.insets = new Insets(0, 4, 8, 0);
@@ -698,7 +716,10 @@ public class SettingsPanel extends JPanel {
         comboLogLevel.setSelectedItem(AppSettings.getLogLevel());
         tfJvmMinHeap.setText(AppSettings.getJvmMinHeap());
         tfJvmMaxHeap.setText(AppSettings.getJvmMaxHeap());
-        spinnerTransferBatchSize.setValue(AppSettings.getTransferBatchSize());
+        spinnerBatchTargetSeconds.setValue(AppSettings.getTransferBatchTargetSeconds());
+        spinnerBatchThroughputMBps.setValue(AppSettings.getTransferAssumedThroughputMBps());
+        spinnerBatchIntervalSeconds.setValue(AppSettings.getTransferBatchIntervalSeconds());
+        tfBatchMaxBytesOverride.setText(AppSettings.get(AppSettings.KEY_TRANSFER_BATCH_MAX_BYTES));
     }
 
     private void savePrefs() {
@@ -723,8 +744,21 @@ public class SettingsPanel extends JPanel {
             live.put(AppSettings.KEY_LOG_LEVEL, String.valueOf(comboLogLevel.getSelectedItem()));
             live.put(AppSettings.KEY_JVM_MIN_HEAP, tfJvmMinHeap.getText().trim());
             live.put(AppSettings.KEY_JVM_MAX_HEAP, tfJvmMaxHeap.getText().trim());
-            live.put(AppSettings.KEY_TRANSFER_BATCH_SIZE,
-                    String.valueOf((Integer) spinnerTransferBatchSize.getValue()));
+            live.put(AppSettings.KEY_TRANSFER_BATCH_TARGET_SECONDS,
+                    String.valueOf((Integer) spinnerBatchTargetSeconds.getValue()));
+            live.put(AppSettings.KEY_TRANSFER_ASSUMED_THROUGHPUT_MBPS,
+                    String.valueOf((Integer) spinnerBatchThroughputMBps.getValue()));
+            live.put(AppSettings.KEY_TRANSFER_BATCH_INTERVAL_SECONDS,
+                    String.valueOf((Integer) spinnerBatchIntervalSeconds.getValue()));
+            String maxBytesOverride = tfBatchMaxBytesOverride.getText().trim();
+            try {
+                long parsed = maxBytesOverride.isEmpty() ? 0 : Long.parseLong(maxBytesOverride);
+                live.put(AppSettings.KEY_TRANSFER_BATCH_MAX_BYTES, String.valueOf(Math.max(parsed, 0)));
+            } catch (NumberFormatException nfe) {
+                lblStatus.setText("Batch size override must be a whole number of bytes.");
+                lblStatus.setForeground(Color.RED);
+                return;
+            }
             AppSettings.setAll(live);
         } catch (Exception ex) {
             lblStatus.setText("Could not save live settings: " + ex.getMessage());

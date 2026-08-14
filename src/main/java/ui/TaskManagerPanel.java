@@ -31,8 +31,6 @@ public class TaskManagerPanel extends JPanel {
     private static final Color COLOR_SUCCESS  = new Color(0xE8F5E9); // light green
     private static final Color COLOR_DISABLED = new Color(0xF5F5F5); // light grey
     private static final Color COLOR_SKIPPED  = new Color(0xFFF8E1); // light amber
-    // Local-to-local tasks get a distinct tint (light teal) so ops can spot them at a glance
-    private static final Color COLOR_LOCAL    = new Color(0xE0F7FA); // light teal
 
     private final XmlStorageService storage;
     private final TaskSchedulerService scheduler;
@@ -351,7 +349,6 @@ public class TaskManagerPanel extends JPanel {
         p.add(legendChip(COLOR_SKIPPED,  "Skipped (no new file)"));
         p.add(legendChip(COLOR_FAILED,   "Failed"));
         p.add(legendChip(COLOR_DISABLED, "Disabled"));
-        p.add(legendChip(COLOR_LOCAL,    "Local->Local"));
         return p;
     }
 
@@ -373,11 +370,8 @@ public class TaskManagerPanel extends JPanel {
 
     /**
      * Returns the background colour for a table row.
-     * LOCAL-mode column value (col 3) is set to "LOCAL" for local→local tasks,
-     * giving them a distinct teal tint that stands out from both SUCCESS and RUNNING.
      */
     private Color rowColor(String status, String lastResult, String mode) {
-        if ("LOCAL".equals(mode)) return COLOR_LOCAL; // local->local always teal
         if (status == null) return Color.WHITE;
         switch (status) {
             case "RUNNING":  return COLOR_RUNNING;
@@ -403,7 +397,6 @@ public class TaskManagerPanel extends JPanel {
         tableModel.setRowCount(0);
 
         List<ScheduledTask> tasks = storage.loadTasks();
-        String localHost = TransferService.getLocalHostname();
 
         for (ScheduledTask t : tasks) {
             String schedDesc  = buildScheduleDescription(t);
@@ -412,23 +405,12 @@ public class TaskManagerPanel extends JPanel {
             String displayResult = lastResult;
             if ("SKIPPED".equals(lastResult)) displayResult = "SKIPPED";
 
-            // Determine if this is a local→local task for the Mode column.
-            // We check: FILE_TRANSFER + INBOUND + (no targetUsername = local route in factory).
-            boolean isLocalToLocal = t.getTaskType() == TaskType.FILE_TRANSFER
-                && t.getTransferDirection() == TransferDirection.INBOUND
-                && (t.getTargetUsername() == null || t.getTargetUsername().isEmpty());
-
             String directionCell = t.getTaskType() == TaskType.FILE_TRANSFER
                 ? t.getTransferDirection().name() : "";
 
-            // Mode column: show transfer mode for remote, "LOCAL" for local→local
-            String modeCell;
-            if (t.getTaskType() == TaskType.FILE_TRANSFER) {
-                modeCell = isLocalToLocal ? "LOCAL"
-                    : (t.getTransferMode() != null ? t.getTransferMode().name() : "");
-            } else {
-                modeCell = "";
-            }
+            String modeCell = t.getTaskType() == TaskType.FILE_TRANSFER
+                ? (t.getTransferMode() != null ? t.getTransferMode().name() : "")
+                : "";
 
             tableModel.addRow(new Object[]{
                 t.getName(),

@@ -57,7 +57,22 @@ public final class AppSettings {
     public static final String KEY_LOG_LEVEL              = "logLevel";
     public static final String KEY_JVM_MIN_HEAP           = "jvmMinHeap";
     public static final String KEY_JVM_MAX_HEAP           = "jvmMaxHeap";
-    public static final String KEY_TRANSFER_BATCH_SIZE     = "transferBatchSize";
+
+    // ── Size-based transfer batching (replaces the old file-count based
+    //    "transferBatchSize") ──────────────────────────────────────────────
+    // A batch is capped by total bytes rather than file count, because a
+    // handful of huge files can take far longer than many small ones. The
+    // byte cap is derived from two tunable numbers so an admin can reason
+    // about it in human terms ("finish a batch in ~5s over a ~5MB/s link")
+    // instead of guessing a raw byte count:
+    //   maxBytes = assumedThroughputMBps * 1024 * 1024 * batchTargetSeconds
+    // An explicit KEY_TRANSFER_BATCH_MAX_BYTES override is honored if set
+    // (> 0) so an admin who knows their real throughput can just set bytes
+    // directly instead of the two derived inputs.
+    public static final String KEY_TRANSFER_BATCH_TARGET_SECONDS   = "transferBatchTargetSeconds";
+    public static final String KEY_TRANSFER_ASSUMED_THROUGHPUT_MBPS = "transferAssumedThroughputMBps";
+    public static final String KEY_TRANSFER_BATCH_MAX_BYTES        = "transferBatchMaxBytes";
+    public static final String KEY_TRANSFER_BATCH_INTERVAL_SECONDS = "transferBatchIntervalSeconds";
 
     // Built-in fallbacks, used only if neither app-settings.json nor
     // app-config.xml has a value (keeps behavior identical to before this
@@ -72,7 +87,12 @@ public final class AppSettings {
         HARD_DEFAULTS.put(KEY_LOG_LEVEL, "INFO");
         HARD_DEFAULTS.put(KEY_JVM_MIN_HEAP, "512M");
         HARD_DEFAULTS.put(KEY_JVM_MAX_HEAP, "2G");
-        HARD_DEFAULTS.put(KEY_TRANSFER_BATCH_SIZE, "50");
+        // Default: aim for each batch to finish in ~5s assuming a conservative
+        // ~5 MB/s link -> 5 * 5*1024*1024 = 26214400 bytes (~25 MB) per batch.
+        HARD_DEFAULTS.put(KEY_TRANSFER_BATCH_TARGET_SECONDS, "5");
+        HARD_DEFAULTS.put(KEY_TRANSFER_ASSUMED_THROUGHPUT_MBPS, "5");
+        HARD_DEFAULTS.put(KEY_TRANSFER_BATCH_MAX_BYTES, "0"); // 0 = derive from the two settings above
+        HARD_DEFAULTS.put(KEY_TRANSFER_BATCH_INTERVAL_SECONDS, "5");
     }
 
     // app-config.xml tag each key is seeded from on first run.
@@ -86,7 +106,10 @@ public final class AppSettings {
         XML_SEED_TAG.put(KEY_LOG_LEVEL, "logLevel");
         XML_SEED_TAG.put(KEY_JVM_MIN_HEAP, "minHeap");
         XML_SEED_TAG.put(KEY_JVM_MAX_HEAP, "maxHeap");
-        XML_SEED_TAG.put(KEY_TRANSFER_BATCH_SIZE, "transferBatchSize");
+        XML_SEED_TAG.put(KEY_TRANSFER_BATCH_TARGET_SECONDS, "transferBatchTargetSeconds");
+        XML_SEED_TAG.put(KEY_TRANSFER_ASSUMED_THROUGHPUT_MBPS, "transferAssumedThroughputMBps");
+        XML_SEED_TAG.put(KEY_TRANSFER_BATCH_MAX_BYTES, "transferBatchMaxBytes");
+        XML_SEED_TAG.put(KEY_TRANSFER_BATCH_INTERVAL_SECONDS, "transferBatchIntervalSeconds");
     }
 
     private static final Object LOCK = new Object();
@@ -194,19 +217,52 @@ public final class AppSettings {
     /** Applies only on the JVM's NEXT start — see class javadoc. */
     public static String getJvmMaxHeap()             { return get(KEY_JVM_MAX_HEAP); }
 
-    /**
-     * Max number of files sent per WinSCP session (or per local-copy progress
-     * chunk) when a transfer would otherwise move more files than this in one
-     * go. Read live on every transfer — editable from the Settings panel or
-     * by hand-editing app-settings.json, no restart required.
-     */
-    public static int getTransferBatchSize() {
+    private static int intOrDefault(String key) {
         try {
-            int v = Integer.parseInt(get(KEY_TRANSFER_BATCH_SIZE));
-            return v > 0 ? v : Integer.parseInt(HARD_DEFAULTS.get(KEY_TRANSFER_BATCH_SIZE));
+            int v = Integer.parseInt(get(key));
+            return v > 0 ? v : Integer.parseInt(HARD_DEFAULTS.get(key));
         } catch (Exception e) {
-            return Integer.parseInt(HARD_DEFAULTS.get(KEY_TRANSFER_BATCH_SIZE));
+            return Integer.parseInt(HARD_DEFAULTS.get(key));
         }
+    }
+
+    public static int getTransferBatchTargetSeconds() {
+        return intOrDefault(KEY_TRANSFER_BATCH_TARGET_SECONDS);
+    }
+
+    public static int getTransferAssumedThroughputMBps() {
+        return intOrDefault(KEY_TRANSFER_ASSUMED_THROUGHPUT_MBPS);
+    }
+
+    public static int getTransferBatchIntervalSeconds() {
+        try {
+            int v = Integer.parseInt(get(KEY_TRANSFER_BATCH_INTERVAL_SECONDS));
+            return v >= 0 ? v : Integer.parseInt(HARD_DEFAULTS.get(KEY_TRANSFER_BATCH_INTERVAL_SECONDS));
+        } catch (Exception e) {
+            return Integer.parseInt(HARD_DEFAULTS.get(KEY_TRANSFER_BATCH_INTERVAL_SECONDS));
+        }
+    }
+
+    /**
+     * Max total bytes moved per batch (WinSCP session, or local-copy progress
+     * chunk) before pausing for {@link #getTransferBatchIntervalSeconds()}
+     * and starting the next batch. If an explicit override (&gt; 0) is set via
+     * {@link #KEY_TRANSFER_BATCH_MAX_BYTES}, it is used as-is; otherwise the
+     * cap is derived from the target-seconds / assumed-throughput pair so the
+     * *default* results in each batch completing in roughly
+     * {@link #getTransferBatchTargetSeconds()} seconds. Read live on every
+     * transfer — editable from the Settings panel, app-settings.json, or
+     * app-config.xml — no restart required.
+     */
+    public static long getTransferBatchMaxBytes() {
+        try {
+            long override = Long.parseLong(get(KEY_TRANSFER_BATCH_MAX_BYTES));
+            if (override > 0) return override;
+        } catch (Exception ignored) { /* fall through to derived value */ }
+        long throughputBytesPerSec = (long) getTransferAssumedThroughputMBps() * 1024L * 1024L;
+        long targetSeconds = getTransferBatchTargetSeconds();
+        long derived = throughputBytesPerSec * targetSeconds;
+        return derived > 0 ? derived : 26_214_400L; // 25MB absolute fallback
     }
 
     // ─── Public write API ────────────────────────────────────────────────────

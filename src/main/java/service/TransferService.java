@@ -37,6 +37,8 @@ import java.util.stream.Collectors;
 
 /**
  * Executes file transfers via WinSCP's scripting interface (winscp.com).
+ * Local→local file transfers are not supported — every FILE_TRANSFER task
+ * moves data to/from a remote SFTP target.
  *
  * <h2>Watcher integration — both directions</h2>
  * When {@code task.isWatcherEnabled() == true} AND
@@ -49,27 +51,17 @@ import java.util.stream.Collectors;
  *       lastModified is newer than the stored epoch.  Those files are then
  *       pushed to the remote with WinSCP {@code put}.</li>
  *   <li><b>INBOUND LATEST_ONLY</b> — {@link SftpRemoteFileMetadataService}
- *       (or {@link LocalFileMetadataService} for local→local) lists the
- *       <em>remote</em> source directory and returns only new files.  Those
- *       files are pulled with WinSCP {@code get} (or {@link Files#copy} for
- *       local→local).</li>
+ *       lists the <em>remote</em> source directory and returns only new
+ *       files.  Those files are pulled with WinSCP {@code get}.</li>
  * </ul>
  *
- * <h2>Local→local mode (non-watcher)</h2>
- * When the task is INBOUND and the target host is local (blank / localhost /
- * 127.0.0.1 / local hostname), {@link #executeTransfer} bypasses WinSCP
- * entirely and routes directly to {@link #executeLocalCopy}.  All three
- * transfer modes are supported:
- * <ul>
- *   <li>ENTIRE_FOLDER — copies every regular file in the source directory.</li>
- *   <li>LATEST_ONLY   — copies only the file(s) with the newest lastModified
- *       timestamp.  (The watcher variant uses the stored baseline epoch; the
- *       non-watcher variant resolves the latest file at run-time.)</li>
- *   <li>SPECIFIC_FILE — copies the single file identified by
- *       {@code task.getTargetPath()}.</li>
- * </ul>
+ * <h2>Batching</h2>
+ * Transfers (and Backup) are split into SIZE-based batches — see
+ * {@link AppSettings#getTransferBatchMaxBytes()} — rather than a fixed file
+ * count, with a configurable pause between batches
+ * ({@link AppSettings#getTransferBatchIntervalSeconds()}).
  *
- * In both cases an empty result throws {@link WatcherSkipException} so the
+ * In watcher mode an empty result throws {@link WatcherSkipException} so the
  * scheduler marks the run SKIPPED rather than FAILED.  On success the epoch
  * of the newest transferred file is persisted as the new baseline.
  */
@@ -141,17 +133,12 @@ public class TransferService {
             return executeWatcherTransfer(task, target, logLine);
         }
 
-        // ── FIX A: Local→local non-watcher path ──────────────────────────────
-        // When target credential is null (or resolves to the local machine),
-        // the task is a local→local copy — route to executeLocalCopy instead
-        // of falling through to WinSCP (which would crash with a null credential).
-        if (isLocalToLocalTask(task, target)) {
-            return executeLocalCopyNonWatcher(task, logLine);
-        }
-
         // ── Non-watcher remote path ───────────────────────────────────────────
+        // Local→local file transfers are not supported — every FILE_TRANSFER
+        // task must resolve to a remote target credential.
         if (target == null) {
-            logLine.accept("[ERROR] No target credential resolved and task is not local→local.");
+            logLine.accept("[ERROR] No target credential resolved. Local\u2192local file transfers are "
+                    + "not supported — set a Target Username/host/credential for this task.");
             return false;
         }
 
@@ -178,153 +165,31 @@ public class TransferService {
         }
     }
 
-    // ─── Local→local detection ────────────────────────────────────────────────
+    // ─── Local file batch helper (used by Backup for a local source/destination) ──
+
+    /** Whether a local file batch operation copies (leaves original in place) or moves it. */
+    private enum LocalFileOp { COPY, MOVE }
 
     /**
-     * Returns {@code true} when this task should use local filesystem copy
-     * rather than WinSCP — i.e. credential is null OR the credential's host
-     * resolves to the local machine.
+     * Transfers {@code files} into {@code destDir} on the local filesystem, in
+     * SIZE-based batches (see {@link AppSettings#getTransferBatchMaxBytes()}),
+     * pausing {@link AppSettings#getTransferBatchIntervalSeconds()} between
+     * batches. Used by Backup for a local source/destination side.
      */
-    private boolean isLocalToLocalTask(ScheduledTask task, Credential target) {
-        if (task.getTransferDirection() != TransferDirection.INBOUND) return false;
-        if (target == null) return true;
-        String host = target.getHost();
-        if (host == null || host.isEmpty()) return true;
-        String localHost = getLocalHostname();
-        return host.equalsIgnoreCase("localhost")
-                || host.equals("127.0.0.1")
-                || (localHost != null && localHost.equalsIgnoreCase(host));
-    }
-
-    // ─── Local→local copy — non-watcher entry point ──────────────────────────
-
-    /**
-     * Handles all three transfer modes for INBOUND local→local when the watcher
-     * is NOT enabled (or mode is not LATEST_ONLY).
-     *
-     * <p>INBOUND path semantics:
-     * <ul>
-     *   <li>{@code task.getTargetPath()} — the watch/source folder (files come from here)</li>
-     *   <li>{@code task.getSourcePath()} — the local destination folder</li>
-     * </ul>
-     */
-    private boolean executeLocalCopyNonWatcher(ScheduledTask task, Consumer<String> logLine) {
-        Path srcDir  = Paths.get(task.getTargetPath());   // watch folder
-        Path destDir = Paths.get(task.getSourcePath());   // local destination
-
-        logLine.accept("[INFO] Local→local copy (non-watcher)");
-        logLine.accept("[INFO]   Source      : " + srcDir);
-        logLine.accept("[INFO]   Destination : " + destDir);
-        logLine.accept("[INFO]   Mode        : " + task.getTransferMode());
-
-        if (!Files.isDirectory(srcDir)) {
-            logLine.accept("[ERROR] Source directory does not exist: " + srcDir);
-            return false;
-        }
-
-        try {
-            Files.createDirectories(destDir);
-        } catch (IOException ex) {
-            logLine.accept("[ERROR] Cannot create destination directory: " + ex.getMessage());
-            return false;
-        }
-
-        TransferMode mode = task.getTransferMode() != null
-                ? task.getTransferMode() : TransferMode.ENTIRE_FOLDER;
-
-        switch (mode) {
-
-            case SPECIFIC_FILE: {
-                // targetPath is the full path to the specific file
-                Path src  = Paths.get(task.getTargetPath());
-                Path dest = destDir.resolve(src.getFileName());
-                return copySingleFile(src, dest, logLine);
-            }
-
-            case LATEST_ONLY: {
-                // Resolve the newest file at run-time (no stored baseline used here)
-                List<Path> latest = resolveLatestLocalFiles(srcDir, logLine);
-                if (latest.isEmpty()) return false;
-                return copyFilesInBatches(latest, destDir, logLine);
-            }
-
-            case ENTIRE_FOLDER:
-            default: {
-                return copyEntireFolder(srcDir, destDir, logLine);
-            }
-        }
-    }
-
-    /**
-     * Returns the file(s) in {@code dir} whose lastModified timestamp equals
-     * the maximum lastModified of all regular files in the directory.
-     */
-    private List<Path> resolveLatestLocalFiles(Path dir, Consumer<String> logLine) {
-        List<Path> all = new ArrayList<>();
-        try (DirectoryStream<Path> ds = Files.newDirectoryStream(dir)) {
-            for (Path p : ds) {
-                if (Files.isRegularFile(p)) all.add(p);
-            }
-        } catch (IOException ex) {
-            logLine.accept("[ERROR] Cannot list source directory: " + ex.getMessage());
-            return Collections.emptyList();
-        }
-
-        if (all.isEmpty()) {
-            logLine.accept("[WARN] Source directory is empty: " + dir);
-            return Collections.emptyList();
-        }
-
-        long maxTs = all.stream()
-                .mapToLong(p -> p.toFile().lastModified())
-                .max().orElse(0L);
-
-        List<Path> latest = all.stream()
-                .filter(p -> p.toFile().lastModified() == maxTs)
-                .collect(Collectors.toList());
-
-        logLine.accept("[INFO] LATEST_ONLY resolved " + latest.size()
-                + " file(s) with timestamp " + Instant.ofEpochMilli(maxTs));
-        return latest;
-    }
-
-    /** Copies every regular file (non-recursive) from {@code srcDir} to {@code destDir}, in batches. */
-    private boolean copyEntireFolder(Path srcDir, Path destDir, Consumer<String> logLine) {
-        List<Path> files = new ArrayList<>();
-        try (DirectoryStream<Path> ds = Files.newDirectoryStream(srcDir)) {
-            for (Path entry : ds) {
-                if (Files.isRegularFile(entry)) files.add(entry);
-            }
-        } catch (IOException ex) {
-            logLine.accept("[ERROR] Cannot list source directory: " + ex.getMessage());
-            return false;
-        }
-        if (files.isEmpty()) {
-            logLine.accept("[WARN] Source directory contained no regular files: " + srcDir);
-            return false;
-        }
-        return copyFilesInBatches(files, destDir, logLine);
-    }
-
-    /**
-     * Copies {@code files} into {@code destDir} in chunks of the configured
-     * transfer batch size, logging progress per batch — mirrors the WinSCP
-     * batching used for remote transfers so a very large local folder is
-     * worked through in bounded, visible chunks rather than one silent loop.
-     */
-    private boolean copyFilesInBatches(List<Path> files, Path destDir, Consumer<String> logLine) {
-        int batchSize = getConfiguredBatchSize();
-        List<List<Path>> batches = chunk(files, batchSize);
+    private boolean runLocalFileBatch(List<Path> files, Path destDir, LocalFileOp op, Consumer<String> logLine) {
+        List<List<Path>> batches = chunkPathsBySize(files);
+        long maxBytes = AppSettings.getTransferBatchMaxBytes();
+        int intervalSeconds = AppSettings.getTransferBatchIntervalSeconds();
         if (batches.size() > 1) {
-            logLine.accept("[INFO] " + files.size() + " file(s) to copy — splitting into "
-                    + batches.size() + " batch(es) of up to " + batchSize + " file(s) each"
-                    + " (transfer batch size, configurable in Settings).");
+            logLine.accept("[INFO] " + files.size() + " file(s) to " + (op == LocalFileOp.MOVE ? "move" : "copy")
+                    + " — splitting into " + batches.size() + " batch(es), capped at ~"
+                    + humanReadableBytes(maxBytes) + " per batch (configurable in Settings).");
         }
         boolean allOk = true;
-        int copied = 0;
+        int done = 0;
         for (int i = 0; i < batches.size(); i++) {
             if (Thread.currentThread().isInterrupted()) {
-                logLine.accept("[INFO] Copy cancelled.");
+                logLine.accept("[INFO] " + (op == LocalFileOp.MOVE ? "Backup" : "Copy") + " cancelled.");
                 return false;
             }
             List<Path> batch = batches.get(i);
@@ -333,13 +198,19 @@ public class TransferService {
                         + " (" + batch.size() + " file(s))");
             }
             for (Path src : batch) {
-                boolean ok = copySingleFile(src, destDir.resolve(src.getFileName()), logLine);
+                boolean ok = op == LocalFileOp.MOVE
+                        ? moveSingleFile(src, destDir.resolve(src.getFileName()), logLine)
+                        : copySingleFile(src, destDir.resolve(src.getFileName()), logLine);
                 allOk &= ok;
-                if (ok) copied++;
+                if (ok) done++;
+            }
+            if (i < batches.size() - 1 && intervalSeconds > 0) {
+                sleepBetweenBatches(intervalSeconds, logLine);
             }
         }
         if (allOk) {
-            logLine.accept("[SUCCESS] Local copy completed (" + copied + " file(s)).");
+            logLine.accept("[SUCCESS] Local " + (op == LocalFileOp.MOVE ? "backup" : "copy")
+                    + " completed (" + done + " file(s)).");
         }
         return allOk;
     }
@@ -354,6 +225,34 @@ public class TransferService {
             logLine.accept("[ERROR] Failed to copy " + src.getFileName() + ": " + ex.getMessage());
             return false;
         }
+    }
+
+    /** Moves a single file, replacing the destination if it already exists. */
+    private boolean moveSingleFile(Path src, Path dest, Consumer<String> logLine) {
+        try {
+            Files.move(src, dest, StandardCopyOption.REPLACE_EXISTING);
+            logLine.accept("[SUCCESS] Backed up: " + src.getFileName());
+            return true;
+        } catch (IOException ex) {
+            logLine.accept("[ERROR] Failed to back up " + src.getFileName() + ": " + ex.getMessage());
+            return false;
+        }
+    }
+
+    private void sleepBetweenBatches(int intervalSeconds, Consumer<String> logLine) {
+        try {
+            logLine.accept("[INFO] Pausing " + intervalSeconds + "s before next batch...");
+            Thread.sleep(intervalSeconds * 1000L);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private static String humanReadableBytes(long bytes) {
+        if (bytes < 1024) return bytes + " B";
+        int exp = (int) (Math.log(bytes) / Math.log(1024));
+        String pre = "KMGTPE".charAt(exp - 1) + "";
+        return String.format(Locale.ROOT, "%.1f %sB", bytes / Math.pow(1024, exp), pre);
     }
 
     // ─── Watcher transfer — unified for INBOUND and OUTBOUND ─────────────────
@@ -392,7 +291,6 @@ public class TransferService {
                 + " (epoch=" + lastKnownEpochMillis + ")");
 
         List<RemoteFileMetadata> newFiles;
-        boolean isLocalToLocal;
 
         if (isOutbound) {
             // OUTBOUND: always scan the LOCAL source directory
@@ -429,24 +327,13 @@ public class TransferService {
                 newFiles = latestOnly;
             }
 
-            isLocalToLocal = false; // outbound always uses WinSCP to push
-
         } else {
-            // INBOUND: scan remote (or local-to-local) source directory
+            // INBOUND: scan the remote source directory over SFTP
             try (ManagedMetadataService managed =
                          metadataServiceFactory.create(task, target)) {
 
-                isLocalToLocal = (managed.sshSession() == null);
                 String watchDir = managed.watchDirectory();
-
-//                // Temporary SFTP path probe (only for real SFTP connections)
-//                if (!isLocalToLocal) {
-//                    probeWindowsRemotePaths(managed.sshSession(), watchDir, logLine);
-//                }
-
-                logLine.accept("[INFO] Metadata service: "
-                        + (isLocalToLocal ? "LOCAL" : "SFTP")
-                        + " | watch directory: " + watchDir);
+                logLine.accept("[INFO] Metadata service: SFTP | watch directory: " + watchDir);
 
                 if (lastKnownEpochMillis > 0 && task.getLastKnownRemoteFileSize() >= 0) {
                     Instant modifiedAfterInclusive = Instant.ofEpochMilli(lastKnownEpochMillis - 1);
@@ -507,8 +394,6 @@ public class TransferService {
         boolean success;
         if (isOutbound) {
             success = executeWinScpWatcherOutbound(task, target, newFiles, logLine);
-        } else if (isLocalToLocal) {
-            success = executeLocalCopy(task, newFiles, logLine);
         } else {
             success = executeWinScpWatcherInbound(task, target, newFiles, logLine);
         }
@@ -603,12 +488,14 @@ public class TransferService {
         String remoteDir      = remotePath.endsWith("/") ? remotePath : remotePath + "/";
 
         try {
-            List<String> commands = new ArrayList<>();
+            List<SizedCommand> commands = new ArrayList<>();
             for (RemoteFileMetadata meta : files) {
                 String localFile  = normalizeLocalPath(
                         Paths.get(localSourceDir, meta.fileName()).toString());
                 String remoteFile = remoteDir + meta.fileName();
-                commands.add("put " + escapeWinScpPath(localFile) + " " + escapeWinScpRemotePath(remoteFile));
+                commands.add(new SizedCommand(
+                        "put " + escapeWinScpPath(localFile) + " " + escapeWinScpRemotePath(remoteFile),
+                        meta.size()));
                 logLine.accept("[INFO] Queued outbound: " + localFile + " → " + remoteFile);
             }
             return runBatchedWinScpCommands(target, target.getPassword(), commands, logLine, task.getId());
@@ -629,11 +516,13 @@ public class TransferService {
         String remoteDir    = remotePath.endsWith("/") ? remotePath : remotePath + "/";
 
         try {
-            List<String> commands = new ArrayList<>();
+            List<SizedCommand> commands = new ArrayList<>();
             for (RemoteFileMetadata meta : files) {
                 String remoteFile = remoteDir + meta.fileName();
                 String destPath   = buildLocalDestinationPath(localDestDir, meta.fileName());
-                commands.add("get " + escapeWinScpRemotePath(remoteFile) + " " + escapeWinScpPath(destPath));
+                commands.add(new SizedCommand(
+                        "get " + escapeWinScpRemotePath(remoteFile) + " " + escapeWinScpPath(destPath),
+                        meta.size()));
                 logLine.accept("[INFO] Queued inbound: " + remoteFile + " → " + destPath);
             }
             return runBatchedWinScpCommands(target, target.getPassword(), commands, logLine, task.getId());
@@ -641,38 +530,6 @@ public class TransferService {
             logLine.accept("[ERROR] Inbound watcher WinSCP transfer failed: " + ex.getMessage());
             return false;
         }
-    }
-
-    // ─── Local→local copy — watcher path (LATEST_ONLY + watcher enabled) ─────
-
-    /**
-     * Called by the watcher path for INBOUND local→local transfers.
-     * The {@code files} list is already filtered by the watcher baseline.
-     *
-     * INBOUND semantics:
-     *   targetPath = watch folder (source)
-     *   sourcePath = local destination
-     */
-    private boolean executeLocalCopy(ScheduledTask task,
-                                     List<RemoteFileMetadata> files,
-                                     Consumer<String> logLine) {
-        Path srcDir  = Paths.get(task.getTargetPath());   // watch folder (source)
-        Path destDir = Paths.get(task.getSourcePath());   // local destination
-
-        if (!Files.isDirectory(destDir)) {
-            try {
-                Files.createDirectories(destDir);
-                logLine.accept("[INFO] Created destination directory: " + destDir);
-            } catch (IOException ex) {
-                logLine.accept("[ERROR] Cannot create destination directory '"
-                        + destDir + "': " + ex.getMessage());
-                return false;
-            }
-        }
-
-        List<Path> srcPaths = new ArrayList<>();
-        for (RemoteFileMetadata meta : files) srcPaths.add(srcDir.resolve(meta.fileName()));
-        return copyFilesInBatches(srcPaths, destDir, logLine);
     }
 
     // ─── WinSCP script builder (non-watcher remote paths) ────────────────────
@@ -726,16 +583,17 @@ public class TransferService {
 
     // ─── Legacy WinSCP ls (non-watcher INBOUND LATEST_ONLY fallback) ─────────
 
-    private static class LatestRemoteFiles {
-        final List<String> files;
-        final long latestEpochMillis;
-        LatestRemoteFiles(List<String> files, long latestEpochMillis) {
-            this.files             = files;
-            this.latestEpochMillis = latestEpochMillis;
+    /** A remote file's last-modified epoch (ms) and size (bytes), as parsed from `ls -l`. */
+    private static final class RemoteFileStat {
+        final long epochMillis;
+        final long size;
+        RemoteFileStat(long epochMillis, long size) {
+            this.epochMillis = epochMillis;
+            this.size = size;
         }
     }
 
-    private java.util.Map<String, Long> rawRemoteFileEpochs(
+    private java.util.Map<String, RemoteFileStat> rawRemoteFileStats(
             Credential target, String password, String dirPath,
             Consumer<String> logLine) throws Exception {
 
@@ -781,13 +639,16 @@ public class TransferService {
         MONTH_MAP.put("oct",10);MONTH_MAP.put("nov",11);MONTH_MAP.put("dec",12);
 
         int currentYear = LocalDate.now().getYear();
-        java.util.Map<String, Long> fileEpochs = new java.util.LinkedHashMap<>();
+        java.util.Map<String, RemoteFileStat> fileStats = new java.util.LinkedHashMap<>();
 
         for (String line : rawLines) {
             String t = line.trim();
             if (t.isEmpty() || !t.startsWith("-")) continue;
             String[] parts = t.split("\\s+", 10);
             if (parts.length < 9) continue;
+
+            long sizeBytes;
+            try { sizeBytes = Long.parseLong(parts[4]); } catch (NumberFormatException e) { sizeBytes = 0L; }
 
             String monthStr   = parts[5].toLowerCase(java.util.Locale.ENGLISH);
             String dayStr     = parts[6].trim();
@@ -825,10 +686,10 @@ public class TransferService {
                 }
             } catch (Exception ex) { continue; }
 
-            fileEpochs.put(dirPath + fileName, epochMillis);
+            fileStats.put(dirPath + fileName, new RemoteFileStat(epochMillis, sizeBytes));
         }
 
-        return fileEpochs;
+        return fileStats;
     }
 
     private static String remoteListingDirFor(String remotePath) {
@@ -837,33 +698,13 @@ public class TransferService {
                 : remotePath.endsWith("/") ? remotePath : remotePath + "/";
     }
 
-    private LatestRemoteFiles resolveLatestRemoteFilesViaWinScp(
+    /** Full remote file listing WITH sizes, keyed by full remote path — used for size-based batching. */
+    private java.util.Map<String, RemoteFileStat> listAllRemoteFileStatsViaWinScp(
             Credential target, String password, String remotePath,
             Consumer<String> logLine) throws Exception {
 
         String dirPath = remoteListingDirFor(remotePath);
-        java.util.Map<String, Long> fileEpochs = rawRemoteFileEpochs(target, password, dirPath, logLine);
-
-        if (fileEpochs.isEmpty()) return new LatestRemoteFiles(Collections.emptyList(), 0L);
-
-        long maxTs = fileEpochs.values().stream().mapToLong(Long::longValue).max().getAsLong();
-        List<String> latest = new ArrayList<>();
-        for (java.util.Map.Entry<String, Long> e : fileEpochs.entrySet()) {
-            if (e.getValue() == maxTs) latest.add(e.getKey());
-        }
-        return new LatestRemoteFiles(latest, maxTs);
-    }
-
-    /** Full (non-latest-only) remote file listing, sorted by name for deterministic batching. */
-    private List<String> listAllRemoteFilesViaWinScp(
-            Credential target, String password, String remotePath,
-            Consumer<String> logLine) throws Exception {
-
-        String dirPath = remoteListingDirFor(remotePath);
-        java.util.Map<String, Long> fileEpochs = rawRemoteFileEpochs(target, password, dirPath, logLine);
-        List<String> all = new ArrayList<>(fileEpochs.keySet());
-        Collections.sort(all);
-        return all;
+        return rawRemoteFileStats(target, password, dirPath, logLine);
     }
 
     // ─── WinSCP process runner ────────────────────────────────────────────────
@@ -912,50 +753,75 @@ public class TransferService {
 
     // ─── Batch splitting (any transfer mode, any direction) ──────────────────
     //
-    // When a transfer would move more files than the configured batch size in
-    // one go, it is split into sequential chunks so no single run/session has
-    // to move an unbounded number of files. Batch size is read live from
-    // AppSettings (app-settings.json, seeded from app-config.xml's
-    // <transfer><transferBatchSize>) — editable from the Settings panel with
-    // no restart required.
+    // Batches are SIZE-based (total bytes) rather than file-count based: when
+    // a transfer or backup would move more total bytes than the configured
+    // cap in one go, it is split into sequential batches, each capped near
+    // AppSettings.getTransferBatchMaxBytes(), with a pause of
+    // AppSettings.getTransferBatchIntervalSeconds() between batches. A single
+    // file larger than the cap is still sent alone in its own batch — it is
+    // never split. Values are read live from AppSettings (app-settings.json,
+    // seeded from app-config.xml's <transfer> block) — editable from the
+    // Settings panel with no restart required.
 
-    private int getConfiguredBatchSize() {
-        int size = AppSettings.getTransferBatchSize();
-        return size > 0 ? size : Integer.MAX_VALUE;
+    /** A WinSCP command line ("put ..."/"get ...") paired with the transferred file's size, for size-based batching. */
+    private static final class SizedCommand {
+        final String command;
+        final long size;
+        SizedCommand(String command, long size) { this.command = command; this.size = size; }
     }
 
-    private static <T> List<List<T>> chunk(List<T> items, int size) {
+    private static <T> List<List<T>> chunkBySize(
+            List<T> items, java.util.function.ToLongFunction<T> sizeOf, long maxBytes) {
         List<List<T>> out = new ArrayList<>();
-        if (items.isEmpty() || size <= 0) return out;
-        for (int i = 0; i < items.size(); i += size) {
-            out.add(new ArrayList<>(items.subList(i, Math.min(i + size, items.size()))));
+        if (items.isEmpty()) return out;
+        if (maxBytes <= 0) maxBytes = Long.MAX_VALUE;
+        List<T> current = new ArrayList<>();
+        long currentSize = 0;
+        for (T item : items) {
+            long sz = Math.max(sizeOf.applyAsLong(item), 0);
+            if (!current.isEmpty() && currentSize + sz > maxBytes) {
+                out.add(current);
+                current = new ArrayList<>();
+                currentSize = 0;
+            }
+            current.add(item);
+            currentSize += sz;
         }
+        if (!current.isEmpty()) out.add(current);
         return out;
     }
 
+    private static List<List<Path>> chunkPathsBySize(List<Path> files) {
+        long maxBytes = AppSettings.getTransferBatchMaxBytes();
+        return chunkBySize(files, p -> { try { return Files.size(p); } catch (IOException e) { return 0L; } }, maxBytes);
+    }
+
     /**
-     * Runs a list of WinSCP command lines (e.g. "put ..."/"get ...") against
-     * one SFTP session per batch, so a large file set is worked through in
-     * bounded-size chunks instead of one unbounded script. Continues through
-     * remaining batches even if an earlier one fails, so a transient failure
-     * partway through a large backlog doesn't block everything after it;
-     * overall success requires every batch to have succeeded.
+     * Runs a list of sized WinSCP command lines against one SFTP session per
+     * batch, so a large file set is worked through in bounded byte-size
+     * chunks instead of one unbounded script, pausing between batches.
+     * Continues through remaining batches even if an earlier one fails, so a
+     * transient failure partway through a large backlog doesn't block
+     * everything after it; overall success requires every batch to have
+     * succeeded.
      */
     private boolean runBatchedWinScpCommands(Credential target, String password,
-            List<String> commandLines, Consumer<String> logLine, String taskId) throws Exception {
+            List<SizedCommand> sizedCommands, Consumer<String> logLine, String taskId) throws Exception {
 
-        if (commandLines.isEmpty()) {
+        if (sizedCommands.isEmpty()) {
             logLine.accept("[WARN] Nothing to transfer.");
             return false;
         }
 
-        int batchSize = getConfiguredBatchSize();
-        List<List<String>> batches = chunk(commandLines, batchSize);
+        long maxBytes = AppSettings.getTransferBatchMaxBytes();
+        int intervalSeconds = AppSettings.getTransferBatchIntervalSeconds();
+        List<List<SizedCommand>> batches = chunkBySize(sizedCommands, sc -> sc.size, maxBytes);
 
         if (batches.size() > 1) {
-            logLine.accept("[INFO] " + commandLines.size() + " file(s) to transfer — splitting into "
-                    + batches.size() + " batch(es) of up to " + batchSize + " file(s) each"
-                    + " (transfer batch size, configurable in Settings).");
+            long totalBytes = sizedCommands.stream().mapToLong(sc -> sc.size).sum();
+            logLine.accept("[INFO] " + sizedCommands.size() + " file(s), " + humanReadableBytes(totalBytes)
+                    + " total — splitting into " + batches.size() + " batch(es), capped at ~"
+                    + humanReadableBytes(maxBytes) + " per batch (configurable in Settings).");
         }
 
         boolean allOk = true;
@@ -964,10 +830,11 @@ public class TransferService {
                 logLine.accept("[INFO] Transfer cancelled.");
                 return false;
             }
-            List<String> batch = batches.get(i);
+            List<SizedCommand> batch = batches.get(i);
             if (batches.size() > 1) {
+                long batchBytes = batch.stream().mapToLong(sc -> sc.size).sum();
                 logLine.accept("[INFO] Batch " + (i + 1) + "/" + batches.size()
-                        + " (" + batch.size() + " file(s))");
+                        + " (" + batch.size() + " file(s), " + humanReadableBytes(batchBytes) + ")");
             }
             File scriptFile = File.createTempFile("opstool_batch_", ".txt");
             secureTemp(scriptFile);
@@ -976,7 +843,7 @@ public class TransferService {
                 pw.println("option confirm off");
                 pw.println("open sftp://" + escapeUrl(target.getUsername())
                         + ":" + escapeUrl(password) + "@" + target.getHost() + "/ -hostkey=\"*\"");
-                for (String line : batch) pw.println(line);
+                for (SizedCommand sc : batch) pw.println(sc.command);
                 pw.println("close");
                 pw.println("exit");
             }
@@ -989,6 +856,9 @@ public class TransferService {
             if (!ok) {
                 logLine.accept("[ERROR] Batch " + (i + 1) + "/" + batches.size() + " failed.");
                 allOk = false;
+            }
+            if (i < batches.size() - 1 && intervalSeconds > 0) {
+                sleepBetweenBatches(intervalSeconds, logLine);
             }
         }
         return allOk;
@@ -1015,26 +885,37 @@ public class TransferService {
         logLine.accept("[INFO] Transfer mode: " + mode.name()
                 + " | Direction: " + (inbound ? "INBOUND" : "OUTBOUND"));
 
-        List<String> commands = new ArrayList<>();
+        List<SizedCommand> commands = new ArrayList<>();
 
         if (inbound) {
+            java.util.Map<String, RemoteFileStat> remoteStats;
+            if (remotePath.endsWith("*") || new File(task.getSourcePath()).isDirectory()
+                    || mode == TransferMode.LATEST_ONLY) {
+                remoteStats = listAllRemoteFileStatsViaWinScp(target, target.getPassword(), remotePath, logLine);
+            } else {
+                remoteStats = Collections.emptyMap();
+            }
+
             List<String> remoteFiles;
             if (mode == TransferMode.LATEST_ONLY) {
                 logLine.accept("[INFO] Mode: Latest file(s) — non-watcher (INBOUND)");
-                LatestRemoteFiles latest = resolveLatestRemoteFilesViaWinScp(target, target.getPassword(), remotePath, logLine);
-                if (latest.files.isEmpty()) {
+                if (remoteStats.isEmpty()) {
                     logLine.accept("[ERROR] No files found on remote path: " + remotePath);
                     return false;
                 }
-                remoteFiles = latest.files;
+                long maxTs = remoteStats.values().stream().mapToLong(s -> s.epochMillis).max().getAsLong();
+                remoteFiles = remoteStats.entrySet().stream()
+                        .filter(e -> e.getValue().epochMillis == maxTs)
+                        .map(java.util.Map.Entry::getKey)
+                        .collect(Collectors.toList());
             } else {
                 logLine.accept("[INFO] Mode: Entire folder (INBOUND)");
-                if (remotePath.endsWith("*") || new File(task.getSourcePath()).isDirectory()) {
-                    remoteFiles = listAllRemoteFilesViaWinScp(target, target.getPassword(), remotePath, logLine);
-                    if (remoteFiles.isEmpty()) {
-                        logLine.accept("[WARN] No files found on remote path: " + remotePath);
-                        return false;
-                    }
+                if (!remoteStats.isEmpty()) {
+                    remoteFiles = new ArrayList<>(remoteStats.keySet());
+                    Collections.sort(remoteFiles);
+                } else if (remotePath.endsWith("*") || new File(task.getSourcePath()).isDirectory()) {
+                    logLine.accept("[WARN] No files found on remote path: " + remotePath);
+                    return false;
                 } else {
                     remoteFiles = Collections.singletonList(remotePath);
                 }
@@ -1042,7 +923,10 @@ public class TransferService {
             for (String remoteFile : remoteFiles) {
                 String fname    = remoteFile.substring(remoteFile.lastIndexOf('/') + 1);
                 String destPath = buildLocalDestinationPath(localPath, fname);
-                commands.add("get " + escapeWinScpRemotePath(remoteFile) + " " + escapeWinScpPath(destPath));
+                RemoteFileStat stat = remoteStats.get(remoteFile);
+                long size = stat != null ? stat.size : 0L;
+                commands.add(new SizedCommand(
+                        "get " + escapeWinScpRemotePath(remoteFile) + " " + escapeWinScpPath(destPath), size));
             }
         } else {
             List<File> localFiles;
@@ -1076,8 +960,8 @@ public class TransferService {
             }
             for (File f : localFiles) {
                 String remoteDestPath = prepareRemoteDestination(remotePath, f.getName());
-                commands.add("put " + escapeWinScpPath(normalizeLocalPath(f.getAbsolutePath()))
-                        + " " + escapeWinScpRemotePath(remoteDestPath));
+                commands.add(new SizedCommand("put " + escapeWinScpPath(normalizeLocalPath(f.getAbsolutePath()))
+                        + " " + escapeWinScpRemotePath(remoteDestPath), f.length()));
             }
         }
 
@@ -1091,20 +975,38 @@ public class TransferService {
     }
 
 
-    // ─── Backup (retention-based day archiving) ───────────────────────────────
+    // ─── Backup (retention-based archiving; local or remote, either side) ────
     //
-    // "D" = today. backupRetentionDays files are KEPT in place in the source
-    // folder: D, D-1, ..., D-(retentionDays-1). Everything older (D-retentionDays
-    // and beyond) is a backup candidate. Each run moves at most backupBatchDays
-    // of the OLDEST remaining day-buckets into <destination>/<yyyy-MM-dd>/, so a
-    // large backlog is worked off gradually across multiple runs rather than in
-    // one giant operation.
+    // "D" = today. backupRetentionDays files are KEPT in place at the source:
+    // D, D-1, ..., D-(retentionDays-1). Everything older is a backup
+    // candidate. Unlike previous versions, a run archives EVERY eligible file
+    // in one go — there is no more day-bucket/"batch days" limit. A large
+    // backlog is instead worked through using the same SIZE-based batching as
+    // file transfers (AppSettings.getTransferBatchMaxBytes()), pausing
+    // AppSettings.getTransferBatchIntervalSeconds() between batches, so a
+    // huge one-time backlog doesn't hammer the link or block for a long
+    // unbroken stretch.
+    //
+    // Either side (source or destination) may be LOCAL or REMOTE:
+    //   - LOCAL  side: backupSource/DestinationUsername is blank; the path is
+    //     a plain filesystem folder.
+    //   - REMOTE side: backupSource/DestinationUsername is set, and the path
+    //     is resolved over SFTP using that username's stored credential (the
+    //     same creds_<username>.xml mechanism File Transfer tasks use).
+    // Both sides being remote at once is not supported (would require a
+    // double SFTP hop) and is rejected with a clear error.
 
-    /** A regular file from the backup source, together with the calendar day it belongs to. */
-    private static final class DatedFile {
-        final File file;
+    /** A backup-eligible file: its full identity/location, calendar day, and size in bytes. */
+    private static final class BackupCandidate {
+        final String name;
         final LocalDate day;
-        DatedFile(File file, LocalDate day) { this.file = file; this.day = day; }
+        final long size;
+        final Path localPath;      // set when source is LOCAL
+        final String remotePath;   // set when source is REMOTE (full remote path)
+        BackupCandidate(String name, LocalDate day, long size, Path localPath, String remotePath) {
+            this.name = name; this.day = day; this.size = size;
+            this.localPath = localPath; this.remotePath = remotePath;
+        }
     }
 
     public boolean executeBackup(ScheduledTask task, Consumer<String> logLine) {
@@ -1120,95 +1022,268 @@ public class TransferService {
             return false;
         }
 
+        boolean sourceRemote = task.getBackupSourceUsername() != null && !task.getBackupSourceUsername().trim().isEmpty();
+        boolean destRemote   = task.getBackupDestinationUsername() != null && !task.getBackupDestinationUsername().trim().isEmpty();
+
+        if (sourceRemote && destRemote) {
+            logLine.accept("[ERROR] Backup source and destination cannot both be remote "
+                    + "(remote\u2192remote backup is not supported). Make one side local.");
+            return false;
+        }
+
+        Credential sourceCred = sourceRemote ? resolveNamedCredential(task.getBackupSourceUsername(), "source", logLine) : null;
+        if (sourceRemote && sourceCred == null) return false;
+        Credential destCred = destRemote ? resolveNamedCredential(task.getBackupDestinationUsername(), "destination", logLine) : null;
+        if (destRemote && destCred == null) return false;
+
         int retentionDays = task.getBackupRetentionDays();
         if (retentionDays < 1) retentionDays = 1;
-        int batchDays = task.getBackupBatchDays();
-        if (batchDays < 1) batchDays = 1;
-
-        File sourceDir = new File(sourcePathStr);
-        if (!sourceDir.isDirectory()) {
-            logLine.accept("[ERROR] Backup source folder does not exist: " + sourcePathStr);
-            return false;
-        }
-        File destRoot = new File(destPathStr);
-        if (!destRoot.exists() && !destRoot.mkdirs()) {
-            logLine.accept("[ERROR] Cannot create backup destination folder: " + destPathStr);
-            return false;
-        }
 
         LocalDate today = LocalDate.now();
         // Oldest day that is still KEPT in place, e.g. retentionDays=3 → keep D, D-1, D-2.
         LocalDate keepFromDay = today.minusDays(retentionDays - 1);
 
-        logLine.accept("[INFO] Backup source      : " + sourceDir.getAbsolutePath());
-        logLine.accept("[INFO] Backup destination : " + destRoot.getAbsolutePath());
+        logLine.accept("[INFO] Backup source      : " + sourcePathStr + (sourceRemote ? " (REMOTE, " + sourceCred.getHost() + ")" : " (local)"));
+        logLine.accept("[INFO] Backup destination : " + destPathStr + (destRemote ? " (REMOTE, " + destCred.getHost() + ")" : " (local)"));
         logLine.accept("[INFO] Today (D)          : " + today);
         logLine.accept("[INFO] Retention          : keep " + retentionDays
                 + " day(s) in place (" + keepFromDay + " .. " + today + ")");
-        logLine.accept("[INFO] Batch size         : up to " + batchDays + " day(s) archived per run");
+        logLine.accept("[INFO] Batching           : entire backlog runs in one go, split into size-based "
+                + "batches (~" + humanReadableBytes(AppSettings.getTransferBatchMaxBytes()) + " each, "
+                + AppSettings.getTransferBatchIntervalSeconds() + "s between batches).");
 
-        File[] rawFiles = sourceDir.listFiles(File::isFile);
-        if (rawFiles == null || rawFiles.length == 0) {
-            logLine.accept("[INFO] Source folder is empty — nothing to evaluate for backup.");
-            return true;
+        // ── Enumerate backup candidates from the source (local or remote) ─────
+        List<BackupCandidate> candidates;
+        try {
+            candidates = sourceRemote
+                    ? enumerateRemoteBackupCandidates(sourceCred, sourcePathStr, keepFromDay, logLine)
+                    : enumerateLocalBackupCandidates(sourcePathStr, keepFromDay, logLine);
+        } catch (Exception ex) {
+            logLine.accept("[ERROR] Failed to list backup source: " + ex.getMessage());
+            return false;
         }
-
-        java.util.Map<LocalDate, List<File>> byDay = new java.util.TreeMap<>();
-        for (File f : rawFiles) {
-            LocalDate day = Instant.ofEpochMilli(f.lastModified())
-                    .atZone(java.time.ZoneId.systemDefault()).toLocalDate();
-            if (!day.isBefore(keepFromDay)) continue; // within retention window — leave in place
-            byDay.computeIfAbsent(day, d -> new ArrayList<>()).add(f);
-        }
-
-        if (byDay.isEmpty()) {
+        if (candidates == null) return false; // error already logged
+        if (candidates.isEmpty()) {
             logLine.accept("[INFO] Nothing to back up — all files fall within the "
                     + retentionDays + "-day retention window.");
             return true;
         }
 
-        List<LocalDate> candidateDays = new ArrayList<>(byDay.keySet()); // TreeMap → ascending, oldest first
-        List<LocalDate> daysThisRun = candidateDays.size() > batchDays
-                ? candidateDays.subList(0, batchDays) : candidateDays;
+        long totalBytes = candidates.stream().mapToLong(c -> c.size).sum();
+        java.util.Set<LocalDate> days = candidates.stream().map(c -> c.day).collect(Collectors.toCollection(java.util.TreeSet::new));
+        logLine.accept("[INFO] " + candidates.size() + " file(s), " + humanReadableBytes(totalBytes)
+                + " total, spanning " + days.size() + " day(s) older than the retention window.");
 
-        logLine.accept("[INFO] " + candidateDays.size() + " day-bucket(s) older than retention window"
-                + (candidateDays.size() > daysThisRun.size()
-                        ? "; archiving the oldest " + daysThisRun.size() + " this run, "
-                          + (candidateDays.size() - daysThisRun.size()) + " remaining for future runs."
-                        : "; archiving all of them this run."));
+        // ── Move/transfer, in size-based batches ───────────────────────────────
+        boolean ok;
+        if (!sourceRemote && !destRemote) {
+            ok = runLocalToLocalBackup(candidates, destPathStr, logLine);
+        } else if (sourceRemote) {
+            ok = runRemoteToLocalBackup(sourceCred, candidates, destPathStr, logLine);
+        } else {
+            ok = runLocalToRemoteBackup(destCred, candidates, destPathStr, logLine);
+        }
 
+        logLine.accept((ok ? "[SUCCESS] " : "[WARNING] ") + "Backup run complete.");
+        return ok;
+    }
+
+    /** Local source: lists regular files older than the retention cutoff, grouped by calendar day. */
+    private List<BackupCandidate> enumerateLocalBackupCandidates(
+            String sourcePathStr, LocalDate keepFromDay, Consumer<String> logLine) {
+        File sourceDir = new File(sourcePathStr);
+        if (!sourceDir.isDirectory()) {
+            logLine.accept("[ERROR] Backup source folder does not exist: " + sourcePathStr);
+            return null;
+        }
+        File[] rawFiles = sourceDir.listFiles(File::isFile);
+        List<BackupCandidate> out = new ArrayList<>();
+        if (rawFiles == null) return out;
+        for (File f : rawFiles) {
+            LocalDate day = Instant.ofEpochMilli(f.lastModified())
+                    .atZone(java.time.ZoneId.systemDefault()).toLocalDate();
+            if (!day.isBefore(keepFromDay)) continue; // within retention window — leave in place
+            out.add(new BackupCandidate(f.getName(), day, f.length(), f.toPath(), null));
+        }
+        return out;
+    }
+
+    /** Remote source: lists remote files (over SFTP) older than the retention cutoff, grouped by calendar day. */
+    private List<BackupCandidate> enumerateRemoteBackupCandidates(
+            Credential sourceCred, String sourcePathStr, LocalDate keepFromDay, Consumer<String> logLine) throws Exception {
+        String remotePath = normalizeRemotePath(sourcePathStr);
+        String dirPath = remoteListingDirFor(remotePath);
+        java.util.Map<String, RemoteFileStat> stats =
+                rawRemoteFileStats(sourceCred, sourceCred.getPassword(), dirPath, logLine);
+        List<BackupCandidate> out = new ArrayList<>();
+        for (java.util.Map.Entry<String, RemoteFileStat> e : stats.entrySet()) {
+            String fullPath = e.getKey();
+            RemoteFileStat stat = e.getValue();
+            LocalDate day = Instant.ofEpochMilli(stat.epochMillis)
+                    .atZone(java.time.ZoneId.systemDefault()).toLocalDate();
+            if (!day.isBefore(keepFromDay)) continue;
+            String fname = fullPath.substring(fullPath.lastIndexOf('/') + 1);
+            out.add(new BackupCandidate(fname, day, stat.size, null, fullPath));
+        }
+        return out;
+    }
+
+    /** Local→local backup: moves files into {@code <destRoot>/<yyyy-MM-dd>/}, in size-based batches. */
+    private boolean runLocalToLocalBackup(List<BackupCandidate> candidates, String destPathStr, Consumer<String> logLine) {
+        File destRoot = new File(destPathStr);
+        if (!destRoot.exists() && !destRoot.mkdirs()) {
+            logLine.accept("[ERROR] Cannot create backup destination folder: " + destPathStr);
+            return false;
+        }
+        List<List<BackupCandidate>> batches = chunkBySize(candidates, c -> c.size, AppSettings.getTransferBatchMaxBytes());
+        int intervalSeconds = AppSettings.getTransferBatchIntervalSeconds();
+        if (batches.size() > 1) {
+            logLine.accept("[INFO] Splitting into " + batches.size() + " batch(es).");
+        }
         boolean allOk = true;
-        int totalMoved = 0;
-        for (LocalDate day : daysThisRun) {
+        int moved = 0;
+        for (int i = 0; i < batches.size(); i++) {
             if (Thread.currentThread().isInterrupted()) {
                 logLine.accept("[INFO] Backup cancelled.");
                 return false;
             }
-            List<File> files = byDay.get(day);
-            File dayDestDir = new File(destRoot, day.toString()); // yyyy-MM-dd
+            List<BackupCandidate> batch = batches.get(i);
+            if (batches.size() > 1) {
+                logLine.accept("[INFO] Batch " + (i + 1) + "/" + batches.size() + " (" + batch.size() + " file(s))");
+            }
+            for (BackupCandidate c : batch) {
+                File dayDestDir = new File(destRoot, c.day.toString());
+                if (!dayDestDir.exists() && !dayDestDir.mkdirs()) {
+                    logLine.accept("[ERROR] Cannot create backup folder for " + c.day + ": " + dayDestDir);
+                    allOk = false;
+                    continue;
+                }
+                boolean ok = moveSingleFile(c.localPath, dayDestDir.toPath().resolve(c.name), logLine);
+                allOk &= ok;
+                if (ok) moved++;
+            }
+            if (i < batches.size() - 1 && intervalSeconds > 0) sleepBetweenBatches(intervalSeconds, logLine);
+        }
+        logLine.accept("[INFO] " + moved + " file(s) archived.");
+        return allOk;
+    }
+
+    /** Remote source → local destination: pulls files via WinSCP `get` into {@code <destRoot>/<yyyy-MM-dd>/}, in size-based batches. */
+    private boolean runRemoteToLocalBackup(Credential sourceCred, List<BackupCandidate> candidates,
+            String destPathStr, Consumer<String> logLine) {
+        File destRoot = new File(destPathStr);
+        if (!destRoot.exists() && !destRoot.mkdirs()) {
+            logLine.accept("[ERROR] Cannot create backup destination folder: " + destPathStr);
+            return false;
+        }
+        List<SizedCommand> commands = new ArrayList<>();
+        java.util.Map<String, LocalDate> dayByRemotePath = new java.util.HashMap<>();
+        for (BackupCandidate c : candidates) {
+            File dayDestDir = new File(destRoot, c.day.toString());
             if (!dayDestDir.exists() && !dayDestDir.mkdirs()) {
-                logLine.accept("[ERROR] Cannot create backup folder for " + day + ": " + dayDestDir);
-                allOk = false;
+                logLine.accept("[ERROR] Cannot create backup folder for " + c.day + ": " + dayDestDir);
                 continue;
             }
-            logLine.accept("[INFO] Archiving " + files.size() + " file(s) for " + day + " → " + dayDestDir);
-            for (File f : files) {
-                Path src  = f.toPath();
-                Path dest = dayDestDir.toPath().resolve(f.getName());
-                try {
-                    Files.move(src, dest, StandardCopyOption.REPLACE_EXISTING);
-                    logLine.accept("[SUCCESS] Backed up: " + f.getName());
-                    totalMoved++;
-                } catch (IOException ex) {
-                    logLine.accept("[ERROR] Failed to back up " + f.getName() + ": " + ex.getMessage());
-                    allOk = false;
-                }
+            String destPath = normalizeLocalPath(new File(dayDestDir, c.name).getAbsolutePath());
+            commands.add(new SizedCommand(
+                    "get " + escapeWinScpRemotePath(c.remotePath) + " " + escapeWinScpPath(destPath), c.size));
+        }
+        try {
+            boolean ok = runBatchedWinScpCommands(sourceCred, sourceCred.getPassword(), commands, logLine, "backup");
+            if (ok) {
+                // Remove originals from the remote source now that they've landed locally.
+                deleteRemoteFilesViaWinScp(sourceCred, candidates.stream().map(c -> c.remotePath).collect(Collectors.toList()), logLine);
             }
+            return ok;
+        } catch (Exception ex) {
+            logLine.accept("[ERROR] Remote\u2192local backup failed: " + ex.getMessage());
+            return false;
+        }
+    }
+
+    /** Local source → remote destination: pushes files via WinSCP `put` into {@code <destRoot>/<yyyy-MM-dd>/}, in size-based batches. */
+    private boolean runLocalToRemoteBackup(Credential destCred, List<BackupCandidate> candidates,
+            String destPathStr, Consumer<String> logLine) {
+        String remoteRoot = normalizeRemotePath(destPathStr);
+        String remoteRootDir = remoteRoot.endsWith("/") ? remoteRoot : remoteRoot + "/";
+
+        // One mkdir per distinct day, de-duplicated, run best-effort first (a day
+        // folder that already exists from a previous run is not an error).
+        java.util.LinkedHashSet<String> mkdirCmds = new java.util.LinkedHashSet<>();
+        for (BackupCandidate c : candidates) {
+            mkdirCmds.add("mkdir " + escapeWinScpRemotePath((remoteRootDir + c.day)));
         }
 
-        logLine.accept((allOk ? "[SUCCESS] " : "[WARNING] ") + "Backup run complete — "
-                + totalMoved + " file(s) archived across " + daysThisRun.size() + " day(s).");
-        return allOk;
+        try {
+            boolean mkdirOk = runBestEffortWinScpCommands(destCred, mkdirCmds, logLine);
+            if (!mkdirOk) {
+                logLine.accept("[WARN] Some remote day folders may not have been created (they may already exist) — continuing.");
+            }
+            List<SizedCommand> putCommands = candidates.stream().map(c -> new SizedCommand(
+                    "put " + escapeWinScpPath(normalizeLocalPath(c.localPath.toAbsolutePath().toString()))
+                            + " " + escapeWinScpRemotePath(remoteRootDir + c.day + "/" + c.name), c.size))
+                    .collect(Collectors.toList());
+            boolean ok = runBatchedWinScpCommands(destCred, destCred.getPassword(), putCommands, logLine, "backup");
+            if (ok) {
+                for (BackupCandidate c : candidates) {
+                    try {
+                        Files.delete(c.localPath);
+                    } catch (IOException ex) {
+                        logLine.accept("[WARN] Uploaded but could not remove local original " + c.name + ": " + ex.getMessage());
+                    }
+                }
+            }
+            return ok;
+        } catch (Exception ex) {
+            logLine.accept("[ERROR] Local\u2192remote backup failed: " + ex.getMessage());
+            return false;
+        }
+    }
+
+    /** Runs a small set of WinSCP commands (e.g. mkdir) in one session, tolerating individual failures. */
+    private boolean runBestEffortWinScpCommands(Credential target, java.util.Collection<String> cmds, Consumer<String> logLine) throws Exception {
+        if (cmds.isEmpty()) return true;
+        File scriptFile = File.createTempFile("opstool_mkdir_", ".txt");
+        secureTemp(scriptFile);
+        try (PrintWriter pw = new PrintWriter(new FileWriter(scriptFile))) {
+            pw.println("option batch continue"); // don't abort the whole script if a single mkdir fails (dir exists)
+            pw.println("option confirm off");
+            pw.println("open sftp://" + escapeUrl(target.getUsername())
+                    + ":" + escapeUrl(target.getPassword()) + "@" + target.getHost() + "/ -hostkey=\"*\"");
+            for (String c : cmds) pw.println(c);
+            pw.println("close");
+            pw.println("exit");
+        }
+        try {
+            return runWinScpScript(scriptFile, logLine, "backup-mkdir");
+        } finally {
+            scriptFile.delete();
+        }
+    }
+
+    /** Deletes a batch of remote files (after a successful remote→local backup pull). */
+    private void deleteRemoteFilesViaWinScp(Credential target, List<String> remotePaths, Consumer<String> logLine) {
+        if (remotePaths.isEmpty()) return;
+        try {
+            File scriptFile = File.createTempFile("opstool_rm_", ".txt");
+            secureTemp(scriptFile);
+            try (PrintWriter pw = new PrintWriter(new FileWriter(scriptFile))) {
+                pw.println("option batch continue");
+                pw.println("option confirm off");
+                pw.println("open sftp://" + escapeUrl(target.getUsername())
+                        + ":" + escapeUrl(target.getPassword()) + "@" + target.getHost() + "/ -hostkey=\"*\"");
+                for (String p : remotePaths) pw.println("rm " + escapeWinScpRemotePath(p));
+                pw.println("close");
+                pw.println("exit");
+            }
+            try {
+                runWinScpScript(scriptFile, logLine, "backup-cleanup");
+            } finally {
+                scriptFile.delete();
+            }
+        } catch (Exception ex) {
+            logLine.accept("[WARN] Backed up but could not remove some remote originals: " + ex.getMessage());
+        }
     }
 
     // ─── Mail / Outlook (Microsoft Graph) ────────────────────────────────────
@@ -2093,8 +2168,20 @@ public class TransferService {
                     .filter(x -> x.getId().equals(task.getTargetCredentialId()))
                     .findFirst().orElse(null);
         }
-        // No username and no credential ID — likely a local→local task; return null cleanly.
+        logLine.accept("[ERROR] No target credential configured — local\u2192local transfers are not supported.");
         return null;
+    }
+
+    /** Resolves a username to a stored {@link Credential} for a Backup source/destination side, or null if blank/not found. */
+    private Credential resolveNamedCredential(String username, String sideLabel, Consumer<String> logLine) {
+        if (username == null || username.trim().isEmpty()) return null;
+        Credential c = storage.loadCredentialByUsername(username.trim());
+        if (c == null) {
+            logLine.accept("[ERROR] No credential file found for backup " + sideLabel + " username '" + username
+                    + "'. Expected: " + storage.credFileForUser(username.trim()).getName()
+                    + " in " + storage.getDataDir().getAbsolutePath());
+        }
+        return c;
     }
 
     // ─── Local file helpers ───────────────────────────────────────────────────

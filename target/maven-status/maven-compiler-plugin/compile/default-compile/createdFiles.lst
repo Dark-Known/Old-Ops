@@ -16,17 +16,16 @@ util\ImapSearchCriteria$AdvancedCriteria.class
 service\TaskSchedulerService$TaskMetrics.class
 model\ScheduledTask$TransferMode.class
 service\TaskLogService.class
-service\TransferService$DatedFile.class
 service\TransferService.class
 ui\MainWindow$2.class
 service\RemoteFileMetadataServiceFactory.class
 service\TransferService$WatcherSkipException.class
 ui\SearchCriteriaPanel$CriterionTag.class
+service\TransferService$RemoteFileStat.class
 util\MiniJson.class
-service\TransferService$1.class
 util\ImapSearchCriteria$TextCriteria.class
 model\RemoteFileException.class
-service\TransferService$LatestRemoteFiles.class
+service\TransferService$SizedCommand.class
 service\RemoteFileMetadataServiceFactory$ManagedMetadataService.class
 ui\CredentialManagerPanel$1.class
 ui\MainWindow$3.class
@@ -34,7 +33,7 @@ ui\TaskManagerPanel$2.class
 model\Credential.class
 util\MailFetchMode.class
 service\RemoteFileMetadataService.class
-ui\TaskDialog$5.class
+service\TransferService$BackupCandidate.class
 ui\TaskDialog$2.class
 ui\NotificationPanel.class
 service\XmlStorageService.class
@@ -59,6 +58,7 @@ Daemon$1.class
 AdminElevation.class
 ui\TaskDialog.class
 util\ImapSearchCriteria$Builder.class
+service\TransferService$LocalFileOp.class
 ui\MainWindow$1.class
 service\TransferService$MarkerMatch.class
 service\GraphMailService.class

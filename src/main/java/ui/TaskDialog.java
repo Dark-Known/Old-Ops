@@ -22,17 +22,18 @@ import java.util.UUID;
  *
  * Watcher + service integration changes:
  *
- *  LOCAL-TO-LOCAL MODE
- *  ───────────────────
- *  When the transfer direction is INBOUND and the target host field is left blank
- *  (or explicitly matches the local hostname / "localhost" / "127.0.0.1"), the
- *  dialog treats the task as a local-to-local copy.  In that case:
- *    • The "Target System Credentials" tab is still shown but its fields are
- *      optional — validation is skipped for host/user/pass.
- *    • A blue info banner ("Local→Local mode") is shown in the Transfer tab so
- *      the operator knows no SFTP connection will be opened.
- *    • The source path label changes to "Watch Folder (source) *" and the target
- *      folder label to "Destination Folder *".
+ *  FILE TRANSFER — REMOTE ONLY
+ *  ────────────────────────────
+ *  Local→local file transfers are not supported. Every FILE_TRANSFER task
+ *  requires a resolved target credential (Target Credentials tab: host,
+ *  username, password) and moves data over SFTP in both directions.
+ *
+ *  BACKUP — LOCAL OR REMOTE, EITHER SIDE
+ *  ──────────────────────────────────────
+ *  A Backup task's source and/or destination may each independently be a
+ *  local folder or a REMOTE path reached over SFTP (checkbox + username,
+ *  reusing the same creds_<username>.xml credential store as Target
+ *  Credentials). Source and destination cannot both be remote at once.
  *
  *  WATCHER BASELINE ROW
  *  ────────────────────
@@ -88,14 +89,14 @@ public class TaskDialog extends JDialog {
     // Watcher status row panel (made a field so visibility can be toggled reliably)
     private JPanel      watcherStatusRow;
 
-    // ── Local-to-local banner (shown when target host is local / blank) ───────
-    private JLabel lblLocalToLocalBanner;
-
     // ── Backup panel ──────────────────────────────────────────────────────────
     private JTextField  tfBackupSourcePath;
     private JTextField  tfBackupDestinationPath;
     private JSpinner    spBackupRetentionDays;
-    private JSpinner    spBackupBatchDays;
+    private JCheckBox   cbBackupSourceRemote;
+    private JTextField  tfBackupSourceUsername;
+    private JCheckBox   cbBackupDestinationRemote;
+    private JTextField  tfBackupDestinationUsername;
 
     // ── Outlook mail (Microsoft Graph) ─────────────────────────────────────────
     private JPanel      mailPanel;
@@ -270,27 +271,12 @@ public class TaskDialog extends JDialog {
 
         refreshWatcherStatusLabel(existing);
 
-        // ── Local-to-local info banner ────────────────────────────────────────
-        // Visible whenever INBOUND is selected AND the target host looks local.
-        // Informs the operator that no SFTP connection will be opened and that
-        // files are copied using Files.copy (LocalFileMetadataService path).
-        lblLocalToLocalBanner = new JLabel(
-                "<html><div style='width:380px'><b style='color:#0D47A1'>Info: Local->Local mode:</b> "
-                        + "<i style='color:#1565C0'>Target host is local - files will be discovered with "
-                        + "LocalFileMetadataService and copied with Files.copy. No SFTP or WinSCP needed. "
-                        + "Leave the Target Credentials tab blank.</i></div></html>");
-        lblLocalToLocalBanner.setFont(lblLocalToLocalBanner.getFont().deriveFont(Font.PLAIN, 11f));
-        lblLocalToLocalBanner.setBorder(BorderFactory.createCompoundBorder(
-                BorderFactory.createMatteBorder(1, 3, 1, 1, new Color(0x1565C0)),
-                new EmptyBorder(4, 6, 4, 4)));
-        lblLocalToLocalBanner.setBackground(new Color(0xE3F2FD));
-        lblLocalToLocalBanner.setOpaque(true);
-        lblLocalToLocalBanner.setVisible(false);
+        // ── Local→local mode is not supported — every FILE_TRANSFER task
+        // requires a remote target credential (see Target Credentials tab).
 
         lblTargetFolder = new JLabel();
         lblTargetHint   = hint("");
 
-        // Row layout — rows 8, 9 are the new local-to-local banner + baseline row
         addRow(fileTransferPanel, "Transfer Direction *",    cbTransferDirection,    0);
         addRow(fileTransferPanel, "Transfer Mode *",         cbTransferMode,         1);
         addRow(fileTransferPanel, lblTargetFolder,           tfTargetFolder,         2);
@@ -298,12 +284,6 @@ public class TaskDialog extends JDialog {
         addRow(fileTransferPanel, "",                        cbWatcherEnabled,4);
         addRow(fileTransferPanel, "",                        lblWatcherInfo,         5);
         addRow(fileTransferPanel, "Watcher baseline",        watcherStatusRow,       6);
-        // Local-to-local banner spans both columns
-        GridBagConstraints bannerGbc = new GridBagConstraints();
-        bannerGbc.gridx = 0; bannerGbc.gridy = 9; bannerGbc.gridwidth = 2;
-        bannerGbc.fill = GridBagConstraints.HORIZONTAL;
-        bannerGbc.insets = new Insets(6, 4, 4, 4);
-        fileTransferPanel.add(lblLocalToLocalBanner, bannerGbc);
 
         transferTab = new JPanel(new GridBagLayout());
         transferTab.setOpaque(false);
@@ -318,6 +298,9 @@ public class TaskDialog extends JDialog {
         transferTab.add(fileTransferPanel);
 
         // ── Backup panel ──────────────────────────────────────────────────────
+        // Either side (source or destination) may be a plain local folder, or a
+        // REMOTE path reached over SFTP using a stored credential (same
+        // creds_<username>.xml mechanism as File Transfer's Target Username).
         backupPanel = titledPanel("Backup");
         tfBackupSourcePath = makeField(new JTextField(
                 existing != null && existing.getBackupSourcePath() != null ? existing.getBackupSourcePath() : "", 28));
@@ -325,17 +308,34 @@ public class TaskDialog extends JDialog {
                 existing != null && existing.getBackupDestinationPath() != null ? existing.getBackupDestinationPath() : "", 28));
         int existingRetention = existing != null && existing.getBackupRetentionDays() > 0
                 ? existing.getBackupRetentionDays() : 3;
-        int existingBatchDays = existing != null && existing.getBackupBatchDays() > 0
-                ? existing.getBackupBatchDays() : 2;
         spBackupRetentionDays = new JSpinner(new SpinnerNumberModel(existingRetention, 1, 365, 1));
-        spBackupBatchDays     = new JSpinner(new SpinnerNumberModel(existingBatchDays, 1, 365, 1));
+
+        String existingSrcUser  = existing != null && existing.getBackupSourceUsername() != null
+                ? existing.getBackupSourceUsername() : "";
+        String existingDestUser = existing != null && existing.getBackupDestinationUsername() != null
+                ? existing.getBackupDestinationUsername() : "";
+
+        cbBackupSourceRemote = new JCheckBox("Source is remote (SFTP)", !existingSrcUser.isEmpty());
+        tfBackupSourceUsername = makeField(new JTextField(existingSrcUser, 20));
+        tfBackupSourceUsername.setEnabled(cbBackupSourceRemote.isSelected());
+        cbBackupSourceRemote.addActionListener(e -> tfBackupSourceUsername.setEnabled(cbBackupSourceRemote.isSelected()));
+
+        cbBackupDestinationRemote = new JCheckBox("Destination is remote (SFTP)", !existingDestUser.isEmpty());
+        tfBackupDestinationUsername = makeField(new JTextField(existingDestUser, 20));
+        tfBackupDestinationUsername.setEnabled(cbBackupDestinationRemote.isSelected());
+        cbBackupDestinationRemote.addActionListener(e -> tfBackupDestinationUsername.setEnabled(cbBackupDestinationRemote.isSelected()));
 
         addRow(backupPanel, "Source Folder *",      tfBackupSourcePath, 0);
-        addRow(backupPanel, "Backup Folder *",      tfBackupDestinationPath, 1);
-        addRow(backupPanel, "Days to keep (D..) *", spBackupRetentionDays, 2);
-        addRow(backupPanel, "", hint("If today is D, this many days are kept in the source folder — D, D-1, ... — and everything older becomes eligible for backup."), 3);
-        addRow(backupPanel, "Days per run *",       spBackupBatchDays, 4);
-        addRow(backupPanel, "", hint("How many of the oldest day-buckets to archive each time this task runs. Any remaining backlog is picked up on the next run."), 5);
+        addRow(backupPanel, "",                     cbBackupSourceRemote, 1);
+        addRow(backupPanel, "Source Username",      tfBackupSourceUsername, 2);
+        addRow(backupPanel, "", hint("Only needed if 'Source is remote' is checked — must match a saved credential's username (see Target Credentials on a File Transfer task)."), 3);
+        addRow(backupPanel, "Backup Folder *",      tfBackupDestinationPath, 4);
+        addRow(backupPanel, "",                     cbBackupDestinationRemote, 5);
+        addRow(backupPanel, "Destination Username", tfBackupDestinationUsername, 6);
+        addRow(backupPanel, "", hint("Only needed if 'Destination is remote' is checked — must match a saved credential's username."), 7);
+        addRow(backupPanel, "Days to keep (D..) *", spBackupRetentionDays, 8);
+        addRow(backupPanel, "", hint("If today is D, this many days are kept in the source — D, D-1, ... — and everything older becomes eligible for backup. Note: source and destination cannot both be remote."), 9);
+        addRow(backupPanel, "", hint("Every eligible file is backed up in a single run. Large runs are split into batches by total file size, not day or file count — see Settings for batch size/interval."), 10);
 
         // ── Mail / Outlook panel (Microsoft Graph) ────────────────────────────
         // Reads mail via Microsoft Graph rather than IMAP: Microsoft has disabled
@@ -509,16 +509,7 @@ public class TaskDialog extends JDialog {
                                 cred.getOsType() != null ? cred.getOsType() : "WINDOWS");
                     }
                 }
-                // Recheck local-to-local banner whenever the user types a host
-                updateLocalToLocalBanner();
             }
-        });
-
-        // Also recheck banner when tfTargetHost is edited directly
-        tfTargetHost.getDocument().addDocumentListener(new javax.swing.event.DocumentListener() {
-            public void insertUpdate (javax.swing.event.DocumentEvent e) { updateLocalToLocalBanner(); }
-            public void removeUpdate (javax.swing.event.DocumentEvent e) { updateLocalToLocalBanner(); }
-            public void changedUpdate(javax.swing.event.DocumentEvent e) { updateLocalToLocalBanner(); }
         });
 
         addRow(targetPanel, "Hostname / IP",  tfTargetHost, 0);
@@ -588,7 +579,6 @@ public class TaskDialog extends JDialog {
         cbTransferDirection.addActionListener(e -> {
             updateTransferDirectionLabels();
             updateWatcherFieldsVisibility();
-            updateLocalToLocalBanner();
             updateTransferTabVisibility();
             checkTransferDirectionChanged(existing);
         });
@@ -615,7 +605,6 @@ public class TaskDialog extends JDialog {
 
         updateTransferDirectionLabels();
         updateWatcherFieldsVisibility();
-        updateLocalToLocalBanner();
         updateVisibility();
         updateScheduleDetails();
         updateMailFieldsVisibility();
@@ -702,43 +691,6 @@ public class TaskDialog extends JDialog {
         if (btnResetBaseline != null) btnResetBaseline.setVisible(true);
     }
 
-    // ── Local-to-local banner ─────────────────────────────────────────────────
-
-    /**
-     * Shows the local-to-local info banner when:
-     *   • Direction is INBOUND, AND
-     *   • The target host field is blank / "localhost" / "127.0.0.1" / equals
-     *     the local machine's hostname.
-     *
-     * Also updates the source-path label to make the "watch folder" intent clear.
-     */
-    private void updateLocalToLocalBanner() {
-        if (lblLocalToLocalBanner == null) return;
-        String direction = (String) cbTransferDirection.getSelectedItem();
-        boolean inbound     = "INBOUND".equals(direction);
-        boolean localTarget = isLocalTargetHost();
-        boolean show        = inbound && localTarget;
-        lblLocalToLocalBanner.setVisible(show);
-
-        if (show && lblSourcePath != null) {
-            lblSourcePath.setText("Watch Folder (source) *");
-            lblTargetFolder.setText("Destination Folder *");
-        }
-
-        if (transferTab != null) { transferTab.revalidate(); transferTab.repaint(); }
-        revalidate(); repaint();
-        pack();
-    }
-
-    /** Returns true when the currently entered target host looks local. */
-    private boolean isLocalTargetHost() {
-        String host = tfTargetHost != null ? tfTargetHost.getText().trim() : "";
-        if (host.isEmpty() || host.equalsIgnoreCase("localhost") || host.equals("127.0.0.1"))
-            return true;
-        String localHost = TransferService.getLocalHostname();
-        return localHost != null && localHost.equalsIgnoreCase(host);
-    }
-
     // ── Visibility helpers ────────────────────────────────────────────────────
 
     private void updateVisibility() {
@@ -770,17 +722,14 @@ public class TaskDialog extends JDialog {
         String direction = (String) cbTransferDirection.getSelectedItem();
         boolean inbound = "INBOUND".equals(direction);
 
-        if (!isLocalTargetHost()) {
-            lblSourcePath.setText(inbound ? "Local Destination Path *" : "Source Path *");
-            lblTargetFolder.setText(inbound ? "Remote Source Folder *" : "Destination Folder *");
-        }
+        lblSourcePath.setText(inbound ? "Local Destination Path *" : "Source Path *");
+        lblTargetFolder.setText(inbound ? "Remote Source Folder *" : "Destination Folder *");
 
         lblSourceHint.setText(inbound
                 ? "<html><i style='color:gray'>Local path where files retrieved from the target will be saved.</i></html>"
                 : "<html><i style='color:gray'>Local file or folder to send to the target server.</i></html>");
         lblTargetHint.setText(inbound
-                ? "<html><i style='color:gray'>Remote source file or folder path on the target server "
-                + "(or local source folder for local→local copies).</i></html>"
+                ? "<html><i style='color:gray'>Remote source file or folder path on the target server.</i></html>"
                 : "<html><i style='color:gray'>Remote destination folder on the target server.</i></html>");
 
         // Watcher checkbox is available for both directions (watching is supported for inbound and outbound
@@ -985,18 +934,13 @@ public class TaskDialog extends JDialog {
 
         boolean isBackup    = "BACKUP".equals(cbTaskType.getSelectedItem());
 
-        // For local→local FILE_TRANSFER tasks (auto-detected via a blank/local target host)
-        // credentials are not required.
-        boolean isLocalToLocal = isTransfer
-                && "INBOUND".equals(cbTransferDirection.getSelectedItem())
-                && isLocalTargetHost();
-
         String targetHost = tfTargetHost.getText().trim();
         String targetUser = tfTargetUser.getText().trim();
         String targetPass = new String(pfTargetPass.getPassword());
 
         // Mail and Backup tasks don't use the SFTP-style target credential.
-        if (!isMail && !isBackup && !isLocalToLocal) {
+        // Every FILE_TRANSFER task requires one — local→local is not supported.
+        if (!isMail && !isBackup) {
             if (targetHost.isEmpty()) { msg("Target hostname / IP is required."); return; }
             if (targetUser.isEmpty()) { msg("Target username is required.");       return; }
             if (targetPass.isEmpty()) { msg("Target password is required.");       return; }
@@ -1004,11 +948,11 @@ public class TaskDialog extends JDialog {
 
         if (isTransfer) {
             if (tfSourcePath.getText().trim().isEmpty()) {
-                msg(isLocalToLocal ? "Watch folder (source) is required." : "Source path is required.");
+                msg("Source path is required.");
                 return;
             }
             if (tfTargetFolder.getText().trim().isEmpty()) {
-                msg(isLocalToLocal ? "Destination folder is required." : "Destination folder is required.");
+                msg("Destination folder is required.");
                 return;
             }
 
@@ -1074,11 +1018,24 @@ public class TaskDialog extends JDialog {
         } else if (isBackup) {
             if (tfBackupSourcePath.getText().trim().isEmpty()) { msg("Backup source folder is required."); return; }
             if (tfBackupDestinationPath.getText().trim().isEmpty()) { msg("Backup destination folder is required."); return; }
+            boolean srcRemote  = cbBackupSourceRemote.isSelected();
+            boolean destRemote = cbBackupDestinationRemote.isSelected();
+            if (srcRemote && destRemote) {
+                msg("Backup source and destination cannot both be remote — make one side local.");
+                return;
+            }
+            if (srcRemote && tfBackupSourceUsername.getText().trim().isEmpty()) {
+                msg("Source Username is required when 'Source is remote' is checked."); return;
+            }
+            if (destRemote && tfBackupDestinationUsername.getText().trim().isEmpty()) {
+                msg("Destination Username is required when 'Destination is remote' is checked."); return;
+            }
         }
 
         // ── Persist credential file creds_<username>.xml ──────────────────────
-        // Skipped for mail (uses OAuth2, not a stored credential), backup, and local→local tasks.
-        if (!isMail && !isBackup && !isLocalToLocal && !targetUser.isEmpty()) {
+        // Skipped for mail (uses OAuth2, not a stored credential) and backup
+        // (backup credentials are persisted separately, see below).
+        if (!isMail && !isBackup && !targetUser.isEmpty()) {
             Credential cred = storage.loadCredentialByUsername(targetUser);
             if (cred == null) cred = new Credential();
             if (cred.getId() == null) cred.setId(UUID.randomUUID().toString());
@@ -1104,10 +1061,9 @@ public class TaskDialog extends JDialog {
         t.setTaskType(TaskType.valueOf((String) cbTaskType.getSelectedItem()));
         if (existing == null) t.setStatus(TaskStatus.PENDING);
 
-        // For local→local and mail tasks targetUsername is left blank — mail uses
-        // OAuth2/Graph and local→local routes to LocalFileMetadataService via a
-        // null credential, per resolveTargetCredential()/isLocalToLocalTask().
-        t.setTargetUsername(!isMail && !isBackup && !isLocalToLocal ? targetUser : "");
+        // Mail tasks use OAuth2/Graph, so targetUsername is left blank for them
+        // (and for Backup, which stores its own source/destination usernames).
+        t.setTargetUsername(!isMail && !isBackup ? targetUser : "");
         t.setSourceCredentialId(
                 tfSourceUser.getText().trim() + "@" + tfSourceHost.getText().trim());
 
@@ -1147,7 +1103,10 @@ public class TaskDialog extends JDialog {
             t.setBackupSourcePath(tfBackupSourcePath.getText().trim());
             t.setBackupDestinationPath(tfBackupDestinationPath.getText().trim());
             t.setBackupRetentionDays((Integer) spBackupRetentionDays.getValue());
-            t.setBackupBatchDays((Integer) spBackupBatchDays.getValue());
+            t.setBackupSourceUsername(cbBackupSourceRemote.isSelected()
+                    ? tfBackupSourceUsername.getText().trim() : "");
+            t.setBackupDestinationUsername(cbBackupDestinationRemote.isSelected()
+                    ? tfBackupDestinationUsername.getText().trim() : "");
         }
 
         t.setRetryCount((Integer) spinnerRetryCount.getValue());

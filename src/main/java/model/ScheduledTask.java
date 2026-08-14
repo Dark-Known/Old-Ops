@@ -34,12 +34,23 @@ public class ScheduledTask {
     private String targetPath;
 
     // Backup fields ("D" = today; retention keeps D, D-1 ... D-(retentionDays-1) untouched
-    // in the source folder, and each run archives up to batchDays of the oldest
-    // remaining day-buckets into the destination folder).
+    // in the source, and everything older than that is eligible for backup).
+    // Every eligible file is archived in a single run (no more day-bucket
+    // batching) — large runs are instead worked through in size-based
+    // batches internally, the same batching used for file transfers (see
+    // AppSettings.getTransferBatchMaxBytes()/getTransferBatchIntervalSeconds()).
     private String backupSourcePath;
     private String backupDestinationPath;
     private int backupRetentionDays;   // how many most-recent days to KEEP in place (D..D-(n-1))
-    private int backupBatchDays;       // how many old day-buckets to back up per run
+
+    // Remote backup support: when set (non-empty), that side of the backup
+    // is a REMOTE path reached over SFTP using the credential stored in
+    // creds_<username>.xml for that username — same mechanism File Transfer
+    // tasks use for targetUsername. When blank, that side is a plain local
+    // filesystem path. At most one side may be remote at a time (backing up
+    // between two different remote servers isn't supported).
+    private String backupSourceUsername;
+    private String backupDestinationUsername;
 
     // Outlook mail fields — read via Microsoft Graph (see GraphMailService).
     // NOTE: Graph is a cloud REST API regardless of where the task runs, so the
@@ -109,7 +120,8 @@ public class ScheduledTask {
         this.inboundWatcherPollIntervalMinutes = 0;
         this.inboundWatcherMaxAgeMinutes = 0;
         this.backupRetentionDays = 3;
-        this.backupBatchDays = 2;
+        this.backupSourceUsername = "";
+        this.backupDestinationUsername = "";
     }
 
     // ── Getters / Setters ────────────────────────────────────────────────────
@@ -157,8 +169,11 @@ public class ScheduledTask {
     public int  getBackupRetentionDays()         { return backupRetentionDays; }
     public void setBackupRetentionDays(int d)    { this.backupRetentionDays = d; }
 
-    public int  getBackupBatchDays()             { return backupBatchDays; }
-    public void setBackupBatchDays(int d)        { this.backupBatchDays = d; }
+    public String getBackupSourceUsername()      { return backupSourceUsername; }
+    public void   setBackupSourceUsername(String u) { this.backupSourceUsername = u; }
+
+    public String getBackupDestinationUsername() { return backupDestinationUsername; }
+    public void   setBackupDestinationUsername(String u) { this.backupDestinationUsername = u; }
 
     public String getImapFolder()                { return imapFolder; }
     public void   setImapFolder(String s)        { this.imapFolder = s; }
