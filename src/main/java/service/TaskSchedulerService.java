@@ -40,9 +40,11 @@ public class TaskSchedulerService {
     // Tracks currently running task futures so they can be cancelled on request
      private final ConcurrentMap<String, Future<?>> runningTaskFutures = new ConcurrentHashMap<>();
      private final ConcurrentMap<String, TaskMetrics> taskMetrics = new ConcurrentHashMap<>();
-     // Default stale threshold is 30 minutes. For interval-based tasks, it's increased to
+     // Base stale threshold, configurable live from the Settings panel
+     // (util.AppSettings#KEY_STALE_RUNNING_THRESHOLD_MINUTES, default 30
+     // minutes — see getStaleRunningThreshold below). For interval-based
+     // tasks it's additionally scaled up relative to their own interval, to
      // accommodate longer-running operations like large file transfers.
-     private static final Duration STALE_RUNNING_THRESHOLD = Duration.ofMinutes(30);
 
     /** Poll loop interval in seconds (default 60). If a task requests INTERVAL_SECONDS
      * smaller than this value we schedule it with its own dedicated timer so it can
@@ -198,24 +200,28 @@ public class TaskSchedulerService {
     }
 
     private Duration getStaleRunningThreshold(ScheduledTask task) {
-        if (task == null) return STALE_RUNNING_THRESHOLD;
+        // Read live on every check (util.AppSettings does a cheap mtime-checked
+        // reload) so an admin's Settings-panel edit takes effect on the very
+        // next scheduler poll, no restart required.
+        Duration base = Duration.ofMinutes(util.AppSettings.getStaleRunningThresholdMinutes());
+        if (task == null) return base;
         switch (task.getScheduleType()) {
             case INTERVAL_SECONDS:
                 if (task.getIntervalSeconds() > 0) {
-                    long threshold = Math.max(STALE_RUNNING_THRESHOLD.getSeconds(), task.getIntervalSeconds() * 3L);
+                    long threshold = Math.max(base.getSeconds(), task.getIntervalSeconds() * 3L);
                     return Duration.ofSeconds(threshold);
                 }
                 break;
             case INTERVAL_MINUTES:
                 if (task.getIntervalMinutes() > 0) {
-                    long thresholdMins = Math.max(STALE_RUNNING_THRESHOLD.toMinutes(), task.getIntervalMinutes() * 2L);
+                    long thresholdMins = Math.max(base.toMinutes(), task.getIntervalMinutes() * 2L);
                     return Duration.ofMinutes(thresholdMins);
                 }
                 break;
             default:
                 break;
         }
-        return STALE_RUNNING_THRESHOLD;
+        return base;
     }
 
     private boolean isStaleRunning(ScheduledTask task, LocalDateTime now) {
@@ -358,6 +364,22 @@ public class TaskSchedulerService {
             if (transferService != null) transferService.cancelRunningTask(taskId);
         } catch (Exception ignored) {}
         return cancelledAny;
+    }
+
+    /**
+     * How many WinSCP/SFTP sessions are currently open for this task right
+     * now — see {@link TransferService#getActiveSessionCount(String)}.
+     * Normally 0 or 1; can briefly exceed 1 when
+     * {@code AppSettings.getTransferBatchConcurrency()} &gt; 1 and several
+     * batches are running in parallel. Safe to poll from the UI on a timer.
+     */
+    public int getActiveSessionCount(String taskId) {
+        return transferService != null ? transferService.getActiveSessionCount(taskId) : 0;
+    }
+
+    /** Total WinSCP/SFTP sessions open across every task right now. */
+    public int getTotalActiveSessionCount() {
+        return transferService != null ? transferService.getTotalActiveSessionCount() : 0;
     }
 
     /**

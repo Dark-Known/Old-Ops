@@ -74,6 +74,21 @@ public final class AppSettings {
     public static final String KEY_TRANSFER_BATCH_MAX_BYTES        = "transferBatchMaxBytes";
     public static final String KEY_TRANSFER_BATCH_INTERVAL_SECONDS = "transferBatchIntervalSeconds";
 
+    // How many batches run at once (separate WinSCP/SFTP sessions in
+    // parallel) instead of one strictly sequential session at a time. Big
+    // win for backlogs with many small files, where per-file protocol
+    // round-trip latency — not bandwidth — is the bottleneck, since the
+    // byte-size batch cap above still lets a single "small" batch contain
+    // thousands of files. 1 = old sequential behavior (default, safest).
+    public static final String KEY_TRANSFER_BATCH_CONCURRENCY = "transferBatchConcurrency";
+
+    // How long a task may sit in RUNNING before the scheduler assumes it
+    // crashed/hung and force-cancels it. For long-running transfers/backups
+    // (e.g. large backlogs of many small files) this may need to be raised
+    // well above the 30-minute default so a legitimately slow — but still
+    // progressing — run isn't killed and reported as FAILED partway through.
+    public static final String KEY_STALE_RUNNING_THRESHOLD_MINUTES = "staleRunningThresholdMinutes";
+
     // Built-in fallbacks, used only if neither app-settings.json nor
     // app-config.xml has a value (keeps behavior identical to before this
     // file existed, for anyone upgrading in place).
@@ -93,6 +108,8 @@ public final class AppSettings {
         HARD_DEFAULTS.put(KEY_TRANSFER_ASSUMED_THROUGHPUT_MBPS, "5");
         HARD_DEFAULTS.put(KEY_TRANSFER_BATCH_MAX_BYTES, "0"); // 0 = derive from the two settings above
         HARD_DEFAULTS.put(KEY_TRANSFER_BATCH_INTERVAL_SECONDS, "5");
+        HARD_DEFAULTS.put(KEY_TRANSFER_BATCH_CONCURRENCY, "1"); // 1 = sequential (old behavior)
+        HARD_DEFAULTS.put(KEY_STALE_RUNNING_THRESHOLD_MINUTES, "30");
     }
 
     // app-config.xml tag each key is seeded from on first run.
@@ -110,6 +127,8 @@ public final class AppSettings {
         XML_SEED_TAG.put(KEY_TRANSFER_ASSUMED_THROUGHPUT_MBPS, "transferAssumedThroughputMBps");
         XML_SEED_TAG.put(KEY_TRANSFER_BATCH_MAX_BYTES, "transferBatchMaxBytes");
         XML_SEED_TAG.put(KEY_TRANSFER_BATCH_INTERVAL_SECONDS, "transferBatchIntervalSeconds");
+        XML_SEED_TAG.put(KEY_TRANSFER_BATCH_CONCURRENCY, "transferBatchConcurrency");
+        XML_SEED_TAG.put(KEY_STALE_RUNNING_THRESHOLD_MINUTES, "staleRunningThresholdMinutes");
     }
 
     private static final Object LOCK = new Object();
@@ -241,6 +260,30 @@ public final class AppSettings {
         } catch (Exception e) {
             return Integer.parseInt(HARD_DEFAULTS.get(KEY_TRANSFER_BATCH_INTERVAL_SECONDS));
         }
+    }
+
+    /**
+     * How many batches are run concurrently (each its own WinSCP/SFTP
+     * session) instead of one at a time. Defaults to 1 (sequential, matches
+     * pre-existing behavior). Values &lt;= 1 mean sequential. Read live —
+     * editable from the Settings panel, app-settings.json, or app-config.xml
+     * — no restart required.
+     */
+    public static int getTransferBatchConcurrency() {
+        return Math.max(1, intOrDefault(KEY_TRANSFER_BATCH_CONCURRENCY));
+    }
+
+    /**
+     * How many minutes a task may remain RUNNING before the scheduler treats
+     * it as stale (crashed/hung) and force-cancels it. Defaults to 30.
+     * Interval-scheduled tasks additionally scale this up relative to their
+     * own interval (see {@code TaskSchedulerService.getStaleRunningThreshold}),
+     * but this value is always the floor. Read live — editable from the
+     * Settings panel, app-settings.json, or app-config.xml — no restart
+     * required.
+     */
+    public static int getStaleRunningThresholdMinutes() {
+        return Math.max(1, intOrDefault(KEY_STALE_RUNNING_THRESHOLD_MINUTES));
     }
 
     /**

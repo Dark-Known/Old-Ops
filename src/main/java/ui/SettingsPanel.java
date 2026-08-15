@@ -39,6 +39,8 @@ public class SettingsPanel extends JPanel {
     private javax.swing.JSpinner spinnerBatchThroughputMBps;
     private javax.swing.JSpinner spinnerBatchIntervalSeconds;
     private JTextField tfBatchMaxBytesOverride;
+    private javax.swing.JSpinner spinnerBatchConcurrency;
+    private javax.swing.JSpinner spinnerStaleThresholdMinutes;
 
     public SettingsPanel(TransferService transferService) {
         this(transferService, null);
@@ -304,6 +306,36 @@ public class SettingsPanel extends JPanel {
 
         tfBatchMaxBytesOverride = new JTextField(12);
         row = addFieldRow(panel, lc, fc, "Batch size override (bytes, 0=auto):", tfBatchMaxBytesOverride, row);
+
+        spinnerBatchConcurrency = new javax.swing.JSpinner(
+                new javax.swing.SpinnerNumberModel(1, 1, 50, 1));
+        row = addFieldRow(panel, lc, fc, "Batches/files to run at once:", spinnerBatchConcurrency, row);
+
+        JLabel concurrencyHint = new JLabel("<html><body style='width: 480px'><i style='color:gray'>"
+            + "1 = one operation at a time (original behavior) — one WinSCP/SFTP session for remote "
+            + "transfers/backups, one file copy/move at a time for local backups. Raising this runs that "
+            + "many in parallel — the main lever for backlogs with a huge number of small files, where "
+            + "per-file overhead (network round trips, or local open/copy/close calls) is the real "
+            + "bottleneck rather than link speed or disk throughput. Increase gradually; for remote "
+            + "transfers, confirm the server tolerates multiple simultaneous connections.</i></body></html>");
+        GridBagConstraints chc = new GridBagConstraints();
+        chc.gridx = 0; chc.gridy = row++; chc.gridwidth = 3; chc.anchor = GridBagConstraints.WEST;
+        chc.insets = new Insets(0, 4, 8, 0);
+        panel.add(concurrencyHint, chc);
+
+        spinnerStaleThresholdMinutes = new javax.swing.JSpinner(
+                new javax.swing.SpinnerNumberModel(30, 1, 1440, 1));
+        row = addFieldRow(panel, lc, fc, "Stale RUNNING task timeout (min):", spinnerStaleThresholdMinutes, row);
+
+        JLabel staleHint = new JLabel("<html><body style='width: 480px'><i style='color:gray'>"
+            + "If a task stays RUNNING longer than this, the scheduler assumes it crashed/hung and "
+            + "force-cancels it, marking it FAILED (stale). Raise this for backups/transfers with large "
+            + "backlogs that legitimately take a long time, so a slow-but-progressing run isn't killed "
+            + "and reported as failed partway through.</i></body></html>");
+        GridBagConstraints shc = new GridBagConstraints();
+        shc.gridx = 0; shc.gridy = row++; shc.gridwidth = 3; shc.anchor = GridBagConstraints.WEST;
+        shc.insets = new Insets(0, 4, 8, 0);
+        panel.add(staleHint, shc);
 
         // Fixed pixel width in the <body> style forces the HTML renderer to wrap
         // this onto multiple lines instead of laying it out as one long line that
@@ -735,6 +767,8 @@ public class SettingsPanel extends JPanel {
         spinnerBatchThroughputMBps.setValue(AppSettings.getTransferAssumedThroughputMBps());
         spinnerBatchIntervalSeconds.setValue(AppSettings.getTransferBatchIntervalSeconds());
         tfBatchMaxBytesOverride.setText(AppSettings.get(AppSettings.KEY_TRANSFER_BATCH_MAX_BYTES));
+        spinnerBatchConcurrency.setValue(AppSettings.getTransferBatchConcurrency());
+        spinnerStaleThresholdMinutes.setValue(AppSettings.getStaleRunningThresholdMinutes());
     }
 
     private void savePrefs() {
@@ -774,6 +808,10 @@ public class SettingsPanel extends JPanel {
                 lblStatus.setForeground(Color.RED);
                 return;
             }
+            live.put(AppSettings.KEY_TRANSFER_BATCH_CONCURRENCY,
+                    String.valueOf((Integer) spinnerBatchConcurrency.getValue()));
+            live.put(AppSettings.KEY_STALE_RUNNING_THRESHOLD_MINUTES,
+                    String.valueOf((Integer) spinnerStaleThresholdMinutes.getValue()));
             AppSettings.setAll(live);
         } catch (Exception ex) {
             lblStatus.setText("Could not save live settings: " + ex.getMessage());

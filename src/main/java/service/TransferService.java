@@ -81,7 +81,11 @@ public class TransferService {
     private final OAuth2TokenService oauthService;
     private final GraphMailService graphMailService = new GraphMailService();
 
-    private final ConcurrentMap<String, Process> activeProcesses = new ConcurrentHashMap<>();
+    // Keyed by taskId. A Set rather than a single Process because, with
+    // AppSettings.getTransferBatchConcurrency() > 1, more than one WinSCP
+    // process can legitimately be in flight for the same task at once (one
+    // per concurrently-running batch).
+    private final ConcurrentMap<String, java.util.Set<Process>> activeProcesses = new ConcurrentHashMap<>();
 
     public TransferService(XmlStorageService storage) {
         this.storage                = storage;
@@ -174,15 +178,27 @@ public class TransferService {
      * SIZE-based batches (see {@link AppSettings#getTransferBatchMaxBytes()}),
      * pausing {@link AppSettings#getTransferBatchIntervalSeconds()} between
      * batches. Used by Backup for a local source/destination side.
+     *
+     * <p>Within each batch, individual file copies/moves run concurrently —
+     * up to {@link AppSettings#getTransferBatchConcurrency()} at once — the
+     * same setting that controls parallel SFTP sessions for remote transfers.
+     * Concurrency is 1 (fully sequential, original behavior) by default.
+     * This matters for local backlogs of many small files too: even on local
+     * disks, thousands of individual open/copy/close syscalls each carry
+     * fixed overhead, and overlapping them (especially when the destination
+     * is a network share/mapped drive rather than truly local disk) can cut
+     * wall-clock time substantially versus doing them strictly one at a time.
      */
     private boolean runLocalFileBatch(List<Path> files, Path destDir, LocalFileOp op, Consumer<String> logLine) {
         List<List<Path>> batches = chunkPathsBySize(files);
         long maxBytes = AppSettings.getTransferBatchMaxBytes();
         int intervalSeconds = AppSettings.getTransferBatchIntervalSeconds();
+        int concurrency = AppSettings.getTransferBatchConcurrency();
         if (batches.size() > 1) {
             logLine.accept("[INFO] " + files.size() + " file(s) to " + (op == LocalFileOp.MOVE ? "move" : "copy")
                     + " — splitting into " + batches.size() + " batch(es), capped at ~"
-                    + humanReadableBytes(maxBytes) + " per batch (configurable in Settings).");
+                    + humanReadableBytes(maxBytes) + " per batch (configurable in Settings)."
+                    + (concurrency > 1 ? " Running up to " + concurrency + " file(s) at a time." : ""));
         }
         boolean allOk = true;
         int done = 0;
@@ -196,13 +212,12 @@ public class TransferService {
                 logLine.accept("[INFO] Batch " + (i + 1) + "/" + batches.size()
                         + " (" + batch.size() + " file(s))");
             }
-            for (Path src : batch) {
-                boolean ok = op == LocalFileOp.MOVE
-                        ? moveSingleFile(src, destDir.resolve(src.getFileName()), logLine)
-                        : copySingleFile(src, destDir.resolve(src.getFileName()), logLine);
-                allOk &= ok;
-                if (ok) done++;
-            }
+            int[] batchDone = new int[1];
+            boolean batchOk = (concurrency <= 1)
+                    ? runLocalFileOpsSequentially(batch, destDir, op, logLine, batchDone)
+                    : runLocalFileOpsConcurrently(batch, destDir, op, logLine, concurrency, batchDone);
+            allOk &= batchOk;
+            done += batchDone[0];
             if (i < batches.size() - 1 && intervalSeconds > 0) {
                 sleepBetweenBatches(intervalSeconds, logLine);
             }
@@ -211,6 +226,68 @@ public class TransferService {
             logLine.accept("[SUCCESS] Local " + (op == LocalFileOp.MOVE ? "backup" : "copy")
                     + " completed (" + done + " file(s)).");
         }
+        return allOk;
+    }
+
+    /** Original one-at-a-time behavior for a single batch — used when concurrency is 1 (default). */
+    private boolean runLocalFileOpsSequentially(List<Path> batch, Path destDir, LocalFileOp op,
+            Consumer<String> logLine, int[] doneOut) {
+        boolean allOk = true;
+        int done = 0;
+        for (Path src : batch) {
+            boolean ok = op == LocalFileOp.MOVE
+                    ? moveSingleFile(src, destDir.resolve(src.getFileName()), logLine)
+                    : copySingleFile(src, destDir.resolve(src.getFileName()), logLine);
+            allOk &= ok;
+            if (ok) done++;
+        }
+        doneOut[0] = done;
+        return allOk;
+    }
+
+    /**
+     * Runs a batch's file copies/moves through a fixed-size thread pool
+     * (size = {@code concurrency}) instead of one file at a time. Safe here
+     * because {@link #copySingleFile} / {@link #moveSingleFile} each touch a
+     * distinct source/destination pair with no shared mutable state besides
+     * the thread-safe logging callback.
+     */
+    private boolean runLocalFileOpsConcurrently(List<Path> batch, Path destDir, LocalFileOp op,
+            Consumer<String> logLine, int concurrency, int[] doneOut) {
+        java.util.concurrent.ExecutorService pool =
+                java.util.concurrent.Executors.newFixedThreadPool(Math.min(concurrency, batch.size()));
+        java.util.concurrent.atomic.AtomicInteger done = new java.util.concurrent.atomic.AtomicInteger(0);
+        boolean allOk = true;
+        try {
+            List<java.util.concurrent.Callable<Boolean>> tasks = new ArrayList<>();
+            for (Path src : batch) {
+                tasks.add(() -> {
+                    boolean ok = op == LocalFileOp.MOVE
+                            ? moveSingleFile(src, destDir.resolve(src.getFileName()), logLine)
+                            : copySingleFile(src, destDir.resolve(src.getFileName()), logLine);
+                    if (ok) done.incrementAndGet();
+                    return ok;
+                });
+            }
+            List<java.util.concurrent.Future<Boolean>> results;
+            try {
+                results = pool.invokeAll(tasks);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                doneOut[0] = done.get();
+                return false;
+            }
+            for (java.util.concurrent.Future<Boolean> r : results) {
+                try {
+                    if (!Boolean.TRUE.equals(r.get())) allOk = false;
+                } catch (Exception e) {
+                    allOk = false;
+                }
+            }
+        } finally {
+            pool.shutdownNow();
+        }
+        doneOut[0] = done.get();
         return allOk;
     }
 
@@ -612,10 +689,11 @@ public class TransferService {
         }
 
         List<String> rawLines = new ArrayList<>();
+        File listLogFile = new File(listScript.getAbsolutePath() + ".log");
         try {
             ProcessBuilder pb = new ProcessBuilder(
                     winScpPath, "/script=" + listScript.getAbsolutePath(),
-                    "/log=" + getTempLogPath(), "/loglevel=1");
+                    "/log=" + listLogFile.getAbsolutePath(), "/loglevel=1");
             pb.redirectErrorStream(true);
             Process proc = pb.start();
             try (BufferedReader br =
@@ -633,6 +711,7 @@ public class TransferService {
             proc.waitFor();
         } finally {
             listScript.delete();
+            try { listLogFile.delete(); } catch (Exception ignored) {}
         }
         logLine.accept("[INFO] Received " + rawLines.size() + " lines from remote listing.");
 
@@ -728,16 +807,24 @@ public class TransferService {
 
     private boolean runWinScpScript(File scriptFile, Consumer<String> logLine,
                                     String taskId) throws Exception {
+        // Unique per call (derived from the already-unique scriptFile name)
+        // rather than the old fixed shared path — required now that batches
+        // can run concurrently (AppSettings.getTransferBatchConcurrency() >
+        // 1), since two WinSCP processes writing the same log file at once
+        // would collide/lock on Windows. Best-effort cleanup afterward.
+        File logFile = new File(scriptFile.getAbsolutePath() + ".log");
         ProcessBuilder pb = new ProcessBuilder(
                 winScpPath,
                 "/script=" + scriptFile.getAbsolutePath(),
-                "/log=" + getTempLogPath(),
+                "/log=" + logFile.getAbsolutePath(),
                 "/loglevel=1");
         pb.redirectErrorStream(true);
         Process proc = null;
         try {
             proc = pb.start();
-            if (taskId != null) activeProcesses.put(taskId, proc);
+            if (taskId != null) {
+                activeProcesses.computeIfAbsent(taskId, k -> ConcurrentHashMap.newKeySet()).add(proc);
+            }
 
             try (BufferedReader br =
                          new BufferedReader(new InputStreamReader(proc.getInputStream()))) {
@@ -764,7 +851,14 @@ public class TransferService {
             Thread.currentThread().interrupt();
             return false;
         } finally {
-            if (taskId != null) activeProcesses.remove(taskId);
+            if (taskId != null) {
+                java.util.Set<Process> set = activeProcesses.get(taskId);
+                if (set != null) {
+                    set.remove(proc);
+                    if (set.isEmpty()) activeProcesses.remove(taskId, set);
+                }
+            }
+            try { logFile.delete(); } catch (Exception ignored) {}
         }
     }
 
@@ -821,6 +915,19 @@ public class TransferService {
      * transient failure partway through a large backlog doesn't block
      * everything after it; overall success requires every batch to have
      * succeeded.
+     *
+     * <p>By default batches run one at a time (matching the original
+     * behavior). If {@link AppSettings#getTransferBatchConcurrency()} is set
+     * above 1, up to that many batches run at once — each its own WinSCP/SFTP
+     * session — which is the difference between "many small round trips one
+     * after another" and "many small round trips in parallel". This matters
+     * a lot for backlogs of many small files (e.g. tens of thousands of
+     * few-KB files): the byte-size cap alone still packs thousands of files
+     * into one "small" batch, and per-file SFTP round-trip latency —
+     * not bandwidth — is what dominates wall-clock time in that case.
+     * Batches are still processed in size-capped groups ("waves") of up to
+     * {@code concurrency} batches; the configured pause happens between
+     * waves rather than between every single batch.
      */
     private boolean runBatchedWinScpCommands(Credential target, String password,
             List<SizedCommand> sizedCommands, Consumer<String> logLine, String taskId) throws Exception {
@@ -832,28 +939,103 @@ public class TransferService {
 
         long maxBytes = AppSettings.getTransferBatchMaxBytes();
         int intervalSeconds = AppSettings.getTransferBatchIntervalSeconds();
+        int concurrency = AppSettings.getTransferBatchConcurrency();
         List<List<SizedCommand>> batches = chunkBySize(sizedCommands, sc -> sc.size, maxBytes);
 
         if (batches.size() > 1) {
             long totalBytes = sizedCommands.stream().mapToLong(sc -> sc.size).sum();
             logLine.accept("[INFO] " + sizedCommands.size() + " file(s), " + humanReadableBytes(totalBytes)
                     + " total — splitting into " + batches.size() + " batch(es), capped at ~"
-                    + humanReadableBytes(maxBytes) + " per batch (configurable in Settings).");
+                    + humanReadableBytes(maxBytes) + " per batch (configurable in Settings)."
+                    + (concurrency > 1 ? " Running up to " + concurrency + " batch(es) at a time." : ""));
         }
 
+        if (concurrency <= 1 || batches.size() <= 1) {
+            return runBatchesSequentially(target, password, batches, intervalSeconds, logLine, taskId);
+        }
+        return runBatchesConcurrently(target, password, batches, concurrency, intervalSeconds, logLine, taskId);
+    }
+
+    /** Original one-at-a-time behavior — used when concurrency is 1 (default) or there's only one batch. */
+    private boolean runBatchesSequentially(Credential target, String password, List<List<SizedCommand>> batches,
+            int intervalSeconds, Consumer<String> logLine, String taskId) throws Exception {
         boolean allOk = true;
         for (int i = 0; i < batches.size(); i++) {
             if (Thread.currentThread().isInterrupted()) {
                 logLine.accept("[INFO] Transfer cancelled.");
                 return false;
             }
-            List<SizedCommand> batch = batches.get(i);
-            if (batches.size() > 1) {
-                long batchBytes = batch.stream().mapToLong(sc -> sc.size).sum();
-                logLine.accept("[INFO] Batch " + (i + 1) + "/" + batches.size()
-                        + " (" + batch.size() + " file(s), " + humanReadableBytes(batchBytes) + ")");
+            if (!runOneBatch(target, password, batches.get(i), i, batches.size(), logLine, taskId)) {
+                allOk = false;
             }
-            File scriptFile = File.createTempFile("opstool_batch_", ".txt");
+            if (i < batches.size() - 1 && intervalSeconds > 0) {
+                sleepBetweenBatches(intervalSeconds, logLine);
+            }
+        }
+        return allOk;
+    }
+
+    /**
+     * Runs batches in waves of up to {@code concurrency} at once, each wave
+     * on its own thread submitting its own WinSCP process, waiting for the
+     * whole wave to finish before pausing (if configured) and starting the
+     * next wave. Keeps the existing pause-between-groups behavior while
+     * letting each group's SFTP round trips overlap instead of queueing.
+     */
+    private boolean runBatchesConcurrently(Credential target, String password, List<List<SizedCommand>> batches,
+            int concurrency, int intervalSeconds, Consumer<String> logLine, String taskId) throws Exception {
+        boolean allOk = true;
+        int total = batches.size();
+        java.util.concurrent.ExecutorService pool =
+                java.util.concurrent.Executors.newFixedThreadPool(Math.min(concurrency, total));
+        try {
+            for (int waveStart = 0; waveStart < total; waveStart += concurrency) {
+                if (Thread.currentThread().isInterrupted()) {
+                    logLine.accept("[INFO] Transfer cancelled.");
+                    return false;
+                }
+                int waveEnd = Math.min(waveStart + concurrency, total);
+                List<java.util.concurrent.Callable<Boolean>> waveTasks = new ArrayList<>();
+                for (int i = waveStart; i < waveEnd; i++) {
+                    final int idx = i;
+                    waveTasks.add(() -> runOneBatch(target, password, batches.get(idx), idx, total, logLine, taskId));
+                }
+                List<java.util.concurrent.Future<Boolean>> results;
+                try {
+                    results = pool.invokeAll(waveTasks);
+                } catch (InterruptedException ie) {
+                    logLine.accept("[INFO] Transfer cancelled.");
+                    Thread.currentThread().interrupt();
+                    return false;
+                }
+                for (java.util.concurrent.Future<Boolean> r : results) {
+                    try {
+                        if (!Boolean.TRUE.equals(r.get())) allOk = false;
+                    } catch (Exception e) {
+                        allOk = false;
+                    }
+                }
+                if (waveEnd < total && intervalSeconds > 0) {
+                    sleepBetweenBatches(intervalSeconds, logLine);
+                }
+            }
+        } finally {
+            pool.shutdownNow();
+        }
+        return allOk;
+    }
+
+    /** Builds and runs the WinSCP script for a single batch. Safe to call from multiple threads concurrently. */
+    private boolean runOneBatch(Credential target, String password, List<SizedCommand> batch,
+            int index, int totalBatches, Consumer<String> logLine, String taskId) {
+        if (totalBatches > 1) {
+            long batchBytes = batch.stream().mapToLong(sc -> sc.size).sum();
+            logLine.accept("[INFO] Batch " + (index + 1) + "/" + totalBatches
+                    + " (" + batch.size() + " file(s), " + humanReadableBytes(batchBytes) + ")");
+        }
+        File scriptFile;
+        try {
+            scriptFile = File.createTempFile("opstool_batch_", ".txt");
             secureTemp(scriptFile);
             try (PrintWriter pw = new PrintWriter(new FileWriter(scriptFile))) {
                 pw.println("option batch abort");
@@ -864,21 +1046,24 @@ public class TransferService {
                 pw.println("close");
                 pw.println("exit");
             }
-            boolean ok;
-            try {
-                ok = runWinScpScript(scriptFile, logLine, taskId);
-            } finally {
-                scriptFile.delete();
-            }
-            if (!ok) {
-                logLine.accept("[ERROR] Batch " + (i + 1) + "/" + batches.size() + " failed.");
-                allOk = false;
-            }
-            if (i < batches.size() - 1 && intervalSeconds > 0) {
-                sleepBetweenBatches(intervalSeconds, logLine);
-            }
+        } catch (IOException ex) {
+            logLine.accept("[ERROR] Batch " + (index + 1) + "/" + totalBatches
+                    + " failed to prepare script: " + ex.getMessage());
+            return false;
         }
-        return allOk;
+        boolean ok;
+        try {
+            ok = runWinScpScript(scriptFile, logLine, taskId);
+        } catch (Exception ex) {
+            logLine.accept("[ERROR] Batch " + (index + 1) + "/" + totalBatches + " failed: " + ex.getMessage());
+            ok = false;
+        } finally {
+            scriptFile.delete();
+        }
+        if (!ok) {
+            logLine.accept("[ERROR] Batch " + (index + 1) + "/" + totalBatches + " failed.");
+        }
+        return ok;
     }
 
     /**
@@ -2160,12 +2345,39 @@ public class TransferService {
 
     // ─── Cancellation ─────────────────────────────────────────────────────────
 
+    /**
+     * How many WinSCP/SFTP processes are currently in flight for this task
+     * right now. Normally 0 (idle) or 1 (running, concurrency=1). With
+     * {@link AppSettings#getTransferBatchConcurrency()} &gt; 1 this can
+     * briefly be more than 1 while several batches run in parallel — that's
+     * exactly what the setting is for. Cheap (map lookup), safe to poll from
+     * the UI on a timer.
+     */
+    public int getActiveSessionCount(String taskId) {
+        if (taskId == null) return 0;
+        java.util.Set<Process> procs = activeProcesses.get(taskId);
+        return procs == null ? 0 : procs.size();
+    }
+
+    /** Total WinSCP/SFTP processes in flight across every task right now, for an at-a-glance overall count. */
+    public int getTotalActiveSessionCount() {
+        int total = 0;
+        for (java.util.Set<Process> procs : activeProcesses.values()) {
+            total += procs.size();
+        }
+        return total;
+    }
+
     public boolean cancelRunningTask(String taskId) {
         if (taskId == null) return false;
-        Process p = activeProcesses.remove(taskId);
-        if (p == null) return false;
-        try { p.destroyForcibly(); return true; }
-        catch (Exception e) { return false; }
+        java.util.Set<Process> procs = activeProcesses.remove(taskId);
+        if (procs == null || procs.isEmpty()) return false;
+        boolean any = false;
+        for (Process p : procs) {
+            try { p.destroyForcibly(); any = true; }
+            catch (Exception ignored) {}
+        }
+        return any;
     }
 
     // ─── Credential resolution ────────────────────────────────────────────────
@@ -2245,7 +2457,6 @@ public class TransferService {
     }
 
     private String maskPasswords(String line)  { return line.replaceAll("(?i)(password[=:])\\S+", "$1****"); }
-    private String getTempLogPath()            { return System.getProperty("java.io.tmpdir") + File.separator + "opstool_winscp.log"; }
     private String nvl(String s, String def)   { return (s != null && !s.isEmpty()) ? s : def; }
 
     private String buildLocalDestinationPath(String dir, String fileName) {

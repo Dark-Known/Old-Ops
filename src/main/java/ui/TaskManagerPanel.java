@@ -39,6 +39,7 @@ public class TaskManagerPanel extends JPanel {
     private JTable table;
     private JTextArea logArea;
     private JLabel lblSelectedTask;
+    private JLabel lblActiveSessions;
 
     // ── Watcher fingerprint status bar ────────────────────────────────────────
     // Surfaces the epoch + size baseline for the selected task.
@@ -78,6 +79,26 @@ public class TaskManagerPanel extends JPanel {
         // thousands of `ls` result lines) into a handful of UI updates.
         Timer logFlushTimer = new Timer(150, e -> flushPendingLogLines());
         logFlushTimer.start();
+
+        // Separate lightweight timer for the active-session count: a plain
+        // map lookup, so no need to coalesce like the log lines above — but
+        // it DOES need its own tick, since it must keep updating even when
+        // no new log line has arrived (sessions opening/closing doesn't
+        // itself produce a log line at the exact moment the count changes).
+        Timer sessionCountTimer = new Timer(500, e -> refreshActiveSessionLabel());
+        sessionCountTimer.start();
+    }
+
+    private void refreshActiveSessionLabel() {
+        String taskId = getSelectedTaskId();
+        if (taskId == null) {
+            lblActiveSessions.setText(" ");
+            return;
+        }
+        int count = scheduler.getActiveSessionCount(taskId);
+        lblActiveSessions.setText(count > 0
+                ? "● " + count + " session" + (count == 1 ? "" : "s") + " open"
+                : " ");
     }
 
     private void flushPendingLogLines() {
@@ -258,9 +279,23 @@ public class TaskManagerPanel extends JPanel {
         logButtonPanel.add(btnExportLog);
         logButtonPanel.add(btnClearLog);
 
+        // Live count of open WinSCP/SFTP sessions for the selected task.
+        // Normally 0 (idle) or 1; can show >1 when Settings' "Batches/files
+        // to run at once" is raised above 1 and several batches are running
+        // in parallel — this is what lets you actually see that concurrency
+        // setting doing something, rather than just inferring it from
+        // overlapping "Batch N/Total" log lines.
+        lblActiveSessions = new JLabel(" ");
+        lblActiveSessions.setFont(lblActiveSessions.getFont().deriveFont(Font.PLAIN, 11f));
+        lblActiveSessions.setForeground(new Color(0x1565C0));
+        lblActiveSessions.setBorder(new EmptyBorder(4, 10, 4, 0));
+
         JPanel logHeader = new JPanel(new BorderLayout());
         logHeader.add(lblSelectedTask, BorderLayout.WEST);
-        logHeader.add(logButtonPanel,  BorderLayout.EAST);
+        JPanel logHeaderRight = new JPanel(new FlowLayout(FlowLayout.RIGHT, 0, 0));
+        logHeaderRight.add(lblActiveSessions);
+        logHeaderRight.add(logButtonPanel);
+        logHeader.add(logHeaderRight, BorderLayout.EAST);
 
         // ── Watcher fingerprint bar ───────────────────────────────────────────
         // Thin amber-tinted strip shown below the log header whenever the selected

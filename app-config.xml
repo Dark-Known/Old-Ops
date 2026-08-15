@@ -222,7 +222,32 @@
         <!-- 0 = derive from the two settings above; set >0 to override directly (bytes) -->
         <transferBatchMaxBytes>0</transferBatchMaxBytes>
         <transferBatchIntervalSeconds>5</transferBatchIntervalSeconds>
+
+        <!-- How many batches run at once (each its own WinSCP/SFTP session)
+             instead of strictly one at a time. 1 = original sequential
+             behavior. Raise this for backlogs of many small files, where
+             per-file round-trip latency (not link speed) is the bottleneck —
+             the byte-size cap above still packs thousands of tiny files into
+             one "small" batch, so running several batches in parallel is
+             what actually speeds things up in that case. Also applies to
+             local-to-local backups/copies: within a batch, up to this many
+             individual file copies/moves run at once instead of one at a
+             time (same "many small files" problem, just local open/copy/
+             close overhead instead of network round trips). -->
+        <transferBatchConcurrency>1</transferBatchConcurrency>
     </transfer>
+
+    <!-- Scheduler watchdog: how long a task may sit in RUNNING before it's
+         assumed crashed/hung and force-cancelled (marked FAILED (stale)).
+         Same live-reload rules as <transfer> above. Raise this for
+         backup/transfer tasks with large backlogs that legitimately take a
+         long time, so a slow-but-progressing run isn't killed and reported
+         as failed partway through. Interval-scheduled tasks additionally
+         scale their own effective threshold up relative to their interval,
+         but never below this floor. -->
+    <scheduler>
+        <staleRunningThresholdMinutes>30</staleRunningThresholdMinutes>
+    </scheduler>
 
     <!-- Network and Connectivity Settings -->
     <network>
