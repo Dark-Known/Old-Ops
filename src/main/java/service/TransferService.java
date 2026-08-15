@@ -19,7 +19,6 @@ import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
-import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -623,7 +622,11 @@ public class TransferService {
                          new BufferedReader(new InputStreamReader(proc.getInputStream()))) {
                 String line;
                 while ((line = br.readLine()) != null) {
-                    logLine.accept("[LS] " + maskPasswords(line));
+                    // NOTE: intentionally not logging every raw `ls` line here.
+                    // For directories with many thousands of files this used to push
+                    // one log line (and one UI update) per file, which is what drove
+                    // the CPU/memory spike during large listings. We still collect
+                    // every line for parsing below — just log a single summary count.
                     rawLines.add(line);
                 }
             }
@@ -631,6 +634,7 @@ public class TransferService {
         } finally {
             listScript.delete();
         }
+        logLine.accept("[INFO] Received " + rawLines.size() + " lines from remote listing.");
 
         java.util.Map<String, Integer> MONTH_MAP = new java.util.HashMap<>();
         MONTH_MAP.put("jan",1); MONTH_MAP.put("feb",2); MONTH_MAP.put("mar",3);
@@ -660,6 +664,16 @@ public class TransferService {
             int dayNum;
             try { dayNum = Integer.parseInt(dayStr); } catch (NumberFormatException e) { continue; }
 
+            // NOTE: these timestamps are parsed as if `ls -l` reported them in this
+            // JVM's local zone (java.time.ZoneId.systemDefault()) rather than UTC.
+            // That has to match the zone used later to bucket files into day-folders
+            // (see enumerateLocalBackupCandidates/enumerateRemoteBackupCandidates,
+            // which also use ZoneId.systemDefault()) — otherwise a file near a day
+            // boundary gets parsed in one zone and bucketed in another, and ends up
+            // filed under the wrong calendar day (e.g. a D-1 file landing in the D
+            // folder). If the remote server's clock is known to run in a different
+            // zone than this machine, that zone should become a configurable setting
+            // here instead of an assumption.
             long epochMillis;
             try {
                 if (timeOrYear.contains(":")) {
@@ -672,17 +686,20 @@ public class TransferService {
                         epochMillis = LocalDateTime.of(year, monthNum, dayNum,
                                         Integer.parseInt(tp[0]), Integer.parseInt(tp[1]),
                                         Integer.parseInt(tp[2]))
-                                .toEpochSecond(ZoneOffset.UTC) * 1000L;
+                                .atZone(java.time.ZoneId.systemDefault())
+                                .toInstant().toEpochMilli();
                     } else {
                         String[] tp = timeOrYear.split(":");
                         LocalDateTime ldt = LocalDateTime.of(currentYear, monthNum, dayNum,
                                 Integer.parseInt(tp[0]), Integer.parseInt(tp[1]), 0);
                         if (ldt.isAfter(LocalDateTime.now())) ldt = ldt.minusYears(1);
-                        epochMillis = ldt.toEpochSecond(ZoneOffset.UTC) * 1000L;
+                        epochMillis = ldt.atZone(java.time.ZoneId.systemDefault())
+                                .toInstant().toEpochMilli();
                     }
                 } else {
                     LocalDate ld = LocalDate.of(Integer.parseInt(timeOrYear), monthNum, dayNum);
-                    epochMillis = ld.atStartOfDay().toEpochSecond(ZoneOffset.UTC) * 1000L;
+                    epochMillis = ld.atStartOfDay(java.time.ZoneId.systemDefault())
+                            .toInstant().toEpochMilli();
                 }
             } catch (Exception ex) { continue; }
 

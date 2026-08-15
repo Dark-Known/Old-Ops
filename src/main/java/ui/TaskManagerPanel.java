@@ -20,6 +20,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentLinkedQueue;
 
 public class TaskManagerPanel extends JPanel {
 
@@ -50,6 +51,17 @@ public class TaskManagerPanel extends JPanel {
     private final Map<String, StringBuilder> taskLogs = new HashMap<>();
     private final List<String> taskIds = new ArrayList<>();
 
+    // Cap how much log text we retain per task so long-running listings
+    // (e.g. `ls` over huge remote directories) don't grow memory unboundedly.
+    // Oldest text is trimmed off once a task's log exceeds this.
+    private static final int MAX_LOG_CHARS_PER_TASK = 500_000; // ~500 KB per task
+
+    // Log lines arrive on a background (scheduler) thread. Instead of scheduling
+    // one SwingUtilities.invokeLater(...) per line — which floods the EDT queue
+    // and makes every append+getText() call redo work against a huge document —
+    // we queue lines here and drain/coalesce them on a timer.
+    private final ConcurrentLinkedQueue<String[]> pendingLogLines = new ConcurrentLinkedQueue<>();
+
     public TaskManagerPanel(XmlStorageService storage, TaskSchedulerService scheduler) {
         this.storage   = storage;
         this.scheduler = scheduler;
@@ -57,9 +69,72 @@ public class TaskManagerPanel extends JPanel {
         setBorder(new EmptyBorder(10, 10, 10, 10));
         buildUI();
 
-        // Register log callback — called by the scheduler on every emitted log line
-        scheduler.setLogCallback((taskId, line) ->
-            SwingUtilities.invokeLater(() -> appendLog(taskId, line)));
+        // Register log callback — called by the scheduler on every emitted log line.
+        // Just enqueue; no Swing/UI work happens on the caller's thread.
+        scheduler.setLogCallback((taskId, line) -> pendingLogLines.add(new String[]{taskId, line}));
+
+        // Drain queued log lines in batches instead of one EDT task per line.
+        // 150ms is frequent enough to feel live, but coalesces bursts (e.g.
+        // thousands of `ls` result lines) into a handful of UI updates.
+        Timer logFlushTimer = new Timer(150, e -> flushPendingLogLines());
+        logFlushTimer.start();
+    }
+
+    private void flushPendingLogLines() {
+        if (pendingLogLines.isEmpty()) return;
+
+        Map<String, StringBuilder> batchByTask = new HashMap<>();
+        boolean sawTerminalLine = false;
+
+        // Cap how much we drain in one tick so a huge burst still yields
+        // control back to the EDT promptly (remaining lines flush next tick).
+        String[] entry;
+        int drained = 0;
+        while (drained < 5000 && (entry = pendingLogLines.poll()) != null) {
+            String taskId = entry[0];
+            String line = entry[1];
+            batchByTask.computeIfAbsent(taskId, k -> new StringBuilder()).append(line).append('\n');
+            if (line.contains("=== Task") && line.contains("finished")) sawTerminalLine = true;
+            drained++;
+        }
+        if (batchByTask.isEmpty()) return;
+
+        String selectedTaskId = getSelectedTaskId();
+        boolean selectedHasRow = table.getSelectedRow() >= 0;
+        boolean appendedToVisibleArea = false;
+
+        for (Map.Entry<String, StringBuilder> e : batchByTask.entrySet()) {
+            String taskId = e.getKey();
+            String chunk = e.getValue().toString();
+
+            StringBuilder taskLog = taskLogs.computeIfAbsent(taskId, k -> new StringBuilder());
+            taskLog.append(chunk);
+            if (taskLog.length() > MAX_LOG_CHARS_PER_TASK) {
+                taskLog.delete(0, taskLog.length() - MAX_LOG_CHARS_PER_TASK);
+            }
+
+            if (selectedHasRow && taskId.equals(selectedTaskId)) {
+                logArea.append(chunk);
+                appendedToVisibleArea = true;
+            }
+        }
+
+        if (appendedToVisibleArea) {
+            // Document.getLength() is O(1) — unlike getText().length(), which
+            // copies the entire document into a new String on every call.
+            logArea.setCaretPosition(logArea.getDocument().getLength());
+        }
+
+        // Only refresh table on terminal lines — not every log line.
+        // This prevents UI thrash that breaks the Refresh button and next-run calculation.
+        if (sawTerminalLine) {
+            Timer timer = new Timer(600, e -> {
+                refresh();
+                updateWatcherFingerprintBar();
+            });
+            timer.setRepeats(false);
+            timer.start();
+        }
     }
 
     private void buildUI() {
@@ -662,8 +737,7 @@ public class TaskManagerPanel extends JPanel {
         } else {
             logArea.setText(String.join("\n", logs));
         }
-        logArea.setCaretPosition(
-            Math.min(logArea.getText().length(), logArea.getDocument().getLength()));
+        logArea.setCaretPosition(logArea.getDocument().getLength());
     }
 
     private void showLatestLogsForSelected() {
@@ -691,27 +765,6 @@ public class TaskManagerPanel extends JPanel {
         }
         logArea.setCaretPosition(
             Math.min(logArea.getText().length(), logArea.getDocument().getLength()));
-    }
-
-    private void appendLog(String taskId, String line) {
-        taskLogs.computeIfAbsent(taskId, k -> new StringBuilder()).append(line).append("\n");
-
-        int row = table.getSelectedRow();
-        if (row >= 0 && taskId.equals(getSelectedTaskId())) {
-            logArea.append(line + "\n");
-            logArea.setCaretPosition(logArea.getText().length());
-        }
-
-        // Only refresh table on terminal lines — not every log line
-        // This prevents UI thrash that breaks the Refresh button and next-run calculation
-        if (line.contains("=== Task") && line.contains("finished")) {
-            Timer timer = new Timer(600, e -> {
-                refresh();
-                updateWatcherFingerprintBar();
-            });
-            timer.setRepeats(false);
-            timer.start();
-        }
     }
 
     // ── Export / archives ─────────────────────────────────────────────────────

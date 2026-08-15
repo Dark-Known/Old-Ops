@@ -247,7 +247,17 @@ public class SettingsPanel extends JPanel {
         GridBagConstraints lc = new GridBagConstraints();
         lc.anchor = GridBagConstraints.WEST; lc.insets = new Insets(4, 4, 4, 8);
         GridBagConstraints fc = new GridBagConstraints();
-        fc.fill = GridBagConstraints.HORIZONTAL; fc.weightx = 1; fc.insets = new Insets(4, 0, 4, 4);
+        // fill = NONE (not HORIZONTAL): these are short folder-name/number fields,
+        // so each should render at its own preferred width (set via JTextField(cols)
+        // below) and stay left-anchored, instead of stretching to match whatever
+        // column width the widest row in this panel happens to need. Note that
+        // weightx=0 alone is NOT enough here — GridBagLayout still sizes a shared
+        // column to fit its widest occupant (e.g. the "Attachment download
+        // location" field below), and HORIZONTAL fill would stretch every other
+        // field in that column to match regardless of weightx. fill=NONE is what
+        // actually decouples each field's rendered size from its neighbours'.
+        fc.fill = GridBagConstraints.NONE; fc.weightx = 0; fc.anchor = GridBagConstraints.WEST;
+        fc.insets = new Insets(4, 0, 4, 4);
         GridBagConstraints bc = new GridBagConstraints();
         bc.insets = new Insets(4, 0, 4, 4);
 
@@ -295,21 +305,26 @@ public class SettingsPanel extends JPanel {
         tfBatchMaxBytesOverride = new JTextField(12);
         row = addFieldRow(panel, lc, fc, "Batch size override (bytes, 0=auto):", tfBatchMaxBytesOverride, row);
 
-        JLabel batchHint = new JLabel("<html><i style='color:gray'>Transfers and backups (any mode/"
+        // Fixed pixel width in the <body> style forces the HTML renderer to wrap
+        // this onto multiple lines instead of laying it out as one long line that
+        // would otherwise force the whole panel (and every field in it) wider.
+        JLabel batchHint = new JLabel("<html><body style='width: 480px'><i style='color:gray'>"
+            + "Transfers and backups (any mode/"
             + "direction) are split by total FILE SIZE, not file count: each batch is capped so it "
             + "should complete in roughly the target duration above, given the assumed link speed "
             + "(cap = target seconds &times; link speed). A single file larger than the cap is still "
             + "sent alone in its own batch. Between batches the run pauses for the configured "
             + "interval. Set the override above (&gt;0 bytes) to bypass the derived cap and use an "
-            + "exact byte limit instead.</i></html>");
+            + "exact byte limit instead.</i></body></html>");
         GridBagConstraints bhc = new GridBagConstraints();
         bhc.gridx = 0; bhc.gridy = row++; bhc.gridwidth = 3; bhc.anchor = GridBagConstraints.WEST;
         bhc.insets = new Insets(0, 4, 8, 0);
         panel.add(batchHint, bhc);
 
-        JLabel hint = new JLabel("<html><i style='color:gray'>Attachments are saved to "
+        JLabel hint = new JLabel("<html><body style='width: 480px'><i style='color:gray'>"
+            + "Attachments are saved to "
             + "&lt;location&gt;\\LDM|PTM|Others\\&lt;message&gt;\\&lt;file&gt;. Leave blank to keep "
-            + "saving them inside each task's own output folder instead.</i></html>");
+            + "saving them inside each task's own output folder instead.</i></body></html>");
         GridBagConstraints hc = new GridBagConstraints();
         hc.gridx = 0; hc.gridy = row++; hc.gridwidth = 3; hc.anchor = GridBagConstraints.WEST;
         hc.insets = new Insets(0, 4, 8, 0);
