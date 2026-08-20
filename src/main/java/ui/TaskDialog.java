@@ -81,6 +81,8 @@ public class TaskDialog extends JDialog {
     private JLabel      lblSourceHint;
     private JLabel      lblTargetHint;
     private JTextField  tfTargetFolder;
+    private JTextField  tfAdditionalTargetFolders;
+    private JLabel      lblAdditionalTargetFolders;
     private JCheckBox   cbWatcherEnabled;
     private JLabel      lblWatcherInfo;
     private JLabel      lblWatcherStatus;
@@ -235,6 +237,16 @@ public class TaskDialog extends JDialog {
         tfTargetFolder = makeField(new JTextField(
                 existing != null && existing.getTargetPath() != null ? existing.getTargetPath() : "", 28));
 
+        tfAdditionalTargetFolders = makeField(new JTextField(
+                existing != null && existing.getAdditionalTargetPaths() != null
+                        ? existing.getAdditionalTargetPaths() : "", 28));
+        tfAdditionalTargetFolders.setToolTipText(
+                "Optional. Copy every transferred file to these folders too, in addition to the "
+                        + "destination above. OUTBOUND: additional remote folders on the same target "
+                        + "server/credential. INBOUND: additional local folders on this machine. "
+                        + "Separate multiple paths with a semicolon (;).");
+        lblAdditionalTargetFolders = new JLabel("Additional destinations");
+
         // ── Inbound watcher fields ────────────────────────────────────────────
         cbWatcherEnabled = new JCheckBox("Enable watcher task");
         lblWatcherInfo = new JLabel("<html><div style='width:380px'><i style='color:gray'>"
@@ -281,9 +293,10 @@ public class TaskDialog extends JDialog {
         addRow(fileTransferPanel, "Transfer Mode *",         cbTransferMode,         1);
         addRow(fileTransferPanel, lblTargetFolder,           tfTargetFolder,         2);
         addRow(fileTransferPanel, "",                        lblTargetHint,          3);
-        addRow(fileTransferPanel, "",                        cbWatcherEnabled,4);
-        addRow(fileTransferPanel, "",                        lblWatcherInfo,         5);
-        addRow(fileTransferPanel, "Watcher baseline",        watcherStatusRow,       6);
+        addRow(fileTransferPanel, lblAdditionalTargetFolders, tfAdditionalTargetFolders, 4);
+        addRow(fileTransferPanel, "",                        cbWatcherEnabled,5);
+        addRow(fileTransferPanel, "",                        lblWatcherInfo,         6);
+        addRow(fileTransferPanel, "Watcher baseline",        watcherStatusRow,       7);
 
         transferTab = new JPanel(new GridBagLayout());
         transferTab.setOpaque(false);
@@ -735,6 +748,12 @@ public class TaskDialog extends JDialog {
         // Watcher checkbox is available for both directions (watching is supported for inbound and outbound
         // transfers). Keep the checkbox visible whenever the Transfer tab is shown.
         cbWatcherEnabled.setVisible(true);
+
+        // Multi-destination copying is supported for both directions: OUTBOUND
+        // copies to additional remote folders on the same server, INBOUND
+        // copies the downloaded file to additional local folders.
+        lblAdditionalTargetFolders.setText(inbound ? "Additional local destinations" : "Additional destinations");
+
         transferTab.revalidate(); transferTab.repaint();
         revalidate(); repaint();
         pack();
@@ -1074,6 +1093,7 @@ public class TaskDialog extends JDialog {
                     (String) cbTransferMode.getSelectedItem()));
             t.setSourcePath(tfSourcePath.getText().trim());
             t.setTargetPath(tfTargetFolder.getText().trim());
+            t.setAdditionalTargetPaths(tfAdditionalTargetFolders.getText().trim());
             t.setWatcherEnabled(cbWatcherEnabled.isSelected());
 
 

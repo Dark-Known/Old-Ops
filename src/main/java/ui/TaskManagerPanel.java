@@ -763,7 +763,7 @@ public class TaskManagerPanel extends JPanel {
             lblSelectedTask.setForeground(UIManager.getColor("Label.foreground"));
         }
 
-        List<String> logs = scheduler.getLogService().getTaskLogs(id);
+        List<String> logs = scheduler.getLogService().getTaskLogs(id, name);
         if (logs.isEmpty()) {
             StringBuilder sb = taskLogs.getOrDefault(id, new StringBuilder());
             logArea.setText(sb.length() > 0
@@ -790,7 +790,7 @@ public class TaskManagerPanel extends JPanel {
         lblSelectedTask.setText("Latest 50 lines - Execution log: " + name);
         lblSelectedTask.setForeground(UIManager.getColor("Label.foreground"));
 
-        List<String> logs = scheduler.getLogService().getTaskLogsLastN(id, 50);
+        List<String> logs = scheduler.getLogService().getTaskLogsLastN(id, name, 50);
         if (logs.isEmpty()) {
             StringBuilder sb = taskLogs.getOrDefault(id, new StringBuilder());
             logArea.setText(sb.length() > 0 ? sb.toString()
@@ -822,7 +822,7 @@ public class TaskManagerPanel extends JPanel {
         if (fc.showSaveDialog(this) == JFileChooser.APPROVE_OPTION) {
             java.io.File selected = fc.getSelectedFile();
             try (java.io.FileWriter fw = new java.io.FileWriter(selected)) {
-                for (String logLine : scheduler.getLogService().getTaskLogs(id))
+                for (String logLine : scheduler.getLogService().getTaskLogs(id, name))
                     fw.write(logLine + "\n");
                 JOptionPane.showMessageDialog(this,
                     "Logs exported to:\n" + selected.getAbsolutePath(),
@@ -848,7 +848,7 @@ public class TaskManagerPanel extends JPanel {
                 "No Task Selected", JOptionPane.WARNING_MESSAGE); return;
         }
 
-        List<java.io.File> archives = scheduler.getLogService().getTaskLogArchives(id);
+        List<java.io.File> archives = scheduler.getLogService().getTaskLogArchives(id, name);
         if (archives.isEmpty()) {
             JOptionPane.showMessageDialog(this,
                 "No archived logs found for this task.",

@@ -33,6 +33,17 @@ public class ScheduledTask {
     private String sourcePath;
     private String targetPath;
 
+    // Optional extra destination folders, in addition to targetPath —
+    // every transferred file also gets copied to each of these.
+    // OUTBOUND: additional REMOTE folders on the SAME target server/
+    //   credential as targetPath (extra "put" commands).
+    // INBOUND: additional LOCAL folders on this machine — the file is
+    //   downloaded once, then copied locally to each extra folder.
+    // Stored as a single semicolon-separated string (mirrors how simple
+    // multi-value fields are already persisted elsewhere in this class) so
+    // no XML schema change is needed.
+    private String additionalTargetPaths;
+
     // Backup fields ("D" = today; retention keeps D, D-1 ... D-(retentionDays-1) untouched
     // in the source, and everything older than that is eligible for backup).
     // Every eligible file is archived in a single run (no more day-bucket
@@ -159,6 +170,21 @@ public class ScheduledTask {
 
     public String getTargetPath()                { return targetPath; }
     public void   setTargetPath(String s)        { this.targetPath = s; }
+
+    /** Raw semicolon-separated extra destination folders (remote for OUTBOUND, local for INBOUND), or null/empty if none configured. */
+    public String getAdditionalTargetPaths()     { return additionalTargetPaths; }
+    public void   setAdditionalTargetPaths(String s) { this.additionalTargetPaths = s; }
+
+    /** Parsed, trimmed, non-empty list of extra destination folders. Empty list if none configured. */
+    public java.util.List<String> getAdditionalTargetPathList() {
+        java.util.List<String> result = new java.util.ArrayList<>();
+        if (additionalTargetPaths == null || additionalTargetPaths.trim().isEmpty()) return result;
+        for (String p : additionalTargetPaths.split(";")) {
+            String trimmed = p.trim();
+            if (!trimmed.isEmpty()) result.add(trimmed);
+        }
+        return result;
+    }
 
     public String getBackupSourcePath()          { return backupSourcePath; }
     public void   setBackupSourcePath(String s)  { this.backupSourcePath = s; }

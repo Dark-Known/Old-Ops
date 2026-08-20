@@ -187,7 +187,7 @@ public class TaskSchedulerService {
         List<ScheduledTask> tasks = storage.loadTasks();
         tasks.stream().filter(t -> t.getId().equals(taskId)).findFirst().ifPresent(t -> {
             if (t.getStatus() == TaskStatus.RUNNING || t.getStatus() == TaskStatus.RETRYING) {
-                emit(t.getId(), "[INFO] Task is already active and will not be requeued.");
+                emit(t, "[INFO] Task is already active and will not be requeued.");
                 return;
             }
             t.setStatus(TaskStatus.RUNNING);
@@ -245,7 +245,7 @@ public class TaskSchedulerService {
                 if (task.getStatus() == TaskStatus.RETRYING) continue;
                 if (task.getStatus() == TaskStatus.RUNNING) {
                     if (isStaleRunning(task, now)) {
-                        emit(task.getId(), "[WARN] Detected stale RUNNING task; cancelling and resetting.");
+                        emit(task, "[WARN] Detected stale RUNNING task; cancelling and resetting.");
                         try {
                             cancelTask(task.getId());
                         } catch (Exception ignored) {}
@@ -313,7 +313,7 @@ public class TaskSchedulerService {
                         if (t.getStatus() == TaskStatus.RETRYING) return;
                         if (t.getStatus() == TaskStatus.RUNNING) {
                             if (isStaleRunning(t, LocalDateTime.now())) {
-                                emit(t.getId(), "[WARN] Detected stale short-interval RUNNING task; cancelling and resetting.");
+                                emit(t, "[WARN] Detected stale short-interval RUNNING task; cancelling and resetting.");
                                 try {
                                     cancelTask(t.getId());
                                 } catch (Exception ignored) {}
@@ -502,13 +502,13 @@ public class TaskSchedulerService {
                     StandardOpenOption.CREATE, StandardOpenOption.WRITE);
             fileLock = lockChannel.tryLock();
         } catch (Exception e) {
-            emit(task.getId(), "[WARN] Could not set up cross-process task lock (" + e.getMessage()
+            emit(task, "[WARN] Could not set up cross-process task lock (" + e.getMessage()
                     + ") — proceeding without it.");
         }
 
         if (lockChannel != null && fileLock == null) {
             // Another process (GUI or Daemon) already holds the lock for this task.
-            emit(task.getId(), "[INFO] Skipped: task '" + task.getName()
+            emit(task, "[INFO] Skipped: task '" + task.getName()
                     + "' is already running in another process (GUI or Daemon) at this tick.");
             try { lockChannel.close(); } catch (IOException ignored) {}
             try { runningTaskFutures.remove(task.getId()); } catch (Exception ignored) {}
@@ -516,16 +516,16 @@ public class TaskSchedulerService {
         }
 
         try {
-        emit(task.getId(), "=== Starting task: " + task.getName() + " ===");
-        emit(task.getId(), "[DEBUG] Task ID: " + task.getId());
-        emit(task.getId(), "[DEBUG] Task Type: " + task.getTaskType());
-        emit(task.getId(), "[DEBUG] Schedule Type: " + task.getScheduleType());
+        emit(task, "=== Starting task: " + task.getName() + " ===");
+        emit(task, "[DEBUG] Task ID: " + task.getId());
+        emit(task, "[DEBUG] Task Type: " + task.getTaskType());
+        emit(task, "[DEBUG] Schedule Type: " + task.getScheduleType());
         if (task.getTaskType() == ScheduledTask.TaskType.FILE_TRANSFER) {
             // Transfer Mode only applies to file-transfer tasks — logging it
             // unconditionally printed a leftover/default value for every
             // mail task too, which was just noise (and misleading, since
             // that field isn't actually used for anything on mail tasks).
-            emit(task.getId(), "[DEBUG] Transfer Mode: " + (task.getTransferMode() != null ? task.getTransferMode().name() : "NULL"));
+            emit(task, "[DEBUG] Transfer Mode: " + (task.getTransferMode() != null ? task.getTransferMode().name() : "NULL"));
         }
         
         boolean success;
@@ -534,39 +534,39 @@ public class TaskSchedulerService {
             switch (task.getTaskType()) {
                 case FILE_TRANSFER:
                     try {
-                        success = transferService.executeTransfer(task, line -> emit(task.getId(), line));
+                        success = transferService.executeTransfer(task, line -> emit(task, line));
                     }
                     catch (TransferService.WatcherSkipException e) {
-                        emit(task.getId(), "[INFO] Inbound watcher skipped transfer: " + e.getMessage());
+                        emit(task, "[INFO] Inbound watcher skipped transfer: " + e.getMessage());
                         success = true;
                         skipped = true;
                     }
                     break;
                 case OUTLOOK_MAIL:
                     try {
-                        success = transferService.executeImapMailTask(task, line -> emit(task.getId(), line));
+                        success = transferService.executeImapMailTask(task, line -> emit(task, line));
                     }
                     catch (TransferService.WatcherSkipException e) {
-                        emit(task.getId(), "[INFO] Mail watcher skipped run: " + e.getMessage());
+                        emit(task, "[INFO] Mail watcher skipped run: " + e.getMessage());
                         success = true;
                         skipped = true;
                     }
                     break;
                 case BACKUP:
-                    success = transferService.executeBackup(task, line -> emit(task.getId(), line));
+                    success = transferService.executeBackup(task, line -> emit(task, line));
                     break;
                 default:
-                    emit(task.getId(), "[ERROR] Unknown task type: " + task.getTaskType());
+                    emit(task, "[ERROR] Unknown task type: " + task.getTaskType());
                     success = false;
             }
         } catch (Exception e) {
-            emit(task.getId(), "[ERROR] Unexpected error: " + e.getMessage());
+            emit(task, "[ERROR] Unexpected error: " + e.getMessage());
             e.printStackTrace();
             success = false;
         }
 
         if (!success && task.getRetryCount() > 0) {
-            emit(task.getId(), "[INFO] Task failed and will be retried " + task.getRetryCount() + " time(s).\n");
+            emit(task, "[INFO] Task failed and will be retried " + task.getRetryCount() + " time(s).\n");
             task.setStatus(TaskStatus.RETRYING);
             task.setLastStartedAt(null);
             storage.saveTask(task);
@@ -590,14 +590,14 @@ public class TaskSchedulerService {
                     || t.getScheduleType() == ScheduleType.INTERVAL_SECONDS))
                     || finalSkipped) {
                 t.setStatus(TaskStatus.PENDING);
-                emit(task.getId(), "[INFO] Task reset to PENDING for next scheduled run");
+                emit(task, "[INFO] Task reset to PENDING for next scheduled run");
             } else {
                 t.setStatus(finalSuccess ? TaskStatus.SUCCESS : TaskStatus.FAILED);
             }
             storage.saveTask(t);
         });
 
-        emit(task.getId(), "=== Task " + task.getName() + " finished: " + (success ? "SUCCESS" : "FAILED") + " ===");
+        emit(task, "=== Task " + task.getName() + " finished: " + (success ? "SUCCESS" : "FAILED") + " ===");
         task.setLastStartedAt(null);
         long durationMs = (System.nanoTime() - startNanos) / 1_000_000;
         long cpuMs = THREAD_BEAN.isCurrentThreadCpuTimeSupported() ? (THREAD_BEAN.getCurrentThreadCpuTime() - startCpuNanos) / 1_000_000 : 0L;
@@ -631,9 +631,11 @@ public class TaskSchedulerService {
         });
     }
 
-    private void emit(String taskId, String line) {
+    private void emit(ScheduledTask task, String line) {
+        String taskId = task != null ? task.getId() : null;
+        String taskName = task != null ? task.getName() : null;
         log.info("[" + taskId + "] " + line);
-        logService.log(taskId, line);
+        logService.log(taskId, taskName, line);
         if (logCallback != null) {
             logCallback.accept(taskId, LocalDateTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"))
                 + "  " + line);

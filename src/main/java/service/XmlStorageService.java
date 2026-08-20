@@ -146,6 +146,7 @@ public class XmlStorageService {
                         t.setTargetCredentialId(child(e, "targetCredentialId"));
                         t.setSourcePath(child(e, "sourcePath"));
                         t.setTargetPath(child(e, "targetPath"));
+                        t.setAdditionalTargetPaths(child(e, "additionalTargetPaths"));
                         t.setBackupSourcePath(child(e, "backupSourcePath"));
                         t.setBackupDestinationPath(child(e, "backupDestinationPath"));
                         String backupRetention = child(e, "backupRetentionDays");
@@ -344,6 +345,7 @@ public class XmlStorageService {
                             ? t.getTransferMode().name() : TransferMode.ENTIRE_FOLDER.name());
                     addChild(doc, e, "sourcePath", t.getSourcePath());
                     addChild(doc, e, "targetPath", t.getTargetPath());
+                    addChild(doc, e, "additionalTargetPaths", t.getAdditionalTargetPaths());
                     addChild(doc, e, "backupSourcePath", t.getBackupSourcePath());
                     addChild(doc, e, "backupDestinationPath", t.getBackupDestinationPath());
                     addChild(doc, e, "backupRetentionDays", String.valueOf(t.getBackupRetentionDays()));

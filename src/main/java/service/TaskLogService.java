@@ -10,7 +10,13 @@ import java.util.*;
 
 /**
  * Manages per-task logging — each task has its own log file.
- * Logs are stored in ~/.opstool/logs/task-{taskId}/
+ * Logs are stored in ~/.opstool/logs/{TaskName}_{shortId}/ — the folder is
+ * named after the task's display name (sanitized for the filesystem) rather
+ * than its raw task id, so logs are browsable/identifiable directly from the
+ * file system. A short suffix derived from the task id is still appended to
+ * keep folders unique even if two tasks share the same name, and renaming a
+ * task later will simply start a new folder under the new name (old logs
+ * stay where they were written).
  * 
  * Latest log is always in task.log
  * Rotated logs are named task-YYYY-MM-DD-HHmmss.log
@@ -33,6 +39,27 @@ public class TaskLogService {
         this.logsDir = new File(dataDir, "logs");
         this.logsDir.mkdirs();
     }
+
+    /**
+     * Builds the on-disk folder name for a task: sanitized task name plus a
+     * short id-derived suffix for uniqueness. Falls back to "task-{taskId}"
+     * when no usable name is available (e.g. very old callers that only had
+     * an id), and to "system" for the no-task (taskId == null) case used for
+     * scheduler-level messages.
+     */
+    private static String folderNameFor(String taskId, String taskName) {
+        if (taskId == null) return "system";
+        String sanitized = sanitize(taskName);
+        String idSuffix = taskId.length() > 8 ? taskId.substring(taskId.length() - 8) : taskId;
+        return sanitized.isEmpty() ? "task-" + taskId : sanitized + "_" + idSuffix;
+    }
+
+    private static String sanitize(String name) {
+        if (name == null) return "";
+        String cleaned = name.trim().replaceAll("[\\\\/:*?\"<>|]", "_").replaceAll("\\s+", "_");
+        if (cleaned.length() > 60) cleaned = cleaned.substring(0, 60);
+        return cleaned;
+    }
     
     /**
      * Log a message for a specific task, filtered by the currently
@@ -47,10 +74,10 @@ public class TaskLogService {
      * recognized tag is treated as INFO. Automatically rotates logs if they
      * exceed MAX_LOG_SIZE_BYTES.
      */
-    public synchronized void log(String taskId, String message) {
+    public synchronized void log(String taskId, String taskName, String message) {
         if (!meetsConfiguredLevel(message)) return;
         try {
-            File taskDir = new File(logsDir, "task-" + taskId);
+            File taskDir = new File(logsDir, folderNameFor(taskId, taskName));
             taskDir.mkdirs();
             
             File logFile = new File(taskDir, "task.log");
@@ -108,10 +135,10 @@ public class TaskLogService {
     /**
      * Retrieve all log lines for a task from the current log file.
      */
-    public List<String> getTaskLogs(String taskId) {
+    public List<String> getTaskLogs(String taskId, String taskName) {
         List<String> lines = new ArrayList<>();
         try {
-            File taskDir = new File(logsDir, "task-" + taskId);
+            File taskDir = new File(logsDir, folderNameFor(taskId, taskName));
             File logFile = new File(taskDir, "task.log");
             
             if (logFile.exists()) {
@@ -126,8 +153,8 @@ public class TaskLogService {
     /**
      * Retrieve the last N log lines for a task (most recent first from bottom of file).
      */
-    public List<String> getTaskLogsLastN(String taskId, int maxLines) {
-        List<String> allLines = getTaskLogs(taskId);
+    public List<String> getTaskLogsLastN(String taskId, String taskName, int maxLines) {
+        List<String> allLines = getTaskLogs(taskId, taskName);
         if (allLines.size() <= maxLines) {
             return allLines;
         }
@@ -137,10 +164,10 @@ public class TaskLogService {
     /**
      * Retrieve all rotated log files for a task (for archive/history).
      */
-    public List<File> getTaskLogArchives(String taskId) {
+    public List<File> getTaskLogArchives(String taskId, String taskName) {
         List<File> archives = new ArrayList<>();
         try {
-            File taskDir = new File(logsDir, "task-" + taskId);
+            File taskDir = new File(logsDir, folderNameFor(taskId, taskName));
             if (taskDir.exists()) {
                 File[] files = taskDir.listFiles((dir, name) -> 
                     name.startsWith("task-") && name.endsWith(".log") && !name.equals("task.log"));
@@ -158,9 +185,9 @@ public class TaskLogService {
     /**
      * Clear old rotated logs, keeping only the last N files per task.
      */
-    public void cleanupOldLogs(String taskId, int keepCount) {
+    public void cleanupOldLogs(String taskId, String taskName, int keepCount) {
         try {
-            List<File> archives = getTaskLogArchives(taskId);
+            List<File> archives = getTaskLogArchives(taskId, taskName);
             while (archives.size() > keepCount) {
                 File toDelete = archives.remove(archives.size() - 1);
                 toDelete.delete();
@@ -180,7 +207,7 @@ public class TaskLogService {
     }
     
     /** Get the directory for a specific task's logs. */
-    public File getTaskLogDirectory(String taskId) {
-        return new File(logsDir, "task-" + taskId);
+    public File getTaskLogDirectory(String taskId, String taskName) {
+        return new File(logsDir, folderNameFor(taskId, taskName));
     }
 }

@@ -159,7 +159,18 @@ public class TransferService {
         try {
             scriptFile = buildWinScpScript(target, target.getPassword(), task, logLine);
             logLine.accept("[INFO] WinSCP script prepared. Starting transfer...");
-            return runWinScpScript(scriptFile, logLine, task.getId());
+            boolean ok = runWinScpScript(scriptFile, logLine, task.getId());
+
+            if (ok && task.getTransferDirection() == TransferDirection.INBOUND) {
+                List<String> extraDestFolders = task.getAdditionalTargetPathList();
+                if (!extraDestFolders.isEmpty()) {
+                    String remotePath = normalizeRemotePath(task.getTargetPath());
+                    String fname = remotePath.substring(remotePath.lastIndexOf('/') + 1);
+                    String destPath = buildLocalDestinationPath(normalizeLocalPath(task.getSourcePath()), fname);
+                    copyDownloadedFilesToExtraFolders(Collections.singletonList(destPath), extraDestFolders, logLine);
+                }
+            }
+            return ok;
         } catch (Exception e) {
             logLine.accept("[ERROR] Transfer failed: " + e.getMessage());
             return false;
@@ -565,6 +576,11 @@ public class TransferService {
 
         try {
             List<SizedCommand> commands = new ArrayList<>();
+            List<String> extraDestFolders = task.getAdditionalTargetPathList();
+            if (!extraDestFolders.isEmpty()) {
+                logLine.accept("[INFO] Also copying to " + extraDestFolders.size()
+                        + " additional destination(s) on the same server: " + String.join(", ", extraDestFolders));
+            }
             for (RemoteFileMetadata meta : files) {
                 String localFile  = normalizeLocalPath(
                         Paths.get(localSourceDir, meta.fileName()).toString());
@@ -573,6 +589,15 @@ public class TransferService {
                         "put " + escapeWinScpPath(localFile) + " " + escapeWinScpRemotePath(remoteFile),
                         meta.size()));
                 logLine.accept("[INFO] Queued outbound: " + localFile + " → " + remoteFile);
+
+                for (String extraFolder : extraDestFolders) {
+                    String extraRemoteDir = normalizeRemotePath(extraFolder);
+                    extraRemoteDir = extraRemoteDir.endsWith("/") ? extraRemoteDir : extraRemoteDir + "/";
+                    String extraRemoteFile = extraRemoteDir + meta.fileName();
+                    commands.add(new SizedCommand(
+                            "put " + escapeWinScpPath(localFile) + " " + escapeWinScpRemotePath(extraRemoteFile),
+                            meta.size()));
+                }
             }
             return runBatchedWinScpCommands(target, target.getPassword(), commands, logLine, task.getId());
         } catch (Exception ex) {
@@ -593,6 +618,7 @@ public class TransferService {
 
         try {
             List<SizedCommand> commands = new ArrayList<>();
+            List<String> downloadedLocalPaths = new ArrayList<>();
             for (RemoteFileMetadata meta : files) {
                 String remoteFile = remoteDir + meta.fileName();
                 String destPath   = buildLocalDestinationPath(localDestDir, meta.fileName());
@@ -600,8 +626,16 @@ public class TransferService {
                         "get " + escapeWinScpRemotePath(remoteFile) + " " + escapeWinScpPath(destPath),
                         meta.size()));
                 logLine.accept("[INFO] Queued inbound: " + remoteFile + " → " + destPath);
+                downloadedLocalPaths.add(destPath);
             }
-            return runBatchedWinScpCommands(target, target.getPassword(), commands, logLine, task.getId());
+            boolean ok = runBatchedWinScpCommands(target, target.getPassword(), commands, logLine, task.getId());
+            List<String> extraDestFolders = task.getAdditionalTargetPathList();
+            if (ok && !extraDestFolders.isEmpty()) {
+                logLine.accept("[INFO] Also copying downloaded file(s) to " + extraDestFolders.size()
+                        + " additional local destination(s): " + String.join(", ", extraDestFolders));
+                copyDownloadedFilesToExtraFolders(downloadedLocalPaths, extraDestFolders, logLine);
+            }
+            return ok;
         } catch (Exception ex) {
             logLine.accept("[ERROR] Inbound watcher WinSCP transfer failed: " + ex.getMessage());
             return false;
@@ -644,11 +678,23 @@ public class TransferService {
                         + " " + escapeWinScpPath(destPath));
             } else {
                 logLine.accept("[INFO] Mode: Specific file (OUTBOUND)");
-                String remoteDestPath = prepareRemoteDestination(
-                        remotePath, new File(localPath).getName());
+                String fileName = new File(localPath).getName();
+                String remoteDestPath = prepareRemoteDestination(remotePath, fileName);
                 pw.println("put "
                         + escapeWinScpPath(localPath)
                         + " " + escapeWinScpRemotePath(remoteDestPath));
+
+                List<String> extraDestFolders = task.getAdditionalTargetPathList();
+                if (!extraDestFolders.isEmpty()) {
+                    logLine.accept("[INFO] Also copying to " + extraDestFolders.size()
+                            + " additional destination(s) on the same server: " + String.join(", ", extraDestFolders));
+                }
+                for (String extraFolder : extraDestFolders) {
+                    String extraDestPath = prepareRemoteDestination(normalizeRemotePath(extraFolder), fileName);
+                    pw.println("put "
+                            + escapeWinScpPath(localPath)
+                            + " " + escapeWinScpRemotePath(extraDestPath));
+                }
             }
 
             pw.println("close");
@@ -1122,6 +1168,12 @@ public class TransferService {
                     remoteFiles = Collections.singletonList(remotePath);
                 }
             }
+            List<String> extraDestFolders = task.getAdditionalTargetPathList();
+            if (!extraDestFolders.isEmpty()) {
+                logLine.accept("[INFO] Also copying downloaded file(s) to " + extraDestFolders.size()
+                        + " additional local destination(s): " + String.join(", ", extraDestFolders));
+            }
+            List<String> downloadedLocalPaths = new ArrayList<>();
             for (String remoteFile : remoteFiles) {
                 String fname    = remoteFile.substring(remoteFile.lastIndexOf('/') + 1);
                 String destPath = buildLocalDestinationPath(localPath, fname);
@@ -1129,7 +1181,14 @@ public class TransferService {
                 long size = stat != null ? stat.size : 0L;
                 commands.add(new SizedCommand(
                         "get " + escapeWinScpRemotePath(remoteFile) + " " + escapeWinScpPath(destPath), size));
+                downloadedLocalPaths.add(destPath);
             }
+
+            boolean ok = runBatchedWinScpCommands(target, target.getPassword(), commands, logLine, task.getId());
+            if (ok && !extraDestFolders.isEmpty()) {
+                copyDownloadedFilesToExtraFolders(downloadedLocalPaths, extraDestFolders, logLine);
+            }
+            return ok;
         } else {
             List<File> localFiles;
             File sourceDir = new File(task.getSourcePath());
@@ -1160,14 +1219,57 @@ public class TransferService {
                     localFiles = Collections.singletonList(sourceDir);
                 }
             }
+            List<String> extraDestFolders = task.getAdditionalTargetPathList();
+            if (!extraDestFolders.isEmpty()) {
+                logLine.accept("[INFO] Also copying to " + extraDestFolders.size()
+                        + " additional destination(s) on the same server: " + String.join(", ", extraDestFolders));
+            }
             for (File f : localFiles) {
                 String remoteDestPath = prepareRemoteDestination(remotePath, f.getName());
                 commands.add(new SizedCommand("put " + escapeWinScpPath(normalizeLocalPath(f.getAbsolutePath()))
                         + " " + escapeWinScpRemotePath(remoteDestPath), f.length()));
+
+                // Copy to every additional destination folder as well (same
+                // target server/credential — see ScheduledTask.additionalTargetPaths).
+                for (String extraFolder : extraDestFolders) {
+                    String extraDestPath = prepareRemoteDestination(normalizeRemotePath(extraFolder), f.getName());
+                    commands.add(new SizedCommand("put " + escapeWinScpPath(normalizeLocalPath(f.getAbsolutePath()))
+                            + " " + escapeWinScpRemotePath(extraDestPath), f.length()));
+                }
             }
         }
 
         return runBatchedWinScpCommands(target, target.getPassword(), commands, logLine, task.getId());
+    }
+
+    /**
+     * After a successful INBOUND download, copies each downloaded file from
+     * its primary local destination to every additional local destination
+     * folder (see {@link model.ScheduledTask#getAdditionalTargetPathList()}).
+     * A local file copy, not a second remote download — the file is already
+     * on disk after the WinSCP batch completes.
+     */
+    private void copyDownloadedFilesToExtraFolders(List<String> downloadedLocalPaths,
+            List<String> extraDestFolders, Consumer<String> logLine) {
+        for (String localPath : downloadedLocalPaths) {
+            File source = new File(localPath);
+            if (!source.exists()) continue;
+            for (String extraFolder : extraDestFolders) {
+                try {
+                    File destDir = new File(extraFolder);
+                    if (!destDir.exists() && !destDir.mkdirs()) {
+                        logLine.accept("[WARN] Could not create additional destination folder: " + extraFolder);
+                        continue;
+                    }
+                    Path dest = destDir.toPath().resolve(source.getName());
+                    Files.copy(source.toPath(), dest, StandardCopyOption.REPLACE_EXISTING);
+                    logLine.accept("[INFO] Copied " + source.getName() + " -> " + dest);
+                } catch (IOException ex) {
+                    logLine.accept("[WARN] Failed to copy " + source.getName()
+                            + " to additional destination '" + extraFolder + "': " + ex.getMessage());
+                }
+            }
+        }
     }
 
     // ─── Exception type ───────────────────────────────────────────────────────
@@ -1281,9 +1383,9 @@ public class TransferService {
         if (!sourceRemote && !destRemote) {
             ok = runLocalToLocalBackup(candidates, destPathStr, logLine);
         } else if (sourceRemote) {
-            ok = runRemoteToLocalBackup(sourceCred, candidates, destPathStr, logLine);
+            ok = runRemoteToLocalBackup(task.getId(), sourceCred, candidates, destPathStr, logLine);
         } else {
-            ok = runLocalToRemoteBackup(destCred, candidates, destPathStr, logLine);
+            ok = runLocalToRemoteBackup(task.getId(), destCred, candidates, destPathStr, logLine);
         }
 
         logLine.accept((ok ? "[SUCCESS] " : "[WARNING] ") + "Backup run complete.");
@@ -1371,7 +1473,7 @@ public class TransferService {
     }
 
     /** Remote source → local destination: pulls files via WinSCP `get` into {@code <destRoot>/<yyyy-MM-dd>/}, in size-based batches. */
-    private boolean runRemoteToLocalBackup(Credential sourceCred, List<BackupCandidate> candidates,
+    private boolean runRemoteToLocalBackup(String taskId, Credential sourceCred, List<BackupCandidate> candidates,
             String destPathStr, Consumer<String> logLine) {
         File destRoot = new File(destPathStr);
         if (!destRoot.exists() && !destRoot.mkdirs()) {
@@ -1391,7 +1493,7 @@ public class TransferService {
                     "get " + escapeWinScpRemotePath(c.remotePath) + " " + escapeWinScpPath(destPath), c.size));
         }
         try {
-            boolean ok = runBatchedWinScpCommands(sourceCred, sourceCred.getPassword(), commands, logLine, "backup");
+            boolean ok = runBatchedWinScpCommands(sourceCred, sourceCred.getPassword(), commands, logLine, taskId);
             if (ok) {
                 // Remove originals from the remote source now that they've landed locally.
                 deleteRemoteFilesViaWinScp(sourceCred, candidates.stream().map(c -> c.remotePath).collect(Collectors.toList()), logLine);
@@ -1404,7 +1506,7 @@ public class TransferService {
     }
 
     /** Local source → remote destination: pushes files via WinSCP `put` into {@code <destRoot>/<yyyy-MM-dd>/}, in size-based batches. */
-    private boolean runLocalToRemoteBackup(Credential destCred, List<BackupCandidate> candidates,
+    private boolean runLocalToRemoteBackup(String taskId, Credential destCred, List<BackupCandidate> candidates,
             String destPathStr, Consumer<String> logLine) {
         String remoteRoot = normalizeRemotePath(destPathStr);
         String remoteRootDir = remoteRoot.endsWith("/") ? remoteRoot : remoteRoot + "/";
@@ -1425,7 +1527,7 @@ public class TransferService {
                     "put " + escapeWinScpPath(normalizeLocalPath(c.localPath.toAbsolutePath().toString()))
                             + " " + escapeWinScpRemotePath(remoteRootDir + c.day + "/" + c.name), c.size))
                     .collect(Collectors.toList());
-            boolean ok = runBatchedWinScpCommands(destCred, destCred.getPassword(), putCommands, logLine, "backup");
+            boolean ok = runBatchedWinScpCommands(destCred, destCred.getPassword(), putCommands, logLine, taskId);
             if (ok) {
                 for (BackupCandidate c : candidates) {
                     try {
@@ -1651,17 +1753,19 @@ public class TransferService {
             }
             logLine.accept("[END MAIL MESSAGE]");
 
+            // Classify once, before naming the file, and reuse for the filename,
+            // attachment placement, and the mailbox folder move below, so all
+            // three stay consistent.
+            String classification = classifyForFolderRouting(m);
+
             try {
-                Path rcvFile = outputDir.resolve(buildRcvFileName(m));
+                Path rcvFile = uniqueRcvPath(outputDir, buildRcvFileName(m, classification));
                 Files.write(rcvFile, buildRcvFileContent(m, mode, logLine).getBytes(StandardCharsets.UTF_8));
                 logLine.accept("[INFO] Wrote " + rcvFile.getFileName());
             } catch (IOException ex) {
                 logLine.accept("[WARN] Failed to write .RCV file for '" + m.subject + "': " + ex.getMessage());
             }
 
-            // Classify once and reuse for both attachment placement and the
-            // mailbox folder move below, so the two stay consistent.
-            String classification = classifyForFolderRouting(m);
             saveAttachmentsToDisk(m, outputDir, classification, logLine);
 
             try {
@@ -1737,7 +1841,7 @@ public class TransferService {
                 : "PTM".equals(classification) ? "PTM"
                 : "Others";
 
-        String messageFolderName = buildRcvFileName(m);
+        String messageFolderName = buildRcvFileName(m, classification);
         int dot = messageFolderName.lastIndexOf('.');
         if (dot > 0) messageFolderName = messageFolderName.substring(0, dot);
 
@@ -1774,11 +1878,26 @@ public class TransferService {
 
     // ─── .RCV file output ─────────────────────────────────────────────────────
 
+    private static final DateTimeFormatter RCV_LDM_PTM_TS_FMT = DateTimeFormatter.ofPattern("yyyyMMddHHmmss");
+
     /**
-     * Builds a unique, filesystem-safe filename for a fetched message:
+     * Builds a filesystem-safe filename for a fetched message.
+     *
+     * <p>LDM/PTM messages (classification == "LDM" or "PTM") use the fixed
+     * operational naming convention {@code LDM_YYYYMMDDHHMMSS.RCV} /
+     * {@code PTM_YYYYMMDDHHMMSS.RCV} instead of the generic subject-based
+     * name — collisions within the same second are resolved by
+     * {@link #uniqueRcvPath(Path, String)} at write time.
+     *
+     * <p>Everything else keeps the previous generic form:
      * {@code <timestamp>_<sanitized subject>_<id suffix>.RCV}
      */
-    private String buildRcvFileName(GraphMailService.MailMessage m) {
+    private String buildRcvFileName(GraphMailService.MailMessage m, String classification) {
+        if ("LDM".equals(classification) || "PTM".equals(classification)) {
+            String ts = java.time.LocalDateTime.now().format(RCV_LDM_PTM_TS_FMT);
+            return classification + "_" + ts + ".RCV";
+        }
+
         String subject = (m.subject == null || m.subject.trim().isEmpty()) ? "no_subject" : m.subject.trim();
         String safeSubject = subject.replaceAll("[\\\\/:*?\"<>|]", "_").replaceAll("\\s+", "_");
         if (safeSubject.length() > 60) safeSubject = safeSubject.substring(0, 60);
@@ -1790,6 +1909,28 @@ public class TransferService {
                 : String.format("%06d", Math.abs((long) (Math.random() * 1_000_000)));
 
         return ts + "_" + safeSubject + "_" + idSuffix + ".RCV";
+    }
+
+    /**
+     * Resolves {@code outputDir/desiredName} to a path that doesn't already
+     * exist, appending "_2", "_3", ... before the extension if needed.
+     * Needed because the LDM/PTM naming convention (type + second-resolution
+     * timestamp) can collide when two messages of the same type land within
+     * the same second.
+     */
+    private Path uniqueRcvPath(Path outputDir, String desiredName) {
+        Path candidate = outputDir.resolve(desiredName);
+        if (!Files.exists(candidate)) return candidate;
+
+        int dot = desiredName.lastIndexOf('.');
+        String base = dot > 0 ? desiredName.substring(0, dot) : desiredName;
+        String ext = dot > 0 ? desiredName.substring(dot) : "";
+        int suffix = 2;
+        while (Files.exists(candidate)) {
+            candidate = outputDir.resolve(base + "_" + suffix + ext);
+            suffix++;
+        }
+        return candidate;
     }
 
     /**
