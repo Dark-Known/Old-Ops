@@ -1,0 +1,767 @@
+diff --git a/src/main/java/model/ScheduledTask.java b/src/main/java/model/ScheduledTask.java
+index a24e350..1d715ba 100644
+--- a/src/main/java/model/ScheduledTask.java
++++ b/src/main/java/model/ScheduledTask.java
+@@ -33,6 +33,17 @@ public class ScheduledTask {
+     private String sourcePath;
+     private String targetPath;
+ 
++    // Optional extra destination folders, in addition to targetPath —
++    // every transferred file also gets copied to each of these.
++    // OUTBOUND: additional REMOTE folders on the SAME target server/
++    //   credential as targetPath (extra "put" commands).
++    // INBOUND: additional LOCAL folders on this machine — the file is
++    //   downloaded once, then copied locally to each extra folder.
++    // Stored as a single semicolon-separated string (mirrors how simple
++    // multi-value fields are already persisted elsewhere in this class) so
++    // no XML schema change is needed.
++    private String additionalTargetPaths;
++
+     // Backup fields ("D" = today; retention keeps D, D-1 ... D-(retentionDays-1) untouched
+     // in the source, and everything older than that is eligible for backup).
+     // Every eligible file is archived in a single run (no more day-bucket
+@@ -160,6 +171,21 @@ public class ScheduledTask {
+     public String getTargetPath()                { return targetPath; }
+     public void   setTargetPath(String s)        { this.targetPath = s; }
+ 
++    /** Raw semicolon-separated extra destination folders (remote for OUTBOUND, local for INBOUND), or null/empty if none configured. */
++    public String getAdditionalTargetPaths()     { return additionalTargetPaths; }
++    public void   setAdditionalTargetPaths(String s) { this.additionalTargetPaths = s; }
++
++    /** Parsed, trimmed, non-empty list of extra destination folders. Empty list if none configured. */
++    public java.util.List<String> getAdditionalTargetPathList() {
++        java.util.List<String> result = new java.util.ArrayList<>();
++        if (additionalTargetPaths == null || additionalTargetPaths.trim().isEmpty()) return result;
++        for (String p : additionalTargetPaths.split(";")) {
++            String trimmed = p.trim();
++            if (!trimmed.isEmpty()) result.add(trimmed);
++        }
++        return result;
++    }
++
+     public String getBackupSourcePath()          { return backupSourcePath; }
+     public void   setBackupSourcePath(String s)  { this.backupSourcePath = s; }
+ 
+diff --git a/src/main/java/service/TaskLogService.java b/src/main/java/service/TaskLogService.java
+index 4f49792..b60cce4 100644
+--- a/src/main/java/service/TaskLogService.java
++++ b/src/main/java/service/TaskLogService.java
+@@ -10,7 +10,13 @@ import java.util.*;
+ 
+ /**
+  * Manages per-task logging — each task has its own log file.
+- * Logs are stored in ~/.opstool/logs/task-{taskId}/
++ * Logs are stored in ~/.opstool/logs/{TaskName}_{shortId}/ — the folder is
++ * named after the task's display name (sanitized for the filesystem) rather
++ * than its raw task id, so logs are browsable/identifiable directly from the
++ * file system. A short suffix derived from the task id is still appended to
++ * keep folders unique even if two tasks share the same name, and renaming a
++ * task later will simply start a new folder under the new name (old logs
++ * stay where they were written).
+  * 
+  * Latest log is always in task.log
+  * Rotated logs are named task-YYYY-MM-DD-HHmmss.log
+@@ -33,6 +39,27 @@ public class TaskLogService {
+         this.logsDir = new File(dataDir, "logs");
+         this.logsDir.mkdirs();
+     }
++
++    /**
++     * Builds the on-disk folder name for a task: sanitized task name plus a
++     * short id-derived suffix for uniqueness. Falls back to "task-{taskId}"
++     * when no usable name is available (e.g. very old callers that only had
++     * an id), and to "system" for the no-task (taskId == null) case used for
++     * scheduler-level messages.
++     */
++    private static String folderNameFor(String taskId, String taskName) {
++        if (taskId == null) return "system";
++        String sanitized = sanitize(taskName);
++        String idSuffix = taskId.length() > 8 ? taskId.substring(taskId.length() - 8) : taskId;
++        return sanitized.isEmpty() ? "task-" + taskId : sanitized + "_" + idSuffix;
++    }
++
++    private static String sanitize(String name) {
++        if (name == null) return "";
++        String cleaned = name.trim().replaceAll("[\\\\/:*?\"<>|]", "_").replaceAll("\\s+", "_");
++        if (cleaned.length() > 60) cleaned = cleaned.substring(0, 60);
++        return cleaned;
++    }
+     
+     /**
+      * Log a message for a specific task, filtered by the currently
+@@ -47,10 +74,10 @@ public class TaskLogService {
+      * recognized tag is treated as INFO. Automatically rotates logs if they
+      * exceed MAX_LOG_SIZE_BYTES.
+      */
+-    public synchronized void log(String taskId, String message) {
++    public synchronized void log(String taskId, String taskName, String message) {
+         if (!meetsConfiguredLevel(message)) return;
+         try {
+-            File taskDir = new File(logsDir, "task-" + taskId);
++            File taskDir = new File(logsDir, folderNameFor(taskId, taskName));
+             taskDir.mkdirs();
+             
+             File logFile = new File(taskDir, "task.log");
+@@ -108,10 +135,10 @@ public class TaskLogService {
+     /**
+      * Retrieve all log lines for a task from the current log file.
+      */
+-    public List<String> getTaskLogs(String taskId) {
++    public List<String> getTaskLogs(String taskId, String taskName) {
+         List<String> lines = new ArrayList<>();
+         try {
+-            File taskDir = new File(logsDir, "task-" + taskId);
++            File taskDir = new File(logsDir, folderNameFor(taskId, taskName));
+             File logFile = new File(taskDir, "task.log");
+             
+             if (logFile.exists()) {
+@@ -126,8 +153,8 @@ public class TaskLogService {
+     /**
+      * Retrieve the last N log lines for a task (most recent first from bottom of file).
+      */
+-    public List<String> getTaskLogsLastN(String taskId, int maxLines) {
+-        List<String> allLines = getTaskLogs(taskId);
++    public List<String> getTaskLogsLastN(String taskId, String taskName, int maxLines) {
++        List<String> allLines = getTaskLogs(taskId, taskName);
+         if (allLines.size() <= maxLines) {
+             return allLines;
+         }
+@@ -137,10 +164,10 @@ public class TaskLogService {
+     /**
+      * Retrieve all rotated log files for a task (for archive/history).
+      */
+-    public List<File> getTaskLogArchives(String taskId) {
++    public List<File> getTaskLogArchives(String taskId, String taskName) {
+         List<File> archives = new ArrayList<>();
+         try {
+-            File taskDir = new File(logsDir, "task-" + taskId);
++            File taskDir = new File(logsDir, folderNameFor(taskId, taskName));
+             if (taskDir.exists()) {
+                 File[] files = taskDir.listFiles((dir, name) -> 
+                     name.startsWith("task-") && name.endsWith(".log") && !name.equals("task.log"));
+@@ -158,9 +185,9 @@ public class TaskLogService {
+     /**
+      * Clear old rotated logs, keeping only the last N files per task.
+      */
+-    public void cleanupOldLogs(String taskId, int keepCount) {
++    public void cleanupOldLogs(String taskId, String taskName, int keepCount) {
+         try {
+-            List<File> archives = getTaskLogArchives(taskId);
++            List<File> archives = getTaskLogArchives(taskId, taskName);
+             while (archives.size() > keepCount) {
+                 File toDelete = archives.remove(archives.size() - 1);
+                 toDelete.delete();
+@@ -180,7 +207,7 @@ public class TaskLogService {
+     }
+     
+     /** Get the directory for a specific task's logs. */
+-    public File getTaskLogDirectory(String taskId) {
+-        return new File(logsDir, "task-" + taskId);
++    public File getTaskLogDirectory(String taskId, String taskName) {
++        return new File(logsDir, folderNameFor(taskId, taskName));
+     }
+ }
+diff --git a/src/main/java/service/TaskSchedulerService.java b/src/main/java/service/TaskSchedulerService.java
+index 697bc43..47ed212 100644
+--- a/src/main/java/service/TaskSchedulerService.java
++++ b/src/main/java/service/TaskSchedulerService.java
+@@ -187,7 +187,7 @@ public class TaskSchedulerService {
+         List<ScheduledTask> tasks = storage.loadTasks();
+         tasks.stream().filter(t -> t.getId().equals(taskId)).findFirst().ifPresent(t -> {
+             if (t.getStatus() == TaskStatus.RUNNING || t.getStatus() == TaskStatus.RETRYING) {
+-                emit(t.getId(), "[INFO] Task is already active and will not be requeued.");
++                emit(t, "[INFO] Task is already active and will not be requeued.");
+                 return;
+             }
+             t.setStatus(TaskStatus.RUNNING);
+@@ -245,7 +245,7 @@ public class TaskSchedulerService {
+                 if (task.getStatus() == TaskStatus.RETRYING) continue;
+                 if (task.getStatus() == TaskStatus.RUNNING) {
+                     if (isStaleRunning(task, now)) {
+-                        emit(task.getId(), "[WARN] Detected stale RUNNING task; cancelling and resetting.");
++                        emit(task, "[WARN] Detected stale RUNNING task; cancelling and resetting.");
+                         try {
+                             cancelTask(task.getId());
+                         } catch (Exception ignored) {}
+@@ -313,7 +313,7 @@ public class TaskSchedulerService {
+                         if (t.getStatus() == TaskStatus.RETRYING) return;
+                         if (t.getStatus() == TaskStatus.RUNNING) {
+                             if (isStaleRunning(t, LocalDateTime.now())) {
+-                                emit(t.getId(), "[WARN] Detected stale short-interval RUNNING task; cancelling and resetting.");
++                                emit(t, "[WARN] Detected stale short-interval RUNNING task; cancelling and resetting.");
+                                 try {
+                                     cancelTask(t.getId());
+                                 } catch (Exception ignored) {}
+@@ -502,13 +502,13 @@ public class TaskSchedulerService {
+                     StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+             fileLock = lockChannel.tryLock();
+         } catch (Exception e) {
+-            emit(task.getId(), "[WARN] Could not set up cross-process task lock (" + e.getMessage()
++            emit(task, "[WARN] Could not set up cross-process task lock (" + e.getMessage()
+                     + ") — proceeding without it.");
+         }
+ 
+         if (lockChannel != null && fileLock == null) {
+             // Another process (GUI or Daemon) already holds the lock for this task.
+-            emit(task.getId(), "[INFO] Skipped: task '" + task.getName()
++            emit(task, "[INFO] Skipped: task '" + task.getName()
+                     + "' is already running in another process (GUI or Daemon) at this tick.");
+             try { lockChannel.close(); } catch (IOException ignored) {}
+             try { runningTaskFutures.remove(task.getId()); } catch (Exception ignored) {}
+@@ -516,16 +516,16 @@ public class TaskSchedulerService {
+         }
+ 
+         try {
+-        emit(task.getId(), "=== Starting task: " + task.getName() + " ===");
+-        emit(task.getId(), "[DEBUG] Task ID: " + task.getId());
+-        emit(task.getId(), "[DEBUG] Task Type: " + task.getTaskType());
+-        emit(task.getId(), "[DEBUG] Schedule Type: " + task.getScheduleType());
++        emit(task, "=== Starting task: " + task.getName() + " ===");
++        emit(task, "[DEBUG] Task ID: " + task.getId());
++        emit(task, "[DEBUG] Task Type: " + task.getTaskType());
++        emit(task, "[DEBUG] Schedule Type: " + task.getScheduleType());
+         if (task.getTaskType() == ScheduledTask.TaskType.FILE_TRANSFER) {
+             // Transfer Mode only applies to file-transfer tasks — logging it
+             // unconditionally printed a leftover/default value for every
+             // mail task too, which was just noise (and misleading, since
+             // that field isn't actually used for anything on mail tasks).
+-            emit(task.getId(), "[DEBUG] Transfer Mode: " + (task.getTransferMode() != null ? task.getTransferMode().name() : "NULL"));
++            emit(task, "[DEBUG] Transfer Mode: " + (task.getTransferMode() != null ? task.getTransferMode().name() : "NULL"));
+         }
+         
+         boolean success;
+@@ -534,39 +534,39 @@ public class TaskSchedulerService {
+             switch (task.getTaskType()) {
+                 case FILE_TRANSFER:
+                     try {
+-                        success = transferService.executeTransfer(task, line -> emit(task.getId(), line));
++                        success = transferService.executeTransfer(task, line -> emit(task, line));
+                     }
+                     catch (TransferService.WatcherSkipException e) {
+-                        emit(task.getId(), "[INFO] Inbound watcher skipped transfer: " + e.getMessage());
++                        emit(task, "[INFO] Inbound watcher skipped transfer: " + e.getMessage());
+                         success = true;
+                         skipped = true;
+                     }
+                     break;
+                 case OUTLOOK_MAIL:
+                     try {
+-                        success = transferService.executeImapMailTask(task, line -> emit(task.getId(), line));
++                        success = transferService.executeImapMailTask(task, line -> emit(task, line));
+                     }
+                     catch (TransferService.WatcherSkipException e) {
+-                        emit(task.getId(), "[INFO] Mail watcher skipped run: " + e.getMessage());
++                        emit(task, "[INFO] Mail watcher skipped run: " + e.getMessage());
+                         success = true;
+                         skipped = true;
+                     }
+                     break;
+                 case BACKUP:
+-                    success = transferService.executeBackup(task, line -> emit(task.getId(), line));
++                    success = transferService.executeBackup(task, line -> emit(task, line));
+                     break;
+                 default:
+-                    emit(task.getId(), "[ERROR] Unknown task type: " + task.getTaskType());
++                    emit(task, "[ERROR] Unknown task type: " + task.getTaskType());
+                     success = false;
+             }
+         } catch (Exception e) {
+-            emit(task.getId(), "[ERROR] Unexpected error: " + e.getMessage());
++            emit(task, "[ERROR] Unexpected error: " + e.getMessage());
+             e.printStackTrace();
+             success = false;
+         }
+ 
+         if (!success && task.getRetryCount() > 0) {
+-            emit(task.getId(), "[INFO] Task failed and will be retried " + task.getRetryCount() + " time(s).\n");
++            emit(task, "[INFO] Task failed and will be retried " + task.getRetryCount() + " time(s).\n");
+             task.setStatus(TaskStatus.RETRYING);
+             task.setLastStartedAt(null);
+             storage.saveTask(task);
+@@ -590,14 +590,14 @@ public class TaskSchedulerService {
+                     || t.getScheduleType() == ScheduleType.INTERVAL_SECONDS))
+                     || finalSkipped) {
+                 t.setStatus(TaskStatus.PENDING);
+-                emit(task.getId(), "[INFO] Task reset to PENDING for next scheduled run");
++                emit(task, "[INFO] Task reset to PENDING for next scheduled run");
+             } else {
+                 t.setStatus(finalSuccess ? TaskStatus.SUCCESS : TaskStatus.FAILED);
+             }
+             storage.saveTask(t);
+         });
+ 
+-        emit(task.getId(), "=== Task " + task.getName() + " finished: " + (success ? "SUCCESS" : "FAILED") + " ===");
++        emit(task, "=== Task " + task.getName() + " finished: " + (success ? "SUCCESS" : "FAILED") + " ===");
+         task.setLastStartedAt(null);
+         long durationMs = (System.nanoTime() - startNanos) / 1_000_000;
+         long cpuMs = THREAD_BEAN.isCurrentThreadCpuTimeSupported() ? (THREAD_BEAN.getCurrentThreadCpuTime() - startCpuNanos) / 1_000_000 : 0L;
+@@ -631,9 +631,11 @@ public class TaskSchedulerService {
+         });
+     }
+ 
+-    private void emit(String taskId, String line) {
++    private void emit(ScheduledTask task, String line) {
++        String taskId = task != null ? task.getId() : null;
++        String taskName = task != null ? task.getName() : null;
+         log.info("[" + taskId + "] " + line);
+-        logService.log(taskId, line);
++        logService.log(taskId, taskName, line);
+         if (logCallback != null) {
+             logCallback.accept(taskId, LocalDateTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"))
+                 + "  " + line);
+diff --git a/src/main/java/service/TransferService.java b/src/main/java/service/TransferService.java
+index 4201433..450c7b7 100644
+--- a/src/main/java/service/TransferService.java
++++ b/src/main/java/service/TransferService.java
+@@ -159,7 +159,18 @@ public class TransferService {
+         try {
+             scriptFile = buildWinScpScript(target, target.getPassword(), task, logLine);
+             logLine.accept("[INFO] WinSCP script prepared. Starting transfer...");
+-            return runWinScpScript(scriptFile, logLine, task.getId());
++            boolean ok = runWinScpScript(scriptFile, logLine, task.getId());
++
++            if (ok && task.getTransferDirection() == TransferDirection.INBOUND) {
++                List<String> extraDestFolders = task.getAdditionalTargetPathList();
++                if (!extraDestFolders.isEmpty()) {
++                    String remotePath = normalizeRemotePath(task.getTargetPath());
++                    String fname = remotePath.substring(remotePath.lastIndexOf('/') + 1);
++                    String destPath = buildLocalDestinationPath(normalizeLocalPath(task.getSourcePath()), fname);
++                    copyDownloadedFilesToExtraFolders(Collections.singletonList(destPath), extraDestFolders, logLine);
++                }
++            }
++            return ok;
+         } catch (Exception e) {
+             logLine.accept("[ERROR] Transfer failed: " + e.getMessage());
+             return false;
+@@ -565,6 +576,11 @@ public class TransferService {
+ 
+         try {
+             List<SizedCommand> commands = new ArrayList<>();
++            List<String> extraDestFolders = task.getAdditionalTargetPathList();
++            if (!extraDestFolders.isEmpty()) {
++                logLine.accept("[INFO] Also copying to " + extraDestFolders.size()
++                        + " additional destination(s) on the same server: " + String.join(", ", extraDestFolders));
++            }
+             for (RemoteFileMetadata meta : files) {
+                 String localFile  = normalizeLocalPath(
+                         Paths.get(localSourceDir, meta.fileName()).toString());
+@@ -573,6 +589,15 @@ public class TransferService {
+                         "put " + escapeWinScpPath(localFile) + " " + escapeWinScpRemotePath(remoteFile),
+                         meta.size()));
+                 logLine.accept("[INFO] Queued outbound: " + localFile + " → " + remoteFile);
++
++                for (String extraFolder : extraDestFolders) {
++                    String extraRemoteDir = normalizeRemotePath(extraFolder);
++                    extraRemoteDir = extraRemoteDir.endsWith("/") ? extraRemoteDir : extraRemoteDir + "/";
++                    String extraRemoteFile = extraRemoteDir + meta.fileName();
++                    commands.add(new SizedCommand(
++                            "put " + escapeWinScpPath(localFile) + " " + escapeWinScpRemotePath(extraRemoteFile),
++                            meta.size()));
++                }
+             }
+             return runBatchedWinScpCommands(target, target.getPassword(), commands, logLine, task.getId());
+         } catch (Exception ex) {
+@@ -593,6 +618,7 @@ public class TransferService {
+ 
+         try {
+             List<SizedCommand> commands = new ArrayList<>();
++            List<String> downloadedLocalPaths = new ArrayList<>();
+             for (RemoteFileMetadata meta : files) {
+                 String remoteFile = remoteDir + meta.fileName();
+                 String destPath   = buildLocalDestinationPath(localDestDir, meta.fileName());
+@@ -600,8 +626,16 @@ public class TransferService {
+                         "get " + escapeWinScpRemotePath(remoteFile) + " " + escapeWinScpPath(destPath),
+                         meta.size()));
+                 logLine.accept("[INFO] Queued inbound: " + remoteFile + " → " + destPath);
++                downloadedLocalPaths.add(destPath);
+             }
+-            return runBatchedWinScpCommands(target, target.getPassword(), commands, logLine, task.getId());
++            boolean ok = runBatchedWinScpCommands(target, target.getPassword(), commands, logLine, task.getId());
++            List<String> extraDestFolders = task.getAdditionalTargetPathList();
++            if (ok && !extraDestFolders.isEmpty()) {
++                logLine.accept("[INFO] Also copying downloaded file(s) to " + extraDestFolders.size()
++                        + " additional local destination(s): " + String.join(", ", extraDestFolders));
++                copyDownloadedFilesToExtraFolders(downloadedLocalPaths, extraDestFolders, logLine);
++            }
++            return ok;
+         } catch (Exception ex) {
+             logLine.accept("[ERROR] Inbound watcher WinSCP transfer failed: " + ex.getMessage());
+             return false;
+@@ -644,11 +678,23 @@ public class TransferService {
+                         + " " + escapeWinScpPath(destPath));
+             } else {
+                 logLine.accept("[INFO] Mode: Specific file (OUTBOUND)");
+-                String remoteDestPath = prepareRemoteDestination(
+-                        remotePath, new File(localPath).getName());
++                String fileName = new File(localPath).getName();
++                String remoteDestPath = prepareRemoteDestination(remotePath, fileName);
+                 pw.println("put "
+                         + escapeWinScpPath(localPath)
+                         + " " + escapeWinScpRemotePath(remoteDestPath));
++
++                List<String> extraDestFolders = task.getAdditionalTargetPathList();
++                if (!extraDestFolders.isEmpty()) {
++                    logLine.accept("[INFO] Also copying to " + extraDestFolders.size()
++                            + " additional destination(s) on the same server: " + String.join(", ", extraDestFolders));
++                }
++                for (String extraFolder : extraDestFolders) {
++                    String extraDestPath = prepareRemoteDestination(normalizeRemotePath(extraFolder), fileName);
++                    pw.println("put "
++                            + escapeWinScpPath(localPath)
++                            + " " + escapeWinScpRemotePath(extraDestPath));
++                }
+             }
+ 
+             pw.println("close");
+@@ -1122,6 +1168,12 @@ public class TransferService {
+                     remoteFiles = Collections.singletonList(remotePath);
+                 }
+             }
++            List<String> extraDestFolders = task.getAdditionalTargetPathList();
++            if (!extraDestFolders.isEmpty()) {
++                logLine.accept("[INFO] Also copying downloaded file(s) to " + extraDestFolders.size()
++                        + " additional local destination(s): " + String.join(", ", extraDestFolders));
++            }
++            List<String> downloadedLocalPaths = new ArrayList<>();
+             for (String remoteFile : remoteFiles) {
+                 String fname    = remoteFile.substring(remoteFile.lastIndexOf('/') + 1);
+                 String destPath = buildLocalDestinationPath(localPath, fname);
+@@ -1129,7 +1181,14 @@ public class TransferService {
+                 long size = stat != null ? stat.size : 0L;
+                 commands.add(new SizedCommand(
+                         "get " + escapeWinScpRemotePath(remoteFile) + " " + escapeWinScpPath(destPath), size));
++                downloadedLocalPaths.add(destPath);
++            }
++
++            boolean ok = runBatchedWinScpCommands(target, target.getPassword(), commands, logLine, task.getId());
++            if (ok && !extraDestFolders.isEmpty()) {
++                copyDownloadedFilesToExtraFolders(downloadedLocalPaths, extraDestFolders, logLine);
+             }
++            return ok;
+         } else {
+             List<File> localFiles;
+             File sourceDir = new File(task.getSourcePath());
+@@ -1160,16 +1219,59 @@ public class TransferService {
+                     localFiles = Collections.singletonList(sourceDir);
+                 }
+             }
++            List<String> extraDestFolders = task.getAdditionalTargetPathList();
++            if (!extraDestFolders.isEmpty()) {
++                logLine.accept("[INFO] Also copying to " + extraDestFolders.size()
++                        + " additional destination(s) on the same server: " + String.join(", ", extraDestFolders));
++            }
+             for (File f : localFiles) {
+                 String remoteDestPath = prepareRemoteDestination(remotePath, f.getName());
+                 commands.add(new SizedCommand("put " + escapeWinScpPath(normalizeLocalPath(f.getAbsolutePath()))
+                         + " " + escapeWinScpRemotePath(remoteDestPath), f.length()));
++
++                // Copy to every additional destination folder as well (same
++                // target server/credential — see ScheduledTask.additionalTargetPaths).
++                for (String extraFolder : extraDestFolders) {
++                    String extraDestPath = prepareRemoteDestination(normalizeRemotePath(extraFolder), f.getName());
++                    commands.add(new SizedCommand("put " + escapeWinScpPath(normalizeLocalPath(f.getAbsolutePath()))
++                            + " " + escapeWinScpRemotePath(extraDestPath), f.length()));
++                }
+             }
+         }
+ 
+         return runBatchedWinScpCommands(target, target.getPassword(), commands, logLine, task.getId());
+     }
+ 
++    /**
++     * After a successful INBOUND download, copies each downloaded file from
++     * its primary local destination to every additional local destination
++     * folder (see {@link model.ScheduledTask#getAdditionalTargetPathList()}).
++     * A local file copy, not a second remote download — the file is already
++     * on disk after the WinSCP batch completes.
++     */
++    private void copyDownloadedFilesToExtraFolders(List<String> downloadedLocalPaths,
++            List<String> extraDestFolders, Consumer<String> logLine) {
++        for (String localPath : downloadedLocalPaths) {
++            File source = new File(localPath);
++            if (!source.exists()) continue;
++            for (String extraFolder : extraDestFolders) {
++                try {
++                    File destDir = new File(extraFolder);
++                    if (!destDir.exists() && !destDir.mkdirs()) {
++                        logLine.accept("[WARN] Could not create additional destination folder: " + extraFolder);
++                        continue;
++                    }
++                    Path dest = destDir.toPath().resolve(source.getName());
++                    Files.copy(source.toPath(), dest, StandardCopyOption.REPLACE_EXISTING);
++                    logLine.accept("[INFO] Copied " + source.getName() + " -> " + dest);
++                } catch (IOException ex) {
++                    logLine.accept("[WARN] Failed to copy " + source.getName()
++                            + " to additional destination '" + extraFolder + "': " + ex.getMessage());
++                }
++            }
++        }
++    }
++
+     // ─── Exception type ───────────────────────────────────────────────────────
+ 
+     static class WatcherSkipException extends Exception {
+@@ -1281,9 +1383,9 @@ public class TransferService {
+         if (!sourceRemote && !destRemote) {
+             ok = runLocalToLocalBackup(candidates, destPathStr, logLine);
+         } else if (sourceRemote) {
+-            ok = runRemoteToLocalBackup(sourceCred, candidates, destPathStr, logLine);
++            ok = runRemoteToLocalBackup(task.getId(), sourceCred, candidates, destPathStr, logLine);
+         } else {
+-            ok = runLocalToRemoteBackup(destCred, candidates, destPathStr, logLine);
++            ok = runLocalToRemoteBackup(task.getId(), destCred, candidates, destPathStr, logLine);
+         }
+ 
+         logLine.accept((ok ? "[SUCCESS] " : "[WARNING] ") + "Backup run complete.");
+@@ -1371,7 +1473,7 @@ public class TransferService {
+     }
+ 
+     /** Remote source → local destination: pulls files via WinSCP `get` into {@code <destRoot>/<yyyy-MM-dd>/}, in size-based batches. */
+-    private boolean runRemoteToLocalBackup(Credential sourceCred, List<BackupCandidate> candidates,
++    private boolean runRemoteToLocalBackup(String taskId, Credential sourceCred, List<BackupCandidate> candidates,
+             String destPathStr, Consumer<String> logLine) {
+         File destRoot = new File(destPathStr);
+         if (!destRoot.exists() && !destRoot.mkdirs()) {
+@@ -1391,7 +1493,7 @@ public class TransferService {
+                     "get " + escapeWinScpRemotePath(c.remotePath) + " " + escapeWinScpPath(destPath), c.size));
+         }
+         try {
+-            boolean ok = runBatchedWinScpCommands(sourceCred, sourceCred.getPassword(), commands, logLine, "backup");
++            boolean ok = runBatchedWinScpCommands(sourceCred, sourceCred.getPassword(), commands, logLine, taskId);
+             if (ok) {
+                 // Remove originals from the remote source now that they've landed locally.
+                 deleteRemoteFilesViaWinScp(sourceCred, candidates.stream().map(c -> c.remotePath).collect(Collectors.toList()), logLine);
+@@ -1404,7 +1506,7 @@ public class TransferService {
+     }
+ 
+     /** Local source → remote destination: pushes files via WinSCP `put` into {@code <destRoot>/<yyyy-MM-dd>/}, in size-based batches. */
+-    private boolean runLocalToRemoteBackup(Credential destCred, List<BackupCandidate> candidates,
++    private boolean runLocalToRemoteBackup(String taskId, Credential destCred, List<BackupCandidate> candidates,
+             String destPathStr, Consumer<String> logLine) {
+         String remoteRoot = normalizeRemotePath(destPathStr);
+         String remoteRootDir = remoteRoot.endsWith("/") ? remoteRoot : remoteRoot + "/";
+@@ -1425,7 +1527,7 @@ public class TransferService {
+                     "put " + escapeWinScpPath(normalizeLocalPath(c.localPath.toAbsolutePath().toString()))
+                             + " " + escapeWinScpRemotePath(remoteRootDir + c.day + "/" + c.name), c.size))
+                     .collect(Collectors.toList());
+-            boolean ok = runBatchedWinScpCommands(destCred, destCred.getPassword(), putCommands, logLine, "backup");
++            boolean ok = runBatchedWinScpCommands(destCred, destCred.getPassword(), putCommands, logLine, taskId);
+             if (ok) {
+                 for (BackupCandidate c : candidates) {
+                     try {
+@@ -1651,17 +1753,19 @@ public class TransferService {
+             }
+             logLine.accept("[END MAIL MESSAGE]");
+ 
++            // Classify once, before naming the file, and reuse for the filename,
++            // attachment placement, and the mailbox folder move below, so all
++            // three stay consistent.
++            String classification = classifyForFolderRouting(m);
++
+             try {
+-                Path rcvFile = outputDir.resolve(buildRcvFileName(m));
++                Path rcvFile = uniqueRcvPath(outputDir, buildRcvFileName(m, classification));
+                 Files.write(rcvFile, buildRcvFileContent(m, mode, logLine).getBytes(StandardCharsets.UTF_8));
+                 logLine.accept("[INFO] Wrote " + rcvFile.getFileName());
+             } catch (IOException ex) {
+                 logLine.accept("[WARN] Failed to write .RCV file for '" + m.subject + "': " + ex.getMessage());
+             }
+ 
+-            // Classify once and reuse for both attachment placement and the
+-            // mailbox folder move below, so the two stay consistent.
+-            String classification = classifyForFolderRouting(m);
+             saveAttachmentsToDisk(m, outputDir, classification, logLine);
+ 
+             try {
+@@ -1737,7 +1841,7 @@ public class TransferService {
+                 : "PTM".equals(classification) ? "PTM"
+                 : "Others";
+ 
+-        String messageFolderName = buildRcvFileName(m);
++        String messageFolderName = buildRcvFileName(m, classification);
+         int dot = messageFolderName.lastIndexOf('.');
+         if (dot > 0) messageFolderName = messageFolderName.substring(0, dot);
+ 
+@@ -1774,11 +1878,26 @@ public class TransferService {
+ 
+     // ─── .RCV file output ─────────────────────────────────────────────────────
+ 
++    private static final DateTimeFormatter RCV_LDM_PTM_TS_FMT = DateTimeFormatter.ofPattern("yyyyMMddHHmmss");
++
+     /**
+-     * Builds a unique, filesystem-safe filename for a fetched message:
++     * Builds a filesystem-safe filename for a fetched message.
++     *
++     * <p>LDM/PTM messages (classification == "LDM" or "PTM") use the fixed
++     * operational naming convention {@code LDM_YYYYMMDDHHMMSS.RCV} /
++     * {@code PTM_YYYYMMDDHHMMSS.RCV} instead of the generic subject-based
++     * name — collisions within the same second are resolved by
++     * {@link #uniqueRcvPath(Path, String)} at write time.
++     *
++     * <p>Everything else keeps the previous generic form:
+      * {@code <timestamp>_<sanitized subject>_<id suffix>.RCV}
+      */
+-    private String buildRcvFileName(GraphMailService.MailMessage m) {
++    private String buildRcvFileName(GraphMailService.MailMessage m, String classification) {
++        if ("LDM".equals(classification) || "PTM".equals(classification)) {
++            String ts = java.time.LocalDateTime.now().format(RCV_LDM_PTM_TS_FMT);
++            return classification + "_" + ts + ".RCV";
++        }
++
+         String subject = (m.subject == null || m.subject.trim().isEmpty()) ? "no_subject" : m.subject.trim();
+         String safeSubject = subject.replaceAll("[\\\\/:*?\"<>|]", "_").replaceAll("\\s+", "_");
+         if (safeSubject.length() > 60) safeSubject = safeSubject.substring(0, 60);
+@@ -1792,6 +1911,28 @@ public class TransferService {
+         return ts + "_" + safeSubject + "_" + idSuffix + ".RCV";
+     }
+ 
++    /**
++     * Resolves {@code outputDir/desiredName} to a path that doesn't already
++     * exist, appending "_2", "_3", ... before the extension if needed.
++     * Needed because the LDM/PTM naming convention (type + second-resolution
++     * timestamp) can collide when two messages of the same type land within
++     * the same second.
++     */
++    private Path uniqueRcvPath(Path outputDir, String desiredName) {
++        Path candidate = outputDir.resolve(desiredName);
++        if (!Files.exists(candidate)) return candidate;
++
++        int dot = desiredName.lastIndexOf('.');
++        String base = dot > 0 ? desiredName.substring(0, dot) : desiredName;
++        String ext = dot > 0 ? desiredName.substring(dot) : "";
++        int suffix = 2;
++        while (Files.exists(candidate)) {
++            candidate = outputDir.resolve(base + "_" + suffix + ext);
++            suffix++;
++        }
++        return candidate;
++    }
++
+     /**
+      * Builds the .RCV file content. FULL_MESSAGE mode already returns raw
+      * RFC 2822 MIME (headers included) from Graph, so it's written as-is.
+diff --git a/src/main/java/service/XmlStorageService.java b/src/main/java/service/XmlStorageService.java
+index 6a04df1..f9cd3a8 100644
+--- a/src/main/java/service/XmlStorageService.java
++++ b/src/main/java/service/XmlStorageService.java
+@@ -146,6 +146,7 @@ public class XmlStorageService {
+                         t.setTargetCredentialId(child(e, "targetCredentialId"));
+                         t.setSourcePath(child(e, "sourcePath"));
+                         t.setTargetPath(child(e, "targetPath"));
++                        t.setAdditionalTargetPaths(child(e, "additionalTargetPaths"));
+                         t.setBackupSourcePath(child(e, "backupSourcePath"));
+                         t.setBackupDestinationPath(child(e, "backupDestinationPath"));
+                         String backupRetention = child(e, "backupRetentionDays");
+@@ -344,6 +345,7 @@ public class XmlStorageService {
+                             ? t.getTransferMode().name() : TransferMode.ENTIRE_FOLDER.name());
+                     addChild(doc, e, "sourcePath", t.getSourcePath());
+                     addChild(doc, e, "targetPath", t.getTargetPath());
++                    addChild(doc, e, "additionalTargetPaths", t.getAdditionalTargetPaths());
+                     addChild(doc, e, "backupSourcePath", t.getBackupSourcePath());
+                     addChild(doc, e, "backupDestinationPath", t.getBackupDestinationPath());
+                     addChild(doc, e, "backupRetentionDays", String.valueOf(t.getBackupRetentionDays()));
+diff --git a/src/main/java/ui/TaskDialog.java b/src/main/java/ui/TaskDialog.java
+index d7aa6eb..5b52c9b 100644
+--- a/src/main/java/ui/TaskDialog.java
++++ b/src/main/java/ui/TaskDialog.java
+@@ -81,6 +81,8 @@ public class TaskDialog extends JDialog {
+     private JLabel      lblSourceHint;
+     private JLabel      lblTargetHint;
+     private JTextField  tfTargetFolder;
++    private JTextField  tfAdditionalTargetFolders;
++    private JLabel      lblAdditionalTargetFolders;
+     private JCheckBox   cbWatcherEnabled;
+     private JLabel      lblWatcherInfo;
+     private JLabel      lblWatcherStatus;
+@@ -235,6 +237,16 @@ public class TaskDialog extends JDialog {
+         tfTargetFolder = makeField(new JTextField(
+                 existing != null && existing.getTargetPath() != null ? existing.getTargetPath() : "", 28));
+ 
++        tfAdditionalTargetFolders = makeField(new JTextField(
++                existing != null && existing.getAdditionalTargetPaths() != null
++                        ? existing.getAdditionalTargetPaths() : "", 28));
++        tfAdditionalTargetFolders.setToolTipText(
++                "Optional. Copy every transferred file to these folders too, in addition to the "
++                        + "destination above. OUTBOUND: additional remote folders on the same target "
++                        + "server/credential. INBOUND: additional local folders on this machine. "
++                        + "Separate multiple paths with a semicolon (;).");
++        lblAdditionalTargetFolders = new JLabel("Additional destinations");
++
+         // ── Inbound watcher fields ────────────────────────────────────────────
+         cbWatcherEnabled = new JCheckBox("Enable watcher task");
+         lblWatcherInfo = new JLabel("<html><div style='width:380px'><i style='color:gray'>"
+@@ -281,9 +293,10 @@ public class TaskDialog extends JDialog {
+         addRow(fileTransferPanel, "Transfer Mode *",         cbTransferMode,         1);
+         addRow(fileTransferPanel, lblTargetFolder,           tfTargetFolder,         2);
+         addRow(fileTransferPanel, "",                        lblTargetHint,          3);
+-        addRow(fileTransferPanel, "",                        cbWatcherEnabled,4);
+-        addRow(fileTransferPanel, "",                        lblWatcherInfo,         5);
+-        addRow(fileTransferPanel, "Watcher baseline",        watcherStatusRow,       6);
++        addRow(fileTransferPanel, lblAdditionalTargetFolders, tfAdditionalTargetFolders, 4);
++        addRow(fileTransferPanel, "",                        cbWatcherEnabled,5);
++        addRow(fileTransferPanel, "",                        lblWatcherInfo,         6);
++        addRow(fileTransferPanel, "Watcher baseline",        watcherStatusRow,       7);
+ 
+         transferTab = new JPanel(new GridBagLayout());
+         transferTab.setOpaque(false);
+@@ -735,6 +748,12 @@ public class TaskDialog extends JDialog {
+         // Watcher checkbox is available for both directions (watching is supported for inbound and outbound
+         // transfers). Keep the checkbox visible whenever the Transfer tab is shown.
+         cbWatcherEnabled.setVisible(true);
++
++        // Multi-destination copying is supported for both directions: OUTBOUND
++        // copies to additional remote folders on the same server, INBOUND
++        // copies the downloaded file to additional local folders.
++        lblAdditionalTargetFolders.setText(inbound ? "Additional local destinations" : "Additional destinations");
++
+         transferTab.revalidate(); transferTab.repaint();
+         revalidate(); repaint();
+         pack();
+@@ -1074,6 +1093,7 @@ public class TaskDialog extends JDialog {
+                     (String) cbTransferMode.getSelectedItem()));
+             t.setSourcePath(tfSourcePath.getText().trim());
+             t.setTargetPath(tfTargetFolder.getText().trim());
++            t.setAdditionalTargetPaths(tfAdditionalTargetFolders.getText().trim());
+             t.setWatcherEnabled(cbWatcherEnabled.isSelected());
+ 
+ 
+diff --git a/src/main/java/ui/TaskManagerPanel.java b/src/main/java/ui/TaskManagerPanel.java
+index 31ff849..cdc30af 100644
+--- a/src/main/java/ui/TaskManagerPanel.java
++++ b/src/main/java/ui/TaskManagerPanel.java
+@@ -763,7 +763,7 @@ public class TaskManagerPanel extends JPanel {
+             lblSelectedTask.setForeground(UIManager.getColor("Label.foreground"));
+         }
+ 
+-        List<String> logs = scheduler.getLogService().getTaskLogs(id);
++        List<String> logs = scheduler.getLogService().getTaskLogs(id, name);
+         if (logs.isEmpty()) {
+             StringBuilder sb = taskLogs.getOrDefault(id, new StringBuilder());
+             logArea.setText(sb.length() > 0
+@@ -790,7 +790,7 @@ public class TaskManagerPanel extends JPanel {
+         lblSelectedTask.setText("Latest 50 lines - Execution log: " + name);
+         lblSelectedTask.setForeground(UIManager.getColor("Label.foreground"));
+ 
+-        List<String> logs = scheduler.getLogService().getTaskLogsLastN(id, 50);
++        List<String> logs = scheduler.getLogService().getTaskLogsLastN(id, name, 50);
+         if (logs.isEmpty()) {
+             StringBuilder sb = taskLogs.getOrDefault(id, new StringBuilder());
+             logArea.setText(sb.length() > 0 ? sb.toString()
+@@ -822,7 +822,7 @@ public class TaskManagerPanel extends JPanel {
+         if (fc.showSaveDialog(this) == JFileChooser.APPROVE_OPTION) {
+             java.io.File selected = fc.getSelectedFile();
+             try (java.io.FileWriter fw = new java.io.FileWriter(selected)) {
+-                for (String logLine : scheduler.getLogService().getTaskLogs(id))
++                for (String logLine : scheduler.getLogService().getTaskLogs(id, name))
+                     fw.write(logLine + "\n");
+                 JOptionPane.showMessageDialog(this,
+                     "Logs exported to:\n" + selected.getAbsolutePath(),
+@@ -848,7 +848,7 @@ public class TaskManagerPanel extends JPanel {
+                 "No Task Selected", JOptionPane.WARNING_MESSAGE); return;
+         }
+ 
+-        List<java.io.File> archives = scheduler.getLogService().getTaskLogArchives(id);
++        List<java.io.File> archives = scheduler.getLogService().getTaskLogArchives(id, name);
+         if (archives.isEmpty()) {
+             JOptionPane.showMessageDialog(this,
+                 "No archived logs found for this task.",
