@@ -1,3 +1,4 @@
+ui\ToastManager$2.class
 ui\SettingsPanel.class
 service\OAuth2TokenService.class
 Daemon.class
@@ -14,6 +15,7 @@ model\RemoteFileMetadata.class
 service\GraphMailService$MailMessage.class
 util\ImapSearchCriteria$AdvancedCriteria.class
 service\TaskSchedulerService$TaskMetrics.class
+ui\NotificationBell$1.class
 model\ScheduledTask$TransferMode.class
 service\TaskLogService.class
 service\TransferService.class
@@ -41,6 +43,7 @@ ui\TaskDialog$2.class
 ui\NotificationPanel.class
 service\XmlStorageService.class
 ui\TaskDialog$1.class
+ui\ToastManager.class
 model\ScheduledTask$MailFetchScope.class
 util\ImapSearchCriteria$DateCriteria.class
 ui\RunHistoryPanel$3.class
@@ -64,7 +67,9 @@ ui\TaskDialog.class
 util\ImapSearchCriteria$Builder.class
 service\TransferService$LocalFileOp.class
 ui\RunHistoryPanel.class
+ui\ToastManager$1.class
 ui\MainWindow$1.class
+ui\NotificationBell.class
 ui\RunHistoryPanel$2.class
 model\TaskRunRecord$Status.class
 service\TransferService$MarkerMatch.class
