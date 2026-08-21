@@ -7,6 +7,7 @@ import javax.swing.*;
 import javax.swing.border.EmptyBorder;
 import java.awt.*;
 import java.awt.event.ActionListener;
+import java.text.SimpleDateFormat;
 import java.util.*;
 import java.util.List;
 import java.util.regex.Matcher;
@@ -37,6 +38,16 @@ public class SearchCriteriaPanel extends JPanel {
     private JPanel pnlCriteria;
     private List<CriterionTag> selectedCriteria = new ArrayList<>();
     private ActionListener onCriteriaChanged;
+
+    // ── Date range ("between") filter ───────────────────────────────────────
+    // The single-date DateCriteria (BEFORE/SINCE/ON) can't express "give me
+    // everything between two dates" without the user manually adding two
+    // separate criteria and knowing that SINCE+BEFORE combine as an AND.
+    // This adds that as one first-class control.
+    private JSpinner spDateRangeFrom;
+    private JSpinner spDateRangeTo;
+    private JComboBox<String> cbDateRangeBasis;
+    private static final SimpleDateFormat IMAP_DATE_FMT = new SimpleDateFormat("dd-MMM-yyyy", Locale.ENGLISH);
 
     public SearchCriteriaPanel() {
         setLayout(new BorderLayout(5, 5));
@@ -85,6 +96,34 @@ public class SearchCriteriaPanel extends JPanel {
         pnlBuilderTop.add(btnAdd);
 
         pnlBuilder.add(pnlBuilderTop, BorderLayout.NORTH);
+
+        // ── Date range ("between") row ─────────────────────────────────────────
+        JPanel pnlDateRange = new JPanel(new FlowLayout(FlowLayout.LEFT, 5, 5));
+        pnlDateRange.setBorder(BorderFactory.createTitledBorder("Date Range (between)"));
+
+        cbDateRangeBasis = new JComboBox<>(new String[]{"Received date", "Sent date"});
+
+        spDateRangeFrom = new JSpinner(new SpinnerDateModel());
+        spDateRangeFrom.setEditor(new JSpinner.DateEditor(spDateRangeFrom, "yyyy-MM-dd"));
+        spDateRangeFrom.setValue(java.sql.Timestamp.valueOf(
+                java.time.LocalDate.now().minusDays(7).atStartOfDay()));
+
+        spDateRangeTo = new JSpinner(new SpinnerDateModel());
+        spDateRangeTo.setEditor(new JSpinner.DateEditor(spDateRangeTo, "yyyy-MM-dd"));
+        spDateRangeTo.setValue(java.sql.Timestamp.valueOf(
+                java.time.LocalDate.now().atStartOfDay()));
+
+        JButton btnAddDateRange = new JButton("Add Range");
+        btnAddDateRange.addActionListener(e -> addDateRangeCriteria());
+
+        pnlDateRange.add(new JLabel("From:"));
+        pnlDateRange.add(spDateRangeFrom);
+        pnlDateRange.add(new JLabel("To:"));
+        pnlDateRange.add(spDateRangeTo);
+        pnlDateRange.add(cbDateRangeBasis);
+        pnlDateRange.add(btnAddDateRange);
+
+        pnlBuilder.add(pnlDateRange, BorderLayout.SOUTH);
 
         // ── Criteria display panel ────────────────────────────────────────────
         pnlCriteria = new JPanel();
@@ -166,6 +205,40 @@ public class SearchCriteriaPanel extends JPanel {
 
         tfArgument.setText("");
         cbAdvancedType.setSelectedIndex(0);
+    }
+
+    /**
+     * Adds a combined SINCE/BEFORE (or SENTSINCE/SENTBEFORE) pair as a single
+     * removable tag, letting the user filter "between two dates" in one step
+     * instead of manually adding two separate date criteria.
+     */
+    private void addDateRangeCriteria() {
+        java.util.Date from = (java.util.Date) spDateRangeFrom.getValue();
+        java.util.Date to = (java.util.Date) spDateRangeTo.getValue();
+
+        if (from.after(to)) {
+            showError("\"From\" date must be on or before \"To\" date");
+            return;
+        }
+
+        // BEFORE/SENTBEFORE is exclusive of the given day, so bump "to" by one
+        // day to make the range inclusive of the selected end date.
+        java.util.Calendar cal = java.util.Calendar.getInstance();
+        cal.setTime(to);
+        cal.add(java.util.Calendar.DAY_OF_MONTH, 1);
+        java.util.Date toExclusive = cal.getTime();
+
+        boolean sent = "Sent date".equals(cbDateRangeBasis.getSelectedItem());
+        String sinceToken = sent ? "SENTSINCE" : "SINCE";
+        String beforeToken = sent ? "SENTBEFORE" : "BEFORE";
+
+        String fromStr = IMAP_DATE_FMT.format(from);
+        String toStr = IMAP_DATE_FMT.format(to);
+        String toExclusiveStr = IMAP_DATE_FMT.format(toExclusive);
+
+        String criterion = sinceToken + " " + fromStr + " " + beforeToken + " " + toExclusiveStr;
+        String display = "Between: " + fromStr + " \u2192 " + toStr + (sent ? " (sent)" : "");
+        addCriteriaTag(criterion, display);
     }
 
     private void addCriteriaTag(String criterion, String display) {

@@ -42,6 +42,12 @@ public class TaskSchedulerService {
     // Tracks currently running task futures so they can be cancelled on request
      private final ConcurrentMap<String, Future<?>> runningTaskFutures = new ConcurrentHashMap<>();
      private final ConcurrentMap<String, TaskMetrics> taskMetrics = new ConcurrentHashMap<>();
+     // Last time ANY log line was emitted for a task's current run (wall-clock
+     // millis). Used by isStaleRunning() to catch a run whose connection has
+     // gone silent — e.g. network dropped mid-transfer — much faster than
+     // waiting out the full "since start" threshold; see emit() and
+     // getStaleInactivityThresholdMinutes.
+     private final ConcurrentMap<String, Long> lastActivityMillis = new ConcurrentHashMap<>();
      // Base stale threshold, configurable live from the Settings panel
      // (util.AppSettings#KEY_STALE_RUNNING_THRESHOLD_MINUTES, default 30
      // minutes — see getStaleRunningThreshold below). For interval-based
@@ -239,7 +245,21 @@ public class TaskSchedulerService {
     private boolean isStaleRunning(ScheduledTask task, LocalDateTime now) {
         if (task == null || task.getStatus() != TaskStatus.RUNNING) return false;
         if (task.getLastStartedAt() == null) return true;
-        return task.getLastStartedAt().plus(getStaleRunningThreshold(task)).isBefore(now);
+        if (task.getLastStartedAt().plus(getStaleRunningThreshold(task)).isBefore(now)) return true;
+
+        // Second, independent check: has this run gone completely silent
+        // (no log line at all) for longer than the inactivity threshold?
+        // This is what actually catches "network died mid-transfer" quickly
+        // — the WinSCP process is still alive from the OS's point of view
+        // (blocked on a socket read that will never return), so the "since
+        // start" check above won't fire for the full 30 minutes even though
+        // no bytes have moved in ages. A task that's still genuinely
+        // progressing keeps resetting this clock via emit(), so a long but
+        // active transfer is never penalized by it.
+        Long lastActivity = lastActivityMillis.get(task.getId());
+        if (lastActivity == null) return false; // no activity recorded yet — fall back to the start-time check only
+        Duration inactivity = Duration.ofMillis(System.currentTimeMillis() - lastActivity);
+        return inactivity.toMinutes() >= util.AppSettings.getStaleInactivityThresholdMinutes();
     }
 
     private void checkAndRunDueTasks() {
@@ -255,6 +275,21 @@ public class TaskSchedulerService {
             for (ScheduledTask task : tasks) {
                 if (task.getStatus() == TaskStatus.DISABLED) continue;
                 if (task.getStatus() == TaskStatus.RETRYING) continue;
+                // Tasks with their own dedicated short-interval timer (see
+                // setupShortIntervalTasks) are already being polled and fired
+                // independently, on their own faster cadence. Without this
+                // skip, the global tick evaluated EVERY task including
+                // those — so a fast test task (e.g. a 5s/10s INTERVAL_SECONDS
+                // task) could be picked up here AND by its own timer within
+                // the same in-process moment, both seeing it as due and both
+                // racing to execute it. That's a same-process double-fire,
+                // not an actual second GUI/Daemon process — but it produces
+                // the exact same "already running in another process" skip
+                // log via the cross-process file lock in executeTask(),
+                // which is misleading when only one process is running at
+                // all. The dedicated timer already performs this same due
+                // check and stale-recovery, so it's safe to leave it to that.
+                if (shortIntervalFutures.containsKey(task.getId())) continue;
                 if (task.getStatus() == TaskStatus.RUNNING) {
                     if (isStaleRunning(task, now)) {
                         emit(task, "[WARN] Detected stale RUNNING task; cancelling and resetting.");
@@ -265,6 +300,7 @@ public class TaskSchedulerService {
                         task.setLastRunResult("FAILED (stale)");
                         task.setStatus(TaskStatus.FAILED);
                         storage.saveTask(task);
+                        lastActivityMillis.remove(task.getId());
                     }
                     continue;
                 }
@@ -333,6 +369,7 @@ public class TaskSchedulerService {
                                 t.setLastRunResult("FAILED (stale)");
                                 t.setStatus(TaskStatus.FAILED);
                                 storage.saveTask(t);
+                                lastActivityMillis.remove(t.getId());
                             }
                             return;
                         }
@@ -538,6 +575,7 @@ public class TaskSchedulerService {
                     TaskRunRecord.Status.SKIPPED, reason, reason, runStartedAt, LocalDateTime.now());
             try { lockChannel.close(); } catch (IOException ignored) {}
             try { runningTaskFutures.remove(task.getId()); } catch (Exception ignored) {}
+            lastActivityMillis.remove(task.getId());
             return;
         }
 
@@ -605,6 +643,7 @@ public class TaskSchedulerService {
             task.setStatus(TaskStatus.RETRYING);
             task.setLastStartedAt(null);
             storage.saveTask(task);
+            lastActivityMillis.remove(task.getId());
             scheduler.schedule(() -> retryTask(task), 5, TimeUnit.SECONDS);
             return;
         }
@@ -653,6 +692,7 @@ public class TaskSchedulerService {
         recordMetricsOnComplete(task.getId(), success, durationMs, cpuMs);
         // Clean up running future mapping
         try { runningTaskFutures.remove(task.getId()); } catch (Exception ignored) {}
+        lastActivityMillis.remove(task.getId());
         } finally {
             // Always release the cross-process lock, however this run ended
             // (normal completion, exception, or the early "retry scheduled" return).
@@ -705,6 +745,7 @@ public class TaskSchedulerService {
     private void emit(ScheduledTask task, String line) {
         String taskId = task != null ? task.getId() : null;
         String taskName = task != null ? task.getName() : null;
+        if (taskId != null) lastActivityMillis.put(taskId, System.currentTimeMillis());
         log.info("[" + taskId + "] " + line);
         logService.log(taskId, taskName, line);
         if (logCallback != null) {

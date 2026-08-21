@@ -225,6 +225,18 @@ public class MainWindow extends JFrame {
         toastManager = new ToastManager(this);
         scheduler.getRunHistoryService().addRunListener(record ->
                 SwingUtilities.invokeLater(() -> {
+                    // "Already running in another process" SKIPPED records are
+                    // an internal concurrency guard (see TaskSchedulerService's
+                    // cross-process file lock), not something the operator
+                    // needs to react to — surfacing a toast for every one of
+                    // them was pure noise, especially for fast-interval tasks.
+                    // The run is still recorded in the DB and visible on the
+                    // Logs tab for anyone who does want to see it; it just
+                    // doesn't pop a toast or bump the failure bell.
+                    if (isInternalConcurrencySkip(record)) {
+                        runHistoryPanel.onRunRecorded(record);
+                        return;
+                    }
                     toastManager.showToast(record);
                     notificationBell.refreshCount();
                     runHistoryPanel.onRunRecorded(record);
@@ -243,6 +255,22 @@ public class MainWindow extends JFrame {
         statusBar.setBorder(BorderFactory.createMatteBorder(1, 0, 0, 0, Color.LIGHT_GRAY));
         statusBar.add(new JLabel("Data: " + loadDataDir()));
         add(statusBar, BorderLayout.SOUTH);
+    }
+
+    /**
+     * True for a SKIPPED run whose reason is the cross-process file-lock
+     * guard in TaskSchedulerService#executeTask ("... already running in
+     * another process (GUI or Daemon) at this tick."). That guard also
+     * fires on a benign same-process race (e.g. a fast INTERVAL_SECONDS
+     * task's dedicated timer and the global poll both glancing at it at
+     * once) — it's an implementation detail, not something the operator
+     * needs a popup for. The run is still recorded normally; this only
+     * controls whether it also interrupts the operator with a toast/bell.
+     */
+    private boolean isInternalConcurrencySkip(model.TaskRunRecord record) {
+        return record.getStatus() == model.TaskRunRecord.Status.SKIPPED
+                && record.getReason() != null
+                && record.getReason().contains("already running in another process");
     }
 
     private Icon iconFor(String name) {

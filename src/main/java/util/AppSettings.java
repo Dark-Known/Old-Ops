@@ -89,6 +89,20 @@ public final class AppSettings {
     // progressing — run isn't killed and reported as FAILED partway through.
     public static final String KEY_STALE_RUNNING_THRESHOLD_MINUTES = "staleRunningThresholdMinutes";
 
+    // How many minutes a RUNNING task may go without emitting ANY new log
+    // line before the scheduler treats it as network-stalled and
+    // force-cancels it — independent of, and much shorter than, the overall
+    // KEY_STALE_RUNNING_THRESHOLD_MINUTES "since start" ceiling above. A
+    // transfer whose connection silently died mid-file (no TCP reset, just
+    // packets going nowhere) can otherwise sit producing no output for the
+    // *entire* multi-batch run, and the old start-time-only check wouldn't
+    // catch that until the full 30-minute (or longer, for scaled interval
+    // tasks) threshold elapsed — which reads as "stuck in a dead loop" to
+    // an operator watching the Logs tab. This catches that case fast while
+    // still letting a genuinely slow-but-progressing transfer run as long
+    // as it needs to, since every WinSCP output line resets the clock.
+    public static final String KEY_STALE_INACTIVITY_THRESHOLD_MINUTES = "staleInactivityThresholdMinutes";
+
     // Built-in fallbacks, used only if neither app-settings.json nor
     // app-config.xml has a value (keeps behavior identical to before this
     // file existed, for anyone upgrading in place).
@@ -110,6 +124,7 @@ public final class AppSettings {
         HARD_DEFAULTS.put(KEY_TRANSFER_BATCH_INTERVAL_SECONDS, "5");
         HARD_DEFAULTS.put(KEY_TRANSFER_BATCH_CONCURRENCY, "1"); // 1 = sequential (old behavior)
         HARD_DEFAULTS.put(KEY_STALE_RUNNING_THRESHOLD_MINUTES, "30");
+        HARD_DEFAULTS.put(KEY_STALE_INACTIVITY_THRESHOLD_MINUTES, "5");
     }
 
     // app-config.xml tag each key is seeded from on first run.
@@ -129,6 +144,7 @@ public final class AppSettings {
         XML_SEED_TAG.put(KEY_TRANSFER_BATCH_INTERVAL_SECONDS, "transferBatchIntervalSeconds");
         XML_SEED_TAG.put(KEY_TRANSFER_BATCH_CONCURRENCY, "transferBatchConcurrency");
         XML_SEED_TAG.put(KEY_STALE_RUNNING_THRESHOLD_MINUTES, "staleRunningThresholdMinutes");
+        XML_SEED_TAG.put(KEY_STALE_INACTIVITY_THRESHOLD_MINUTES, "staleInactivityThresholdMinutes");
     }
 
     private static final Object LOCK = new Object();
@@ -284,6 +300,17 @@ public final class AppSettings {
      */
     public static int getStaleRunningThresholdMinutes() {
         return Math.max(1, intOrDefault(KEY_STALE_RUNNING_THRESHOLD_MINUTES));
+    }
+
+    /**
+     * How many minutes a RUNNING task may go without emitting any new log
+     * line before it's treated as network-stalled and force-cancelled —
+     * see {@link #KEY_STALE_INACTIVITY_THRESHOLD_MINUTES}. Defaults to 5.
+     * Read live — editable from the Settings panel, app-settings.json, or
+     * app-config.xml — no restart required.
+     */
+    public static int getStaleInactivityThresholdMinutes() {
+        return Math.max(1, intOrDefault(KEY_STALE_INACTIVITY_THRESHOLD_MINUTES));
     }
 
     /**

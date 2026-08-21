@@ -23,6 +23,16 @@ public class NotificationBell extends JButton {
     private final TaskSchedulerService scheduler;
     private int failedCount = 0;
 
+    // Facebook's header bell: a plain outline icon sitting directly on the
+    // bar (no permanent background), with a soft circular highlight that
+    // only appears on hover, and a solid red count badge overlapping the
+    // top-right corner. Reproduced here with a semi-transparent white
+    // hover disc (Facebook uses a light gray one on its white bar; white
+    // is the equivalent on this app's dark navy header) instead of an
+    // always-on colored chip.
+    private static final Color HOVER_HIGHLIGHT = new Color(255, 255, 255, 38);
+    private boolean hovering = false;
+
     public NotificationBell(XmlStorageService storage, TaskSchedulerService scheduler) {
         this.storage = storage;
         this.scheduler = scheduler;
@@ -30,11 +40,16 @@ public class NotificationBell extends JButton {
         setContentAreaFilled(false);
         setBorderPainted(false);
         setOpaque(false);
-        setFont(getFont().deriveFont(Font.PLAIN, 20f));
+        setFont(getFont().deriveFont(Font.PLAIN, 18f));
         setText("\uD83D\uDD14"); // 🔔
+        setForeground(Color.WHITE); // plain white icon reads clearly on the navy header, Facebook-style
         setToolTipText("Failed tasks");
-        setMargin(new Insets(2, 10, 2, 10));
+        setMargin(new Insets(4, 4, 4, 4));
         addActionListener(e -> showDropdown());
+        addMouseListener(new java.awt.event.MouseAdapter() {
+            @Override public void mouseEntered(java.awt.event.MouseEvent e) { hovering = true; repaint(); }
+            @Override public void mouseExited(java.awt.event.MouseEvent e) { hovering = false; repaint(); }
+        });
         refreshCount();
     }
 
@@ -52,24 +67,43 @@ public class NotificationBell extends JButton {
     }
 
     @Override
+    public Dimension getPreferredSize() {
+        return new Dimension(34, 34);
+    }
+
+    @Override
     protected void paintComponent(Graphics g) {
-        super.paintComponent(g);
-        if (failedCount <= 0) return;
         Graphics2D g2 = (Graphics2D) g.create();
         g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+
+        // Soft circular highlight on hover only — like Facebook's bell.
+        if (hovering) {
+            int size = Math.min(getWidth(), getHeight());
+            int x = (getWidth() - size) / 2;
+            int y = (getHeight() - size) / 2;
+            g2.setColor(HOVER_HIGHLIGHT);
+            g2.fillOval(x, y, size, size);
+        }
+        g2.dispose();
+
+        super.paintComponent(g);
+
+        if (failedCount <= 0) return;
+        Graphics2D g3 = (Graphics2D) g.create();
+        g3.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
         String label = failedCount > 99 ? "99+" : String.valueOf(failedCount);
         Font badgeFont = getFont().deriveFont(Font.BOLD, 10f);
-        FontMetrics fm = g2.getFontMetrics(badgeFont);
+        FontMetrics fm = g3.getFontMetrics(badgeFont);
         int textWidth = fm.stringWidth(label);
         int diameter = Math.max(16, textWidth + 8);
-        int x = getWidth() - diameter - 1;
-        int y = 1;
-        g2.setColor(new Color(0xE53935));
-        g2.fillOval(x, y, diameter, diameter);
-        g2.setColor(Color.WHITE);
-        g2.setFont(badgeFont);
-        g2.drawString(label, x + (diameter - textWidth) / 2, y + diameter - 5);
-        g2.dispose();
+        int bx = getWidth() - diameter - 1;
+        int by = 1;
+        g3.setColor(new Color(0xE53935));
+        g3.fillOval(bx, by, diameter, diameter);
+        g3.setColor(Color.WHITE);
+        g3.setFont(badgeFont);
+        g3.drawString(label, bx + (diameter - textWidth) / 2, by + diameter - 5);
+        g3.dispose();
     }
 
     private void showDropdown() {

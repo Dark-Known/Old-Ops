@@ -726,7 +726,6 @@ public class TaskDialog extends JDialog {
         }
         updateTransferTabVisibility();
         revalidate(); repaint();
-        pack();
     }
 
     private void updateTransferDirectionLabels() {
@@ -754,7 +753,6 @@ public class TaskDialog extends JDialog {
 
         transferTab.revalidate(); transferTab.repaint();
         revalidate(); repaint();
-        pack();
     }
 
     /**
@@ -775,7 +773,6 @@ public class TaskDialog extends JDialog {
 
         transferTab.revalidate(); transferTab.repaint();
         revalidate(); repaint();
-        pack();
     }
 
     private void updateScheduleDetails() {
@@ -1300,12 +1297,21 @@ public class TaskDialog extends JDialog {
         additionalDestRowsContainer.add(row);
     }
 
-    /** Re-lays-out and resizes the dialog after a destination row is added or removed. */
+    /**
+     * Re-lays-out the destination rows after one is added or removed.
+     *
+     * This intentionally does NOT call pack() on the dialog. The dialog's
+     * content sits inside a JScrollPane with a fixed preferred size (see
+     * buildUI), so extra rows scroll into view instead of resizing the
+     * window. Previously this called Window.pack() on every add/remove,
+     * which fought with the dialog's minimum size and repeatedly grew it —
+     * the dialog is meant to open at a fixed size and only change size if
+     * the user deliberately drags an edge (setResizable(true) already
+     * allows that).
+     */
     private void refreshAdditionalDestinationsLayout() {
         additionalDestRowsContainer.revalidate();
         additionalDestRowsContainer.repaint();
-        Window w = SwingUtilities.getWindowAncestor(additionalDestRowsContainer);
-        if (w != null) w.pack();
     }
 
     private JPasswordField makePasswordField(JPasswordField field) {

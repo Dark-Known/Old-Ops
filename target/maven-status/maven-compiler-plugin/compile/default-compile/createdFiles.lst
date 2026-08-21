@@ -40,6 +40,7 @@ ui\RunHistoryPanel$1.class
 service\RemoteFileMetadataService.class
 service\TransferService$BackupCandidate.class
 ui\TaskDialog$2.class
+ui\NotificationBell$2.class
 ui\NotificationPanel.class
 service\XmlStorageService.class
 ui\TaskDialog$1.class
