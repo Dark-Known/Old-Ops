@@ -2,6 +2,7 @@ package service;
 
 import model.ScheduledTask.*;
 import model.ScheduledTask;
+import model.TaskRunRecord;
 import service.TaskLogService;
 
 import java.io.IOException;
@@ -34,6 +35,7 @@ public class TaskSchedulerService {
     private final XmlStorageService storage;
     private final TransferService transferService;
     private final TaskLogService logService;
+    private final RunHistoryService runHistoryService;
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(4);
     private final ExecutorService executor = Executors.newCachedThreadPool();
     private final ConcurrentMap<String, ScheduledFuture<?>> shortIntervalFutures = new ConcurrentHashMap<>();
@@ -63,6 +65,11 @@ public class TaskSchedulerService {
         this.storage = storage;
         this.transferService = transferService;
         this.logService = new TaskLogService(storage.getDataDir().getAbsolutePath());
+        this.runHistoryService = new RunHistoryService(storage.getDataDir().getAbsolutePath());
+        // Keep the run-history database from growing unbounded — every run
+        // (success, failure, or skip) adds a row. 90 days is a generous
+        // default; adjust here if a different retention window is needed.
+        this.runHistoryService.pruneOlderThan(90);
         this.pollIntervalSeconds = Math.max(1, pollIntervalSeconds);
     }
 
@@ -72,6 +79,10 @@ public class TaskSchedulerService {
 
     public TaskLogService getLogService() {
         return logService;
+    }
+
+    public RunHistoryService getRunHistoryService() {
+        return runHistoryService;
     }
 
     public XmlStorageService getStorage() {
@@ -179,6 +190,7 @@ public class TaskSchedulerService {
         scheduler.shutdownNow();
         executor.shutdownNow();
         logService.closeAll();
+        runHistoryService.close();
         log.info("TaskSchedulerService stopped.");
     }
 
@@ -478,6 +490,17 @@ public class TaskSchedulerService {
     private void executeTask(ScheduledTask task) {
         final long startNanos = System.nanoTime();
         final long startCpuNanos = THREAD_BEAN.isCurrentThreadCpuTimeSupported() ? THREAD_BEAN.getCurrentThreadCpuTime() : 0L;
+        final LocalDateTime runStartedAt = LocalDateTime.now();
+
+        // Captures every line emitted for THIS run only (as opposed to
+        // logService, which is the running text log for the task overall)
+        // so it can be stored as the "details" for this one run's history
+        // row once the run finishes.
+        final StringBuilder runLog = new StringBuilder();
+        final java.util.function.Consumer<String> emitCap = line -> {
+            runLog.append(line).append('\n');
+            emit(task, line);
+        };
 
         // ─── Cross-process execution lock ───────────────────────────────────
         // The GUI's in-app scheduler and the standalone Daemon each poll
@@ -508,65 +531,77 @@ public class TaskSchedulerService {
 
         if (lockChannel != null && fileLock == null) {
             // Another process (GUI or Daemon) already holds the lock for this task.
-            emit(task, "[INFO] Skipped: task '" + task.getName()
-                    + "' is already running in another process (GUI or Daemon) at this tick.");
+            String reason = "Task '" + task.getName()
+                    + "' is already running in another process (GUI or Daemon) at this tick.";
+            emit(task, "[INFO] Skipped: " + reason);
+            runHistoryService.recordRun(task.getId(), task.getName(), task.getTaskType().name(),
+                    TaskRunRecord.Status.SKIPPED, reason, reason, runStartedAt, LocalDateTime.now());
             try { lockChannel.close(); } catch (IOException ignored) {}
             try { runningTaskFutures.remove(task.getId()); } catch (Exception ignored) {}
             return;
         }
 
         try {
-        emit(task, "=== Starting task: " + task.getName() + " ===");
-        emit(task, "[DEBUG] Task ID: " + task.getId());
-        emit(task, "[DEBUG] Task Type: " + task.getTaskType());
-        emit(task, "[DEBUG] Schedule Type: " + task.getScheduleType());
+        emitCap.accept("=== Starting task: " + task.getName() + " ===");
+        emitCap.accept("[DEBUG] Task ID: " + task.getId());
+        emitCap.accept("[DEBUG] Task Type: " + task.getTaskType());
+        emitCap.accept("[DEBUG] Schedule Type: " + task.getScheduleType());
         if (task.getTaskType() == ScheduledTask.TaskType.FILE_TRANSFER) {
             // Transfer Mode only applies to file-transfer tasks — logging it
             // unconditionally printed a leftover/default value for every
             // mail task too, which was just noise (and misleading, since
             // that field isn't actually used for anything on mail tasks).
-            emit(task, "[DEBUG] Transfer Mode: " + (task.getTransferMode() != null ? task.getTransferMode().name() : "NULL"));
+            emitCap.accept("[DEBUG] Transfer Mode: " + (task.getTransferMode() != null ? task.getTransferMode().name() : "NULL"));
         }
         
         boolean success;
         boolean skipped = false;
+        String skipReason = null;
+        String failureReason = null;
         try {
             switch (task.getTaskType()) {
                 case FILE_TRANSFER:
                     try {
-                        success = transferService.executeTransfer(task, line -> emit(task, line));
+                        success = transferService.executeTransfer(task, emitCap);
                     }
                     catch (TransferService.WatcherSkipException e) {
-                        emit(task, "[INFO] Inbound watcher skipped transfer: " + e.getMessage());
+                        emitCap.accept("[INFO] Inbound watcher skipped transfer: " + e.getMessage());
                         success = true;
                         skipped = true;
+                        skipReason = e.getMessage();
                     }
                     break;
                 case OUTLOOK_MAIL:
                     try {
-                        success = transferService.executeImapMailTask(task, line -> emit(task, line));
+                        success = transferService.executeImapMailTask(task, emitCap);
                     }
                     catch (TransferService.WatcherSkipException e) {
-                        emit(task, "[INFO] Mail watcher skipped run: " + e.getMessage());
+                        emitCap.accept("[INFO] Mail watcher skipped run: " + e.getMessage());
                         success = true;
                         skipped = true;
+                        skipReason = e.getMessage();
                     }
                     break;
                 case BACKUP:
-                    success = transferService.executeBackup(task, line -> emit(task, line));
+                    success = transferService.executeBackup(task, emitCap);
                     break;
                 default:
-                    emit(task, "[ERROR] Unknown task type: " + task.getTaskType());
+                    emitCap.accept("[ERROR] Unknown task type: " + task.getTaskType());
                     success = false;
+                    failureReason = "Unknown task type: " + task.getTaskType();
             }
         } catch (Exception e) {
-            emit(task, "[ERROR] Unexpected error: " + e.getMessage());
+            emitCap.accept("[ERROR] Unexpected error: " + e.getMessage());
             e.printStackTrace();
             success = false;
+            failureReason = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
         }
 
         if (!success && task.getRetryCount() > 0) {
-            emit(task, "[INFO] Task failed and will be retried " + task.getRetryCount() + " time(s).\n");
+            String retryReason = failureReason != null ? failureReason : lastErrorLine(runLog.toString());
+            emitCap.accept("[INFO] Task failed and will be retried " + task.getRetryCount() + " time(s).\n");
+            runHistoryService.recordRun(task.getId(), task.getName(), task.getTaskType().name(),
+                    TaskRunRecord.Status.FAILED, retryReason, runLog.toString(), runStartedAt, LocalDateTime.now());
             task.setStatus(TaskStatus.RETRYING);
             task.setLastStartedAt(null);
             storage.saveTask(task);
@@ -597,6 +632,20 @@ public class TaskSchedulerService {
             storage.saveTask(t);
         });
 
+        LocalDateTime runEndedAt = LocalDateTime.now();
+        TaskRunRecord.Status historyStatus = finalSkipped ? TaskRunRecord.Status.SKIPPED
+                : (finalSuccess ? TaskRunRecord.Status.SUCCESS : TaskRunRecord.Status.FAILED);
+        String historyReason;
+        if (finalSkipped) {
+            historyReason = skipReason != null ? skipReason : "Skipped (no specific reason captured).";
+        } else if (finalSuccess) {
+            historyReason = lastInfoLine(runLog.toString());
+        } else {
+            historyReason = failureReason != null ? failureReason : lastErrorLine(runLog.toString());
+        }
+        runHistoryService.recordRun(task.getId(), task.getName(), task.getTaskType().name(),
+                historyStatus, historyReason, runLog.toString(), runStartedAt, runEndedAt);
+
         emit(task, "=== Task " + task.getName() + " finished: " + (success ? "SUCCESS" : "FAILED") + " ===");
         task.setLastStartedAt(null);
         long durationMs = (System.nanoTime() - startNanos) / 1_000_000;
@@ -614,6 +663,28 @@ public class TaskSchedulerService {
                 try { lockChannel.close(); } catch (IOException ignored) {}
             }
         }
+    }
+
+    /** Last "[ERROR] ..." line in a captured run log, with the tag stripped — or a generic fallback. */
+    private static String lastErrorLine(String runLogText) {
+        String[] lines = runLogText.split("\n");
+        for (int i = lines.length - 1; i >= 0; i--) {
+            String l = lines[i].trim();
+            if (l.startsWith("[ERROR]")) return l.substring("[ERROR]".length()).trim();
+        }
+        return "Failed — see run details for the full log.";
+    }
+
+    /** Last "[INFO] ..." line in a captured run log (skipping boilerplate start/debug lines), with the tag stripped. */
+    private static String lastInfoLine(String runLogText) {
+        String[] lines = runLogText.split("\n");
+        for (int i = lines.length - 1; i >= 0; i--) {
+            String l = lines[i].trim();
+            if (l.startsWith("[INFO]") && !l.startsWith("[INFO] Task reset to PENDING")) {
+                return l.substring("[INFO]".length()).trim();
+            }
+        }
+        return "Completed successfully.";
     }
 
     private void retryTask(ScheduledTask task) {

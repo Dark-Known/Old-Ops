@@ -18,7 +18,7 @@ public class AdminElevation {
     /**
      * Check if running as admin; if not, re-launch with elevation and exit.
      * Safe to call multiple times (no-op if already admin).
-     */
+got      */
     public static void ensureAdminOrExit() {
         log.info("=== AdminElevation.ensureAdminOrExit() called ===");
         log.info("Current user: " + System.getProperty("user.name"));

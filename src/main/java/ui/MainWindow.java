@@ -198,16 +198,19 @@ public class MainWindow extends JFrame {
         taskPanel = new TaskManagerPanel(storage, scheduler);
         credPanel = new CredentialManagerPanel(storage);
         JPanel notificationPanel = new NotificationPanel(storage, scheduler);
+        RunHistoryPanel runHistoryPanel = new RunHistoryPanel(storage, scheduler.getRunHistoryService());
 
         tabs.addTab("Tasks", iconFor("tasks"), taskPanel);
         tabs.addTab("Credentials", iconFor("creds"), credPanel);
         tabs.addTab("Notifications", iconFor("settings"), notificationPanel);
+        tabs.addTab("Logs", iconFor("tasks"), runHistoryPanel);
         tabs.addTab("Settings", iconFor("settings"), new SettingsPanel(transferService, scheduler));
 
         // Refresh task panel when switching back from credentials
         tabs.addChangeListener(e -> {
             if (tabs.getSelectedComponent() == taskPanel) taskPanel.refresh();
             if (tabs.getSelectedComponent() == credPanel) credPanel.refresh();
+            if (tabs.getSelectedComponent() == runHistoryPanel) runHistoryPanel.refresh();
         });
 
         add(header, BorderLayout.NORTH);
