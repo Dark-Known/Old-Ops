@@ -24,6 +24,8 @@ public class MainWindow extends JFrame {
 
     private TaskManagerPanel taskPanel;
     private CredentialManagerPanel credPanel;
+    private NotificationBell notificationBell;
+    private ToastManager toastManager;
 
     public MainWindow() {
         String dataDir = loadDataDir();
@@ -163,6 +165,9 @@ public class MainWindow extends JFrame {
         badges.add(guiBadge);
         badges.add(daemonBadge);
 
+        notificationBell = new NotificationBell(storage, scheduler);
+        badges.add(notificationBell);
+
         // Check daemon status in background
         new javax.swing.SwingWorker<String, Void>() {
             protected String doInBackground() {
@@ -197,12 +202,10 @@ public class MainWindow extends JFrame {
 
         taskPanel = new TaskManagerPanel(storage, scheduler);
         credPanel = new CredentialManagerPanel(storage);
-        JPanel notificationPanel = new NotificationPanel(storage, scheduler);
         RunHistoryPanel runHistoryPanel = new RunHistoryPanel(storage, scheduler.getRunHistoryService());
 
         tabs.addTab("Tasks", iconFor("tasks"), taskPanel);
         tabs.addTab("Credentials", iconFor("creds"), credPanel);
-        tabs.addTab("Notifications", iconFor("settings"), notificationPanel);
         tabs.addTab("Logs", iconFor("tasks"), runHistoryPanel);
         tabs.addTab("Settings", iconFor("settings"), new SettingsPanel(transferService, scheduler));
 
@@ -212,6 +215,25 @@ public class MainWindow extends JFrame {
             if (tabs.getSelectedComponent() == credPanel) credPanel.refresh();
             if (tabs.getSelectedComponent() == runHistoryPanel) runHistoryPanel.refresh();
         });
+
+        // ── Toast popups + live updates for every task run ──────────────────────
+        // Fired from RunHistoryService right after each run is recorded — covers
+        // success, failure, AND skip, for every task, no matter which tab is
+        // currently showing. The listener itself runs on whatever thread recorded
+        // the run (a scheduler worker thread), so everything it touches gets
+        // marshaled onto the EDT first.
+        toastManager = new ToastManager(this);
+        scheduler.getRunHistoryService().addRunListener(record ->
+                SwingUtilities.invokeLater(() -> {
+                    toastManager.showToast(record);
+                    notificationBell.refreshCount();
+                    runHistoryPanel.onRunRecorded(record);
+                }));
+
+        // Belt-and-suspenders periodic refresh for the bell badge, in case a
+        // task's status changes some way other than a recorded run (e.g. the
+        // Restart buttons in the failure-recovery dialog set status directly).
+        new javax.swing.Timer(15_000, e -> notificationBell.refreshCount()).start();
 
         add(header, BorderLayout.NORTH);
         add(tabs, BorderLayout.CENTER);

@@ -37,6 +37,12 @@ public class RunHistoryService {
 
     private final Connection conn;
 
+    // Notified (on whatever thread recordRun() was called from — usually a
+    // scheduler worker thread, never the EDT) after every run is recorded,
+    // so the UI can show a toast and refresh live views without polling.
+    private final List<java.util.function.Consumer<TaskRunRecord>> runListeners =
+            new java.util.concurrent.CopyOnWriteArrayList<>();
+
     public RunHistoryService(String dataDir) {
         File dbFile = new File(dataDir, "run_history.db");
         Connection c = null;
@@ -66,6 +72,11 @@ public class RunHistoryService {
         this.conn = c;
     }
 
+    /** Registers a listener invoked after every recorded run (success, failure, or skip). Not called on the EDT — marshal accordingly. */
+    public void addRunListener(java.util.function.Consumer<TaskRunRecord> listener) {
+        runListeners.add(listener);
+    }
+
     /** Records one completed run. Safe no-op if the database failed to initialize. */
     public synchronized void recordRun(String taskId, String taskName, String taskType,
             TaskRunRecord.Status status, String reason, String details,
@@ -88,6 +99,23 @@ public class RunHistoryService {
             ps.executeUpdate();
         } catch (SQLException e) {
             log.log(Level.WARNING, "Failed to record task run history", e);
+            return;
+        }
+
+        if (!runListeners.isEmpty()) {
+            TaskRunRecord rec = new TaskRunRecord();
+            rec.setTaskId(taskId);
+            rec.setTaskName(taskName);
+            rec.setTaskType(taskType);
+            rec.setStatus(status);
+            rec.setReason(reason);
+            rec.setDetails(details);
+            rec.setStartedAt(startedAt);
+            rec.setEndedAt(endedAt);
+            rec.setDurationMs(durationMs);
+            for (java.util.function.Consumer<TaskRunRecord> listener : runListeners) {
+                try { listener.accept(rec); } catch (Exception ignored) {}
+            }
         }
     }
 
@@ -105,7 +133,17 @@ public class RunHistoryService {
      * Queries runs, newest first, optionally filtered by task id and/or
      * status. Either filter may be null to mean "any".
      */
-    public synchronized List<TaskRunRecord> queryRuns(String taskId, TaskRunRecord.Status status, int limit) {
+    public List<TaskRunRecord> queryRuns(String taskId, TaskRunRecord.Status status, int limit) {
+        return queryRuns(taskId, status, null, null, limit);
+    }
+
+    /**
+     * Queries runs, newest first, optionally filtered by task id, status,
+     * and/or a start-time date range. Any filter may be null to mean "any".
+     * {@code from}/{@code to} bound {@code started_at} (inclusive on both ends).
+     */
+    public synchronized List<TaskRunRecord> queryRuns(String taskId, TaskRunRecord.Status status,
+            LocalDateTime from, LocalDateTime to, int limit) {
         List<TaskRunRecord> results = new ArrayList<>();
         if (conn == null) return results;
 
@@ -118,6 +156,14 @@ public class RunHistoryService {
         if (status != null) {
             sql.append(" AND status = ?");
             params.add(status.name());
+        }
+        if (from != null) {
+            sql.append(" AND started_at >= ?");
+            params.add(from.format(TS_FMT));
+        }
+        if (to != null) {
+            sql.append(" AND started_at <= ?");
+            params.add(to.format(TS_FMT));
         }
         sql.append(" ORDER BY started_at DESC, id DESC LIMIT ?");
         params.add(limit);

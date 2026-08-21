@@ -81,7 +81,8 @@ public class TaskDialog extends JDialog {
     private JLabel      lblSourceHint;
     private JLabel      lblTargetHint;
     private JTextField  tfTargetFolder;
-    private JTextField  tfAdditionalTargetFolders;
+    private JPanel       additionalDestRowsContainer;
+    private final java.util.List<JTextField> additionalDestFields = new java.util.ArrayList<>();
     private JLabel      lblAdditionalTargetFolders;
     private JCheckBox   cbWatcherEnabled;
     private JLabel      lblWatcherInfo;
@@ -237,15 +238,12 @@ public class TaskDialog extends JDialog {
         tfTargetFolder = makeField(new JTextField(
                 existing != null && existing.getTargetPath() != null ? existing.getTargetPath() : "", 28));
 
-        tfAdditionalTargetFolders = makeField(new JTextField(
-                existing != null && existing.getAdditionalTargetPaths() != null
-                        ? existing.getAdditionalTargetPaths() : "", 28));
-        tfAdditionalTargetFolders.setToolTipText(
+        lblAdditionalTargetFolders = new JLabel("Additional destinations");
+        lblAdditionalTargetFolders.setToolTipText(
                 "Optional. Copy every transferred file to these folders too, in addition to the "
                         + "destination above. OUTBOUND: additional remote folders on the same target "
-                        + "server/credential. INBOUND: additional local folders on this machine. "
-                        + "Separate multiple paths with a semicolon (;).");
-        lblAdditionalTargetFolders = new JLabel("Additional destinations");
+                        + "server/credential. INBOUND: additional local folders on this machine.");
+        JPanel additionalDestinationsField = buildAdditionalDestinationsField(existing);
 
         // ── Inbound watcher fields ────────────────────────────────────────────
         cbWatcherEnabled = new JCheckBox("Enable watcher task");
@@ -293,7 +291,7 @@ public class TaskDialog extends JDialog {
         addRow(fileTransferPanel, "Transfer Mode *",         cbTransferMode,         1);
         addRow(fileTransferPanel, lblTargetFolder,           tfTargetFolder,         2);
         addRow(fileTransferPanel, "",                        lblTargetHint,          3);
-        addRow(fileTransferPanel, lblAdditionalTargetFolders, tfAdditionalTargetFolders, 4);
+        addRow(fileTransferPanel, lblAdditionalTargetFolders, additionalDestinationsField, 4);
         addRow(fileTransferPanel, "",                        cbWatcherEnabled,5);
         addRow(fileTransferPanel, "",                        lblWatcherInfo,         6);
         addRow(fileTransferPanel, "Watcher baseline",        watcherStatusRow,       7);
@@ -1093,7 +1091,16 @@ public class TaskDialog extends JDialog {
                     (String) cbTransferMode.getSelectedItem()));
             t.setSourcePath(tfSourcePath.getText().trim());
             t.setTargetPath(tfTargetFolder.getText().trim());
-            t.setAdditionalTargetPaths(tfAdditionalTargetFolders.getText().trim());
+            {
+                StringBuilder extraPaths = new StringBuilder();
+                for (JTextField f : additionalDestFields) {
+                    String v = f.getText().trim();
+                    if (v.isEmpty()) continue;
+                    if (extraPaths.length() > 0) extraPaths.append(';');
+                    extraPaths.append(v);
+                }
+                t.setAdditionalTargetPaths(extraPaths.toString());
+            }
             t.setWatcherEnabled(cbWatcherEnabled.isSelected());
 
 
@@ -1222,6 +1229,83 @@ public class TaskDialog extends JDialog {
         field.setColumns(20);
         field.setMaximumSize(new Dimension(Integer.MAX_VALUE, field.getPreferredSize().height));
         return field;
+    }
+
+    /**
+     * Builds the "Additional destinations" field as a dynamic list of rows —
+     * one text field per extra destination path, each with a "−" button to
+     * remove it, plus a "+ Add destination" button below to append more.
+     * Replaces the old single semicolon-separated text field so users don't
+     * have to hand-edit a delimited string.
+     */
+    private JPanel buildAdditionalDestinationsField(ScheduledTask existing) {
+        JPanel wrapper = new JPanel();
+        wrapper.setLayout(new BoxLayout(wrapper, BoxLayout.Y_AXIS));
+        wrapper.setOpaque(false);
+        wrapper.setAlignmentX(Component.LEFT_ALIGNMENT);
+
+        additionalDestRowsContainer = new JPanel();
+        additionalDestRowsContainer.setLayout(new BoxLayout(additionalDestRowsContainer, BoxLayout.Y_AXIS));
+        additionalDestRowsContainer.setOpaque(false);
+        additionalDestRowsContainer.setAlignmentX(Component.LEFT_ALIGNMENT);
+        wrapper.add(additionalDestRowsContainer);
+
+        java.util.List<String> initialPaths = existing != null
+                ? existing.getAdditionalTargetPathList() : java.util.Collections.emptyList();
+        if (initialPaths.isEmpty()) {
+            addAdditionalDestinationRow("");
+        } else {
+            for (String p : initialPaths) addAdditionalDestinationRow(p);
+        }
+
+        JButton btnAdd = new JButton("+ Add destination");
+        btnAdd.setFocusPainted(false);
+        btnAdd.addActionListener(e -> {
+            addAdditionalDestinationRow("");
+            refreshAdditionalDestinationsLayout();
+        });
+        JPanel addBtnRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 4));
+        addBtnRow.setOpaque(false);
+        addBtnRow.setAlignmentX(Component.LEFT_ALIGNMENT);
+        addBtnRow.add(btnAdd);
+        wrapper.add(addBtnRow);
+
+        return wrapper;
+    }
+
+    /** Appends one destination row (text field + "−" remove button) to additionalDestRowsContainer. */
+    private void addAdditionalDestinationRow(String initialValue) {
+        JPanel row = new JPanel(new BorderLayout(6, 0));
+        row.setOpaque(false);
+        row.setAlignmentX(Component.LEFT_ALIGNMENT);
+        row.setMaximumSize(new Dimension(Integer.MAX_VALUE, 28));
+
+        JTextField tf = new JTextField(initialValue);
+        tf.setColumns(24);
+        additionalDestFields.add(tf);
+
+        JButton btnRemove = new JButton("\u2212"); // minus sign
+        btnRemove.setToolTipText("Remove this destination");
+        btnRemove.setFocusPainted(false);
+        btnRemove.setMargin(new Insets(0, 8, 0, 8));
+        btnRemove.addActionListener(e -> {
+            additionalDestFields.remove(tf);
+            additionalDestRowsContainer.remove(row);
+            refreshAdditionalDestinationsLayout();
+        });
+
+        row.add(tf, BorderLayout.CENTER);
+        row.add(btnRemove, BorderLayout.EAST);
+
+        additionalDestRowsContainer.add(row);
+    }
+
+    /** Re-lays-out and resizes the dialog after a destination row is added or removed. */
+    private void refreshAdditionalDestinationsLayout() {
+        additionalDestRowsContainer.revalidate();
+        additionalDestRowsContainer.repaint();
+        Window w = SwingUtilities.getWindowAncestor(additionalDestRowsContainer);
+        if (w != null) w.pack();
     }
 
     private JPasswordField makePasswordField(JPasswordField field) {

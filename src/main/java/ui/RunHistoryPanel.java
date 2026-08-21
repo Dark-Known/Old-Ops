@@ -6,10 +6,16 @@ import service.RunHistoryService;
 import service.XmlStorageService;
 
 import javax.swing.*;
+import javax.swing.event.ChangeListener;
 import javax.swing.table.DefaultTableCellRenderer;
 import javax.swing.table.DefaultTableModel;
 import java.awt.*;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
+import java.time.ZoneId;
+import java.util.Date;
 import java.util.List;
 
 /**
@@ -18,6 +24,13 @@ import java.util.List;
  * run, showing at a glance whether it succeeded, failed, or was skipped and
  * why — with the full captured log for that single run available on
  * double-click for when the short reason isn't enough.
+ *
+ * <p>All filters (task, status, date range, row limit) apply automatically
+ * as soon as they're changed — there's no separate "Apply" step, though a
+ * manual Refresh button is kept for re-pulling the latest rows without
+ * changing any filter. The panel also refreshes itself live whenever a new
+ * run is recorded anywhere in the app (see {@link #onRunRecorded}), so it
+ * doesn't go stale while you're sitting on this tab.
  */
 public class RunHistoryPanel extends JPanel {
 
@@ -31,10 +44,18 @@ public class RunHistoryPanel extends JPanel {
 
     private JComboBox<String> cbTaskFilter;
     private JComboBox<String> cbStatusFilter;
+    private JCheckBox cbUseDateFilter;
+    private JSpinner spFromDate;
+    private JSpinner spToDate;
     private JSpinner spLimit;
     private DefaultTableModel tableModel;
     private JTable table;
     private List<TaskRunRecord> currentRows;
+
+    // Guards against the filter-repopulation in refresh() (removeAllItems /
+    // addItem on the task combo) re-triggering itself via the very
+    // ActionListener that's supposed to auto-apply filters on user changes.
+    private boolean suppressFilterEvents = false;
 
     public RunHistoryPanel(XmlStorageService storage, RunHistoryService runHistoryService) {
         this.storage = storage;
@@ -49,32 +70,86 @@ public class RunHistoryPanel extends JPanel {
     }
 
     private JComponent buildFilterBar() {
-        JPanel bar = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 4));
+        JPanel bar = new JPanel();
+        bar.setLayout(new BoxLayout(bar, BoxLayout.Y_AXIS));
 
-        bar.add(new JLabel("Task:"));
+        JPanel row1 = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 4));
+        row1.add(new JLabel("Task:"));
         cbTaskFilter = new JComboBox<>();
         cbTaskFilter.addItem("All tasks");
-        bar.add(cbTaskFilter);
+        cbTaskFilter.addActionListener(e -> { if (!suppressFilterEvents) refresh(); });
+        row1.add(cbTaskFilter);
 
-        bar.add(new JLabel("Status:"));
+        row1.add(new JLabel("Status:"));
         cbStatusFilter = new JComboBox<>(new String[]{"All", "SUCCESS", "FAILED", "SKIPPED"});
-        bar.add(cbStatusFilter);
+        cbStatusFilter.addActionListener(e -> { if (!suppressFilterEvents) refresh(); });
+        row1.add(cbStatusFilter);
 
-        bar.add(new JLabel("Show last:"));
+        row1.add(new JLabel("Show last:"));
         spLimit = new JSpinner(new SpinnerNumberModel(200, 10, 5000, 50));
         ((JSpinner.DefaultEditor) spLimit.getEditor()).getTextField().setColumns(5);
-        bar.add(spLimit);
+        spLimit.addChangeListener(e -> { if (!suppressFilterEvents) refresh(); });
+        row1.add(spLimit);
 
         JButton btnRefresh = new JButton("Refresh");
+        btnRefresh.setToolTipText("Filters apply automatically — this just re-pulls the latest rows without changing them.");
         btnRefresh.addActionListener(e -> refresh());
-        bar.add(btnRefresh);
+        row1.add(btnRefresh);
 
         JLabel hint = new JLabel("Double-click a row for full run details");
         hint.setFont(hint.getFont().deriveFont(Font.ITALIC, 11f));
         hint.setForeground(new Color(0x757575));
-        bar.add(hint);
+        row1.add(hint);
 
+        JPanel row2 = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 2));
+        cbUseDateFilter = new JCheckBox("Filter by date range:");
+        cbUseDateFilter.addActionListener(e -> {
+            boolean on = cbUseDateFilter.isSelected();
+            spFromDate.setEnabled(on);
+            spToDate.setEnabled(on);
+            if (!suppressFilterEvents) refresh();
+        });
+        row2.add(cbUseDateFilter);
+
+        row2.add(new JLabel("From:"));
+        spFromDate = new JSpinner(new SpinnerDateModel());
+        spFromDate.setEditor(new JSpinner.DateEditor(spFromDate, "yyyy-MM-dd"));
+        spFromDate.setValue(toDate(LocalDate.now().minusDays(7)));
+        spFromDate.setEnabled(false);
+        ChangeListener dateChangeListener = e -> { if (!suppressFilterEvents && cbUseDateFilter.isSelected()) refresh(); };
+        spFromDate.addChangeListener(dateChangeListener);
+        row2.add(spFromDate);
+
+        row2.add(new JLabel("To:"));
+        spToDate = new JSpinner(new SpinnerDateModel());
+        spToDate.setEditor(new JSpinner.DateEditor(spToDate, "yyyy-MM-dd"));
+        spToDate.setValue(toDate(LocalDate.now()));
+        spToDate.setEnabled(false);
+        spToDate.addChangeListener(dateChangeListener);
+        row2.add(spToDate);
+
+        JButton btnClearDates = new JButton("Clear dates");
+        btnClearDates.addActionListener(e -> {
+            cbUseDateFilter.setSelected(false);
+            spFromDate.setEnabled(false);
+            spToDate.setEnabled(false);
+            refresh();
+        });
+        row2.add(btnClearDates);
+
+        bar.add(row1);
+        bar.add(row2);
         return bar;
+    }
+
+    private static Date toDate(LocalDate d) {
+        return Date.from(d.atStartOfDay(ZoneId.systemDefault()).toInstant());
+    }
+
+    private static LocalDateTime dateSpinnerToLocalDateTime(JSpinner spinner, boolean endOfDay) {
+        Date d = (Date) spinner.getValue();
+        LocalDate ld = d.toInstant().atZone(ZoneId.systemDefault()).toLocalDate();
+        return endOfDay ? LocalDateTime.of(ld, LocalTime.of(23, 59, 59)) : LocalDateTime.of(ld, LocalTime.MIDNIGHT);
     }
 
     private JComponent buildTable() {
@@ -129,16 +204,26 @@ public class RunHistoryPanel extends JPanel {
         return new JScrollPane(table);
     }
 
-    /** Repopulates the task filter dropdown and reloads the table from the database. */
+    /**
+     * Repopulates the task filter dropdown and reloads the table from the
+     * database using the current filter values. Safe to call from
+     * {@link #onRunRecorded} — repopulating the task combo is guarded so it
+     * doesn't recursively re-trigger this same method via its own listener.
+     */
     public void refresh() {
-        String previouslySelectedTask = (String) cbTaskFilter.getSelectedItem();
-        cbTaskFilter.removeAllItems();
-        cbTaskFilter.addItem("All tasks");
-        for (ScheduledTask t : storage.loadTasks()) {
-            cbTaskFilter.addItem(t.getName());
-        }
-        if (previouslySelectedTask != null) {
-            cbTaskFilter.setSelectedItem(previouslySelectedTask);
+        suppressFilterEvents = true;
+        try {
+            String previouslySelectedTask = (String) cbTaskFilter.getSelectedItem();
+            cbTaskFilter.removeAllItems();
+            cbTaskFilter.addItem("All tasks");
+            for (ScheduledTask t : storage.loadTasks()) {
+                cbTaskFilter.addItem(t.getName());
+            }
+            if (previouslySelectedTask != null) {
+                cbTaskFilter.setSelectedItem(previouslySelectedTask);
+            }
+        } finally {
+            suppressFilterEvents = false;
         }
 
         String taskFilterName = (String) cbTaskFilter.getSelectedItem();
@@ -155,7 +240,14 @@ public class RunHistoryPanel extends JPanel {
         TaskRunRecord.Status status = (statusFilterStr != null && !"All".equals(statusFilterStr))
                 ? TaskRunRecord.Status.valueOf(statusFilterStr) : null;
 
-        currentRows = runHistoryService.queryRuns(taskId, status, limit);
+        LocalDateTime from = null;
+        LocalDateTime to = null;
+        if (cbUseDateFilter.isSelected()) {
+            from = dateSpinnerToLocalDateTime(spFromDate, false);
+            to = dateSpinnerToLocalDateTime(spToDate, true);
+        }
+
+        currentRows = runHistoryService.queryRuns(taskId, status, from, to, limit);
 
         tableModel.setRowCount(0);
         for (TaskRunRecord r : currentRows) {
@@ -168,6 +260,16 @@ public class RunHistoryPanel extends JPanel {
                     r.getReason() != null ? r.getReason() : ""
             });
         }
+    }
+
+    /**
+     * Called (via {@link SwingUtilities#invokeLater}, from whatever thread
+     * recorded the run) whenever a new run is recorded anywhere in the app,
+     * so this tab reflects new runs immediately without the user needing to
+     * switch tabs or click Refresh.
+     */
+    public void onRunRecorded(TaskRunRecord record) {
+        refresh();
     }
 
     private void showDetails(TaskRunRecord r) {
