@@ -37,7 +37,20 @@ public class TaskSchedulerService {
     private final TaskLogService logService;
     private final RunHistoryService runHistoryService;
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(4);
-    private final ExecutorService executor = Executors.newCachedThreadPool();
+    // Bounded, NOT Executors.newCachedThreadPool(). A cached pool creates a
+    // brand-new thread for every task submitted while none are idle, with
+    // no ceiling — each thread reserves its own stack (OS-default is
+    // typically several hundred KB–1MB), so any burst of task submissions
+    // (a backlog of due tasks after the GUI was closed a while, retries,
+    // or previously the same-process double-scheduling race fixed above)
+    // could spawn hundreds of threads and visibly balloon the process's
+    // memory footprint without a single object leak anywhere. A fixed pool
+    // sized to a realistic worst-case concurrent-task count keeps that
+    // bounded; excess submissions simply queue instead of spawning more
+    // threads. Configurable since a very large deployment may genuinely
+    // want more parallel transfers.
+    private final ExecutorService executor = Executors.newFixedThreadPool(
+            Math.max(4, util.AppSettings.getMaxConcurrentTaskThreads()));
     private final ConcurrentMap<String, ScheduledFuture<?>> shortIntervalFutures = new ConcurrentHashMap<>();
     // Tracks currently running task futures so they can be cancelled on request
      private final ConcurrentMap<String, Future<?>> runningTaskFutures = new ConcurrentHashMap<>();

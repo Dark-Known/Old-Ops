@@ -41,7 +41,7 @@ public class SettingsPanel extends JPanel {
     private JTextField tfBatchMaxBytesOverride;
     private javax.swing.JSpinner spinnerBatchConcurrency;
     private javax.swing.JSpinner spinnerStaleThresholdMinutes;
-
+    private javax.swing.JSpinner spinnerMaxConcurrentTaskThreads;
     public SettingsPanel(TransferService transferService) {
         this(transferService, null);
     }
@@ -194,9 +194,9 @@ public class SettingsPanel extends JPanel {
         String dataDir = resolveActualDataDir();
         addInfoRow(infoPanel, "Data directory:", dataDir, 0);
         addInfoRow(infoPanel, "Tasks file:",     dataDir + File.separator + "tasks.xml", 1);
-        addInfoRow(infoPanel, "Credentials:",    dataDir + File.separator + "creds_<username>.xml", 2);
+        addInfoRow(infoPanel, "Credentials:",    dataDir + File.separator + "credentials.db", 2);
         addInfoRow(infoPanel, "Daemon log:",     dataDir + File.separator + resolveDaemonLogFileName(), 3);
-        addInfoRow(infoPanel, "Live settings (JSON):", AppSettings.filePath(), 4);
+        addInfoRow(infoPanel, "Live settings (database):", AppSettings.filePath(), 4);
         outer.add(infoPanel);
         outer.add(Box.createVerticalStrut(12));
 
@@ -336,6 +336,22 @@ public class SettingsPanel extends JPanel {
         shc.gridx = 0; shc.gridy = row++; shc.gridwidth = 3; shc.anchor = GridBagConstraints.WEST;
         shc.insets = new Insets(0, 4, 8, 0);
         panel.add(staleHint, shc);
+
+        spinnerMaxConcurrentTaskThreads = new javax.swing.JSpinner(
+                new javax.swing.SpinnerNumberModel(20, 4, 200, 1));
+        row = addFieldRow(panel, lc, fc, "Max concurrent task threads (restart required):", spinnerMaxConcurrentTaskThreads, row);
+
+        JLabel threadsHint = new JLabel("<html><body style='width: 480px'><i style='color:gray'>"
+            + "Ceiling on how many tasks can be executing at the exact same instant across the whole "
+            + "app. Most tasks here spend their time waiting on a remote server, not the CPU, so a very "
+            + "high number rarely improves throughput — it mainly affects worst-case memory use, since "
+            + "each worker thread reserves its own stack. Lower this if the app's memory footprint is a "
+            + "concern; raise it only if you have many tasks that genuinely need to run in parallel. "
+            + "Unlike the other settings on this page, this one is read once at startup.</i></body></html>");
+        GridBagConstraints thc = new GridBagConstraints();
+        thc.gridx = 0; thc.gridy = row++; thc.gridwidth = 3; thc.anchor = GridBagConstraints.WEST;
+        thc.insets = new Insets(0, 4, 8, 0);
+        panel.add(threadsHint, thc);
 
         // Fixed pixel width in the <body> style forces the HTML renderer to wrap
         // this onto multiple lines instead of laying it out as one long line that
@@ -769,6 +785,7 @@ public class SettingsPanel extends JPanel {
         tfBatchMaxBytesOverride.setText(AppSettings.get(AppSettings.KEY_TRANSFER_BATCH_MAX_BYTES));
         spinnerBatchConcurrency.setValue(AppSettings.getTransferBatchConcurrency());
         spinnerStaleThresholdMinutes.setValue(AppSettings.getStaleRunningThresholdMinutes());
+        spinnerMaxConcurrentTaskThreads.setValue(AppSettings.getMaxConcurrentTaskThreads());
     }
 
     private void savePrefs() {
@@ -812,6 +829,8 @@ public class SettingsPanel extends JPanel {
                     String.valueOf((Integer) spinnerBatchConcurrency.getValue()));
             live.put(AppSettings.KEY_STALE_RUNNING_THRESHOLD_MINUTES,
                     String.valueOf((Integer) spinnerStaleThresholdMinutes.getValue()));
+            live.put(AppSettings.KEY_MAX_CONCURRENT_TASK_THREADS,
+                    String.valueOf((Integer) spinnerMaxConcurrentTaskThreads.getValue()));
             AppSettings.setAll(live);
         } catch (Exception ex) {
             lblStatus.setText("Could not save live settings: " + ex.getMessage());

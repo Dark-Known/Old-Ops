@@ -11,7 +11,8 @@ import java.util.List;
 import java.util.UUID;
 
 /**
- * Displays all per-user credential files (creds_<username>.xml).
+ * Displays all stored server credentials (see {@link service.CredentialDbService},
+ * a small SQLite database at {@code <dataDir>/credentials.db}).
  * Passwords are shown and stored as plain text.
  *
  * Admins can add / edit / delete credentials here directly.
@@ -33,26 +34,40 @@ public class CredentialManagerPanel extends JPanel {
     private void buildUI() {
         // ── Info banner ───────────────────────────────────────────────────────
         JLabel banner = new JLabel(
-            "<html><b>Server Credentials</b> — one <code>creds_&lt;username&gt;.xml</code>"
-            + " file per user, stored in the data directory.<br>"
+            "<html><b>Server Credentials</b> — stored in <code>credentials.db</code>"
+            + " in the data directory.<br>"
             + "<span style='color:gray'>Passwords are plain text. Each Task looks up the"
-            + " matching file by username at run time.</span></html>");
+            + " matching credential by username at run time. \"Tasks Using\" counts how"
+            + " many tasks currently reference each username.</span></html>");
         banner.setBorder(new EmptyBorder(0, 0, 6, 0));
 
         // ── Table ─────────────────────────────────────────────────────────────
-        String[] cols = {"Username", "Host", "OS Type", "Display Name", "Creds File"};
+        String[] cols = {"Username", "Host", "OS Type", "Display Name", "Tasks Using"};
         tableModel = new DefaultTableModel(cols, 0) {
             public boolean isCellEditable(int r, int c) { return false; }
+            public Class<?> getColumnClass(int c) { return c == 4 ? Integer.class : String.class; }
         };
         table = new JTable(tableModel);
         table.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
         table.setRowHeight(26);
+        table.setAutoCreateRowSorter(true);
         table.getTableHeader().setReorderingAllowed(false);
         table.getColumnModel().getColumn(0).setPreferredWidth(120);
         table.getColumnModel().getColumn(1).setPreferredWidth(160);
         table.getColumnModel().getColumn(2).setPreferredWidth(80);
         table.getColumnModel().getColumn(3).setPreferredWidth(160);
-        table.getColumnModel().getColumn(4).setPreferredWidth(200);
+        table.getColumnModel().getColumn(4).setPreferredWidth(90);
+        table.getColumnModel().getColumn(4).setCellRenderer(new javax.swing.table.DefaultTableCellRenderer() {
+            { setHorizontalAlignment(CENTER); }
+            @Override
+            public java.awt.Component getTableCellRendererComponent(JTable t, Object value, boolean isSelected,
+                    boolean hasFocus, int row, int column) {
+                java.awt.Component c = super.getTableCellRendererComponent(t, value, isSelected, hasFocus, row, column);
+                int count = value instanceof Integer ? (Integer) value : 0;
+                if (!isSelected) c.setForeground(count > 0 ? new Color(0x1565C0) : new Color(0x9E9E9E));
+                return c;
+            }
+        });
         JScrollPane scroll = new JScrollPane(table);
 
         // ── Buttons ───────────────────────────────────────────────────────────
@@ -68,18 +83,26 @@ public class CredentialManagerPanel extends JPanel {
         btnEdit.addActionListener(e -> {
             int row = table.getSelectedRow();
             if (row < 0) { JOptionPane.showMessageDialog(this, "Select a credential to edit."); return; }
-            String username = (String) tableModel.getValueAt(row, 0);
+            int modelRow = table.convertRowIndexToModel(row);
+            String username = (String) tableModel.getValueAt(modelRow, 0);
             Credential c = storage.loadCredentialByUsername(username);
             if (c != null) showDialog(c);
         });
         btnDelete.addActionListener(e -> {
             int row = table.getSelectedRow();
             if (row < 0) { JOptionPane.showMessageDialog(this, "Select a credential to delete."); return; }
-            String username = (String) tableModel.getValueAt(row, 0);
+            int modelRow = table.convertRowIndexToModel(row);
+            String username = (String) tableModel.getValueAt(modelRow, 0);
+            int inUse = storage.countTasksUsingCredential(username);
+            String warning = inUse > 0
+                ? "\n\nWarning: " + inUse + " task" + (inUse == 1 ? " is" : "s are")
+                    + " currently configured to use this credential.\n"
+                    + "Deleting it will make " + (inUse == 1 ? "that task" : "those tasks") + " fail at their next run."
+                : "";
             int ok = JOptionPane.showConfirmDialog(this,
-                "Delete credential for \"" + username + "\"?\n"
-                + "File: " + storage.credFileForUser(username).getName(),
-                "Confirm Delete", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
+                "Delete credential for \"" + username + "\"?" + warning,
+                "Confirm Delete", JOptionPane.YES_NO_OPTION,
+                inUse > 0 ? JOptionPane.WARNING_MESSAGE : JOptionPane.QUESTION_MESSAGE);
             if (ok == JOptionPane.YES_OPTION) {
                 storage.deleteCredential(username);
                 refresh();
@@ -109,7 +132,7 @@ public class CredentialManagerPanel extends JPanel {
                 c.getHost(),
                 c.getOsType(),
                 c.getName(),
-                storage.credFileForUser(c.getUsername()).getName()
+                storage.countTasksUsingCredential(c.getUsername())
             });
         }
     }
@@ -144,8 +167,7 @@ public class CredentialManagerPanel extends JPanel {
         addFormRow(form, "OS Type *",   cbOs,   3);
         addFormRow(form, "",
             new JLabel("<html><i style='color:#888'>Password stored as plain text in"
-                + " creds_" + (existing != null ? existing.getUsername() : "&lt;username&gt;")
-                + ".xml</i></html>"), 4);
+                + " credentials.db</i></html>"), 4);
 
         JButton btnSave   = new JButton("Save");
         JButton btnCancel = new JButton("Cancel");

@@ -4,18 +4,22 @@ import model.ScheduledTask;
 import model.TaskRunRecord;
 import service.RunHistoryService;
 import service.XmlStorageService;
+import export.XlsxWriter;
+import export.PdfTableWriter;
 
 import javax.swing.*;
 import javax.swing.event.ChangeListener;
 import javax.swing.table.DefaultTableCellRenderer;
 import javax.swing.table.DefaultTableModel;
 import java.awt.*;
+import java.io.File;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.time.ZoneId;
 import java.util.Date;
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -37,6 +41,9 @@ public class RunHistoryPanel extends JPanel {
     private static final Color COLOR_FAILED  = new Color(0xFFEBEE);
     private static final Color COLOR_SUCCESS = new Color(0xE8F5E9);
     private static final Color COLOR_SKIPPED = new Color(0xFFF8E1);
+    private static final String HEX_FAILED  = "FFEBEE";
+    private static final String HEX_SUCCESS = "E8F5E9";
+    private static final String HEX_SKIPPED = "FFF8E1";
     private static final DateTimeFormatter DT_FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
     private final XmlStorageService storage;
@@ -96,6 +103,16 @@ public class RunHistoryPanel extends JPanel {
         btnRefresh.addActionListener(e -> refresh());
         row1.add(btnRefresh);
 
+        JButton btnExportExcel = new JButton("Export Excel");
+        btnExportExcel.setToolTipText("Export the rows currently shown (with the same status coloring) to a .xlsx file");
+        btnExportExcel.addActionListener(e -> exportExcel());
+        row1.add(btnExportExcel);
+
+        JButton btnExportPdf = new JButton("Export PDF");
+        btnExportPdf.setToolTipText("Export the rows currently shown (with the same status coloring) to a .pdf file");
+        btnExportPdf.addActionListener(e -> exportPdf());
+        row1.add(btnExportPdf);
+
         JLabel hint = new JLabel("Double-click a row for full run details");
         hint.setFont(hint.getFont().deriveFont(Font.ITALIC, 11f));
         hint.setForeground(new Color(0x757575));
@@ -113,8 +130,8 @@ public class RunHistoryPanel extends JPanel {
 
         row2.add(new JLabel("From:"));
         spFromDate = new JSpinner(new SpinnerDateModel());
-        spFromDate.setEditor(new JSpinner.DateEditor(spFromDate, "yyyy-MM-dd"));
-        spFromDate.setValue(toDate(LocalDate.now().minusDays(7)));
+        spFromDate.setEditor(new JSpinner.DateEditor(spFromDate, "yyyy-MM-dd HH:mm"));
+        spFromDate.setValue(toDateTime(LocalDate.now().minusDays(7), LocalTime.MIDNIGHT));
         spFromDate.setEnabled(false);
         ChangeListener dateChangeListener = e -> { if (!suppressFilterEvents && cbUseDateFilter.isSelected()) refresh(); };
         spFromDate.addChangeListener(dateChangeListener);
@@ -122,8 +139,8 @@ public class RunHistoryPanel extends JPanel {
 
         row2.add(new JLabel("To:"));
         spToDate = new JSpinner(new SpinnerDateModel());
-        spToDate.setEditor(new JSpinner.DateEditor(spToDate, "yyyy-MM-dd"));
-        spToDate.setValue(toDate(LocalDate.now()));
+        spToDate.setEditor(new JSpinner.DateEditor(spToDate, "yyyy-MM-dd HH:mm"));
+        spToDate.setValue(toDateTime(LocalDate.now(), LocalTime.of(23, 59)));
         spToDate.setEnabled(false);
         spToDate.addChangeListener(dateChangeListener);
         row2.add(spToDate);
@@ -142,14 +159,23 @@ public class RunHistoryPanel extends JPanel {
         return bar;
     }
 
-    private static Date toDate(LocalDate d) {
-        return Date.from(d.atStartOfDay(ZoneId.systemDefault()).toInstant());
+    private static Date toDateTime(LocalDate d, LocalTime t) {
+        return Date.from(LocalDateTime.of(d, t).atZone(ZoneId.systemDefault()).toInstant());
     }
 
+    /**
+     * Reads both the date AND time of day the user set on the spinner —
+     * previously this only had a date picker, so "From 09:00 to 17:00"
+     * type ranges weren't expressible; a "From" filter always meant
+     * midnight and "To" always meant end-of-day regardless of what the
+     * user actually wanted. Now the spinner's own time-of-day is used
+     * as-is; {@code endOfDay} still pads seconds up to :59 so a "To" value
+     * of e.g. 17:30 is inclusive of that whole minute.
+     */
     private static LocalDateTime dateSpinnerToLocalDateTime(JSpinner spinner, boolean endOfDay) {
         Date d = (Date) spinner.getValue();
-        LocalDate ld = d.toInstant().atZone(ZoneId.systemDefault()).toLocalDate();
-        return endOfDay ? LocalDateTime.of(ld, LocalTime.of(23, 59, 59)) : LocalDateTime.of(ld, LocalTime.MIDNIGHT);
+        LocalDateTime ldt = d.toInstant().atZone(ZoneId.systemDefault()).toLocalDateTime();
+        return endOfDay ? ldt.withSecond(59) : ldt.withSecond(0);
     }
 
     private JComponent buildTable() {
@@ -308,5 +334,121 @@ public class RunHistoryPanel extends JPanel {
         if (h > 0) return String.format("%dh %dm %ds", h, m, s);
         if (m > 0) return String.format("%dm %ds", m, s);
         return s + "s";
+    }
+
+    private static String hexForStatus(TaskRunRecord.Status status) {
+        switch (status) {
+            case SUCCESS: return HEX_SUCCESS;
+            case FAILED:  return HEX_FAILED;
+            case SKIPPED: return HEX_SKIPPED;
+            default:      return null;
+        }
+    }
+
+    /** Common headers/values for both export formats — one row per currently-displayed record, in the same order shown on screen. */
+    private static final String[] EXPORT_HEADERS = {"Task", "Type", "Status", "Started", "Ended", "Duration", "Reason", "Details"};
+
+    private List<String[]> buildExportRows() {
+        List<String[]> out = new ArrayList<>();
+        for (TaskRunRecord r : currentRows) {
+            out.add(new String[]{
+                    r.getTaskName(),
+                    r.getTaskType() != null ? r.getTaskType() : "",
+                    r.getStatus().name(),
+                    r.getStartedAt().format(DT_FMT),
+                    r.getEndedAt().format(DT_FMT),
+                    formatDuration(r.getDurationMs()),
+                    r.getReason() != null ? r.getReason() : "",
+                    r.getDetails() != null ? r.getDetails() : ""
+            });
+        }
+        return out;
+    }
+
+    private List<String> buildExportFills() {
+        List<String> out = new ArrayList<>();
+        for (TaskRunRecord r : currentRows) out.add(hexForStatus(r.getStatus()));
+        return out;
+    }
+
+    /**
+     * Runs {@code exportTask} (the actual file write) on a background
+     * thread so exporting a few thousand rows doesn't freeze the UI, then
+     * shows a success/error dialog back on the EDT. Shared by both the
+     * Excel and PDF export buttons.
+     */
+    private void runExport(String suggestedFileName, String description, String extension,
+            ExportTask exportTask) {
+        if (currentRows == null || currentRows.isEmpty()) {
+            JOptionPane.showMessageDialog(this, "No rows to export — adjust the filters above first.",
+                    "Nothing to export", JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+        JFileChooser chooser = new JFileChooser();
+        chooser.setDialogTitle("Export " + description);
+        chooser.setSelectedFile(new File(suggestedFileName));
+        chooser.setFileFilter(new javax.swing.filechooser.FileNameExtensionFilter(description, extension));
+        int result = chooser.showSaveDialog(this);
+        if (result != JFileChooser.APPROVE_OPTION) return;
+
+        File target = chooser.getSelectedFile();
+        if (!target.getName().toLowerCase().endsWith("." + extension)) {
+            target = new File(target.getParentFile(), target.getName() + "." + extension);
+        }
+        final File finalTarget = target;
+
+        List<String[]> rows = buildExportRows();
+        List<String> fills = buildExportFills();
+
+        new SwingWorker<Void, Void>() {
+            Exception failure;
+            @Override protected Void doInBackground() {
+                try {
+                    exportTask.run(finalTarget, rows, fills);
+                } catch (Exception ex) {
+                    failure = ex;
+                }
+                return null;
+            }
+            @Override protected void done() {
+                if (failure != null) {
+                    JOptionPane.showMessageDialog(RunHistoryPanel.this,
+                            "Export failed: " + failure.getMessage(),
+                            "Export error", JOptionPane.ERROR_MESSAGE);
+                } else {
+                    int open = JOptionPane.showConfirmDialog(RunHistoryPanel.this,
+                            "Exported " + rows.size() + " row(s) to:\n" + finalTarget.getAbsolutePath()
+                                    + "\n\nOpen the containing folder now?",
+                            "Export complete", JOptionPane.YES_NO_OPTION, JOptionPane.INFORMATION_MESSAGE);
+                    if (open == JOptionPane.YES_OPTION) {
+                        try {
+                            Desktop.getDesktop().open(finalTarget.getParentFile());
+                        } catch (Exception ignored) {
+                            // best-effort — not fatal if no desktop file manager is available
+                        }
+                    }
+                }
+            }
+        }.execute();
+    }
+
+    private void exportExcel() {
+        int[] widths = {22, 16, 12, 20, 20, 12, 40, 60};
+        runExport("task_logs.xlsx", "Excel Workbook (*.xlsx)", "xlsx",
+                (file, rows, fills) -> XlsxWriter.write(file, EXPORT_HEADERS, widths, rows, fills));
+    }
+
+    private void exportPdf() {
+        // Points, sums to within the Letter-landscape usable width (792 - 2*30 margin = 732).
+        float[] widths = {95f, 65f, 55f, 85f, 85f, 55f, 150f, 142f};
+        runExport("task_logs.pdf", "PDF Document (*.pdf)", "pdf",
+                (file, rows, fills) -> PdfTableWriter.write(file, "Task Run Logs — exported " +
+                        LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")),
+                        EXPORT_HEADERS, widths, rows, fills));
+    }
+
+    @FunctionalInterface
+    private interface ExportTask {
+        void run(File file, List<String[]> rows, List<String> rowFillHex) throws Exception;
     }
 }

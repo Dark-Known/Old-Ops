@@ -2,11 +2,13 @@ ui\ToastManager$2.class
 ui\SettingsPanel.class
 service\OAuth2TokenService.class
 Daemon.class
+export\XlsxWriter.class
 service\OAuth2TokenService$CachedToken.class
 App.class
 ui\TaskManagerPanel$3.class
 util\CryptoUtil.class
 util\AppSettings.class
+export\PdfTableWriter.class
 util\ImapSearchCriteria$SizeCriteria.class
 model\ScheduledTask.class
 ui\SearchCriteriaPanel.class
@@ -15,6 +17,7 @@ model\RemoteFileMetadata.class
 service\GraphMailService$MailMessage.class
 util\ImapSearchCriteria$AdvancedCriteria.class
 service\TaskSchedulerService$TaskMetrics.class
+ui\RunHistoryPanel$5.class
 ui\NotificationBell$1.class
 model\ScheduledTask$TransferMode.class
 service\TaskLogService.class
@@ -25,11 +28,13 @@ service\TransferService$WatcherSkipException.class
 ui\SearchCriteriaPanel$CriterionTag.class
 ui\RunHistoryPanel$4.class
 service\TransferService$RemoteFileStat.class
+ui\RunHistoryPanel$ExportTask.class
 model\TaskRunRecord.class
 util\MiniJson.class
 util\ImapSearchCriteria$TextCriteria.class
 model\RemoteFileException.class
 service\TransferService$SizedCommand.class
+service\CredentialDbService.class
 service\RemoteFileMetadataServiceFactory$ManagedMetadataService.class
 ui\CredentialManagerPanel$1.class
 ui\MainWindow$3.class
@@ -72,6 +77,7 @@ ui\ToastManager$1.class
 ui\MainWindow$1.class
 ui\NotificationBell.class
 ui\RunHistoryPanel$2.class
+ui\CredentialManagerPanel$2.class
 model\TaskRunRecord$Status.class
 service\TransferService$MarkerMatch.class
 service\GraphMailService.class

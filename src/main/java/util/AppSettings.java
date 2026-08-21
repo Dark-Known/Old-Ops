@@ -4,15 +4,18 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.sql.*;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 /**
- * Live, JSON-backed store for settings that should take effect immediately —
- * without an application (or JVM) restart — and that the Settings panel lets
- * the user edit directly.
+ * Live, database-backed store for settings that should take effect
+ * immediately — without an application (or JVM) restart — and that the
+ * Settings panel lets the user edit directly.
  *
- * <p>This is deliberately a separate file/format from {@code app-config.xml}:
+ * <p>This is deliberately a separate store from {@code app-config.xml}:
  * <ul>
  *   <li><b>app-config.xml</b> stays the *install-time* file consumed by
  *       {@code setup.ps1} (install paths, daemon registration, JVM heap
@@ -20,21 +23,31 @@ import java.util.Map;
  *       it can only take effect on install/relaunch, so there's little value
  *       in hot-reloading it, and doing so would risk the installer and the
  *       running app disagreeing about what's "current".</li>
- *   <li><b>app-settings.json</b> (this class) holds the handful of values
- *       that genuinely are read on every message/task run and can safely
- *       change underneath a running app: mail routing folder names, the
- *       default SITA station address, the attachment download location, and
- *       the log level. JSON also happens to be a much more natural fit than
- *       XML for a settings blob a GUI reads/writes on every save.</li>
+ *   <li><b>app-settings.db</b> (this class, a small SQLite database — see
+ *       {@code <dataDir>/app-settings.db}) holds the handful of values that
+ *       genuinely are read on every message/task run and can safely change
+ *       underneath a running app: mail routing folder names, the default
+ *       SITA station address, the attachment download location, and the
+ *       log level. Moving this from a hand-edited JSON file to SQLite means
+ *       the Settings panel's writes are atomic/durable the same way task
+ *       and credential data already are, and there's one consistent place
+ *       (and one consistent backup step) for all of the app's persistent
+ *       state instead of a mix of JSON + XML + DB files.</li>
  * </ul>
  *
- * <p><b>Real-time behavior:</b> every getter re-stats the backing file and
- * reparses it if its {@code lastModified} timestamp has moved on since the
- * last read. A {@code stat()} call is cheap enough to do on every read (this
- * is not a hot loop — at most a few times per processed message), so no file
- * watcher/polling thread is needed: edits made in the Settings panel (or by
- * hand-editing the JSON) are picked up by the very next read, whether that
- * read happens in the GUI thread or the background daemon process.
+ * <p><b>Real-time behavior:</b> every getter re-checks a short-lived
+ * in-memory cache (see {@link #CACHE_TTL_MILLIS}) and re-queries the
+ * database once it expires. A local SQLite query is cheap enough to do
+ * every couple of seconds (this is not a hot loop — at most a few reads per
+ * processed message), so no file watcher/polling thread is needed: edits
+ * made in the Settings panel are picked up within {@link #CACHE_TTL_MILLIS}
+ * by any reader, whether that's the GUI thread or the background daemon
+ * process (each process has its own connection to the same database file).
+ *
+ * <p>On first run against a data directory that still has the legacy
+ * {@code app-settings.json} from a previous version, that file's contents
+ * are imported into the database once (see {@link #migrateLegacyJsonIfPresent}),
+ * so upgrading in place doesn't reset anyone's settings.
  *
  * <p><b>JVM heap is the one exception.</b> {@code -Xms}/{@code -Xmx} are
  * fixed when the JVM starts; no in-process reload can change already
@@ -46,7 +59,10 @@ import java.util.Map;
  */
 public final class AppSettings {
 
-    private static final String FILE_NAME = "app-settings.json";
+    private static final Logger log = Logger.getLogger(AppSettings.class.getName());
+    private static final String DB_FILE_NAME = "app-settings.db";
+    private static final String LEGACY_JSON_FILE_NAME = "app-settings.json";
+    private static final long CACHE_TTL_MILLIS = 2000; // live-reload granularity
 
     // Keys
     public static final String KEY_LDM_FOLDER            = "ldmFolder";
@@ -103,6 +119,15 @@ public final class AppSettings {
     // as it needs to, since every WinSCP output line resets the clock.
     public static final String KEY_STALE_INACTIVITY_THRESHOLD_MINUTES = "staleInactivityThresholdMinutes";
 
+    // Ceiling on how many task-execution worker threads the scheduler will
+    // ever have alive at once (see TaskSchedulerService's fixed thread
+    // pool). Read once at scheduler startup, not hot-reloaded — restart
+    // required to change. Kept modest by default since most tasks here are
+    // I/O-bound (waiting on a remote server), not CPU-bound, so a large
+    // number of truly-parallel threads rarely helps throughput but does
+    // cost memory (each thread reserves its own stack).
+    public static final String KEY_MAX_CONCURRENT_TASK_THREADS = "maxConcurrentTaskThreads";
+
     // Built-in fallbacks, used only if neither app-settings.json nor
     // app-config.xml has a value (keeps behavior identical to before this
     // file existed, for anyone upgrading in place).
@@ -115,7 +140,17 @@ public final class AppSettings {
         HARD_DEFAULTS.put(KEY_ATTACHMENT_DOWNLOAD_DIR, "");
         HARD_DEFAULTS.put(KEY_LOG_LEVEL, "INFO");
         HARD_DEFAULTS.put(KEY_JVM_MIN_HEAP, "512M");
-        HARD_DEFAULTS.put(KEY_JVM_MAX_HEAP, "2G");
+        // Lowered from the previous 2G default. This app's actual live
+        // object footprint (a task list, a few in-memory logs each capped
+        // at 500KB, a handful of SQLite connections) is a small fraction
+        // of that — 2G was simply how high the JVM was ALLOWED to grow,
+        // and the JVM tends to grow committed heap toward Xmx over a long
+        // session before a full GC reclaims it, which reads as "using 2GB"
+        // in Task Manager even when live data is far smaller. 768M gives
+        // comfortable headroom for normal operation while capping the
+        // worst case much lower; raise it in Settings if a deployment
+        // genuinely needs more (e.g. very large attachment downloads).
+        HARD_DEFAULTS.put(KEY_JVM_MAX_HEAP, "768M");
         // Default: aim for each batch to finish in ~5s assuming a conservative
         // ~5 MB/s link -> 5 * 5*1024*1024 = 26214400 bytes (~25 MB) per batch.
         HARD_DEFAULTS.put(KEY_TRANSFER_BATCH_TARGET_SECONDS, "5");
@@ -125,6 +160,7 @@ public final class AppSettings {
         HARD_DEFAULTS.put(KEY_TRANSFER_BATCH_CONCURRENCY, "1"); // 1 = sequential (old behavior)
         HARD_DEFAULTS.put(KEY_STALE_RUNNING_THRESHOLD_MINUTES, "30");
         HARD_DEFAULTS.put(KEY_STALE_INACTIVITY_THRESHOLD_MINUTES, "5");
+        HARD_DEFAULTS.put(KEY_MAX_CONCURRENT_TASK_THREADS, "20");
     }
 
     // app-config.xml tag each key is seeded from on first run.
@@ -149,87 +185,142 @@ public final class AppSettings {
 
     private static final Object LOCK = new Object();
     private static volatile Map<String, String> cache;
-    private static volatile long cachedFileMtime = -1;
-    private static volatile File resolvedFile;
+    private static volatile long cacheLoadedAtMillis = -1;
+    private static volatile File resolvedDataDir;
+    private static volatile Connection conn;
 
     private AppSettings() {}
 
-    // ─── File resolution ────────────────────────────────────────────────────
+    // ─── Data directory / connection resolution ─────────────────────────────
 
-    private static File file() {
-        if (resolvedFile != null) return resolvedFile;
+    private static File dataDir() {
+        if (resolvedDataDir != null) return resolvedDataDir;
         synchronized (LOCK) {
-            if (resolvedFile != null) return resolvedFile;
+            if (resolvedDataDir != null) return resolvedDataDir;
             String dataDir = AppConfig.readValue("dataDir");
             if (dataDir == null || dataDir.isEmpty()) {
                 // Must match the fallback used by MainWindow.loadDataDir() and
                 // Daemon.loadDataDirFromConfig() exactly — otherwise, whenever
                 // app-config.xml's <dataDir> can't be resolved (e.g. process
                 // launched from a working directory where AppConfig can't
-                // locate the XML), this file would silently end up in a
+                // locate the XML), this DB would silently end up in a
                 // different folder than tasks.xml/credentials/daemon.log,
                 // and edits made in the Settings panel would look like
                 // they're going nowhere.
                 dataDir = "C:\\OpsTools\\Data";
             }
-            resolvedFile = new File(dataDir, FILE_NAME);
-            return resolvedFile;
+            resolvedDataDir = new File(dataDir);
+            return resolvedDataDir;
+        }
+    }
+
+    private static Connection connection() {
+        if (conn != null) return conn;
+        synchronized (LOCK) {
+            if (conn != null) return conn;
+            File dir = dataDir();
+            dir.mkdirs();
+            File dbFile = new File(dir, DB_FILE_NAME);
+            try {
+                Class.forName("org.sqlite.JDBC");
+                Connection c = DriverManager.getConnection("jdbc:sqlite:" + dbFile.getAbsolutePath());
+                try (Statement st = c.createStatement()) {
+                    st.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)");
+                }
+                conn = c;
+                migrateLegacyJsonIfPresent(dir, c);
+            } catch (Exception e) {
+                log.log(Level.SEVERE, "Failed to open/initialize app-settings database", e);
+            }
+            return conn;
+        }
+    }
+
+    /**
+     * One-time import of the legacy app-settings.json (used by versions
+     * prior to the move to SQLite) into the settings table, so upgrading in
+     * place doesn't silently reset every saved setting back to defaults.
+     * Runs only if the table is currently empty; the JSON file itself is
+     * left in place afterward (renamed with a .migrated suffix) rather than
+     * deleted, purely as a safety net.
+     */
+    private static void migrateLegacyJsonIfPresent(File dir, Connection c) {
+        File legacy = new File(dir, LEGACY_JSON_FILE_NAME);
+        if (!legacy.exists()) return;
+        try (Statement st = c.createStatement();
+             ResultSet rs = st.executeQuery("SELECT COUNT(*) FROM settings")) {
+            if (rs.next() && rs.getInt(1) > 0) return; // already has data — don't overwrite
+        } catch (SQLException e) {
+            log.log(Level.WARNING, "Could not check settings table before JSON migration", e);
+            return;
+        }
+        try {
+            String json = Files.readString(legacy.toPath(), StandardCharsets.UTF_8);
+            Map<String, Object> parsed = MiniJson.parseObject(json);
+            if (!parsed.isEmpty()) {
+                try (PreparedStatement ps = c.prepareStatement(
+                        "INSERT INTO settings (key, value) VALUES (?, ?) " +
+                        "ON CONFLICT(key) DO UPDATE SET value = excluded.value")) {
+                    for (Map.Entry<String, Object> e : parsed.entrySet()) {
+                        if (e.getValue() == null) continue;
+                        ps.setString(1, e.getKey());
+                        ps.setString(2, String.valueOf(e.getValue()));
+                        ps.executeUpdate();
+                    }
+                }
+                log.info("Migrated " + parsed.size() + " setting(s) from legacy app-settings.json into " + DB_FILE_NAME);
+            }
+            File renamed = new File(dir, LEGACY_JSON_FILE_NAME + ".migrated");
+            legacy.renameTo(renamed);
+        } catch (Exception e) {
+            log.log(Level.WARNING, "Failed to migrate legacy app-settings.json", e);
         }
     }
 
     // ─── Load (with live reload) ────────────────────────────────────────────
 
     private static Map<String, String> current() {
-        File f = file();
-        long mtime = f.exists() ? f.lastModified() : 0L;
         Map<String, String> snapshot = cache;
-        if (snapshot != null && mtime == cachedFileMtime) {
-            return snapshot; // unchanged since last read — no reparse needed
+        long now = System.currentTimeMillis();
+        if (snapshot != null && (now - cacheLoadedAtMillis) < CACHE_TTL_MILLIS) {
+            return snapshot; // still fresh — no requery needed
         }
         synchronized (LOCK) {
-            mtime = f.exists() ? f.lastModified() : 0L;
-            if (cache != null && mtime == cachedFileMtime) return cache;
-            Map<String, String> loaded = load(f);
+            if (cache != null && (System.currentTimeMillis() - cacheLoadedAtMillis) < CACHE_TTL_MILLIS) {
+                return cache;
+            }
+            Map<String, String> loaded = load();
             cache = loaded;
-            cachedFileMtime = mtime;
+            cacheLoadedAtMillis = System.currentTimeMillis();
             return loaded;
         }
     }
 
-    private static Map<String, String> load(File f) {
+    private static Map<String, String> load() {
         Map<String, String> result = new LinkedHashMap<>();
-        if (f.exists()) {
-            try {
-                String json = Files.readString(f.toPath(), StandardCharsets.UTF_8);
-                Map<String, Object> parsed = MiniJson.parseObject(json);
-                for (Map.Entry<String, Object> e : parsed.entrySet()) {
-                    if (e.getValue() != null) result.put(e.getKey(), String.valueOf(e.getValue()));
+        Connection c = connection();
+        if (c != null) {
+            try (Statement st = c.createStatement();
+                 ResultSet rs = st.executeQuery("SELECT key, value FROM settings")) {
+                while (rs.next()) {
+                    String v = rs.getString("value");
+                    if (v != null) result.put(rs.getString("key"), v);
                 }
-                return result;
-            } catch (Exception ignored) {
-                // fall through to a fresh seed if the file is missing/corrupt
+                if (!result.isEmpty()) return result;
+            } catch (SQLException e) {
+                log.log(Level.WARNING, "Failed to read app settings from database", e);
             }
         }
-        // First run (or unreadable file): seed from app-config.xml so
-        // upgrading in place doesn't silently change behavior, then persist
-        // so the Settings panel has a real file to edit from now on.
+        // Empty table (first run) or DB unavailable: seed from app-config.xml
+        // so upgrading in place doesn't silently change behavior, then
+        // persist so the Settings panel has real rows to edit from now on.
         for (Map.Entry<String, String> seed : XML_SEED_TAG.entrySet()) {
             String xmlVal = AppConfig.readValue(seed.getValue());
             result.put(seed.getKey(), (xmlVal != null && !xmlVal.isEmpty())
                     ? xmlVal : HARD_DEFAULTS.get(seed.getKey()));
         }
-        try {
-            persist(f, result);
-        } catch (IOException ignored) {
-            // best-effort — in-memory defaults still apply for this run
-        }
+        if (c != null) writeThroughLocked(c, result);
         return result;
-    }
-
-    private static void persist(File f, Map<String, String> values) throws IOException {
-        File parent = f.getParentFile();
-        if (parent != null) Files.createDirectories(parent.toPath());
-        Files.writeString(f.toPath(), MiniJson.writeObject(values), StandardCharsets.UTF_8);
     }
 
     // ─── Public read API ─────────────────────────────────────────────────────
@@ -314,6 +405,15 @@ public final class AppSettings {
     }
 
     /**
+     * Ceiling on concurrent task-execution worker threads — see
+     * {@link #KEY_MAX_CONCURRENT_TASK_THREADS}. Defaults to 20. Read once
+     * when TaskSchedulerService starts; changing it requires a restart.
+     */
+    public static int getMaxConcurrentTaskThreads() {
+        return Math.max(1, intOrDefault(KEY_MAX_CONCURRENT_TASK_THREADS));
+    }
+
+    /**
      * Max total bytes moved per batch (WinSCP session, or local-copy progress
      * chunk) before pausing for {@link #getTransferBatchIntervalSeconds()}
      * and starting the next batch. If an explicit override (&gt; 0) is set via
@@ -339,16 +439,17 @@ public final class AppSettings {
 
     /** Sets and immediately persists a single value. Visible to the next read from any process/thread. */
     public static void set(String key, String value) {
-        Map<String, String> updated;
         synchronized (LOCK) {
             Map<String, String> base = new LinkedHashMap<>(current());
             if (value == null || value.isEmpty()) base.remove(key); else base.put(key, value);
-            updated = base;
-            writeThrough(updated);
+            Connection c = connection();
+            if (c != null) writeThroughLocked(c, base);
+            cache = base;
+            cacheLoadedAtMillis = System.currentTimeMillis();
         }
     }
 
-    /** Sets and immediately persists several values in one file write (preferred for a Settings-panel "Save"). */
+    /** Sets and immediately persists several values in one transaction (preferred for a Settings-panel "Save"). */
     public static void setAll(Map<String, String> values) {
         synchronized (LOCK) {
             Map<String, String> base = new LinkedHashMap<>(current());
@@ -356,24 +457,38 @@ public final class AppSettings {
                 if (e.getValue() == null || e.getValue().isEmpty()) base.remove(e.getKey());
                 else base.put(e.getKey(), e.getValue());
             }
-            writeThrough(base);
+            Connection c = connection();
+            if (c != null) writeThroughLocked(c, base);
+            cache = base;
+            cacheLoadedAtMillis = System.currentTimeMillis();
         }
     }
 
-    /** Caller must hold LOCK. */
-    private static void writeThrough(Map<String, String> values) {
-        File f = file();
+    /** Caller must hold LOCK. Replaces the entire settings table contents with {@code values}. */
+    private static void writeThroughLocked(Connection c, Map<String, String> values) {
         try {
-            persist(f, values);
-            cache = values;
-            cachedFileMtime = f.exists() ? f.lastModified() : System.currentTimeMillis();
-        } catch (IOException ex) {
-            throw new RuntimeException("Could not save " + f + ": " + ex.getMessage(), ex);
+            boolean priorAutoCommit = c.getAutoCommit();
+            c.setAutoCommit(false);
+            try (Statement del = c.createStatement()) {
+                del.execute("DELETE FROM settings");
+            }
+            try (PreparedStatement ps = c.prepareStatement("INSERT INTO settings (key, value) VALUES (?, ?)")) {
+                for (Map.Entry<String, String> e : values.entrySet()) {
+                    ps.setString(1, e.getKey());
+                    ps.setString(2, e.getValue());
+                    ps.addBatch();
+                }
+                ps.executeBatch();
+            }
+            c.commit();
+            c.setAutoCommit(priorAutoCommit);
+        } catch (SQLException ex) {
+            throw new RuntimeException("Could not save settings to " + DB_FILE_NAME + ": " + ex.getMessage(), ex);
         }
     }
 
-    /** Absolute path of the backing JSON file, for display in the Settings panel. */
+    /** Absolute path of the backing SQLite database, for display in the Settings panel. */
     public static String filePath() {
-        return file().getAbsolutePath();
+        return new File(dataDir(), DB_FILE_NAME).getAbsolutePath();
     }
 }

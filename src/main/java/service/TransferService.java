@@ -2528,9 +2528,8 @@ public class TransferService {
         if (uname != null && !uname.isEmpty()) {
             Credential c = storage.loadCredentialByUsername(uname);
             if (c != null) return c;
-            logLine.accept("[ERROR] No credential file found for username '" + uname
-                    + "'. Expected: " + storage.credFileForUser(uname).getName()
-                    + " in " + storage.getDataDir().getAbsolutePath());
+            logLine.accept("[ERROR] No credential found for username '" + uname
+                    + "' in credentials.db (" + storage.getDataDir().getAbsolutePath() + ")");
             return null;
         }
         if (task.getTargetCredentialId() != null && !task.getTargetCredentialId().isEmpty()) {
@@ -2547,9 +2546,8 @@ public class TransferService {
         if (username == null || username.trim().isEmpty()) return null;
         Credential c = storage.loadCredentialByUsername(username.trim());
         if (c == null) {
-            logLine.accept("[ERROR] No credential file found for backup " + sideLabel + " username '" + username
-                    + "'. Expected: " + storage.credFileForUser(username.trim()).getName()
-                    + " in " + storage.getDataDir().getAbsolutePath());
+            logLine.accept("[ERROR] No credential found for backup " + sideLabel + " username '" + username
+                    + "' in credentials.db (" + storage.getDataDir().getAbsolutePath() + ")");
         }
         return c;
     }

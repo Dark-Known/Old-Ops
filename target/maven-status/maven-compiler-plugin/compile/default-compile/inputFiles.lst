@@ -1,11 +1,14 @@
 D:\OPS\OpsTransferTool-source\src\main\java\AdminElevation.java
 D:\OPS\OpsTransferTool-source\src\main\java\App.java
 D:\OPS\OpsTransferTool-source\src\main\java\Daemon.java
+D:\OPS\OpsTransferTool-source\src\main\java\export\PdfTableWriter.java
+D:\OPS\OpsTransferTool-source\src\main\java\export\XlsxWriter.java
 D:\OPS\OpsTransferTool-source\src\main\java\model\Credential.java
 D:\OPS\OpsTransferTool-source\src\main\java\model\RemoteFileException.java
 D:\OPS\OpsTransferTool-source\src\main\java\model\RemoteFileMetadata.java
 D:\OPS\OpsTransferTool-source\src\main\java\model\ScheduledTask.java
 D:\OPS\OpsTransferTool-source\src\main\java\model\TaskRunRecord.java
+D:\OPS\OpsTransferTool-source\src\main\java\service\CredentialDbService.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\GraphMailService.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\LocalFileMetadataService.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\OAuth2TokenService.java

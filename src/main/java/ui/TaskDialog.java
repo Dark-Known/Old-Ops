@@ -529,7 +529,7 @@ public class TaskDialog extends JDialog {
         addRow(targetPanel, "OS Type",         cbTargetOs,   3);
         addRow(targetPanel, "",
                 hint("For local→local tasks these fields can be left blank. "
-                        + "Password is saved in plain text in creds_<username>.xml"), 4);
+                        + "Password is saved in plain text in credentials.db"), 4);
 
         // ── Schedule panel ────────────────────────────────────────────────────
         JPanel sched = titledPanel("Schedule");

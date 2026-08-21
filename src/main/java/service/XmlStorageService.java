@@ -39,90 +39,68 @@ public class XmlStorageService {
     private final File dataDir;
     private final File taskFile;
     private final Object taskFileLock = new Object();
+    private final CredentialDbService credentialDb;
 
     public XmlStorageService(String dataDirPath) {
         this.dataDir  = new File(dataDirPath);
         this.dataDir.mkdirs();
         this.taskFile = new File(dataDir, "tasks.xml");
+        this.credentialDb = new CredentialDbService(this.dataDir);
     }
 
     public File getDataDir() {
         return dataDir;
     }
 
-    // ─── Per-user credential file helpers ───────────────────────────────────
+    // ─── Credentials (SQLite-backed — see CredentialDbService) ──────────────
 
-    /** Returns the creds_<username>.xml file for the given username. */
+    /** Returns the legacy creds_<username>.xml path. Retained only so old migration/cleanup tooling can find it; credentials themselves now live in credentials.db. */
     public File credFileForUser(String username) {
         // Sanitise username so it is safe as a filename
         String safe = username.replaceAll("[^a-zA-Z0-9_\\-.]", "_");
         return new File(dataDir, "creds_" + safe + ".xml");
     }
 
-    /**
-     * Look up credentials by username.
-     * Reads creds_<username>.xml and returns the Credential, or null if not found.
-     */
+    /** Look up credentials by username. */
     public Credential loadCredentialByUsername(String username) {
-        if (username == null || username.isEmpty()) return null;
-        File f = credFileForUser(username);
-        if (!f.exists()) return null;
-        try {
-            Document doc = parseXml(f);
-            NodeList nodes = doc.getElementsByTagName("credential");
-            if (nodes.getLength() == 0) return null;
-            return elementToCredential((Element) nodes.item(0));
-        } catch (Exception ex) {
-            ex.printStackTrace();
-            return null;
-        }
+        return credentialDb.loadByUsername(username);
     }
 
-    /**
-     * Save a credential into its per-user XML file (creds_<username>.xml).
-     * One file = one user; calling save replaces the existing entry.
-     */
+    /** Save (insert or replace, keyed by username) a credential. */
     public void saveCredential(Credential cred) {
-        if (cred.getId() == null || cred.getId().isEmpty()) {
-            cred.setId(UUID.randomUUID().toString());
-        }
-        try {
-            Document doc = newDoc("credentials");
-            Element root = doc.getDocumentElement();
-            root.appendChild(credentialToElement(doc, cred));
-            writeXml(doc, credFileForUser(cred.getUsername()));
-        } catch (Exception ex) {
-            ex.printStackTrace();
-        }
+        credentialDb.save(cred);
     }
 
-    /** Delete the per-user creds file for the given username. */
+    /** Delete the stored credential for the given username. */
     public void deleteCredential(String username) {
-        File f = credFileForUser(username);
-        if (f.exists()) f.delete();
+        credentialDb.delete(username);
+    }
+
+    /** List every credential stored. */
+    public List<Credential> loadAllCredentials() {
+        return credentialDb.loadAll();
     }
 
     /**
-     * List every credential stored (one per user).
-     * Scans the data directory for creds_*.xml files.
+     * Counts how many tasks currently reference this username as a
+     * File Transfer target, a Backup source, or a Backup destination
+     * credential — the three places a task can point at a saved
+     * credential by username (see ScheduledTask#targetUsername,
+     * #backupSourceUsername, #backupDestinationUsername). Used by the
+     * Credential Manager to show an in-use count and warn before deleting
+     * a credential something still depends on.
      */
-    public List<Credential> loadAllCredentials() {
-        List<Credential> list = new ArrayList<>();
-        File[] files = dataDir.listFiles(
-            (dir, name) -> name.startsWith("creds_") && name.endsWith(".xml"));
-        if (files == null) return list;
-        for (File f : files) {
-            try {
-                Document doc = parseXml(f);
-                NodeList nodes = doc.getElementsByTagName("credential");
-                for (int i = 0; i < nodes.getLength(); i++) {
-                    list.add(elementToCredential((Element) nodes.item(i)));
-                }
-            } catch (Exception ex) {
-                ex.printStackTrace();
+    public int countTasksUsingCredential(String username) {
+        if (username == null || username.isEmpty()) return 0;
+        int count = 0;
+        for (ScheduledTask t : loadTasks()) {
+            if (username.equals(t.getTargetUsername())
+                    || username.equals(t.getBackupSourceUsername())
+                    || username.equals(t.getBackupDestinationUsername())) {
+                count++;
             }
         }
-        return list;
+        return count;
     }
 
     // ─── Tasks ───────────────────────────────────────────────────────────────
