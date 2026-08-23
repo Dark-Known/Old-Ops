@@ -217,7 +217,8 @@ public class TaskDialog extends JDialog {
 
         addRow(sourcePanel, "Hostname / IP",             tfSourceHost, 0);
         addRow(sourcePanel, "Username",                  tfSourceUser, 1);
-        addRow(sourcePanel, lblSourcePath = new JLabel(), tfSourcePath, 2);
+        addRow(sourcePanel, lblSourcePath = new JLabel(), withBrowseButton(tfSourcePath,
+                () -> browseLocal(tfSourcePath, "This Computer")), 2);
         lblSourceHint = hint("");
         addRow(sourcePanel, "", lblSourceHint, 3);
 
@@ -289,7 +290,9 @@ public class TaskDialog extends JDialog {
 
         addRow(fileTransferPanel, "Transfer Direction *",    cbTransferDirection,    0);
         addRow(fileTransferPanel, "Transfer Mode *",         cbTransferMode,         1);
-        addRow(fileTransferPanel, lblTargetFolder,           tfTargetFolder,         2);
+        addRow(fileTransferPanel, lblTargetFolder,           withBrowseButton(tfTargetFolder, () ->
+                browseRemote(tfTargetFolder, tfTargetHost.getText().trim(), tfTargetUser.getText().trim(),
+                        new String(pfTargetPass.getPassword()), (String) cbTargetOs.getSelectedItem())),   2);
         addRow(fileTransferPanel, "",                        lblTargetHint,          3);
         addRow(fileTransferPanel, lblAdditionalTargetFolders, additionalDestinationsField, 4);
         addRow(fileTransferPanel, "",                        cbWatcherEnabled,5);
@@ -336,11 +339,13 @@ public class TaskDialog extends JDialog {
         tfBackupDestinationUsername.setEnabled(cbBackupDestinationRemote.isSelected());
         cbBackupDestinationRemote.addActionListener(e -> tfBackupDestinationUsername.setEnabled(cbBackupDestinationRemote.isSelected()));
 
-        addRow(backupPanel, "Source Folder *",      tfBackupSourcePath, 0);
+        addRow(backupPanel, "Source Folder *",      withBrowseButton(tfBackupSourcePath, () ->
+                browseBackupSide(tfBackupSourcePath, cbBackupSourceRemote, tfBackupSourceUsername)), 0);
         addRow(backupPanel, "",                     cbBackupSourceRemote, 1);
         addRow(backupPanel, "Source Username",      tfBackupSourceUsername, 2);
         addRow(backupPanel, "", hint("Only needed if 'Source is remote' is checked — must match a saved credential's username (see Target Credentials on a File Transfer task)."), 3);
-        addRow(backupPanel, "Backup Folder *",      tfBackupDestinationPath, 4);
+        addRow(backupPanel, "Backup Folder *",      withBrowseButton(tfBackupDestinationPath, () ->
+                browseBackupSide(tfBackupDestinationPath, cbBackupDestinationRemote, tfBackupDestinationUsername)), 4);
         addRow(backupPanel, "",                     cbBackupDestinationRemote, 5);
         addRow(backupPanel, "Destination Username", tfBackupDestinationUsername, 6);
         addRow(backupPanel, "", hint("Only needed if 'Destination is remote' is checked — must match a saved credential's username."), 7);
@@ -527,9 +532,44 @@ public class TaskDialog extends JDialog {
         addRow(targetPanel, "Username",        tfTargetUser, 1);
         addRow(targetPanel, "Password",        pfTargetPass, 2);
         addRow(targetPanel, "OS Type",         cbTargetOs,   3);
+
+        JButton btnTestConnection = new JButton("Test Connection");
+        btnTestConnection.setToolTipText("Opens a real SFTP session with the fields above to verify they work");
+        btnTestConnection.addActionListener(e -> {
+            String host = tfTargetHost.getText().trim();
+            String user = tfTargetUser.getText().trim();
+            String pass = new String(pfTargetPass.getPassword());
+            if (host.isEmpty() || user.isEmpty()) {
+                JOptionPane.showMessageDialog(this,
+                        "Enter a Hostname / IP and Username first.",
+                        "Test Connection", JOptionPane.WARNING_MESSAGE);
+                return;
+            }
+            service.ConnectionTestService.Result result =
+                    TestConnectionDialog.show(this, host, user, pass);
+            if (result != null && result.success) {
+                Credential cred = storage.loadCredentialByUsername(user);
+                if (cred == null) cred = new Credential();
+                if (cred.getId() == null) cred.setId(UUID.randomUUID().toString());
+                cred.setName(user + "@" + host);
+                cred.setHost(host);
+                cred.setUsername(user);
+                cred.setPassword(pass);
+                cred.setOsType((String) cbTargetOs.getSelectedItem());
+                storage.saveCredential(cred);
+                JOptionPane.showMessageDialog(this,
+                        "Connection verified — credential for \"" + user + "\" has been saved and is now "
+                                + "visible on the Credentials page.",
+                        "Credential Saved", JOptionPane.INFORMATION_MESSAGE);
+            }
+        });
+        JPanel testConnectionRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
+        testConnectionRow.add(btnTestConnection);
+        addRow(targetPanel, "", testConnectionRow, 4);
+
         addRow(targetPanel, "",
                 hint("For local→local tasks these fields can be left blank. "
-                        + "Password is saved in plain text in credentials.db"), 4);
+                        + "Password is saved in plain text in credentials.db"), 5);
 
         // ── Schedule panel ────────────────────────────────────────────────────
         JPanel sched = titledPanel("Schedule");
@@ -1176,6 +1216,116 @@ public class TaskDialog extends JDialog {
     }
 
     public ScheduledTask getResult() { return result; }
+
+    // ── Directory browsing ──────────────────────────────────────────────────
+
+    /** Wraps a path field with a small "..." button that opens the folder browser. */
+    private JPanel withBrowseButton(JTextField field, Runnable onBrowse) {
+        JPanel row = new JPanel(new BorderLayout(6, 0));
+        row.setOpaque(false);
+        JButton btn = new JButton("...");
+        btn.setToolTipText("Browse for a folder");
+        btn.setMargin(new Insets(2, 8, 2, 8));
+        btn.addActionListener(e -> onBrowse.run());
+        row.add(field, BorderLayout.CENTER);
+        row.add(btn, BorderLayout.EAST);
+        return row;
+    }
+
+    /** "WINDOWS" or "LINUX" for whatever machine this app is currently running on. */
+    private static String localOsType() {
+        String os = System.getProperty("os.name", "").toLowerCase();
+        return os.contains("win") ? "WINDOWS" : "LINUX";
+    }
+
+    /** Opens the browser against the local filesystem this app is running on. */
+    private void browseLocal(JTextField field, String label) {
+        String selected = DirectoryBrowserDialog.show(this, label, localOsType(),
+                new DirectoryBrowserDialog.LocalProvider(field.getText().trim()));
+        if (selected != null) field.setText(selected);
+    }
+
+    /**
+     * Opens the browser against a remote host over SFTP — connects first
+     * (with a small "Connecting…" wait dialog since a bad host can take a
+     * few seconds to time out), then shows the themed browser window.
+     */
+    private void browseRemote(JTextField field, String host, String username, String password, String osType) {
+        if (host.isEmpty() || username.isEmpty()) {
+            JOptionPane.showMessageDialog(this,
+                    "Enter a Hostname / IP and Username first.",
+                    "Browse", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+
+        JDialog wait = new JDialog((Frame) SwingUtilities.getWindowAncestor(this), "Connecting", true);
+        wait.setDefaultCloseOperation(JDialog.DO_NOTHING_ON_CLOSE);
+        JPanel content = new JPanel(new BorderLayout(0, 10));
+        content.setBorder(new EmptyBorder(20, 24, 16, 24));
+        content.add(new JLabel("Connecting to " + host + " \u2026", SwingConstants.CENTER), BorderLayout.CENTER);
+        JProgressBar bar = new JProgressBar();
+        bar.setIndeterminate(true);
+        content.add(bar, BorderLayout.SOUTH);
+        wait.add(content);
+        wait.setSize(320, 120);
+        wait.setLocationRelativeTo(this);
+
+        final service.SftpBrowseService[] connection = new service.SftpBrowseService[1];
+        final Exception[] failure = new Exception[1];
+
+        SwingWorker<Void, Void> connector = new SwingWorker<Void, Void>() {
+            @Override protected Void doInBackground() {
+                try {
+                    connection[0] = service.SftpBrowseService.connect(host, username, password);
+                } catch (Exception ex) {
+                    failure[0] = ex;
+                }
+                return null;
+            }
+            @Override protected void done() {
+                wait.dispose();
+            }
+        };
+        connector.execute();
+        wait.setVisible(true); // blocks (modal) until connector's done() disposes it
+
+        if (failure[0] != null) {
+            JOptionPane.showMessageDialog(this,
+                    "Could not connect to " + host + ":\n" + failure[0].getMessage(),
+                    "Connection failed", JOptionPane.ERROR_MESSAGE);
+            return;
+        }
+
+        String initial = field.getText().trim();
+        String selected = DirectoryBrowserDialog.show(this, username + "@" + host, osType,
+                new DirectoryBrowserDialog.RemoteProvider(connection[0], initial.isEmpty() ? null : initial));
+        if (selected != null) field.setText(selected);
+    }
+
+    /** Backup source/destination fields are local or remote depending on their checkbox; resolves the right one. */
+    private void browseBackupSide(JTextField field, JCheckBox remoteCheckbox, JTextField usernameField) {
+        if (!remoteCheckbox.isSelected()) {
+            browseLocal(field, "This Computer");
+            return;
+        }
+        String username = usernameField.getText().trim();
+        if (username.isEmpty()) {
+            JOptionPane.showMessageDialog(this,
+                    "Enter the Username first — it must match a saved credential.",
+                    "Browse", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+        Credential cred = storage.loadCredentialByUsername(username);
+        if (cred == null) {
+            JOptionPane.showMessageDialog(this,
+                    "No saved credential found for username \"" + username + "\".\n"
+                            + "Save one first (e.g. via a File Transfer task's Target Credentials tab, "
+                            + "or the Credentials page).",
+                    "Browse", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+        browseRemote(field, cred.getHost(), cred.getUsername(), cred.getPassword(), cred.getOsType());
+    }
 
     // ── Layout helpers ────────────────────────────────────────────────────────
 

@@ -6,6 +6,7 @@ import service.RunHistoryService;
 import service.XmlStorageService;
 import export.XlsxWriter;
 import export.PdfTableWriter;
+import export.HtmlReportWriter;
 
 import javax.swing.*;
 import javax.swing.event.ChangeListener;
@@ -112,6 +113,12 @@ public class RunHistoryPanel extends JPanel {
         btnExportPdf.setToolTipText("Export the rows currently shown (with the same status coloring) to a .pdf file");
         btnExportPdf.addActionListener(e -> exportPdf());
         row1.add(btnExportPdf);
+
+        JButton btnExportHtml = new JButton("Export HTML");
+        btnExportHtml.setToolTipText("Export the rows currently shown to a self-contained, offline-viewable .html report "
+                + "with a collapsible task/run tree, search, and charts");
+        btnExportHtml.addActionListener(e -> exportHtml());
+        row1.add(btnExportHtml);
 
         JLabel hint = new JLabel("Double-click a row for full run details");
         hint.setFont(hint.getFont().deriveFont(Font.ITALIC, 11f));
@@ -445,6 +452,13 @@ public class RunHistoryPanel extends JPanel {
                 (file, rows, fills) -> PdfTableWriter.write(file, "Task Run Logs — exported " +
                         LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")),
                         EXPORT_HEADERS, widths, rows, fills));
+    }
+
+    private void exportHtml() {
+        runExport("task_logs.html", "HTML Report (*.html)", "html",
+                (file, rows, fills) -> HtmlReportWriter.write(file, "Task Run Logs — exported " +
+                        LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")),
+                        EXPORT_HEADERS, rows));
     }
 
     @FunctionalInterface

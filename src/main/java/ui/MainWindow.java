@@ -259,18 +259,20 @@ public class MainWindow extends JFrame {
 
     /**
      * True for a SKIPPED run whose reason is the cross-process file-lock
-     * guard in TaskSchedulerService#executeTask ("... already running in
-     * another process (GUI or Daemon) at this tick."). That guard also
-     * fires on a benign same-process race (e.g. a fast INTERVAL_SECONDS
-     * task's dedicated timer and the global poll both glancing at it at
-     * once) — it's an implementation detail, not something the operator
-     * needs a popup for. The run is still recorded normally; this only
-     * controls whether it also interrupts the operator with a toast/bell.
+     * guard in TaskSchedulerService#executeTask (either the normal
+     * "... already running in another process (GUI or Daemon) at this
+     * tick." message, or the same-process variant "... already running
+     * elsewhere in this same application instance." — see the comment
+     * next to sameJvmDoubleFire in executeTask()). Both are an
+     * implementation detail, not something the operator needs a popup
+     * for. The run is still recorded normally; this only controls
+     * whether it also interrupts the operator with a toast/bell.
      */
     private boolean isInternalConcurrencySkip(model.TaskRunRecord record) {
         return record.getStatus() == model.TaskRunRecord.Status.SKIPPED
                 && record.getReason() != null
-                && record.getReason().contains("already running in another process");
+                && (record.getReason().contains("already running in another process")
+                    || record.getReason().contains("already running elsewhere in this same application instance"));
     }
 
     private Icon iconFor(String name) {

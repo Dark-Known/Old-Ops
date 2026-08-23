@@ -8,6 +8,7 @@ import service.TaskLogService;
 import java.io.IOException;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
+import java.nio.channels.OverlappingFileLockException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
@@ -399,9 +400,28 @@ public class TaskSchedulerService {
                 }
             };
 
-            ScheduledFuture<?> fut = scheduler.scheduleAtFixedRate(r, 0, interval, TimeUnit.SECONDS);
-            shortIntervalFutures.put(task.getId(), fut);
-            log.info("Scheduled short-interval task " + task.getId() + " every " + interval + "s");
+            // compute() is used instead of the get()-then-put() pattern above so the
+            // "is a timer already registered?" check and the registration itself are
+            // one atomic operation per task ID. Without this, two threads calling
+            // setupShortIntervalTasks() around the same moment (the periodic 60s poll
+            // tick and scheduler.refresh(), which the Task Manager panel calls on the
+            // EDT after every save/edit/delete) could both see no existing timer and
+            // both register one. The second put() would silently orphan the first
+            // timer — it keeps firing every interval forever with no way to cancel
+            // it, so the task now has two independent timers racing each other. The
+            // loser of that race hits OverlappingFileLockException (a same-JVM,
+            // same-process lock conflict — its getMessage() is null) in executeTask's
+            // file lock, which is exactly the confusing
+            // "Could not set up cross-process task lock (null)" + "already running in
+            // another process" pair even when only this one GUI process is running.
+            shortIntervalFutures.compute(task.getId(), (id, currentFuture) -> {
+                if (currentFuture != null && !currentFuture.isCancelled()) {
+                    return currentFuture; // another thread already registered one — keep it
+                }
+                ScheduledFuture<?> fut = scheduler.scheduleAtFixedRate(r, 0, interval, TimeUnit.SECONDS);
+                log.info("Scheduled short-interval task " + task.getId() + " every " + interval + "s");
+                return fut;
+            });
         }
     }
 
@@ -569,20 +589,33 @@ public class TaskSchedulerService {
         Path lockPath = storage.getDataDir().toPath().resolve("task-locks").resolve(task.getId() + ".lock");
         FileChannel lockChannel = null;
         FileLock fileLock = null;
+        boolean sameJvmDoubleFire = false;
         try {
             Files.createDirectories(lockPath.getParent());
             lockChannel = FileChannel.open(lockPath,
                     StandardOpenOption.CREATE, StandardOpenOption.WRITE);
             fileLock = lockChannel.tryLock();
+        } catch (OverlappingFileLockException e) {
+            // Thrown (with no message) when THIS JVM already holds a lock on this
+            // file — i.e. this task somehow got scheduled twice within this same
+            // process (see the comment in setupShortIntervalTasks() for the race
+            // this used to be caused by). Distinguish it from real cross-process
+            // contention, where tryLock() just returns null without throwing.
+            sameJvmDoubleFire = true;
+            emit(task, "[WARN] This task appears to be running twice at once within this "
+                    + "same application instance (not a separate GUI/Daemon process) — skipping "
+                    + "this duplicate run. If this keeps happening, please report it.");
         } catch (Exception e) {
             emit(task, "[WARN] Could not set up cross-process task lock (" + e.getMessage()
                     + ") — proceeding without it.");
         }
 
         if (lockChannel != null && fileLock == null) {
-            // Another process (GUI or Daemon) already holds the lock for this task.
-            String reason = "Task '" + task.getName()
-                    + "' is already running in another process (GUI or Daemon) at this tick.";
+            // Another process (GUI or Daemon) already holds the lock for this task —
+            // or, if sameJvmDoubleFire is true, it's actually this same process (see above).
+            String reason = sameJvmDoubleFire
+                    ? "Task '" + task.getName() + "' is already running elsewhere in this same application instance."
+                    : "Task '" + task.getName() + "' is already running in another process (GUI or Daemon) at this tick.";
             emit(task, "[INFO] Skipped: " + reason);
             runHistoryService.recordRun(task.getId(), task.getName(), task.getTaskType().name(),
                     TaskRunRecord.Status.SKIPPED, reason, reason, runStartedAt, LocalDateTime.now());

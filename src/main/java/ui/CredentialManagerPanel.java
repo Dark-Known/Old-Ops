@@ -141,7 +141,7 @@ public class CredentialManagerPanel extends JPanel {
         JDialog dlg = new JDialog(
             (Frame) SwingUtilities.getWindowAncestor(this),
             existing == null ? "Add Credential" : "Edit Credential", true);
-        dlg.setSize(460, 340);
+        dlg.setSize(460, 380);
         dlg.setLocationRelativeTo(this);
         dlg.setLayout(new BorderLayout(10, 10));
 
@@ -165,9 +165,26 @@ public class CredentialManagerPanel extends JPanel {
         }
         addFormRow(form, "Password *",  tfPass, 2);
         addFormRow(form, "OS Type *",   cbOs,   3);
+
+        JButton btnTest = new JButton("Test Connection");
+        btnTest.setToolTipText("Opens a real SFTP session with the fields above to verify they work");
+        btnTest.addActionListener(e -> {
+            String host = tfHost.getText().trim();
+            String user = tfUser.getText().trim();
+            String pass = new String(tfPass.getPassword());
+            if (host.isEmpty() || user.isEmpty()) {
+                JOptionPane.showMessageDialog(dlg, "Enter a Hostname / IP and Username first.");
+                return;
+            }
+            TestConnectionDialog.show(dlg, host, user, pass);
+        });
+        JPanel testRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
+        testRow.add(btnTest);
+        addFormRow(form, "", testRow, 4);
+
         addFormRow(form, "",
             new JLabel("<html><i style='color:#888'>Password stored as plain text in"
-                + " credentials.db</i></html>"), 4);
+                + " credentials.db</i></html>"), 5);
 
         JButton btnSave   = new JButton("Save");
         JButton btnCancel = new JButton("Cancel");
