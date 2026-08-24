@@ -64,7 +64,7 @@ public class CredentialManagerPanel extends JPanel {
                     boolean hasFocus, int row, int column) {
                 java.awt.Component c = super.getTableCellRendererComponent(t, value, isSelected, hasFocus, row, column);
                 int count = value instanceof Integer ? (Integer) value : 0;
-                if (!isSelected) c.setForeground(count > 0 ? new Color(0x1565C0) : new Color(0x9E9E9E));
+                if (!isSelected) c.setForeground(count > 0 ? AppTheme.EARTH_SIENNA : new Color(0x9E9E9E));
                 return c;
             }
         });
@@ -76,8 +76,8 @@ public class CredentialManagerPanel extends JPanel {
         JButton btnDelete  = new JButton("Delete");
         JButton btnRefresh = new JButton("Refresh");
 
-        styleButton(btnAdd,    new Color(0x2E7D32));
-        styleButton(btnDelete, new Color(0xC62828));
+        styleButton(btnAdd,    AppTheme.EARTH_MOSS);
+        styleButton(btnDelete, AppTheme.EARTH_RUST);
 
         btnAdd.addActionListener(e -> showDialog(null));
         btnEdit.addActionListener(e -> {
@@ -188,7 +188,7 @@ public class CredentialManagerPanel extends JPanel {
 
         JButton btnSave   = new JButton("Save");
         JButton btnCancel = new JButton("Cancel");
-        styleButton(btnSave, new Color(0x1565C0));
+        styleButton(btnSave, AppTheme.EARTH_SIENNA);
         btnCancel.addActionListener(e -> dlg.dispose());
         btnSave.addActionListener(e -> {
             String host = tfHost.getText().trim();

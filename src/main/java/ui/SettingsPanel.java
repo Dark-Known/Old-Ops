@@ -137,8 +137,8 @@ public class SettingsPanel extends JPanel {
         JButton btnViewLog      = new JButton("View Daemon Log");
         JButton btnRefreshStatus = new JButton("Refresh Status");
 
-        styleBtn(btnRegister, new Color(0x1565C0));
-        styleBtn(btnRemove,   new Color(0xC62828));
+        styleBtn(btnRegister, AppTheme.EARTH_SIENNA);
+        styleBtn(btnRemove,   AppTheme.EARTH_RUST);
         styleBtn(btnRunNow,   new Color(0xF57C00));
 
         btnRegister.addActionListener(e      -> registerDaemon());
@@ -223,7 +223,7 @@ public class SettingsPanel extends JPanel {
         // Save button row
         lblStatus = new JLabel(" ");
         JButton btnSave = new JButton("Save Settings");
-        styleBtn(btnSave, new Color(0x1565C0));
+        styleBtn(btnSave, AppTheme.EARTH_SIENNA);
         btnSave.addActionListener(e -> savePrefs());
 
         JPanel saveRow = new JPanel(new FlowLayout(FlowLayout.LEFT));
@@ -639,9 +639,9 @@ public class SettingsPanel extends JPanel {
                     String status = get();
                     lblDaemonStatus.setText(status);
                     lblDaemonStatus.setForeground(
-                        status.contains("NOT REGISTERED") ? new Color(0xC62828) :
+                        status.contains("NOT REGISTERED") ? AppTheme.EARTH_RUST :
                         status.contains("Error") ? new Color(0xFF9800) :
-                        new Color(0x2E7D32));
+                        AppTheme.EARTH_MOSS);
                 } catch (Exception e) {
                     lblDaemonStatus.setText("Error checking status");
                 }
@@ -842,7 +842,7 @@ public class SettingsPanel extends JPanel {
             prefs.put(PREF_WINSCP, path);
             transferService.setWinScpPath(path);
             lblStatus.setText("✓  Settings saved.");
-            lblStatus.setForeground(new Color(0x2E7D32));
+            lblStatus.setForeground(AppTheme.EARTH_MOSS);
         } else {
             lblStatus.setText("WinSCP path cannot be empty.");
             lblStatus.setForeground(Color.RED);
@@ -900,7 +900,7 @@ public class SettingsPanel extends JPanel {
                 try { scheduler.restartTask(id); } catch (Exception ignored) {}
             }
             lblStatus.setText("✓  Settings saved. Restarted " + runningIds.size() + " running task(s) for the new log level.");
-            lblStatus.setForeground(new Color(0x2E7D32));
+            lblStatus.setForeground(AppTheme.EARTH_MOSS);
         }
     }
 

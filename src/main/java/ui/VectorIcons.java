@@ -81,6 +81,145 @@ final class VectorIcons {
         };
     }
 
+    /** A sun (rays + circle) — used for the "switch to light mode" toggle state. */
+    static Icon sun(Color color, int size) {
+        return new Icon() {
+            @Override public int getIconWidth() { return size; }
+            @Override public int getIconHeight() { return size; }
+            @Override public void paintIcon(Component c, Graphics g, int x, int y) {
+                Graphics2D g2 = begin(g);
+                g2.setColor(color);
+                int cx = x + size / 2, cy = y + size / 2;
+                int r = (int) (size * 0.22);
+                g2.fillOval(cx - r, cy - r, r * 2, r * 2);
+                g2.setStroke(new BasicStroke(size * 0.09f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+                double rayInner = size * 0.34, rayOuter = size * 0.47;
+                for (int i = 0; i < 8; i++) {
+                    double ang = Math.PI / 4 * i;
+                    int x1 = cx + (int) (Math.cos(ang) * rayInner);
+                    int y1 = cy + (int) (Math.sin(ang) * rayInner);
+                    int x2 = cx + (int) (Math.cos(ang) * rayOuter);
+                    int y2 = cy + (int) (Math.sin(ang) * rayOuter);
+                    g2.drawLine(x1, y1, x2, y2);
+                }
+                g2.dispose();
+            }
+        };
+    }
+
+    /** A crescent moon — used for the "switch to dark mode" toggle state. */
+    static Icon moon(Color color, int size) {
+        return new Icon() {
+            @Override public int getIconWidth() { return size; }
+            @Override public int getIconHeight() { return size; }
+            @Override public void paintIcon(Component c, Graphics g, int x, int y) {
+                Graphics2D g2 = begin(g);
+                g2.setColor(color);
+                float d = size * 0.72f;
+                float ox = x + size * 0.16f;
+                float oy = y + (size - d) / 2f;
+                java.awt.geom.Area moon = new java.awt.geom.Area(new java.awt.geom.Ellipse2D.Float(ox, oy, d, d));
+                float cutD = d * 0.88f;
+                float cutOx = ox + d * 0.38f;
+                float cutOy = oy - d * 0.08f;
+                moon.subtract(new java.awt.geom.Area(new java.awt.geom.Ellipse2D.Float(cutOx, cutOy, cutD, cutD)));
+                g2.fill(moon);
+                g2.dispose();
+            }
+        };
+    }
+
+    /** A checklist — Tasks nav icon: a rounded rectangle outline with two checkmark rows. */
+    static Icon checklist(Color color, int size) {
+        return new Icon() {
+            @Override public int getIconWidth() { return size; }
+            @Override public int getIconHeight() { return size; }
+            @Override public void paintIcon(Component c, Graphics g, int x, int y) {
+                Graphics2D g2 = begin(g);
+                g2.setColor(color);
+                g2.setStroke(new BasicStroke(size * 0.11f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+                float pad = size * 0.12f;
+                g2.draw(new java.awt.geom.RoundRectangle2D.Float(x + pad, y + pad,
+                        size - pad * 2, size - pad * 2, size * 0.22f, size * 0.22f));
+                float rowY1 = y + size * 0.38f, rowY2 = y + size * 0.65f;
+                float boxX = x + size * 0.24f;
+                drawCheckRow(g2, boxX, rowY1, size);
+                drawCheckRow(g2, boxX, rowY2, size);
+                g2.dispose();
+            }
+            private void drawCheckRow(Graphics2D g2, float boxX, float rowY, int size) {
+                g2.drawLine((int) boxX, (int) rowY, (int) (boxX + size * 0.09f), (int) (rowY + size * 0.09f));
+                g2.drawLine((int) (boxX + size * 0.09f), (int) (rowY + size * 0.09f),
+                        (int) (boxX + size * 0.28f), (int) (rowY - size * 0.12f));
+            }
+        };
+    }
+
+    /** A key — Credentials nav icon: a ring with a small notched shaft. */
+    static Icon key(Color color, int size) {
+        return new Icon() {
+            @Override public int getIconWidth() { return size; }
+            @Override public int getIconHeight() { return size; }
+            @Override public void paintIcon(Component c, Graphics g, int x, int y) {
+                Graphics2D g2 = begin(g);
+                g2.setColor(color);
+                g2.setStroke(new BasicStroke(size * 0.13f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+                float ringD = size * 0.42f;
+                float ringX = x + size * 0.08f, ringY = y + size * 0.08f;
+                g2.draw(new java.awt.geom.Ellipse2D.Float(ringX, ringY, ringD, ringD));
+                float shaftStartX = ringX + ringD * 0.78f, shaftStartY = ringY + ringD * 0.78f;
+                float shaftEndX = x + size * 0.92f, shaftEndY = y + size * 0.92f;
+                g2.draw(new java.awt.geom.Line2D.Float(shaftStartX, shaftStartY, shaftEndX, shaftEndY));
+                float tooth1X = shaftEndX - size * 0.16f, tooth1Y = shaftEndY - size * 0.16f;
+                g2.draw(new java.awt.geom.Line2D.Float(tooth1X, tooth1Y, tooth1X + size * 0.14f, tooth1Y - size * 0.02f));
+                g2.dispose();
+            }
+        };
+    }
+
+    /** A document with lines — Logs nav icon. */
+    static Icon document(Color color, int size) {
+        return new Icon() {
+            @Override public int getIconWidth() { return size; }
+            @Override public int getIconHeight() { return size; }
+            @Override public void paintIcon(Component c, Graphics g, int x, int y) {
+                Graphics2D g2 = begin(g);
+                g2.setColor(color);
+                g2.setStroke(new BasicStroke(size * 0.1f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+                float pad = size * 0.16f;
+                g2.draw(new java.awt.geom.RoundRectangle2D.Float(x + pad, y + pad * 0.6f,
+                        size - pad * 2, size - pad * 1.2f, size * 0.14f, size * 0.14f));
+                for (int i = 0; i < 3; i++) {
+                    float lineY = y + size * (0.4f + i * 0.18f);
+                    g2.draw(new java.awt.geom.Line2D.Float(x + pad * 1.6f, lineY, x + size - pad * 1.6f, lineY));
+                }
+                g2.dispose();
+            }
+        };
+    }
+
+    /** Three sliders with knobs — Settings nav icon. */
+    static Icon sliders(Color color, int size) {
+        return new Icon() {
+            @Override public int getIconWidth() { return size; }
+            @Override public int getIconHeight() { return size; }
+            @Override public void paintIcon(Component c, Graphics g, int x, int y) {
+                Graphics2D g2 = begin(g);
+                g2.setColor(color);
+                g2.setStroke(new BasicStroke(size * 0.1f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+                float[] knobFrac = { 0.65f, 0.35f, 0.55f };
+                for (int i = 0; i < 3; i++) {
+                    float lineY = y + size * (0.22f + i * 0.3f);
+                    g2.draw(new java.awt.geom.Line2D.Float(x + size * 0.1f, lineY, x + size * 0.9f, lineY));
+                    float knobX = x + size * knobFrac[i];
+                    g2.fill(new java.awt.geom.Ellipse2D.Float(knobX - size * 0.08f, lineY - size * 0.08f,
+                            size * 0.16f, size * 0.16f));
+                }
+                g2.dispose();
+            }
+        };
+    }
+
     private static Graphics2D begin(Graphics g) {
         Graphics2D g2 = (Graphics2D) g.create();
         g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);

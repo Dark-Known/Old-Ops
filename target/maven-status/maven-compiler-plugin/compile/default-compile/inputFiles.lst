@@ -23,8 +23,10 @@ D:\OPS\OpsTransferTool-source\src\main\java\service\TaskLogService.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\TaskSchedulerService.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\TransferService.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\XmlStorageService.java
+D:\OPS\OpsTransferTool-source\src\main\java\ui\AppTheme.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\CredentialManagerPanel.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\DirectoryBrowserDialog.java
+D:\OPS\OpsTransferTool-source\src\main\java\ui\GradientPanel.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\MainWindow.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\NotificationBell.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\NotificationPanel.java
@@ -35,6 +37,7 @@ D:\OPS\OpsTransferTool-source\src\main\java\ui\SettingsPanel.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\TaskDialog.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\TaskManagerPanel.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\TestConnectionDialog.java
+D:\OPS\OpsTransferTool-source\src\main\java\ui\Theme.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\ToastManager.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\VectorIcons.java
 D:\OPS\OpsTransferTool-source\src\main\java\util\AppConfig.java

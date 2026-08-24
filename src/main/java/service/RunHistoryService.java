@@ -77,6 +77,11 @@ public class RunHistoryService {
         runListeners.add(listener);
     }
 
+    /** Unregisters a listener previously passed to {@link #addRunListener}. No-op if it isn't registered. */
+    public void removeRunListener(java.util.function.Consumer<TaskRunRecord> listener) {
+        runListeners.remove(listener);
+    }
+
     /** Records one completed run. Safe no-op if the database failed to initialize. */
     public synchronized void recordRun(String taskId, String taskName, String taskType,
             TaskRunRecord.Status status, String reason, String details,

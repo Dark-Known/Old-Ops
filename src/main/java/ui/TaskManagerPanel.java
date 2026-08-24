@@ -27,11 +27,11 @@ public class TaskManagerPanel extends JPanel {
     private static final DateTimeFormatter DT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm");
 
     // ── Status colours ────────────────────────────────────────────────────────
-    private static final Color COLOR_RUNNING  = new Color(0xE3F2FD); // light blue
-    private static final Color COLOR_FAILED   = new Color(0xFFEBEE); // light red
-    private static final Color COLOR_SUCCESS  = new Color(0xE8F5E9); // light green
-    private static final Color COLOR_DISABLED = new Color(0xF5F5F5); // light grey
-    private static final Color COLOR_SKIPPED  = new Color(0xFFF8E1); // light amber
+    private static final Color COLOR_RUNNING  = new Color(0xF5E6D3); // pale sand
+    private static final Color COLOR_FAILED   = new Color(0xF5E0DC); // pale rust
+    private static final Color COLOR_SUCCESS  = new Color(0xEAF0E3); // pale moss
+    private static final Color COLOR_DISABLED = new Color(0xF2EEE8); // warm grey
+    private static final Color COLOR_SKIPPED  = new Color(0xFBF3E3); // pale wheat
 
     private final XmlStorageService storage;
     private final TaskSchedulerService scheduler;
@@ -170,12 +170,12 @@ public class TaskManagerPanel extends JPanel {
         JButton btnViewLogs   = new JButton("View Logs");
         JButton btnLatestLogs = new JButton("Latest Logs");
 
-        styleBtn(btnNew,        new Color(0x2E7D32));
-        styleBtn(btnRunNow,     new Color(0x1565C0));
-        styleBtn(btnRestart,    new Color(0xF57C00));
-        styleBtn(btnDelete,     new Color(0xC62828));
-        styleBtn(btnViewLogs,   new Color(0xFF6F00));
-        styleBtn(btnLatestLogs, new Color(0x00796B));
+        styleBtn(btnNew,        AppTheme.EARTH_MOSS);
+        styleBtn(btnRunNow,     AppTheme.EARTH_SIENNA);
+        styleBtn(btnRestart,    AppTheme.EARTH_OCHRE);
+        styleBtn(btnDelete,     AppTheme.EARTH_RUST);
+        styleBtn(btnViewLogs,   AppTheme.EARTH_CLAY);
+        styleBtn(btnLatestLogs, AppTheme.EARTH_TEAL);
 
         btnNew.addActionListener(e        -> newTask());
         btnEdit.addActionListener(e       -> editTask());
@@ -287,7 +287,7 @@ public class TaskManagerPanel extends JPanel {
         // overlapping "Batch N/Total" log lines.
         lblActiveSessions = new JLabel(" ");
         lblActiveSessions.setFont(lblActiveSessions.getFont().deriveFont(Font.PLAIN, 11f));
-        lblActiveSessions.setForeground(new Color(0x1565C0));
+        lblActiveSessions.setForeground(AppTheme.EARTH_SIENNA);
         lblActiveSessions.setBorder(new EmptyBorder(4, 10, 4, 0));
 
         JPanel logHeader = new JPanel(new BorderLayout());
@@ -307,9 +307,9 @@ public class TaskManagerPanel extends JPanel {
         lblWatcherFingerprint.setFont(lblWatcherFingerprint.getFont().deriveFont(Font.PLAIN, 11f));
 
         watcherBar = new JPanel(new BorderLayout());
-        watcherBar.setBackground(new Color(0xFFFDE7));
+        watcherBar.setBackground(new Color(0xFBF3E3));
         watcherBar.setBorder(BorderFactory.createCompoundBorder(
-            BorderFactory.createMatteBorder(1, 0, 1, 0, new Color(0xFFCC02)),
+            BorderFactory.createMatteBorder(1, 0, 1, 0, new Color(0xD9A441)),
             new EmptyBorder(3, 6, 3, 6)));
         watcherBar.add(lblWatcherFingerprint, BorderLayout.WEST);
         watcherBar.setVisible(false);
@@ -318,7 +318,7 @@ public class TaskManagerPanel extends JPanel {
         // opening the Edit dialog when they spot an amber / stale baseline.
         JButton btnBarReset = new JButton("Reset Baseline");
         btnBarReset.setFont(btnBarReset.getFont().deriveFont(Font.PLAIN, 11f));
-        btnBarReset.setForeground(new Color(0xE65100));
+        btnBarReset.setForeground(AppTheme.EARTH_OCHRE);
         btnBarReset.setBorderPainted(false);
         btnBarReset.setContentAreaFilled(false);
         btnBarReset.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
@@ -757,7 +757,7 @@ public class TaskManagerPanel extends JPanel {
         if (lastResult != null && lastResult.contains("SKIPPED")) {
             lblSelectedTask.setText("Execution log: " + name
                 + "  ⏭ Last run was skipped (no new file detected)");
-            lblSelectedTask.setForeground(new Color(0xE65100));
+            lblSelectedTask.setForeground(AppTheme.EARTH_OCHRE);
         } else {
             lblSelectedTask.setText("Execution log: " + name);
             lblSelectedTask.setForeground(UIManager.getColor("Label.foreground"));

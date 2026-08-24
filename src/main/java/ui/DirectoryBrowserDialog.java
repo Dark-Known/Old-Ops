@@ -55,21 +55,21 @@ public final class DirectoryBrowserDialog {
 
         // ── Palette ──────────────────────────────────────────────────────────
         Color bg          = windows ? new Color(0xFFFFFF) : new Color(0x1E1E1E);
-        Color panelBg     = windows ? new Color(0xF7F8FA) : new Color(0x252526);
-        Color toolbarBg   = windows ? new Color(0xFAFAFA) : new Color(0x2D2D2D);
+        Color panelBg     = windows ? new Color(0xFAF7F2) : new Color(0x25231F);
+        Color toolbarBg   = windows ? new Color(0xF7F3EC) : new Color(0x2D2A25);
         Color text        = windows ? new Color(0x1B1B1B) : new Color(0xD4D4D4);
-        Color accent      = windows ? new Color(0x0078D4) : new Color(0x4EC9B0);
+        Color accent      = windows ? new Color(0xA0522D) : new Color(0x8FA876);
         Color muted       = windows ? new Color(0x6B6B6B) : new Color(0x808080);
-        Color selectBg    = windows ? new Color(0xCCE4F7) : new Color(0x264F4A);
-        Color hoverBg     = windows ? new Color(0xE8F1FB) : new Color(0x2A2D2E);
-        Color border      = windows ? new Color(0xE0E0E0) : new Color(0x3C3C3C);
-        Color errColor    = windows ? new Color(0xC42B1C) : new Color(0xFF6B6B);
+        Color selectBg    = windows ? new Color(0xEAD9C9) : new Color(0x3B4A32);
+        Color hoverBg     = windows ? new Color(0xF2E9DD) : new Color(0x322F28);
+        Color border      = windows ? new Color(0xE3DACC) : new Color(0x3C3730);
+        Color errColor    = windows ? new Color(0xA54A3F) : new Color(0xE0836F);
         Font baseFont     = windows
                 ? new Font("Segoe UI", Font.PLAIN, 13)
                 : new Font(Font.MONOSPACED, Font.PLAIN, 13);
         Font crumbFont    = baseFont.deriveFont(windows ? Font.PLAIN : Font.BOLD, 12.5f);
-        Icon folderIcon   = new FolderIcon(windows ? new Color(0xFFC83D) : accent, windows);
-        Icon homeIcon     = new HomeIcon(windows ? new Color(0x0078D4) : accent);
+        Icon folderIcon   = new FolderIcon(windows ? new Color(0xD9A441) : accent, windows);
+        Icon homeIcon     = new HomeIcon(windows ? new Color(0xA0522D) : accent);
         String windowTitle = windows
                 ? "File Explorer - " + label
                 : "Browse - " + label;
@@ -201,7 +201,7 @@ public final class DirectoryBrowserDialog {
                 c.setFont(baseFont);
                 Color rowBg = isSelected ? selectBg : (index == hoveredIndex[0] ? hoverBg : bg);
                 c.setBackground(rowBg);
-                c.setForeground(isSelected ? text : (windows ? text : new Color(0x9CDCFE)));
+                c.setForeground(isSelected ? text : (windows ? text : new Color(0xB5C99A)));
                 c.setBorder(new EmptyBorder(2, 12, 2, 12));
                 return c;
             }

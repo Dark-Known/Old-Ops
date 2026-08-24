@@ -37,8 +37,8 @@ public class ToastManager {
         Color accent;
         String icon;
         switch (r.getStatus()) {
-            case SUCCESS: accent = new Color(0x2E7D32); icon = "\u2713"; break; // ✓
-            case FAILED:  accent = new Color(0xC62828); icon = "\u2717"; break; // ✗
+            case SUCCESS: accent = AppTheme.EARTH_MOSS; icon = "\u2713"; break; // ✓
+            case FAILED:  accent = AppTheme.EARTH_RUST; icon = "\u2717"; break; // ✗
             default:      accent = new Color(0xF9A825); icon = "\u23ED"; break; // ⏭ (skipped)
         }
 

@@ -391,7 +391,7 @@ public class SearchCriteriaPanel extends JPanel {
         CriterionTag(String criterion, String display, Runnable onRemove) {
             this.criterion = criterion;
             setLayout(new BoxLayout(this, BoxLayout.X_AXIS));
-            setBorder(BorderFactory.createLineBorder(new Color(0x1976D2), 1));
+            setBorder(BorderFactory.createLineBorder(AppTheme.EARTH_SIENNA, 1));
             setBackground(new Color(0xE3F2FD));
             setOpaque(true);
 

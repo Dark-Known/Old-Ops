@@ -4,7 +4,9 @@ ui\SettingsPanel.class
 service\OAuth2TokenService.class
 Daemon.class
 service\OAuth2TokenService$CachedToken.class
+ui\Theme.class
 ui\DirectoryBrowserDialog$RemoteProvider.class
+ui\Theme$3.class
 ui\TaskManagerPanel$3.class
 ui\TestConnectionDialog.class
 export\PdfTableWriter.class
@@ -14,6 +16,7 @@ model\RemoteFileMetadata.class
 service\GraphMailService$MailMessage.class
 util\ImapSearchCriteria$AdvancedCriteria.class
 service\TaskSchedulerService$TaskMetrics.class
+ui\VectorIcons$9.class
 model\ScheduledTask$TransferMode.class
 service\TaskLogService.class
 service\RemoteFileMetadataServiceFactory.class
@@ -25,6 +28,7 @@ model\TaskRunRecord.class
 ui\DirectoryBrowserDialog$UpArrowIcon.class
 model\RemoteFileException.class
 service\CredentialDbService.class
+ui\VectorIcons$6.class
 ui\MainWindow$3.class
 ui\RunHistoryPanel$1.class
 ui\TaskDialog$5.class
@@ -43,6 +47,7 @@ ui\DirectoryBrowserDialog$Item.class
 ui\TaskDialog$4.class
 ui\SettingsPanel$1.class
 util\AppConfig.class
+ui\VectorIcons$4.class
 service\SftpBrowseService$Entry.class
 model\ScheduledTask$TaskType.class
 model\ScheduledTask$TransferDirection.class
@@ -50,6 +55,7 @@ ui\OAuthAuthorizeDialog.class
 ui\DirectoryBrowserDialog.class
 Daemon$1.class
 AdminElevation.class
+ui\Theme$4.class
 ui\RunHistoryPanel.class
 ui\DirectoryBrowserDialog$BackArrowIcon.class
 ui\MainWindow$1.class
@@ -59,6 +65,7 @@ service\GraphMailService.class
 ui\TestConnectionDialog$1.class
 service\SftpBrowseService.class
 service\TaskSchedulerService.class
+ui\VectorIcons$5.class
 ui\DirectoryBrowserDialog$HomeIcon.class
 util\ImapSearchCriteria.class
 ui\DirectoryBrowserDialog$1.class
@@ -87,12 +94,14 @@ ui\TaskManagerPanel$2.class
 model\Credential.class
 util\MailFetchMode.class
 service\ConnectionTestService.class
+ui\Theme$2.class
 service\RemoteFileMetadataService.class
 service\TransferService$BackupCandidate.class
 service\XmlStorageService.class
 ui\TaskDialog$1.class
 util\ImapSearchCriteria$DateCriteria.class
 ui\RunHistoryPanel$3.class
+ui\VectorIcons$7.class
 util\ImapSearchCriteria$SimpleCriteria.class
 service\SftpRemoteFileMetadataService.class
 ui\DirectoryBrowserDialog$5.class
@@ -102,6 +111,7 @@ ui\DirectoryBrowserDialog$LocalProvider.class
 ui\NotificationPanel$1.class
 ui\TaskManagerPanel$1.class
 ui\TaskManagerPanel.class
+ui\Theme$1.class
 ui\TaskDialog.class
 ui\DirectoryBrowserDialog$FwdArrowIcon.class
 ui\DirectoryBrowserDialog$10.class
@@ -114,6 +124,7 @@ service\ConnectionTestService$Result.class
 ui\DirectoryBrowserDialog$4.class
 ui\RunHistoryPanel$2.class
 ui\CredentialManagerPanel$2.class
+ui\MainWindow$4.class
 ui\DirectoryBrowserDialog$Provider.class
 service\TransferService$MarkerMatch.class
 ui\DirectoryBrowserDialog$FolderIcon.class
@@ -125,4 +136,7 @@ ui\OAuthAuthorizeDialog$1.class
 ui\CredentialManagerPanel.class
 service\GraphMailService$AttachmentBundle.class
 model\ScheduledTask$TaskStatus.class
+ui\GradientPanel.class
 service\RunHistoryService.class
+ui\AppTheme.class
+ui\VectorIcons$8.class

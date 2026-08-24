@@ -680,7 +680,7 @@ public class TaskDialog extends JDialog {
         // ── Buttons ───────────────────────────────────────────────────────────
         JButton btnSave   = new JButton(existing == null ? "Create Task" : "Save Changes");
         JButton btnCancel = new JButton("Cancel");
-        styleBtn(btnSave, new Color(0x1565C0));
+        styleBtn(btnSave, AppTheme.EARTH_SIENNA);
         btnCancel.addActionListener(e -> dispose());
         btnSave.addActionListener(e -> save(existing));
 

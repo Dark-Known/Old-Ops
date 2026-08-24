@@ -94,15 +94,15 @@ public final class TestConnectionDialog {
                 bar.setValue(100);
 
                 if (r.success) {
-                    icon.setIcon(VectorIcons.check(new Color(0x2E7D32), 30));
+                    icon.setIcon(VectorIcons.check(AppTheme.EARTH_MOSS, 30));
                     status.setText("Connection successful");
-                    status.setForeground(new Color(0x2E7D32));
-                    bar.setForeground(new Color(0x2E7D32));
+                    status.setForeground(AppTheme.EARTH_MOSS);
+                    bar.setForeground(AppTheme.EARTH_MOSS);
                 } else {
-                    icon.setIcon(VectorIcons.cross(new Color(0xC62828), 30));
+                    icon.setIcon(VectorIcons.cross(AppTheme.EARTH_RUST, 30));
                     status.setText("Connection failed");
-                    status.setForeground(new Color(0xC62828));
-                    bar.setForeground(new Color(0xC62828));
+                    status.setForeground(AppTheme.EARTH_RUST);
+                    bar.setForeground(AppTheme.EARTH_RUST);
                 }
                 detail.setText("<html><div style='width:300px;text-align:center'>"
                         + escape(r.message) + "<br><span style='color:#9E9E9E'>(" + r.elapsedMs + " ms)</span></div></html>");

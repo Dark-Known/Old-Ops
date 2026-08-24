@@ -26,6 +26,9 @@ public class MainWindow extends JFrame {
     private CredentialManagerPanel credPanel;
     private NotificationBell notificationBell;
     private ToastManager toastManager;
+    private java.awt.event.ComponentListener sidebarResizeListener;
+    private java.util.function.Consumer<model.TaskRunRecord> runListener;
+    private javax.swing.Timer bellRefreshTimer;
 
     public MainWindow() {
         String dataDir = loadDataDir();
@@ -45,6 +48,12 @@ public class MainWindow extends JFrame {
         try {
             UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
         } catch (Exception ignored) {}
+        // AppTheme.install() (see App.java's main()) already sets the real look and feel for
+        // the whole app before this window is constructed; this fallback only matters if
+        // MainWindow is ever instantiated directly without going through App.main().
+        if (!(UIManager.getLookAndFeel() instanceof com.formdev.flatlaf.FlatLaf)) {
+            AppTheme.install();
+        }
 
         setIconImage(buildAppIcon());
         buildUI();
@@ -132,41 +141,92 @@ public class MainWindow extends JFrame {
     }
 
     private void buildUI() {
-        // ── Header ────────────────────────────────────────────────────────────
-        JPanel header = new JPanel(new BorderLayout());
-        header.setBackground(new Color(0x1A237E));
-        header.setBorder(new EmptyBorder(10, 16, 10, 16));
+        if (sidebarResizeListener != null) {
+            removeComponentListener(sidebarResizeListener);
+            sidebarResizeListener = null;
+        }
+        // Both of these are re-registered further down every time buildUI() runs (currently
+        // just the theme toggle rebuild) — without removing the previous ones first, each
+        // rebuild would add ANOTHER toast listener and start ANOTHER refresh timer on top of
+        // the old ones, which never get garbage collected because RunHistoryService/the Timer
+        // still holds a reference to them. That's exactly what caused every run to pop one
+        // extra toast per theme toggle: the old (now invisible) ToastManager instances kept
+        // firing right alongside the current one.
+        if (runListener != null) {
+            scheduler.getRunHistoryService().removeRunListener(runListener);
+            runListener = null;
+        }
+        if (bellRefreshTimer != null) {
+            bellRefreshTimer.stop();
+            bellRefreshTimer = null;
+        }
+
+        Color bgBase = UIManager.getColor("Panel.background");
+        boolean dark = AppTheme.isDark();
+        Color sidebarBg = dark ? new Color(0x1B1D28) : new Color(0xF7F7FB);
+        Color sidebarBorder = dark ? new Color(0x2B2E3E) : new Color(0xE7E7F0);
+        Color navSelectedBg = dark ? withAlpha(AppTheme.ACCENT, 40) : withAlpha(AppTheme.ACCENT, 24);
+        Color navIdleFg = dark ? new Color(0x9CA0B5) : new Color(0x6B6F87);
+
+        // ── Header: gradient banner with rounded status chips ───────────────────
+        GradientPanel header = new GradientPanel(new BorderLayout(), AppTheme.ACCENT_DARK, AppTheme.ACCENT_SECONDARY);
+        header.setBorder(new EmptyBorder(14, 20, 14, 20));
 
         JLabel title = new JLabel("Monitoring tool");
-        title.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 18));
+        title.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 19));
         title.setForeground(Color.WHITE);
 
-        JLabel subTitle = new JLabel("Schedule file transfers and service actions • Per-user credentials in plain-text XML");
+        JLabel subTitle = new JLabel("Schedule file transfers and service actions  \u00B7  Per-user credentials in plain-text XML");
         subTitle.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 12));
-        subTitle.setForeground(new Color(0xBBDEFB));
+        subTitle.setForeground(new Color(0xE3E1FB));
 
-        JPanel titleStack = new JPanel(new BorderLayout(0, 2));
+        JPanel titleStack = new JPanel();
         titleStack.setOpaque(false);
-        titleStack.add(title, BorderLayout.NORTH);
-        titleStack.add(subTitle, BorderLayout.SOUTH);
+        titleStack.setLayout(new BoxLayout(titleStack, BoxLayout.Y_AXIS));
+        title.setAlignmentX(Component.LEFT_ALIGNMENT);
+        subTitle.setAlignmentX(Component.LEFT_ALIGNMENT);
+        titleStack.add(title);
+        titleStack.add(Box.createVerticalStrut(3));
+        titleStack.add(subTitle);
 
-        // Status badges panel
-        JPanel badges = new JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.RIGHT, 8, 0));
+        JPanel badges = new JPanel(new FlowLayout(FlowLayout.RIGHT, 10, 0));
         badges.setOpaque(false);
 
-        JLabel guiBadge = new JLabel("● GUI Scheduler Running");
-        guiBadge.setForeground(new Color(0xA5D6A7));
-        guiBadge.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 12));
-
-        JLabel daemonBadge = new JLabel("● Daemon: checking...");
-        daemonBadge.setForeground(new Color(0xFFCC80));
-        daemonBadge.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 12));
+        JLabel guiBadge = statusChip("GUI Scheduler Running", new Color(0x9CB380));
+        JLabel daemonBadge = statusChip("Daemon: checking...", new Color(0xE0A458));
 
         badges.add(guiBadge);
         badges.add(daemonBadge);
 
         notificationBell = new NotificationBell(storage, scheduler);
         badges.add(notificationBell);
+
+        JToggleButton themeToggle = new JToggleButton();
+        themeToggle.setSelected(AppTheme.isDark());
+        themeToggle.setFocusPainted(false);
+        themeToggle.setBorderPainted(false);
+        themeToggle.setContentAreaFilled(false);
+        themeToggle.putClientProperty("JButton.buttonType", "toolBarButton");
+        themeToggle.setMargin(new Insets(4, 8, 4, 8));
+        themeToggle.setPreferredSize(new Dimension(30, 30));
+        Runnable refreshToggleIcon = () -> {
+            boolean isDark = AppTheme.isDark();
+            themeToggle.setIcon(isDark ? VectorIcons.sun(Color.WHITE, 18) : VectorIcons.moon(Color.WHITE, 18));
+            themeToggle.setToolTipText(isDark ? "Switch to light mode" : "Switch to dark mode");
+        };
+        refreshToggleIcon.run();
+        themeToggle.addActionListener(e -> {
+            AppTheme.toggle();
+            refreshToggleIcon.run();
+            // Rebuild the whole shell so the sidebar/chip colors (computed above from
+            // AppTheme.isDark()) match the new theme too — FlatLaf.updateUI() alone only
+            // re-styles standard Swing components, not these custom-painted ones.
+            getContentPane().removeAll();
+            buildUI();
+            revalidate();
+            repaint();
+        });
+        badges.add(themeToggle);
 
         // Check daemon status in background
         new javax.swing.SwingWorker<String, Void>() {
@@ -182,12 +242,10 @@ public class MainWindow extends JFrame {
                 try {
                     String s = get();
                     if ("registered".equals(s)) {
-                        daemonBadge.setText("● Daemon: Active");
-                        daemonBadge.setForeground(new Color(0xA5D6A7));
+                        restyleChip(daemonBadge, "Daemon: Active", new Color(0x9CB380));
                     } else {
-                        daemonBadge.setText("● Daemon: Not registered");
-                        daemonBadge.setForeground(new Color(0xEF9A9A));
-                        daemonBadge.setToolTipText("Go to Settings tab to register the background daemon");
+                        restyleChip(daemonBadge, "Daemon: Not registered", new Color(0xD9785C));
+                        daemonBadge.setToolTipText("Go to Settings to register the background daemon");
                     }
                 } catch (Exception ignored) {}
             }
@@ -196,34 +254,121 @@ public class MainWindow extends JFrame {
         header.add(titleStack, BorderLayout.WEST);
         header.add(badges, BorderLayout.EAST);
 
-        // ── Tabs ─────────────────────────────────────────────────────────────
-        JTabbedPane tabs = new JTabbedPane();
-        tabs.setFont(tabs.getFont().deriveFont(Font.PLAIN, 13f));
-
+        // ── Sidebar navigation (Tasks / Credentials / Logs / Settings) ─────────
         taskPanel = new TaskManagerPanel(storage, scheduler);
         credPanel = new CredentialManagerPanel(storage);
         RunHistoryPanel runHistoryPanel = new RunHistoryPanel(storage, scheduler.getRunHistoryService());
+        SettingsPanel settingsPanel = new SettingsPanel(transferService, scheduler);
 
-        tabs.addTab("Tasks", iconFor("tasks"), taskPanel);
-        tabs.addTab("Credentials", iconFor("creds"), credPanel);
-        tabs.addTab("Logs", iconFor("tasks"), runHistoryPanel);
-        tabs.addTab("Settings", iconFor("settings"), new SettingsPanel(transferService, scheduler));
+        CardLayout cards = new CardLayout();
+        JPanel content = new JPanel(cards);
+        content.setBackground(bgBase);
+        content.setBorder(new EmptyBorder(18, 20, 18, 20));
+        content.add(wrapCard(taskPanel), "Tasks");
+        content.add(wrapCard(credPanel), "Credentials");
+        content.add(wrapCard(runHistoryPanel), "Logs");
+        content.add(wrapCard(settingsPanel), "Settings");
 
-        // Refresh task panel when switching back from credentials
-        tabs.addChangeListener(e -> {
-            if (tabs.getSelectedComponent() == taskPanel) taskPanel.refresh();
-            if (tabs.getSelectedComponent() == credPanel) credPanel.refresh();
-            if (tabs.getSelectedComponent() == runHistoryPanel) runHistoryPanel.refresh();
-        });
+        JPanel sidebar = new JPanel();
+        sidebar.setLayout(new BoxLayout(sidebar, BoxLayout.Y_AXIS));
+        sidebar.setBackground(sidebarBg);
+        sidebar.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createMatteBorder(0, 0, 0, 1, sidebarBorder),
+                new EmptyBorder(16, 8, 16, 8)));
+        sidebar.setPreferredSize(new Dimension(152, 0));
+
+        String[] navNames = { "Tasks", "Credentials", "Logs", "Settings" };
+        Icon[] navIcons = {
+                VectorIcons.checklist(navIdleFg, 18),
+                VectorIcons.key(navIdleFg, 18),
+                VectorIcons.document(navIdleFg, 18),
+                VectorIcons.sliders(navIdleFg, 18)
+        };
+        Icon[] navIconsSelected = {
+                VectorIcons.checklist(AppTheme.ACCENT, 18),
+                VectorIcons.key(AppTheme.ACCENT, 18),
+                VectorIcons.document(AppTheme.ACCENT, 18),
+                VectorIcons.sliders(AppTheme.ACCENT, 18)
+        };
+        JToggleButton[] navButtons = new JToggleButton[navNames.length];
+        ButtonGroup navGroup = new ButtonGroup();
+        for (int i = 0; i < navNames.length; i++) {
+            final int idx = i;
+            JToggleButton btn = new JToggleButton(navNames[i], navIcons[i]);
+            btn.setHorizontalAlignment(SwingConstants.LEFT);
+            btn.setIconTextGap(10);
+            btn.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 13));
+            btn.setFocusPainted(false);
+            btn.setBorderPainted(false);
+            btn.setContentAreaFilled(false);
+            btn.setOpaque(true);
+            btn.setBackground(sidebarBg);
+            btn.setForeground(navIdleFg);
+            btn.setAlignmentX(Component.LEFT_ALIGNMENT);
+            btn.setMaximumSize(new Dimension(Integer.MAX_VALUE, 38));
+            btn.setBorder(new EmptyBorder(8, 10, 8, 8));
+            btn.putClientProperty("JButton.buttonType", "roundRect");
+            navButtons[i] = btn;
+            navGroup.add(btn);
+            btn.addActionListener(e -> {
+                cards.show(content, navNames[idx]);
+                for (int j = 0; j < navButtons.length; j++) {
+                    boolean sel = j == idx;
+                    navButtons[j].setBackground(sel ? navSelectedBg : sidebarBg);
+                    navButtons[j].setForeground(sel ? AppTheme.ACCENT : navIdleFg);
+                    navButtons[j].setFont(navButtons[j].getFont().deriveFont(sel ? Font.BOLD : Font.PLAIN));
+                    navButtons[j].setIcon(sel ? navIconsSelected[j] : navIcons[j]);
+                }
+                if (navNames[idx].equals("Tasks")) taskPanel.refresh();
+                if (navNames[idx].equals("Credentials")) credPanel.refresh();
+                if (navNames[idx].equals("Logs")) runHistoryPanel.refresh();
+            });
+            sidebar.add(btn);
+            sidebar.add(Box.createVerticalStrut(4));
+        }
+        navButtons[0].setSelected(true);
+        navButtons[0].setBackground(navSelectedBg);
+        navButtons[0].setForeground(AppTheme.ACCENT);
+        navButtons[0].setFont(navButtons[0].getFont().deriveFont(Font.BOLD));
+        navButtons[0].setIcon(navIconsSelected[0]);
+        sidebar.add(Box.createVerticalGlue());
+
+        // ── Responsive sidebar: collapse to icon-only once the window gets too
+        // narrow for icon+label to comfortably fit, instead of a fixed width that
+        // either wastes space on a wide window or crowds a narrow one. ─────────
+        final int expandedWidth = 152, collapsedWidth = 56, collapseBelow = 760;
+        sidebarResizeListener = new java.awt.event.ComponentAdapter() {
+            private Boolean collapsed = null; // null forces the first resize event to apply state
+            @Override public void componentResized(java.awt.event.ComponentEvent e) {
+                boolean shouldCollapse = getWidth() < collapseBelow;
+                if (Boolean.valueOf(shouldCollapse).equals(collapsed)) return;
+                collapsed = shouldCollapse;
+                sidebar.setPreferredSize(new Dimension(shouldCollapse ? collapsedWidth : expandedWidth, 0));
+                for (int i = 0; i < navButtons.length; i++) {
+                    JToggleButton b = navButtons[i];
+                    b.setText(shouldCollapse ? null : navNames[i]);
+                    b.setToolTipText(shouldCollapse ? navNames[i] : null);
+                    b.setHorizontalAlignment(shouldCollapse ? SwingConstants.CENTER : SwingConstants.LEFT);
+                    b.setMargin(shouldCollapse ? new Insets(8, 0, 8, 0) : null);
+                }
+                sidebar.revalidate();
+                sidebar.getParent().revalidate();
+                sidebar.repaint();
+            }
+        };
+        addComponentListener(sidebarResizeListener);
+        // Apply the correct state immediately for the window's current size (covers
+        // the theme-toggle rebuild path, where no resize event fires on its own).
+        SwingUtilities.invokeLater(() -> sidebarResizeListener.componentResized(null));
 
         // ── Toast popups + live updates for every task run ──────────────────────
         // Fired from RunHistoryService right after each run is recorded — covers
-        // success, failure, AND skip, for every task, no matter which tab is
+        // success, failure, AND skip, for every task, no matter which nav item is
         // currently showing. The listener itself runs on whatever thread recorded
         // the run (a scheduler worker thread), so everything it touches gets
         // marshaled onto the EDT first.
         toastManager = new ToastManager(this);
-        scheduler.getRunHistoryService().addRunListener(record ->
+        runListener = record ->
                 SwingUtilities.invokeLater(() -> {
                     // "Already running in another process" SKIPPED records are
                     // an internal concurrency guard (see TaskSchedulerService's
@@ -240,21 +385,72 @@ public class MainWindow extends JFrame {
                     toastManager.showToast(record);
                     notificationBell.refreshCount();
                     runHistoryPanel.onRunRecorded(record);
-                }));
+                });
+        scheduler.getRunHistoryService().addRunListener(runListener);
 
         // Belt-and-suspenders periodic refresh for the bell badge, in case a
         // task's status changes some way other than a recorded run (e.g. the
         // Restart buttons in the failure-recovery dialog set status directly).
-        new javax.swing.Timer(15_000, e -> notificationBell.refreshCount()).start();
+        bellRefreshTimer = new javax.swing.Timer(15_000, e -> notificationBell.refreshCount());
+        bellRefreshTimer.start();
+
+        JPanel body = new JPanel(new BorderLayout());
+        body.add(sidebar, BorderLayout.WEST);
+        body.add(content, BorderLayout.CENTER);
 
         add(header, BorderLayout.NORTH);
-        add(tabs, BorderLayout.CENTER);
+        add(body, BorderLayout.CENTER);
 
         // ── Status bar ────────────────────────────────────────────────────────
         JPanel statusBar = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 2));
-        statusBar.setBorder(BorderFactory.createMatteBorder(1, 0, 0, 0, Color.LIGHT_GRAY));
-        statusBar.add(new JLabel("Data: " + loadDataDir()));
+        statusBar.setBorder(BorderFactory.createMatteBorder(1, 0, 0, 0, sidebarBorder));
+        JLabel dataLabel = new JLabel("Data: " + loadDataDir());
+        dataLabel.setFont(dataLabel.getFont().deriveFont(11.5f));
+        dataLabel.setForeground(navIdleFg);
+        statusBar.add(dataLabel);
         add(statusBar, BorderLayout.SOUTH);
+    }
+
+    /** Wraps a panel in a rounded "card" container with breathing room, instead of it
+     *  butting flush against the sidebar/window edges. */
+    private JPanel wrapCard(JComponent inner) {
+        JPanel card = new JPanel(new BorderLayout());
+        card.setBackground(UIManager.getColor("Panel.background"));
+        card.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(UIManager.getColor("Component.borderColor"), 1, true),
+                new EmptyBorder(4, 4, 4, 4)));
+        card.add(inner, BorderLayout.CENTER);
+        return card;
+    }
+
+    /** A small rounded, semi-transparent status pill for the header (e.g. "GUI Scheduler Running"). */
+    private JLabel statusChip(String text, Color dotColor) {
+        JLabel chip = new JLabel("\u25CF  " + text) {
+            @Override protected void paintComponent(Graphics g) {
+                Graphics2D g2 = (Graphics2D) g.create();
+                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                g2.setColor(new Color(255, 255, 255, 30));
+                g2.fillRoundRect(0, 0, getWidth(), getHeight(), getHeight(), getHeight());
+                g2.dispose();
+                super.paintComponent(g);
+            }
+        };
+        chip.setOpaque(false);
+        chip.setForeground(Color.WHITE);
+        chip.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 11.5f > 0 ? 12 : 12));
+        chip.setBorder(new EmptyBorder(5, 12, 5, 12));
+        chip.putClientProperty("dotColor", dotColor);
+        restyleChip(chip, text, dotColor);
+        return chip;
+    }
+
+    private void restyleChip(JLabel chip, String text, Color dotColor) {
+        String hex = String.format("#%02X%02X%02X", dotColor.getRed(), dotColor.getGreen(), dotColor.getBlue());
+        chip.setText("<html><span style='color:" + hex + "'>\u25CF</span>&nbsp;&nbsp;" + text + "</html>");
+    }
+
+    private static Color withAlpha(Color c, int alpha) {
+        return new Color(c.getRed(), c.getGreen(), c.getBlue(), alpha);
     }
 
     /**
@@ -275,34 +471,13 @@ public class MainWindow extends JFrame {
                     || record.getReason().contains("already running elsewhere in this same application instance"));
     }
 
-    private Icon iconFor(String name) {
-        // Simple colored square icons (no external icon files needed)
-        return new Icon() {
-            public int getIconWidth() { return 16; }
-            public int getIconHeight() { return 16; }
-            public void paintIcon(Component c, Graphics g, int x, int y) {
-                Graphics2D g2 = (Graphics2D) g.create();
-                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
-                Color col;
-                switch (name) {
-                    case "tasks": col = new Color(0x1565C0); break;
-                    case "creds": col = new Color(0x2E7D32); break;
-                    default: col = new Color(0x6A1B9A); break;
-                }
-                g2.setColor(col);
-                g2.fillRoundRect(x + 1, y + 1, 14, 14, 4, 4);
-                g2.dispose();
-            }
-        };
-    }
-
     private Image buildAppIcon() {
         // 32x32 programmatic icon
         java.awt.image.BufferedImage img =
             new java.awt.image.BufferedImage(32, 32, java.awt.image.BufferedImage.TYPE_INT_ARGB);
         Graphics2D g2 = img.createGraphics();
         g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
-        g2.setColor(new Color(0x1A237E));
+        g2.setColor(AppTheme.ACCENT_DARK);
         g2.fillRoundRect(0, 0, 32, 32, 8, 8);
         g2.setColor(Color.WHITE);
         g2.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 18));
