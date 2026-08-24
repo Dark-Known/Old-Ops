@@ -78,17 +78,17 @@ public class NotificationPanel extends JPanel {
 
         JScrollPane failedScroll = new JScrollPane(failedTable);
         failedScroll.setPreferredSize(new Dimension(800, 180));
-        failedScroll.setBorder(BorderFactory.createTitledBorder("Failure / Stale Running Tasks"));
 
         JScrollPane skippedScroll = new JScrollPane(skippedTable);
         skippedScroll.setPreferredSize(new Dimension(800, 140));
-        skippedScroll.setBorder(BorderFactory.createTitledBorder("Skipped Tasks"));
 
+        // A label-above-table caption instead of a boxed TitledBorder, so these
+        // tables keep the app-wide rounded ScrollPane corners (see AppTheme).
         JPanel tablesPanel = new JPanel();
         tablesPanel.setLayout(new BoxLayout(tablesPanel, BoxLayout.Y_AXIS));
-        tablesPanel.add(failedScroll);
+        tablesPanel.add(AppTheme.titledSection("Failure / Stale Running Tasks", failedScroll));
         tablesPanel.add(Box.createRigidArea(new Dimension(0, 8)));
-        tablesPanel.add(skippedScroll);
+        tablesPanel.add(AppTheme.titledSection("Skipped Tasks", skippedScroll));
 
         detailsArea = new JTextArea();
         detailsArea.setEditable(false);

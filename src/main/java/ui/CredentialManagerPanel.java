@@ -36,13 +36,13 @@ public class CredentialManagerPanel extends JPanel {
         JLabel banner = new JLabel(
             "<html><b>Server Credentials</b> — stored in <code>credentials.db</code>"
             + " in the data directory.<br>"
-            + "<span style='color:gray'>Passwords are plain text. Each Task looks up the"
-            + " matching credential by username at run time. \"Tasks Using\" counts how"
-            + " many tasks currently reference each username.</span></html>");
+            + "<span style='color:gray'>Passwords are plain text. Each credential has a unique"
+            + " <b>Name</b> you choose when creating it — Tasks look up credentials by username at"
+            + " run time. \"Tasks Using\" counts how many tasks currently reference each username.</span></html>");
         banner.setBorder(new EmptyBorder(0, 0, 6, 0));
 
         // ── Table ─────────────────────────────────────────────────────────────
-        String[] cols = {"Username", "Host", "OS Type", "Display Name", "Tasks Using"};
+        String[] cols = {"Username", "Host", "OS Type", "Name", "Tasks Using"};
         tableModel = new DefaultTableModel(cols, 0) {
             public boolean isCellEditable(int r, int c) { return false; }
             public Class<?> getColumnClass(int c) { return c == 4 ? Integer.class : String.class; }
@@ -141,13 +141,14 @@ public class CredentialManagerPanel extends JPanel {
         JDialog dlg = new JDialog(
             (Frame) SwingUtilities.getWindowAncestor(this),
             existing == null ? "Add Credential" : "Edit Credential", true);
-        dlg.setSize(460, 380);
+        dlg.setSize(460, 410);
         dlg.setLocationRelativeTo(this);
         dlg.setLayout(new BorderLayout(10, 10));
 
         JPanel form = new JPanel(new GridBagLayout());
         form.setBorder(new EmptyBorder(15, 15, 5, 15));
 
+        JTextField    tfName = new JTextField(existing != null ? existing.getName()     : "", 22);
         JTextField    tfHost = new JTextField(existing != null ? existing.getHost()     : "", 22);
         JTextField    tfUser = new JTextField(existing != null ? existing.getUsername() : "", 22);
         JPasswordField tfPass = new JPasswordField(22);
@@ -156,15 +157,24 @@ public class CredentialManagerPanel extends JPanel {
         JComboBox<String> cbOs = new JComboBox<>(new String[]{"WINDOWS", "LINUX"});
         if (existing != null) cbOs.setSelectedItem(existing.getOsType());
 
-        addFormRow(form, "Hostname / IP *", tfHost, 0);
-        addFormRow(form, "Username *",       tfUser, 1);
+        addFormRow(form, "Credential Name *", tfName, 0);
+        JLabel lblNameWarning = new JLabel(" ");
+        lblNameWarning.setFont(lblNameWarning.getFont().deriveFont(Font.PLAIN, 11f));
+        lblNameWarning.setForeground(AppTheme.EARTH_RUST);
+        GridBagConstraints warnC = new GridBagConstraints();
+        warnC.gridx = 1; warnC.gridy = 1;
+        warnC.anchor = GridBagConstraints.WEST;
+        warnC.insets = new Insets(0, 0, 0, 0);
+        form.add(lblNameWarning, warnC);
+        addFormRow(form, "Hostname / IP *", tfHost, 2);
+        addFormRow(form, "Username *",       tfUser, 3);
         // Make username read-only when editing (it is the key)
         if (existing != null) {
             tfUser.setEditable(false);
             tfUser.setBackground(new Color(0xF0F0F0));
         }
-        addFormRow(form, "Password *",  tfPass, 2);
-        addFormRow(form, "OS Type *",   cbOs,   3);
+        addFormRow(form, "Password *",  tfPass, 4);
+        addFormRow(form, "OS Type *",   cbOs,   5);
 
         JButton btnTest = new JButton("Test Connection");
         btnTest.setToolTipText("Opens a real SFTP session with the fields above to verify they work");
@@ -180,29 +190,65 @@ public class CredentialManagerPanel extends JPanel {
         });
         JPanel testRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
         testRow.add(btnTest);
-        addFormRow(form, "", testRow, 4);
+        addFormRow(form, "", testRow, 6);
 
         addFormRow(form, "",
             new JLabel("<html><i style='color:#888'>Password stored as plain text in"
-                + " credentials.db</i></html>"), 5);
+                + " credentials.db</i></html>"), 7);
 
         JButton btnSave   = new JButton("Save");
         JButton btnCancel = new JButton("Cancel");
         styleButton(btnSave, AppTheme.EARTH_SIENNA);
+
+        // Name is the human-chosen unique identifier for a credential — check it
+        // live against every other stored credential (case-insensitive, ignoring
+        // the record being edited, if any) as the user types, disabling Save and
+        // showing an inline warning rather than waiting until they click Save.
+        String editingId = existing != null ? existing.getId() : null;
+        Runnable validateName = () -> {
+            String candidate = tfName.getText().trim();
+            boolean taken = !candidate.isEmpty() && storage.loadAllCredentials().stream()
+                .anyMatch(c -> (editingId == null || !editingId.equals(c.getId()))
+                    && c.getName() != null && c.getName().equalsIgnoreCase(candidate));
+            lblNameWarning.setText(taken ? "A credential with this name already exists." : " ");
+            btnSave.setEnabled(!taken);
+        };
+        tfName.getDocument().addDocumentListener(new javax.swing.event.DocumentListener() {
+            @Override public void insertUpdate(javax.swing.event.DocumentEvent e)  { validateName.run(); }
+            @Override public void removeUpdate(javax.swing.event.DocumentEvent e)  { validateName.run(); }
+            @Override public void changedUpdate(javax.swing.event.DocumentEvent e) { validateName.run(); }
+        });
+
         btnCancel.addActionListener(e -> dlg.dispose());
         btnSave.addActionListener(e -> {
+            String name = tfName.getText().trim();
             String host = tfHost.getText().trim();
             String user = tfUser.getText().trim();
             String pass = new String(tfPass.getPassword());
+            if (name.isEmpty()) {
+                JOptionPane.showMessageDialog(dlg, "Credential Name is required."); return;
+            }
             if (host.isEmpty() || user.isEmpty()) {
                 JOptionPane.showMessageDialog(dlg, "Host and Username are required."); return;
             }
             if (pass.isEmpty()) {
                 JOptionPane.showMessageDialog(dlg, "Password is required."); return;
             }
+            // Belt-and-braces re-check in case something else changed the stored
+            // credentials while this dialog was open (live check above covers the
+            // common case as the user types).
+            boolean nameTaken = storage.loadAllCredentials().stream()
+                .anyMatch(c -> (editingId == null || !editingId.equals(c.getId()))
+                    && c.getName() != null && c.getName().equalsIgnoreCase(name));
+            if (nameTaken) {
+                JOptionPane.showMessageDialog(dlg,
+                    "A credential named \"" + name + "\" already exists. Please choose a different name.",
+                    "Credential Already Exists", JOptionPane.WARNING_MESSAGE);
+                return;
+            }
             Credential c = existing != null ? existing : new Credential();
             if (c.getId() == null) c.setId(UUID.randomUUID().toString());
-            c.setName(user + "@" + host);
+            c.setName(name);
             c.setHost(host);
             c.setUsername(user);
             c.setPassword(pass);
