@@ -4,6 +4,9 @@ import model.ScheduledTask.*;
 import model.ScheduledTask;
 import model.TaskRunRecord;
 import service.TaskLogService;
+import service.queue.TaskDueEvent;
+import service.queue.TaskEventQueue;
+import service.queue.TaskWorkerPool;
 
 import java.io.IOException;
 import java.nio.channels.FileChannel;
@@ -12,6 +15,7 @@ import java.nio.channels.OverlappingFileLockException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.time.DayOfWeek;
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
@@ -25,13 +29,25 @@ import java.util.function.BiConsumer;
 import java.util.logging.Logger;
 
 /**
- * Background scheduler that polls tasks every minute and fires them when due.
- * Supports: RUN_NOW, ONCE, DAILY, WEEKLY, INTERVAL_MINUTES.
+ * Event-driven task scheduler. Rather than polling a task list on a shared
+ * tick, each task's next-due instant is computed once and published as a
+ * {@link TaskDueEvent} onto a {@link TaskEventQueue} (an in-process,
+ * DelayQueue-backed "broker"). A {@link TaskWorkerPool} of independent
+ * worker threads blocks on that queue and executes events exactly when
+ * they come due — no shared tick, no poll-interval phase misalignment.
+ * A lightweight periodic reconcile pass remains only as a self-healing
+ * safety net (new/edited tasks, stale RUNNING recovery, clock skew) — it
+ * no longer decides what fires.
+ * Supports: RUN_NOW, ONCE, DAILY, WEEKLY, INTERVAL_MINUTES, INTERVAL_SECONDS.
  */
 public class TaskSchedulerService {
 
     private static final Logger log = Logger.getLogger(TaskSchedulerService.class.getName());
     private static final ThreadMXBean THREAD_BEAN = ManagementFactory.getThreadMXBean();
+    // How much delivery jitter (worker pool momentarily saturated, GC pause,
+    // etc.) is tolerated before an onTaskDue() delivery is treated as "still
+    // the same occurrence" rather than "stale, re-arm for the real next one".
+    private static final long DUE_TOLERANCE_MS = 5_000L;
 
     private final XmlStorageService storage;
     private final TransferService transferService;
@@ -52,7 +68,14 @@ public class TaskSchedulerService {
     // want more parallel transfers.
     private final ExecutorService executor = Executors.newFixedThreadPool(
             Math.max(4, util.AppSettings.getMaxConcurrentTaskThreads()));
-    private final ConcurrentMap<String, ScheduledFuture<?>> shortIntervalFutures = new ConcurrentHashMap<>();
+    // The in-process "broker": holds one pending TaskDueEvent per eligible
+    // task, releasing each to a worker exactly at its due instant. Replaces
+    // the old shared poll tick + separate short-interval-timer map.
+    private final TaskEventQueue eventQueue = new TaskEventQueue();
+    // Independent worker threads draining eventQueue; execution concurrency
+    // is controlled by pool size, same knob as before (AppSettings.getMaxConcurrentTaskThreads()).
+    private final TaskWorkerPool workerPool = new TaskWorkerPool(
+            eventQueue, Math.max(4, util.AppSettings.getMaxConcurrentTaskThreads()), this::onTaskDue);
     // Tracks currently running task futures so they can be cancelled on request
      private final ConcurrentMap<String, Future<?>> runningTaskFutures = new ConcurrentHashMap<>();
      private final ConcurrentMap<String, TaskMetrics> taskMetrics = new ConcurrentHashMap<>();
@@ -111,6 +134,64 @@ public class TaskSchedulerService {
 
     public TaskMetrics getTaskMetrics(String taskId) {
         return taskId == null ? null : taskMetrics.get(taskId);
+    }
+
+    // ── Monitoring accessors ────────────────────────────────────────────
+    // Read-only views onto the event queue / worker pool for the Event
+    // Monitor GUI (see ui.EventMonitorPanel). None of these affect
+    // scheduling or execution; they're plain snapshots for display.
+
+    /** Every task's pending TaskDueEvent, soonest-due first. Non-destructive. */
+    public List<service.queue.TaskDueEvent> getPendingEvents() {
+        return eventQueue.snapshotPending();
+    }
+
+    /** Total configured worker threads (the execution-concurrency ceiling). */
+    public int getWorkerPoolSize() {
+        return workerPool.getWorkerCount();
+    }
+
+    /** Workers currently executing a task right now. */
+    public int getActiveWorkerCount() {
+        return workerPool.getActiveWorkerCount();
+    }
+
+    /** Newest-first feed of the last {@code limit} events a worker has handled. */
+    public List<service.queue.TaskWorkerPool.ActivityEntry> getRecentActivity(int limit) {
+        return workerPool.getRecentActivity(limit);
+    }
+
+    // ── Cross-process status export ─────────────────────────────────────
+    // Lets a scheduler running in one JVM (typically the headless Daemon)
+    // publish its live state to a shared file that another process
+    // (typically the GUI's Event Monitor window) can read back — see
+    // service.queue.SchedulerStatusExporter / SchedulerStatusSnapshot.
+    private service.queue.SchedulerStatusExporter statusExporter;
+    private ScheduledFuture<?> statusExportFuture;
+
+    /**
+     * Enables periodic status export to {@code <dataDir>/scheduler-status-<processLabel>.dat},
+     * beginning immediately (a 1s initial delay, then every 2s) regardless
+     * of whether {@link #start()} has been called yet. Call this once per
+     * scheduler instance. {@code processLabel} should be a short,
+     * filesystem-safe tag identifying which process this is (e.g. "gui" or
+     * "daemon") so both can export to the same directory without colliding.
+     */
+    public void enableStatusExport(String dataDir, String processLabel) {
+        java.nio.file.Path file = java.nio.file.Path.of(dataDir, "scheduler-status-" + processLabel + ".dat");
+        this.statusExporter = new service.queue.SchedulerStatusExporter(file, processLabel);
+        if (statusExportFuture == null || statusExportFuture.isCancelled()) {
+            statusExportFuture = scheduler.scheduleAtFixedRate(this::exportStatus, 1, 2, TimeUnit.SECONDS);
+        }
+    }
+
+    private void exportStatus() {
+        if (statusExporter == null) return;
+        try {
+            statusExporter.export(getWorkerPoolSize(), getActiveWorkerCount(), getPendingEvents(), getRecentActivity(30));
+        } catch (Exception e) {
+            log.fine("Status export tick failed: " + e.getMessage());
+        }
     }
 
     private TaskMetrics ensureMetrics(String taskId) {
@@ -190,23 +271,22 @@ public class TaskSchedulerService {
         metrics.setCurrentThreadCount(THREAD_BEAN.getThreadCount());
     }
 
-    /** Start the background poll loop (configurable interval). */
+    /** Start the event-driven scheduler: worker pool + safety-net reconcile sweep. */
     public void start() {
-        // Global poll loop handles ONCE/DAILY/WEEKLY/INTERVAL_MINUTES and any
-        // INTERVAL_SECONDS that are >= pollIntervalSeconds.
-        scheduler.scheduleAtFixedRate(this::checkAndRunDueTasks, 5, this.pollIntervalSeconds, TimeUnit.SECONDS);
-        // Also create dedicated timers for short-interval tasks
-        setupShortIntervalTasks();
-        log.info("Task scheduler started (poll interval=" + this.pollIntervalSeconds + "s).");
+        workerPool.start();
+        // Reconcile is a self-healing safety net only (new/edited tasks, stale
+        // RUNNING recovery, clock skew) — it is NOT the firing mechanism.
+        // The 30s cadence is deliberately decoupled from pollIntervalSeconds:
+        // it no longer determines how promptly tasks fire, since publish()
+        // schedules each task's own precise TaskDueEvent immediately.
+        scheduler.scheduleAtFixedRate(this::reconcileSchedules, 5, 30, TimeUnit.SECONDS);
+        reconcileSchedules();
+        log.info("Task scheduler started (event-driven; " + eventQueue.size() + " task(s) pending).");
     }
 
     public void stop() {
-        // Cancel per-task timers
-        for (ScheduledFuture<?> f : shortIntervalFutures.values()) {
-            try { f.cancel(true); } catch (Exception ignored) {}
-        }
-        shortIntervalFutures.clear();
-
+        workerPool.stop();
+        if (statusExportFuture != null) statusExportFuture.cancel(false);
         scheduler.shutdownNow();
         executor.shutdownNow();
         logService.closeAll();
@@ -222,6 +302,10 @@ public class TaskSchedulerService {
                 emit(t, "[INFO] Task is already active and will not be requeued.");
                 return;
             }
+            // Drop any pending scheduled occurrence for this task — it's about
+            // to run now instead, and executeTask's completion path will
+            // publish the correct next occurrence once this run finishes.
+            eventQueue.cancel(t.getId());
             t.setStatus(TaskStatus.RUNNING);
             t.setLastStartedAt(LocalDateTime.now());
             storage.saveTask(t);
@@ -276,34 +360,24 @@ public class TaskSchedulerService {
         return inactivity.toMinutes() >= util.AppSettings.getStaleInactivityThresholdMinutes();
     }
 
-    private void checkAndRunDueTasks() {
+    /**
+     * Safety-net sweep: publishes (or refreshes) a {@link TaskDueEvent} for
+     * every eligible task, and recovers stale RUNNING tasks. Idempotent and
+     * cheap to call repeatedly — {@link TaskEventQueue#publish} transparently
+     * replaces any stale pending event for the same task, so this can run on
+     * its own periodic cadence AND be called immediately from {@link #refresh()}
+     * without ever double-scheduling a task.
+     */
+    private void reconcileSchedules() {
         try {
-            // Keep short-interval timers in sync with stored tasks
-            try { setupShortIntervalTasks(); } catch (Exception e) {
-                log.warning("Error refreshing short-interval tasks: " + e.getMessage());
-            }
-
             List<ScheduledTask> tasks = storage.loadTasks();
             LocalDateTime now = LocalDateTime.now();
 
             for (ScheduledTask task : tasks) {
-                if (task.getStatus() == TaskStatus.DISABLED) continue;
-                if (task.getStatus() == TaskStatus.RETRYING) continue;
-                // Tasks with their own dedicated short-interval timer (see
-                // setupShortIntervalTasks) are already being polled and fired
-                // independently, on their own faster cadence. Without this
-                // skip, the global tick evaluated EVERY task including
-                // those — so a fast test task (e.g. a 5s/10s INTERVAL_SECONDS
-                // task) could be picked up here AND by its own timer within
-                // the same in-process moment, both seeing it as due and both
-                // racing to execute it. That's a same-process double-fire,
-                // not an actual second GUI/Daemon process — but it produces
-                // the exact same "already running in another process" skip
-                // log via the cross-process file lock in executeTask(),
-                // which is misleading when only one process is running at
-                // all. The dedicated timer already performs this same due
-                // check and stale-recovery, so it's safe to leave it to that.
-                if (shortIntervalFutures.containsKey(task.getId())) continue;
+                if (task.getStatus() == TaskStatus.DISABLED || task.getStatus() == TaskStatus.RETRYING) {
+                    eventQueue.cancel(task.getId());
+                    continue;
+                }
                 if (task.getStatus() == TaskStatus.RUNNING) {
                     if (isStaleRunning(task, now)) {
                         emit(task, "[WARN] Detected stale RUNNING task; cancelling and resetting.");
@@ -312,131 +386,191 @@ public class TaskSchedulerService {
                         } catch (Exception ignored) {}
                         task.setLastStartedAt(null);
                         task.setLastRunResult("FAILED (stale)");
-                        task.setStatus(TaskStatus.FAILED);
+                        task.setStatus(TaskStatus.PENDING);
                         storage.saveTask(task);
                         lastActivityMillis.remove(task.getId());
+                        // falls through to get (re)published below
+                    } else {
+                        continue; // already running; its own completion will publish the next occurrence
                     }
-                    continue;
                 }
 
-                if (isDue(task, now)) {
-                    // Mark running immediately before async execution to prevent double-fire
-                    task.setStatus(TaskStatus.RUNNING);
-                    task.setLastStartedAt(LocalDateTime.now());
-                    storage.saveTask(task);
-                    final ScheduledTask t = task;
-                    refreshMetrics(t.getId(), true);
-                    Future<?> f = executor.submit(() -> executeTask(t));
-                    runningTaskFutures.put(t.getId(), f);
-                }
+                publishNextOccurrence(task, now);
             }
         } catch (Exception e) {
-            log.warning("Scheduler poll failed: " + e.getMessage());
-            emit(null, "[ERROR] Scheduler poll failed: " + e.getMessage());
+            log.warning("Scheduler reconcile pass failed: " + e.getMessage());
+            emit(null, "[ERROR] Scheduler reconcile pass failed: " + e.getMessage());
         }
     }
 
-    /** Ensure tasks that require high-frequency (seconds) scheduling are set up
-     * with their own ScheduledFuture so they can run independently of the global
-     * poll interval (e.g. every 5s). This method is safe to call repeatedly. */
-    private void setupShortIntervalTasks() {
-        List<ScheduledTask> tasks = storage.loadTasks();
+    /**
+     * Computes this task's next due instant and publishes a {@link TaskDueEvent}
+     * for it. If the task has nothing further to schedule (e.g. a ONCE task
+     * that already ran, or an invalid config), any existing pending event for
+     * it is cancelled instead.
+     */
+    private void publishNextOccurrence(ScheduledTask task, LocalDateTime now) {
+        Long delayMs = computeNextFireDelayMs(task, now);
+        if (delayMs == null) {
+            eventQueue.cancel(task.getId());
+            return;
+        }
+        LocalDateTime dueAt = now.plus(Duration.ofMillis(delayMs));
+        eventQueue.publish(new TaskDueEvent(task.getId(), dueAt, 0));
+    }
 
-        // Cancel timers for tasks that no longer need a dedicated timer
-        for (String id : shortIntervalFutures.keySet()) {
-            boolean stillNeeded = tasks.stream().anyMatch(t ->
-                t.getId().equals(id)
-                && t.getScheduleType() == ScheduleType.INTERVAL_SECONDS
-                && t.getIntervalSeconds() > 0
-                && t.getIntervalSeconds() < this.pollIntervalSeconds);
-            if (!stillNeeded) {
-                ScheduledFuture<?> f = shortIntervalFutures.remove(id);
-                if (f != null) f.cancel(true);
-            }
+    /**
+     * Milliseconds from {@code now} until this task's next occurrence becomes
+     * due, or {@code null} if it has no future occurrence to schedule. This is
+     * the per-schedule-type "when is this next due" computation, replacing
+     * the old boolean poll check — it computes the exact target instant once,
+     * up front, so the event queue can deliver it precisely instead of
+     * relying on a shared tick to notice it after the fact. Also used by
+     * {@link #onTaskDue} (via {@code DUE_TOLERANCE_MS}) to re-validate a
+     * task at delivery time.
+     */
+    private Long computeNextFireDelayMs(ScheduledTask task, LocalDateTime now) {
+        if (task.isWatcherEnabled() && task.getInboundWatcherPollIntervalMinutes() > 0) {
+            LocalDateTime last = task.getLastRunAt();
+            LocalDateTime next = last == null ? now : last.plusMinutes(task.getInboundWatcherPollIntervalMinutes());
+            return millisUntil(next, now);
         }
 
-        for (ScheduledTask task : tasks) {
-            if (task.getScheduleType() !=ScheduleType.INTERVAL_SECONDS) continue;
-            int interval = task.getIntervalSeconds();
-            if (interval <= 0) continue;
-            // Only schedule dedicated timers for intervals smaller than global poll
-            if (interval >= this.pollIntervalSeconds) continue;
+        switch (task.getScheduleType()) {
+            case RUN_NOW:
+                return task.getLastRunAt() == null ? 0L : null;
 
-            ScheduledFuture<?> existing = shortIntervalFutures.get(task.getId());
-            if (existing != null && !existing.isCancelled()) {
-                continue; // already scheduled
-            }
+            case ONCE:
+                if (task.getLastRunAt() != null || task.getScheduledAt() == null) return null;
+                return millisUntil(task.getScheduledAt(), now);
 
-            Runnable r = () -> {
+            case DAILY: {
+                if (task.getCronExpression() == null) return null;
+                LocalTime target;
                 try {
-                    List<ScheduledTask> ts = storage.loadTasks();
-                    ts.stream().filter(t -> t.getId().equals(task.getId())).findFirst().ifPresent(t -> {
-                        if (t.getStatus() == TaskStatus.DISABLED) return;
-                        if (t.getStatus() == TaskStatus.RETRYING) return;
-                        if (t.getStatus() == TaskStatus.RUNNING) {
-                            if (isStaleRunning(t, LocalDateTime.now())) {
-                                emit(t, "[WARN] Detected stale short-interval RUNNING task; cancelling and resetting.");
-                                try {
-                                    cancelTask(t.getId());
-                                } catch (Exception ignored) {}
-                                t.setLastStartedAt(null);
-                                t.setLastRunResult("FAILED (stale)");
-                                t.setStatus(TaskStatus.FAILED);
-                                storage.saveTask(t);
-                                lastActivityMillis.remove(t.getId());
-                            }
-                            return;
-                        }
-                        // Mark running and persist to avoid double-run
-                        t.setStatus(TaskStatus.RUNNING);
-                        t.setLastStartedAt(LocalDateTime.now());
-                        storage.saveTask(t);
-                        refreshMetrics(t.getId(), true);
-                        Future<?> f = executor.submit(() -> executeTask(t));
-                        runningTaskFutures.put(t.getId(), f);
-                    });
+                    target = LocalTime.parse(task.getCronExpression(), DateTimeFormatter.ofPattern("HH:mm"));
                 } catch (Exception e) {
-                    log.warning("Short-interval task runner error: " + e.getMessage());
+                    return null;
                 }
-            };
+                LocalDateTime next = now.toLocalDate().atTime(target);
+                boolean alreadyRanToday = task.getLastRunAt() != null
+                        && !task.getLastRunAt().toLocalDate().isBefore(now.toLocalDate());
+                if (!next.isAfter(now) || alreadyRanToday) {
+                    next = next.plusDays(1);
+                }
+                return millisUntil(next, now);
+            }
 
-            // compute() is used instead of the get()-then-put() pattern above so the
-            // "is a timer already registered?" check and the registration itself are
-            // one atomic operation per task ID. Without this, two threads calling
-            // setupShortIntervalTasks() around the same moment (the periodic 60s poll
-            // tick and scheduler.refresh(), which the Task Manager panel calls on the
-            // EDT after every save/edit/delete) could both see no existing timer and
-            // both register one. The second put() would silently orphan the first
-            // timer — it keeps firing every interval forever with no way to cancel
-            // it, so the task now has two independent timers racing each other. The
-            // loser of that race hits OverlappingFileLockException (a same-JVM,
-            // same-process lock conflict — its getMessage() is null) in executeTask's
-            // file lock, which is exactly the confusing
-            // "Could not set up cross-process task lock (null)" + "already running in
-            // another process" pair even when only this one GUI process is running.
-            shortIntervalFutures.compute(task.getId(), (id, currentFuture) -> {
-                if (currentFuture != null && !currentFuture.isCancelled()) {
-                    return currentFuture; // another thread already registered one — keep it
+            case WEEKLY: {
+                if (task.getCronExpression() == null) return null;
+                String[] parts = task.getCronExpression().split(" ");
+                if (parts.length < 2) return null;
+                DayOfWeek targetDay = parseDayOfWeek(parts[0]);
+                if (targetDay == null) return null;
+                LocalTime target;
+                try {
+                    target = LocalTime.parse(parts[1], DateTimeFormatter.ofPattern("HH:mm"));
+                } catch (Exception e) {
+                    return null;
                 }
-                ScheduledFuture<?> fut = scheduler.scheduleAtFixedRate(r, 0, interval, TimeUnit.SECONDS);
-                log.info("Scheduled short-interval task " + task.getId() + " every " + interval + "s");
-                return fut;
-            });
+                LocalDateTime next = now.toLocalDate().atTime(target);
+                // Walk forward to the next matching day/time that's actually
+                // still ahead of now; bounded loop (max 7 steps) so a bad/
+                // unmatched day name can never spin forever.
+                for (int i = 0; i < 8 && (next.getDayOfWeek() != targetDay || !next.isAfter(now)); i++) {
+                    next = next.plusDays(1).with(target);
+                }
+                return millisUntil(next, now);
+            }
+
+            case INTERVAL_MINUTES: {
+                if (task.getIntervalMinutes() <= 0) return null;
+                LocalDateTime next = task.getLastRunAt() == null
+                        ? now : task.getLastRunAt().plusMinutes(task.getIntervalMinutes());
+                return millisUntil(next, now);
+            }
+
+            case INTERVAL_SECONDS: {
+                if (task.getIntervalSeconds() <= 0) return null;
+                LocalDateTime next = task.getLastRunAt() == null
+                        ? now : task.getLastRunAt().plusSeconds(task.getIntervalSeconds());
+                return millisUntil(next, now);
+            }
+
+            default:
+                return null;
         }
     }
 
-    /** Public: refresh timers and short-interval setup immediately. */
+    private static long millisUntil(LocalDateTime target, LocalDateTime now) {
+        return Math.max(0L, Duration.between(now, target).toMillis());
+    }
+
+    /** Parses "MON", "MONDAY", etc. (case-insensitive, prefix-tolerant) to a DayOfWeek, or null if unrecognized. */
+    private static DayOfWeek parseDayOfWeek(String raw) {
+        if (raw == null || raw.isBlank()) return null;
+        String norm = raw.trim().toUpperCase();
+        for (DayOfWeek d : DayOfWeek.values()) {
+            if (d.name().equals(norm) || d.name().startsWith(norm) || norm.startsWith(d.name().substring(0, 3))) {
+                return d;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Invoked by a worker thread (see {@link TaskWorkerPool}) exactly when a
+     * task's event comes due. Re-validates against the freshest stored state
+     * — the task may have been edited, disabled, or cancelled between
+     * publish and delivery — then executes synchronously on this worker
+     * thread (pool size is the concurrency limit) and, for recurring
+     * schedule types, the next occurrence is published from executeTask's
+     * completion path once lastRunAt is actually persisted.
+     */
+    private void onTaskDue(TaskDueEvent event) {
+        List<ScheduledTask> tasks = storage.loadTasks();
+        tasks.stream().filter(t -> t.getId().equals(event.getTaskId())).findFirst().ifPresentOrElse(task -> {
+            LocalDateTime now = LocalDateTime.now();
+            if (task.getStatus() == TaskStatus.DISABLED || task.getStatus() == TaskStatus.RETRYING
+                    || task.getStatus() == TaskStatus.RUNNING) {
+                return; // reconcile sweep will pick it back up if it becomes eligible again
+            }
+            // Re-validate against freshly computed state rather than the old
+            // strict "current minute" isDue() check: an event is delivered
+            // essentially exactly at its target instant, but a saturated
+            // worker pool could hand it to a thread a little late. A tight
+            // exact-minute match (fine for a 60s poll tick) would then wrongly
+            // treat a DAILY/WEEKLY task as "missed" and skip a whole day/week.
+            // DUE_TOLERANCE_MS absorbs that scheduling jitter; anything beyond
+            // it really does mean the task was edited/cancelled meanwhile, so
+            // we re-arm against the fresh config instead of firing stale.
+            Long freshDelayMs = computeNextFireDelayMs(task, now);
+            if (freshDelayMs == null) {
+                eventQueue.cancel(task.getId());
+                return;
+            }
+            if (freshDelayMs > DUE_TOLERANCE_MS) {
+                publishNextOccurrence(task, now);
+                return;
+            }
+            task.setStatus(TaskStatus.RUNNING);
+            task.setLastStartedAt(now);
+            storage.saveTask(task);
+            refreshMetrics(task.getId(), true);
+            executeTask(task);
+        }, () -> { /* task deleted since the event was published — nothing to do */ });
+    }
+
+    /** Public: publish/refresh due-events for all tasks immediately — called
+     * by the UI on the EDT after every save/edit/delete so changes take
+     * effect right away instead of waiting for the next reconcile sweep. */
     public void refresh() {
-        setupShortIntervalTasks();
+        reconcileSchedules();
     }
 
-    /** Attempt to cancel a task: removes short-interval timer and cancels running future if present. */
+    /** Attempt to cancel a task: removes its pending queue event and cancels running future if present. */
     public boolean cancelTask(String taskId) {
-        boolean cancelledAny = false;
-        ScheduledFuture<?> sf = shortIntervalFutures.remove(taskId);
-        if (sf != null) {
-            cancelledAny = sf.cancel(true) || cancelledAny;
-        }
+        boolean cancelledAny = eventQueue.cancel(taskId);
         Future<?> f = runningTaskFutures.remove(taskId);
         if (f != null) {
             cancelledAny = f.cancel(true) || cancelledAny;
@@ -494,69 +628,6 @@ public class TaskSchedulerService {
         runNow(taskId);
     }
 
-    private boolean isDue(ScheduledTask task, LocalDateTime now) {
-        if (task.isWatcherEnabled() && task.getInboundWatcherPollIntervalMinutes() > 0) {
-            if (task.getLastRunAt() == null) return true;
-            return task.getLastRunAt().plusMinutes(task.getInboundWatcherPollIntervalMinutes()).isBefore(now);
-        }
-
-        switch (task.getScheduleType()) {
-            case RUN_NOW:
-                // Only runs once on next poll after being saved
-                return task.getLastRunAt() == null;
-
-            case ONCE:
-                return task.getScheduledAt() != null
-                    && !now.isBefore(task.getScheduledAt())
-                    && task.getLastRunAt() == null;
-
-            case DAILY: {
-                // cronExpression stores "HH:mm"
-                if (task.getCronExpression() == null) return false;
-                LocalTime target = LocalTime.parse(task.getCronExpression(),
-                    DateTimeFormatter.ofPattern("HH:mm"));
-                LocalTime nowTime = now.toLocalTime();
-                // Fire within the current minute window
-                boolean timeMatch = nowTime.getHour() == target.getHour()
-                    && nowTime.getMinute() == target.getMinute();
-                if (!timeMatch) return false;
-                if (task.getLastRunAt() == null) return true;
-                // Don't re-run same minute
-                return task.getLastRunAt().toLocalDate().isBefore(now.toLocalDate());
-            }
-
-            case WEEKLY: {
-                // cronExpression stores "MON 09:00" or "TUESDAY 14:30"
-                if (task.getCronExpression() == null) return false;
-                String[] parts = task.getCronExpression().split(" ");
-                if (parts.length < 2) return false;
-                String dayName = parts[0].toUpperCase();
-                LocalTime target = LocalTime.parse(parts[1], DateTimeFormatter.ofPattern("HH:mm"));
-                String todayName = now.getDayOfWeek().name().substring(0, 3); // MON, TUE...
-                boolean dayMatch = dayName.startsWith(todayName) || todayName.startsWith(dayName.substring(0, 3));
-                boolean timeMatch = now.toLocalTime().getHour() == target.getHour()
-                    && now.toLocalTime().getMinute() == target.getMinute();
-                if (!dayMatch || !timeMatch) return false;
-                if (task.getLastRunAt() == null) return true;
-                return task.getLastRunAt().toLocalDate().isBefore(now.toLocalDate());
-            }
-
-            case INTERVAL_MINUTES: {
-                if (task.getIntervalMinutes() <= 0) return false;
-                if (task.getLastRunAt() == null) return true;
-                return task.getLastRunAt().plusMinutes(task.getIntervalMinutes()).isBefore(now);
-            }
-            case INTERVAL_SECONDS: {
-                if (task.getIntervalSeconds() <= 0) return false;
-                if (task.getLastRunAt() == null) return true;
-                return task.getLastRunAt().plusSeconds(task.getIntervalSeconds()).isBefore(now);
-            }
-
-            default:
-                return false;
-        }
-    }
-
     private void executeTask(ScheduledTask task) {
         final long startNanos = System.nanoTime();
         final long startCpuNanos = THREAD_BEAN.isCurrentThreadCpuTimeSupported() ? THREAD_BEAN.getCurrentThreadCpuTime() : 0L;
@@ -598,7 +669,7 @@ public class TaskSchedulerService {
         } catch (OverlappingFileLockException e) {
             // Thrown (with no message) when THIS JVM already holds a lock on this
             // file — i.e. this task somehow got scheduled twice within this same
-            // process (see the comment in setupShortIntervalTasks() for the race
+            // process (this used to also be reachable via a same-JVM double-timer race
             // this used to be caused by). Distinguish it from real cross-process
             // contention, where tryLock() just returns null without throwing.
             sameJvmDoubleFire = true;
@@ -715,6 +786,14 @@ public class TaskSchedulerService {
                 t.setStatus(finalSuccess ? TaskStatus.SUCCESS : TaskStatus.FAILED);
             }
             storage.saveTask(t);
+            // Publish the task's next occurrence immediately — this is what
+            // eliminates the old "wait for the next shared poll tick" delay.
+            // Works uniformly for every schedule type: computeNextFireDelayMs
+            // returns null (nothing to publish) for schedule types with no
+            // future occurrence, e.g. a ONCE task that just ran.
+            if (t.getStatus() != TaskStatus.DISABLED) {
+                publishNextOccurrence(t, LocalDateTime.now());
+            }
         });
 
         LocalDateTime runEndedAt = LocalDateTime.now();

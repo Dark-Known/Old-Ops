@@ -51,7 +51,7 @@ public class OAuthAuthorizeDialog extends JDialog {
         taInstructions.setLineWrap(true);
         taInstructions.setWrapStyleWord(true);
         taInstructions.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 13));
-        taInstructions.setBackground(new Color(0xF5F5F5));
+        taInstructions.setBackground(AppTheme.isDark() ? new Color(0x2A2A2A) : new Color(0xF5F5F5));
         taInstructions.setBorder(new EmptyBorder(10, 10, 10, 10));
         taInstructions.setText("Please wait\u2026");
 

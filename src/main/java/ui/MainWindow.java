@@ -71,6 +71,7 @@ public class MainWindow extends JFrame {
             }
         });
 
+        scheduler.enableStatusExport(dataDir, "gui");
         scheduler.start();
         showStartupFailures();
     }
@@ -200,6 +201,16 @@ public class MainWindow extends JFrame {
 
         notificationBell = new NotificationBell(storage, scheduler);
         badges.add(notificationBell);
+
+        JButton eventMonitorBtn = new JButton("Event Monitor", VectorIcons.pulse(Color.WHITE, 16));
+        eventMonitorBtn.setFocusPainted(false);
+        eventMonitorBtn.setBorderPainted(false);
+        eventMonitorBtn.setContentAreaFilled(false);
+        eventMonitorBtn.putClientProperty("JButton.buttonType", "toolBarButton");
+        eventMonitorBtn.setForeground(Color.WHITE);
+        eventMonitorBtn.setToolTipText("Open a live view of the scheduler's event queue and worker pool");
+        eventMonitorBtn.addActionListener(e -> EventMonitorWindow.open(scheduler, this));
+        badges.add(eventMonitorBtn);
 
         JToggleButton themeToggle = new JToggleButton();
         themeToggle.setSelected(AppTheme.isDark());

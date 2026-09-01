@@ -344,7 +344,27 @@ public class GraphMailService {
                     Map<String, Object> first = (Map<String, Object>) arr.get(0);
                     return MiniJson.getString(first, "id", "inbox");
                 }
-                logLine.accept("[WARN] Folder '" + folder + "' not found via Graph — defaulting to Inbox.");
+                // Folder doesn't exist yet — create it (top-level, under the mailbox
+                // root) rather than silently misfiling the message into Inbox. This
+                // makes the mail-routing table in Settings genuinely "create on first
+                // use": an operator can type a brand-new folder name and it Just Works
+                // the first time a message needs to go there, same as if they'd
+                // created it by hand in Outlook beforehand.
+                try {
+                    String createBody = "{\"displayName\":\"" + MiniJson.escapeString(folder.trim()) + "\"}";
+                    String created = graphPostJson(accessToken, GRAPH_BASE + "/me/mailFolders", createBody);
+                    Map<String, Object> createdObj = MiniJson.parseObject(created);
+                    String newId = MiniJson.getString(createdObj, "id", null);
+                    if (newId != null) {
+                        logLine.accept("[INFO] Created Outlook folder '" + folder.trim() + "' (didn't exist yet).");
+                        return newId;
+                    }
+                } catch (Exception e) {
+                    logLine.accept("[WARN] Could not create Outlook folder '" + folder
+                            + "' (" + e.getMessage() + ") — defaulting to Inbox.");
+                    return "inbox";
+                }
+                logLine.accept("[WARN] Folder '" + folder + "' not found and could not be created — defaulting to Inbox.");
                 return "inbox";
             }
         }
@@ -597,6 +617,25 @@ public class GraphMailService {
             throw new IOException("Graph POST failed (" + resp.statusCode() + ") for " + url
                     + ": " + resp.body());
         }
+    }
+
+    /** Like {@link #graphPost}, but returns the response body — needed when the caller
+     *  wants something back from the created/updated resource (e.g. a new folder's id). */
+    private String graphPostJson(String accessToken, String url, String jsonBody)
+            throws IOException, InterruptedException {
+        HttpRequest req = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .header("Authorization", "Bearer " + accessToken)
+                .header("Content-Type", "application/json")
+                .header("Prefer", "IdType=\"ImmutableId\"")
+                .POST(HttpRequest.BodyPublishers.ofString(jsonBody, StandardCharsets.UTF_8))
+                .build();
+        HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+        if (resp.statusCode() < 200 || resp.statusCode() >= 300) {
+            throw new IOException("Graph POST failed (" + resp.statusCode() + ") for " + url
+                    + ": " + resp.body());
+        }
+        return resp.body();
     }
 
     private String urlEnc(String s) {

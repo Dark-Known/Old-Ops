@@ -5,7 +5,9 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.sql.*;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -68,6 +70,7 @@ public final class AppSettings {
     public static final String KEY_LDM_FOLDER            = "ldmFolder";
     public static final String KEY_PTM_FOLDER             = "ptmFolder";
     public static final String KEY_OTHERS_FOLDER          = "othersFolder";
+    public static final String KEY_MAIL_ROUTING_RULES     = "mailRoutingRulesJson";
     public static final String KEY_DEFAULT_STATION_ADDR   = "defaultStationAddress";
     public static final String KEY_ATTACHMENT_DOWNLOAD_DIR = "attachmentDownloadLocation";
     public static final String KEY_LOG_LEVEL              = "logLevel";
@@ -334,6 +337,105 @@ public final class AppSettings {
     public static String getLdmFolder()             { return get(KEY_LDM_FOLDER); }
     public static String getPtmFolder()              { return get(KEY_PTM_FOLDER); }
     public static String getOthersFolder()           { return get(KEY_OTHERS_FOLDER); }
+
+    /**
+     * The full, user-editable list of mail-routing rules (classification key
+     * → Outlook folder name) shown in the Settings panel's routing table.
+     * Replaces the old fixed LDM/PTM/Others text fields with an
+     * arbitrary-length list.
+     *
+     * <p>On an install that hasn't been touched since before this list
+     * existed, this seeds itself once from the old
+     * {@code ldmFolder}/{@code ptmFolder}/{@code othersFolder} values (or
+     * their hard defaults) — so upgrading in place doesn't reset anyone's
+     * configured folder names — and persists that seeded list immediately
+     * so future reads come straight from {@link #KEY_MAIL_ROUTING_RULES}.
+     *
+     * <p>Always guaranteed to contain at least one rule whose key is
+     * {@link MailRoutingRule#OTHERS_KEY} (the fallback bucket) — a row with
+     * that key is appended if the stored/seeded list is missing one.
+     */
+    public static List<MailRoutingRule> getMailRoutingRules() {
+        String json = get(KEY_MAIL_ROUTING_RULES);
+        List<MailRoutingRule> rules = new ArrayList<>();
+        if (json != null && !json.trim().isEmpty()) {
+            try {
+                Object parsed = MiniJson.parse(json);
+                if (parsed instanceof List) {
+                    for (Object o : (List<?>) parsed) {
+                        if (o instanceof Map) {
+                            @SuppressWarnings("unchecked")
+                            Map<String, Object> m = (Map<String, Object>) o;
+                            String key = MiniJson.getString(m, "key", "");
+                            String folder = MiniJson.getString(m, "folder", "");
+                            if (!key.trim().isEmpty()) rules.add(new MailRoutingRule(key.trim(), folder.trim()));
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                log.log(Level.WARNING, "Could not parse " + KEY_MAIL_ROUTING_RULES + " — using defaults", e);
+            }
+        }
+
+        if (rules.isEmpty()) {
+            // First read ever, or the stored value was empty/corrupt: seed from
+            // the legacy fixed fields (or their hard defaults) and persist so
+            // this branch is only hit once.
+            String ldm = get(KEY_LDM_FOLDER);
+            String ptm = get(KEY_PTM_FOLDER);
+            String others = get(KEY_OTHERS_FOLDER);
+            if (ldm != null && !ldm.trim().isEmpty()) rules.add(new MailRoutingRule("LDM", ldm.trim()));
+            if (ptm != null && !ptm.trim().isEmpty()) rules.add(new MailRoutingRule("PTM", ptm.trim()));
+            rules.add(new MailRoutingRule(MailRoutingRule.OTHERS_KEY,
+                    (others != null && !others.trim().isEmpty()) ? others.trim() : "Others"));
+            setMailRoutingRules(rules);
+            return rules;
+        }
+
+        // Guarantee exactly one fallback row exists, even if a user somehow
+        // deleted it via the editor — routing code always needs somewhere to
+        // send an unmatched message.
+        boolean hasOthers = rules.stream().anyMatch(MailRoutingRule::isOthers);
+        if (!hasOthers) {
+            rules.add(new MailRoutingRule(MailRoutingRule.OTHERS_KEY, "Others"));
+            setMailRoutingRules(rules);
+        }
+        return rules;
+    }
+
+    /** Persists the full mail-routing rule list. Takes effect on the very next message processed — no restart needed. */
+    public static void setMailRoutingRules(List<MailRoutingRule> rules) {
+        List<Map<String, String>> rows = new ArrayList<>();
+        for (MailRoutingRule r : rules) {
+            if (r.getKey() == null || r.getKey().trim().isEmpty()) continue;
+            Map<String, String> row = new LinkedHashMap<>();
+            row.put("key", r.getKey().trim());
+            row.put("folder", r.getFolder() == null ? "" : r.getFolder().trim());
+            rows.add(row);
+        }
+        set(KEY_MAIL_ROUTING_RULES, MiniJson.writeArrayOfObjects(rows));
+    }
+
+    /**
+     * Resolves the destination Outlook folder for a classified message: the
+     * folder configured for the rule whose key matches {@code messageType}
+     * (case-insensitive), or the {@link MailRoutingRule#OTHERS_KEY} rule's
+     * folder if nothing matches (including when {@code messageType} is
+     * {@code null}, i.e. the message didn't match any classification marker
+     * at all).
+     */
+    public static String resolveRoutingFolder(String messageType) {
+        List<MailRoutingRule> rules = getMailRoutingRules();
+        if (messageType != null) {
+            for (MailRoutingRule r : rules) {
+                if (messageType.equalsIgnoreCase(r.getKey())) return r.getFolder();
+            }
+        }
+        for (MailRoutingRule r : rules) {
+            if (r.isOthers()) return r.getFolder();
+        }
+        return "Others"; // unreachable in practice — getMailRoutingRules() always guarantees an Others row
+    }
     public static String getDefaultStationAddress()  { String v = get(KEY_DEFAULT_STATION_ADDR); return v == null || v.isEmpty() ? null : v; }
     /** Base folder attachments are downloaded under (each task's Attachments/&lt;LDM|PTM|Others&gt; subtree is created inside it). Empty/unset = fall back to the task's own output directory. */
     public static String getAttachmentDownloadLocation() { String v = get(KEY_ATTACHMENT_DOWNLOAD_DIR); return v == null || v.isEmpty() ? null : v; }

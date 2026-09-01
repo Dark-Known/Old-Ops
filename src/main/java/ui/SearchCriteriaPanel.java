@@ -392,10 +392,12 @@ public class SearchCriteriaPanel extends JPanel {
             this.criterion = criterion;
             setLayout(new BoxLayout(this, BoxLayout.X_AXIS));
             setBorder(BorderFactory.createLineBorder(AppTheme.EARTH_SIENNA, 1));
-            setBackground(new Color(0xE3F2FD));
+            setBackground(new Color(0xF3E3D6)); // pale sienna — this chip stays pale regardless
+                                                 // of app theme, so its text must stay dark too
             setOpaque(true);
 
             JLabel lbl = new JLabel(display);
+            lbl.setForeground(new Color(0x2B2116));
             lbl.setFont(lbl.getFont().deriveFont(Font.PLAIN, 10f));
             lbl.setBorder(new EmptyBorder(2, 5, 2, 3));
 

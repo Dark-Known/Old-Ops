@@ -94,6 +94,7 @@ public class Daemon {
         }));
 
         // ── Start background poll loop ───────────────────────────────────────
+        scheduler.enableStatusExport(dataDir, "daemon");
         scheduler.start();
         log("Scheduler started — polling every " + pollInterval + " seconds");
 

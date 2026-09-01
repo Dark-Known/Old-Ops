@@ -9,6 +9,7 @@ import export.PdfTableWriter;
 import export.HtmlReportWriter;
 
 import javax.swing.*;
+import javax.swing.border.EmptyBorder;
 import javax.swing.event.ChangeListener;
 import javax.swing.table.DefaultTableCellRenderer;
 import javax.swing.table.DefaultTableModel;
@@ -39,9 +40,9 @@ import java.util.List;
  */
 public class RunHistoryPanel extends JPanel {
 
-    private static final Color COLOR_FAILED  = new Color(0xFFEBEE);
-    private static final Color COLOR_SUCCESS = new Color(0xE8F5E9);
-    private static final Color COLOR_SKIPPED = new Color(0xFFF8E1);
+    private static final Color COLOR_FAILED  = new Color(0xF5E0DC); // pale rust
+    private static final Color COLOR_SUCCESS = new Color(0xEAF0E3); // pale moss
+    private static final Color COLOR_SKIPPED = new Color(0xFBF3E3); // pale wheat
     private static final String HEX_FAILED  = "FFEBEE";
     private static final String HEX_SUCCESS = "E8F5E9";
     private static final String HEX_SKIPPED = "FFF8E1";
@@ -78,8 +79,17 @@ public class RunHistoryPanel extends JPanel {
     }
 
     private JComponent buildFilterBar() {
-        JPanel bar = new JPanel();
-        bar.setLayout(new BoxLayout(bar, BoxLayout.Y_AXIS));
+        JPanel bar = new JPanel(new BorderLayout(0, 4));
+
+        JLabel banner = new JLabel(
+            "<html><b>Task Run Logs</b> — every recorded run (success, failure, or skip) for every task.<br>"
+            + "<span style='color:gray'>Filter by task or status below, then export or archive as needed.</span></html>");
+        banner.setBorder(new EmptyBorder(0, 0, 4, 0));
+        bar.add(banner, BorderLayout.NORTH);
+
+        JPanel filters = new JPanel();
+        filters.setLayout(new BoxLayout(filters, BoxLayout.Y_AXIS));
+        bar.add(filters, BorderLayout.CENTER);
 
         JPanel row1 = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 4));
         row1.add(new JLabel("Task:"));
@@ -161,8 +171,8 @@ public class RunHistoryPanel extends JPanel {
         });
         row2.add(btnClearDates);
 
-        bar.add(row1);
-        bar.add(row2);
+        filters.add(row1);
+        filters.add(row2);
         return bar;
     }
 
@@ -208,13 +218,25 @@ public class RunHistoryPanel extends JPanel {
                 if (!isSelected && row < currentRows.size()) {
                     int modelRow = table.convertRowIndexToModel(row);
                     TaskRunRecord r = currentRows.get(modelRow);
+                    Color special = null;
                     switch (r.getStatus()) {
-                        case SUCCESS: c.setBackground(COLOR_SUCCESS); break;
-                        case FAILED:  c.setBackground(COLOR_FAILED);  break;
-                        case SKIPPED: c.setBackground(COLOR_SKIPPED); break;
+                        case SUCCESS: special = COLOR_SUCCESS; break;
+                        case FAILED:  special = COLOR_FAILED;  break;
+                        case SKIPPED: special = COLOR_SKIPPED; break;
+                    }
+                    if (special != null) {
+                        // Pale status tints stay pale regardless of app theme, so force dark
+                        // text on them explicitly — the default (theme-following) foreground
+                        // goes light-on-light and disappears in dark mode otherwise.
+                        c.setBackground(special);
+                        c.setForeground(new Color(0x2B2116));
+                    } else {
+                        c.setBackground(table.getBackground());
+                        c.setForeground(table.getForeground());
                     }
                 } else if (!isSelected) {
-                    c.setBackground(Color.WHITE);
+                    c.setBackground(table.getBackground());
+                    c.setForeground(table.getForeground());
                 }
                 return c;
             }

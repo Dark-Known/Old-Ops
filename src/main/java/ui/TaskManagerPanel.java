@@ -160,15 +160,15 @@ public class TaskManagerPanel extends JPanel {
 
     private void buildUI() {
         // ── Toolbar ──────────────────────────────────────────────────────────
-        JButton btnNew        = new JButton("New Task");
+        JButton btnNew        = new GradientButton("New Task");
         JButton btnEdit       = new JButton("Edit");
-        JButton btnDelete     = new JButton("Delete");
-        JButton btnRunNow     = new JButton("Run Now");
-        JButton btnRestart    = new JButton("Restart Task");
+        JButton btnDelete     = new GradientButton("Delete");
+        JButton btnRunNow     = new GradientButton("Run Now");
+        JButton btnRestart    = new GradientButton("Restart Task");
         JButton btnEnable     = new JButton("Enable/Disable");
         JButton btnRefresh    = new JButton("Refresh");
-        JButton btnViewLogs   = new JButton("View Logs");
-        JButton btnLatestLogs = new JButton("Latest Logs");
+        JButton btnViewLogs   = new GradientButton("View Logs");
+        JButton btnLatestLogs = new GradientButton("Latest Logs");
 
         styleBtn(btnNew,        AppTheme.EARTH_MOSS);
         styleBtn(btnRunNow,     AppTheme.EARTH_SIENNA);
@@ -198,9 +198,21 @@ public class TaskManagerPanel extends JPanel {
 
         JPanel legend = buildLegend();
 
-        JPanel headerPanel = new JPanel(new BorderLayout(0, 4));
-        headerPanel.add(toolbar, BorderLayout.NORTH);
-        headerPanel.add(legend,  BorderLayout.SOUTH);
+        JLabel banner = new JLabel(
+            "<html><b>Scheduled Tasks</b> — file transfers, mail fetches, and backup jobs run on a schedule.<br>"
+            + "<span style='color:gray'>Select a task below to view its execution log, or use the buttons to"
+            + " create, edit, run, or manage tasks.</span></html>");
+        banner.setBorder(new EmptyBorder(0, 0, 8, 0));
+
+        JPanel headerPanel = new JPanel(new BorderLayout(0, 6));
+        headerPanel.add(banner, BorderLayout.NORTH);
+        JPanel toolbarAndLegend = new JPanel();
+        toolbarAndLegend.setLayout(new BoxLayout(toolbarAndLegend, BoxLayout.Y_AXIS));
+        toolbar.setAlignmentX(Component.LEFT_ALIGNMENT);
+        legend.setAlignmentX(Component.LEFT_ALIGNMENT);
+        toolbarAndLegend.add(toolbar);
+        toolbarAndLegend.add(legend);
+        headerPanel.add(toolbarAndLegend, BorderLayout.CENTER);
         add(headerPanel, BorderLayout.NORTH);
 
         // ── Table ─────────────────────────────────────────────────────────────
@@ -220,7 +232,18 @@ public class TaskManagerPanel extends JPanel {
                     String status = (String) tableModel.getValueAt(row, 4); // col 4 = Status
                     String result = (String) tableModel.getValueAt(row, 8); // col 8 = Last Result
                     String mode   = (String) tableModel.getValueAt(row, 3); // col 3 = Mode (LOCAL)
-                    c.setBackground(rowColor(status, result, mode));
+                    Color special = rowColor(status, result, mode); // null = no special status tint
+                    if (special != null) {
+                        // These status tints are always pale/light regardless of app theme (a
+                        // deliberate highlighter look), so the text on them must always be dark
+                        // too — leaving it at the default (theme-following) color would go
+                        // light-on-light and vanish in dark mode.
+                        c.setBackground(special);
+                        c.setForeground(new Color(0x2B2116));
+                    } else {
+                        c.setBackground(table.getBackground());
+                        c.setForeground(table.getForeground());
+                    }
                 }
                 return c;
             }
@@ -481,8 +504,10 @@ public class TaskManagerPanel extends JPanel {
     /**
      * Returns the background colour for a table row.
      */
+    /** Returns a status-tint background for this row, or {@code null} for no special tint
+     *  (meaning: use the table's own theme-following default background/foreground instead). */
     private Color rowColor(String status, String lastResult, String mode) {
-        if (status == null) return Color.WHITE;
+        if (status == null) return null;
         switch (status) {
             case "RUNNING":  return COLOR_RUNNING;
             case "FAILED":   return COLOR_FAILED;
@@ -492,7 +517,7 @@ public class TaskManagerPanel extends JPanel {
                 return COLOR_SUCCESS;
             default:
                 if (lastResult != null && lastResult.contains("SKIPPED")) return COLOR_SKIPPED;
-                return Color.WHITE;
+                return null;
         }
     }
 
@@ -889,7 +914,6 @@ public class TaskManagerPanel extends JPanel {
         b.setBackground(bg);
         b.setForeground(Color.WHITE);
         b.setFocusPainted(false);
-        b.setOpaque(true);
         b.setBorderPainted(false);
     }
 }

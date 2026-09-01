@@ -220,6 +220,29 @@ final class VectorIcons {
         };
     }
 
+    /** An ECG-style pulse/activity line — used for the Event Monitor launcher. */
+    static Icon pulse(Color color, int size) {
+        return new Icon() {
+            @Override public int getIconWidth() { return size; }
+            @Override public int getIconHeight() { return size; }
+            @Override public void paintIcon(Component c, Graphics g, int x, int y) {
+                Graphics2D g2 = begin(g);
+                g2.setColor(color);
+                g2.setStroke(new BasicStroke(size * 0.11f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+                float midY = y + size * 0.5f;
+                java.awt.geom.Path2D.Float p = new java.awt.geom.Path2D.Float();
+                p.moveTo(x + size * 0.02f, midY);
+                p.lineTo(x + size * 0.24f, midY);
+                p.lineTo(x + size * 0.36f, y + size * 0.18f);
+                p.lineTo(x + size * 0.50f, y + size * 0.86f);
+                p.lineTo(x + size * 0.62f, midY);
+                p.lineTo(x + size * 0.98f, midY);
+                g2.draw(p);
+                g2.dispose();
+            }
+        };
+    }
+
     private static Graphics2D begin(Graphics g) {
         Graphics2D g2 = (Graphics2D) g.create();
         g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);

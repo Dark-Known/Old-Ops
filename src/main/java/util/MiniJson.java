@@ -215,6 +215,20 @@ public final class MiniJson {
         return sb.toString();
     }
 
+    /** Serializes a list of flat Map<String,String> objects into a compact JSON array. */
+    public static String writeArrayOfObjects(List<Map<String, String>> rows) {
+        StringBuilder sb = new StringBuilder();
+        sb.append('[');
+        boolean first = true;
+        for (Map<String, String> row : rows) {
+            if (!first) sb.append(',');
+            first = false;
+            sb.append(writeObject(row));
+        }
+        sb.append(']');
+        return sb.toString();
+    }
+
     private static String escape(String s) {
         return escapeString(s);
     }

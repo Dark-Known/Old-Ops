@@ -66,24 +66,6 @@ public final class AppTheme {
         applyStyleOverrides();
     }
 
-    /**
-     * Wraps a component (typically a table's JScrollPane) with a small bold
-     * label above it instead of a boxed {@link javax.swing.border.TitledBorder}.
-     * A TitledBorder draws its own sharp-cornered rectangle, which overrides —
-     * and clashes with — the rounded ScrollPane.arc styling set in
-     * {@link #applyStyleOverrides()}, so this is the preferred way to caption
-     * a table without losing its soft corners.
-     */
-    public static JPanel titledSection(String title, JComponent content) {
-        JPanel section = new JPanel(new BorderLayout(0, 6));
-        section.setOpaque(false);
-        JLabel label = new JLabel(title);
-        label.setFont(label.getFont().deriveFont(Font.BOLD, 12f));
-        section.add(label, BorderLayout.NORTH);
-        section.add(content, BorderLayout.CENTER);
-        return section;
-    }
-
     public static boolean isDark() {
         return PREFS.getBoolean(PREF_KEY_DARK, false);
     }
@@ -118,14 +100,6 @@ public final class AppTheme {
 
         UIManager.put("TabbedPane.showTabSeparators", true);
         UIManager.put("TabbedPane.tabSeparatorsFullHeight", true);
-
-        // Round the outer frame every JScrollPane draws — including the ones every
-        // panel wraps its JTable in (Task Manager, Run History, Notifications,
-        // Credentials, etc.) — so tables get the same soft corners as buttons and
-        // text fields instead of a hard rectangular box. ScrollPane.Table.arc
-        // overrides the general ScrollPane.arc specifically for table scroll panes.
-        UIManager.put("ScrollPane.arc", 10);
-        UIManager.put("ScrollPane.Table.arc", 10);
 
         UIManager.put("Table.showHorizontalLines", true);
         UIManager.put("Table.showVerticalLines", false);

@@ -6,6 +6,7 @@ import util.AppSettings;
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
 import javax.swing.border.TitledBorder;
+import javax.swing.table.DefaultTableModel;
 import java.awt.*;
 import java.io.*;
 import java.util.LinkedHashMap;
@@ -26,10 +27,12 @@ public class SettingsPanel extends JPanel {
     private JLabel     lblDaemonStatus;
     private javax.swing.JSpinner spinnerPollInterval;
 
-    // Live settings (app-settings.json via util.AppSettings) — see buildRoutingPanel()
-    private JTextField tfLdmFolder;
-    private JTextField tfPtmFolder;
-    private JTextField tfOthersFolder;
+    // Live settings (app-settings.db via util.AppSettings) — see buildRoutingPanel()
+    private JTextField tfNewRuleKey;
+    private JTextField tfNewRuleFolder;
+    private JTable mailRoutingPreviewTable;
+    private DefaultTableModel mailRoutingPreviewModel;
+    private java.util.List<util.MailRoutingRule> mailRoutingRules = new java.util.ArrayList<>();
     private JTextField tfDefaultStationAddress;
     private JTextField tfAttachmentDir;
     private JComboBox<String> comboLogLevel;
@@ -69,6 +72,19 @@ public class SettingsPanel extends JPanel {
     private void buildUI() {
         JPanel outer = new JPanel();
         outer.setLayout(new BoxLayout(outer, BoxLayout.Y_AXIS));
+
+        JLabel banner = new JLabel(
+            "<html><b>Settings</b> — WinSCP path, data directory, daemon registration, and other"
+            + " application-wide preferences.<br>"
+            + "<span style='color:gray'>Changes here apply to both the GUI scheduler and the background daemon.</span></html>");
+        banner.setBorder(new EmptyBorder(0, 0, 10, 0));
+        // Added directly to `this` (BorderLayout.NORTH) rather than into the BoxLayout
+        // column `outer` — BorderLayout.NORTH always stretches its child to the full
+        // container width, which a BoxLayout.Y_AXIS column doesn't reliably do for an
+        // HTML JLabel narrower than the column (see RunHistoryPanel's buildFilterBar
+        // for the full explanation of that quirk). This guarantees the banner spans
+        // full width and stays flush-left regardless of its text length.
+        add(banner, BorderLayout.NORTH);
 
         // WinSCP section
         JPanel winscpPanel = new JPanel(new GridBagLayout());
@@ -127,12 +143,12 @@ public class SettingsPanel extends JPanel {
           + "Important: scheduled tasks are stored in %USERPROFILE%\\.opstool\\tasks.xml.\n"
           + "Redeploying the application jar does not disturb this file unless you delete the data folder.");
         daemonInfo.setEditable(false);
-        daemonInfo.setBackground(new Color(0xF0F4FF));
+        daemonInfo.setBackground(AppTheme.isDark() ? new Color(0x2A2E3D) : new Color(0xF0F4FF));
         daemonInfo.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 12));
         daemonInfo.setBorder(new EmptyBorder(6, 6, 6, 6));
 
-        JButton btnRegister     = new JButton("Register Daemon (Admin required)");
-        JButton btnRemove       = new JButton("Remove Daemon");
+        JButton btnRegister     = new GradientButton("Register Daemon (Admin required)");
+        JButton btnRemove       = new GradientButton("Remove Daemon");
         JButton btnRunNow       = new JButton("Run Daemon Now");
         JButton btnViewLog      = new JButton("View Daemon Log");
         JButton btnRefreshStatus = new JButton("Refresh Status");
@@ -216,13 +232,13 @@ public class SettingsPanel extends JPanel {
         );
         notes.setEditable(false);
         notes.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 11));
-        notes.setBackground(new Color(0xF5F5F5));
+        notes.setBackground(AppTheme.isDark() ? new Color(0x2A2A2A) : new Color(0xF5F5F5));
         notes.setBorder(new TitledBorder("Setup Notes"));
         outer.add(notes);
 
         // Save button row
         lblStatus = new JLabel(" ");
-        JButton btnSave = new JButton("Save Settings");
+        JButton btnSave = new GradientButton("Save Settings");
         styleBtn(btnSave, AppTheme.EARTH_SIENNA);
         btnSave.addActionListener(e -> savePrefs());
 
@@ -263,9 +279,6 @@ public class SettingsPanel extends JPanel {
         GridBagConstraints bc = new GridBagConstraints();
         bc.insets = new Insets(4, 0, 4, 4);
 
-        tfLdmFolder = new JTextField(16);
-        tfPtmFolder = new JTextField(16);
-        tfOthersFolder = new JTextField(16);
         tfDefaultStationAddress = new JTextField(16);
         tfAttachmentDir = new JTextField(30);
         JButton btnBrowseAttach = new JButton("Browse...");
@@ -279,9 +292,7 @@ public class SettingsPanel extends JPanel {
         comboLogLevel = new JComboBox<>(new String[]{"DEBUG", "INFO", "WARN", "ERROR"});
 
         int row = 0;
-        row = addFieldRow(panel, lc, fc, "LDM mailbox folder:", tfLdmFolder, row);
-        row = addFieldRow(panel, lc, fc, "PTM mailbox folder:", tfPtmFolder, row);
-        row = addFieldRow(panel, lc, fc, "Others mailbox folder:", tfOthersFolder, row);
+        row = addFieldRow(panel, lc, fc, "Mail routing:", buildMailRoutingWidget(), row);
         row = addFieldRow(panel, lc, fc, "Default SITA station address:", tfDefaultStationAddress, row);
 
         lc.gridy = fc.gridy = bc.gridy = row; lc.gridx = 0; fc.gridx = 1; bc.gridx = 2;
@@ -398,6 +409,175 @@ public class SettingsPanel extends JPanel {
         panel.add(heapRow, heapC);
 
         return panel;
+    }
+
+    /**
+     * Builds the mail-routing add-row + 2-row preview widget that replaces
+     * the old fixed LDM/PTM/Others text fields. Field Name is the marker
+     * text a message is checked for (case-insensitive, anywhere in subject/
+     * attachment/body); Folder Name is the Outlook folder matching messages
+     * get moved into — created automatically the first time it's needed if
+     * it doesn't already exist (see GraphMailService#resolveFolderSegment).
+     */
+    private JComponent buildMailRoutingWidget() {
+        JPanel wrap = new JPanel();
+        wrap.setLayout(new BoxLayout(wrap, BoxLayout.Y_AXIS));
+
+        JPanel addRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 2));
+        addRow.setOpaque(false);
+        addRow.add(new JLabel("Field Name:"));
+        tfNewRuleKey = new JTextField(9);
+        addRow.add(tfNewRuleKey);
+        addRow.add(new JLabel("Folder Name:"));
+        tfNewRuleFolder = new JTextField(11);
+        addRow.add(tfNewRuleFolder);
+        JButton btnAddRule = new GradientButton("Add");
+        styleBtn(btnAddRule, AppTheme.EARTH_MOSS);
+        btnAddRule.addActionListener(e -> addMailRoutingRuleFromFields());
+        addRow.add(btnAddRule);
+        addRow.setAlignmentX(Component.LEFT_ALIGNMENT);
+        wrap.add(addRow);
+
+        mailRoutingPreviewModel = new DefaultTableModel(new Object[]{"Field Name", "Folder Name"}, 0) {
+            @Override public boolean isCellEditable(int r, int c) { return false; }
+        };
+        mailRoutingPreviewTable = new JTable(mailRoutingPreviewModel);
+        mailRoutingPreviewTable.setRowHeight(24);
+        mailRoutingPreviewTable.setFillsViewportHeight(true);
+        mailRoutingPreviewTable.getTableHeader().setReorderingAllowed(false);
+        mailRoutingPreviewTable.setToolTipText("Click to view, edit, or delete the full list");
+        mailRoutingPreviewTable.addMouseListener(new java.awt.event.MouseAdapter() {
+            @Override public void mouseClicked(java.awt.event.MouseEvent e) { openMailRoutingEditor(); }
+        });
+        // No custom colors set anywhere here — a plain JTable/JScrollPane already
+        // follows the app's current FlatLaf theme (light/dark) automatically, which
+        // is what keeps this correctly readable in both without extra work.
+        JScrollPane preview = new JScrollPane(mailRoutingPreviewTable,
+                JScrollPane.VERTICAL_SCROLLBAR_NEVER, JScrollPane.HORIZONTAL_SCROLLBAR_NEVER);
+        preview.setPreferredSize(new Dimension(360, 2 * 24 + 27)); // header + 2 rows
+        preview.setAlignmentX(Component.LEFT_ALIGNMENT);
+        wrap.add(Box.createVerticalStrut(4));
+        wrap.add(preview);
+
+        JLabel manageAll = new JLabel("Manage all rules...");
+        manageAll.setForeground(AppTheme.EARTH_SIENNA);
+        manageAll.setFont(manageAll.getFont().deriveFont(Font.PLAIN, 11.5f));
+        manageAll.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        manageAll.setBorder(new EmptyBorder(3, 2, 0, 0));
+        manageAll.setAlignmentX(Component.LEFT_ALIGNMENT);
+        manageAll.addMouseListener(new java.awt.event.MouseAdapter() {
+            @Override public void mouseClicked(java.awt.event.MouseEvent e) { openMailRoutingEditor(); }
+        });
+        wrap.add(manageAll);
+
+        refreshMailRoutingPreview();
+        return wrap;
+    }
+
+    private void addMailRoutingRuleFromFields() {
+        String key = tfNewRuleKey.getText().trim();
+        String folder = tfNewRuleFolder.getText().trim();
+        if (key.isEmpty() || folder.isEmpty()) {
+            JOptionPane.showMessageDialog(this,
+                    "Enter both a field name and a folder name.",
+                    "Mail Routing", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+        // Replace rather than duplicate if this key is already configured.
+        mailRoutingRules.removeIf(r -> key.equalsIgnoreCase(r.getKey()));
+        mailRoutingRules.add(new util.MailRoutingRule(key, folder));
+        AppSettings.setMailRoutingRules(mailRoutingRules);
+        tfNewRuleKey.setText("");
+        tfNewRuleFolder.setText("");
+        refreshMailRoutingPreview();
+    }
+
+    private void refreshMailRoutingPreview() {
+        mailRoutingRules = AppSettings.getMailRoutingRules();
+        mailRoutingPreviewModel.setRowCount(0);
+        for (util.MailRoutingRule r : mailRoutingRules) {
+            mailRoutingPreviewModel.addRow(new Object[]{r.getKey(), r.getFolder()});
+        }
+    }
+
+    /** Full editable list — add/delete rows, edit any cell — opened by clicking the preview table. */
+    private void openMailRoutingEditor() {
+        DefaultTableModel model = new DefaultTableModel(new Object[]{"Field Name", "Folder Name"}, 0);
+        for (util.MailRoutingRule r : mailRoutingRules) {
+            model.addRow(new Object[]{r.getKey(), r.getFolder()});
+        }
+
+        JTable table = new JTable(model);
+        table.setRowHeight(26);
+        table.getTableHeader().setReorderingAllowed(false);
+        JScrollPane scroll = new JScrollPane(table);
+        scroll.setPreferredSize(new Dimension(420, 220));
+
+        JLabel info = new JLabel("<html><div style='width:400px'>Edit any value directly in the table below. "
+                + "The <b>Others</b> row is the fallback for messages that don't match any other field name — "
+                + "it can be renamed but a row with that key will always be kept. A folder is created "
+                + "automatically the first time it's needed, if it doesn't already exist in Outlook.</div></html>");
+        info.setBorder(new EmptyBorder(0, 0, 10, 0));
+
+        JButton btnAddRow = new JButton("Add Row");
+        btnAddRow.addActionListener(e -> model.addRow(new Object[]{"", ""}));
+        JButton btnDeleteRow = new JButton("Delete Selected");
+        btnDeleteRow.addActionListener(e -> {
+            if (table.isEditing()) table.getCellEditor().stopCellEditing();
+            int sel = table.getSelectedRow();
+            if (sel >= 0) model.removeRow(sel);
+        });
+        JPanel leftButtons = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
+        leftButtons.add(btnAddRow);
+        leftButtons.add(btnDeleteRow);
+
+        JButton btnCancel = new JButton("Cancel");
+        JButton btnSave = new GradientButton("Save");
+        styleBtn(btnSave, AppTheme.EARTH_SIENNA);
+        JPanel rightButtons = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 0));
+        rightButtons.add(btnCancel);
+        rightButtons.add(btnSave);
+
+        JPanel south = new JPanel(new BorderLayout());
+        south.setBorder(new EmptyBorder(10, 0, 0, 0));
+        south.add(leftButtons, BorderLayout.WEST);
+        south.add(rightButtons, BorderLayout.EAST);
+
+        JPanel content = new JPanel(new BorderLayout(8, 0));
+        content.setBorder(new EmptyBorder(14, 14, 14, 14));
+        content.add(info, BorderLayout.NORTH);
+        content.add(scroll, BorderLayout.CENTER);
+        content.add(south, BorderLayout.SOUTH);
+
+        Window owner = SwingUtilities.getWindowAncestor(this);
+        JDialog dlg = new JDialog(owner instanceof Frame ? (Frame) owner : null, "Mail Routing Rules", true);
+        dlg.setContentPane(content);
+        dlg.pack();
+        dlg.setLocationRelativeTo(this);
+
+        btnCancel.addActionListener(e -> dlg.dispose());
+        btnSave.addActionListener(e -> {
+            if (table.isEditing()) table.getCellEditor().stopCellEditing();
+            java.util.List<util.MailRoutingRule> updated = new java.util.ArrayList<>();
+            boolean hasOthers = false;
+            for (int i = 0; i < model.getRowCount(); i++) {
+                Object keyVal = model.getValueAt(i, 0);
+                Object folderVal = model.getValueAt(i, 1);
+                String k = keyVal == null ? "" : String.valueOf(keyVal).trim();
+                String f = folderVal == null ? "" : String.valueOf(folderVal).trim();
+                if (k.isEmpty()) continue;
+                updated.add(new util.MailRoutingRule(k, f));
+                if (k.equalsIgnoreCase(util.MailRoutingRule.OTHERS_KEY)) hasOthers = true;
+            }
+            if (!hasOthers) {
+                updated.add(new util.MailRoutingRule(util.MailRoutingRule.OTHERS_KEY, "Others"));
+            }
+            AppSettings.setMailRoutingRules(updated);
+            refreshMailRoutingPreview();
+            dlg.dispose();
+        });
+
+        dlg.setVisible(true);
     }
 
     private int addFieldRow(JPanel panel, GridBagConstraints lc, GridBagConstraints fc, String label, JComponent field, int row) {
@@ -751,7 +931,7 @@ public class SettingsPanel extends JPanel {
         vc.weightx = 1; vc.insets = new Insets(3, 0, 3, 4);
         JTextField tf = new JTextField(value);
         tf.setEditable(false);
-        tf.setBackground(new Color(0xF5F5F5));
+        tf.setBackground(AppTheme.isDark() ? new Color(0x3A3A3A) : new Color(0xF5F5F5));
         tf.setBorder(BorderFactory.createEmptyBorder(2, 4, 2, 4));
         p.add(new JLabel(label), lc);
         p.add(tf, vc);
@@ -766,12 +946,10 @@ public class SettingsPanel extends JPanel {
         int poll = prefs.getInt(PREF_POLLSEC, 60);
         spinnerPollInterval.setValue(poll);
 
-        // Live settings (app-settings.json) — loaded fresh every time this
+        // Live settings (app-settings.db) — loaded fresh every time this
         // panel is built, so it always reflects whatever is currently in
         // effect (including edits made elsewhere, e.g. by hand).
-        tfLdmFolder.setText(AppSettings.getLdmFolder());
-        tfPtmFolder.setText(AppSettings.getPtmFolder());
-        tfOthersFolder.setText(AppSettings.getOthersFolder());
+        refreshMailRoutingPreview();
         String defaultAddr = AppSettings.getDefaultStationAddress();
         tfDefaultStationAddress.setText(defaultAddr != null ? defaultAddr : "");
         String attachDir = AppSettings.getAttachmentDownloadLocation();
@@ -799,12 +977,11 @@ public class SettingsPanel extends JPanel {
         } catch (Exception ignored) {}
 
         // Live settings — one file write, takes effect immediately for both
-        // this process and the daemon's next run.
+        // this process and the daemon's next run. Mail routing rules are
+        // saved separately, immediately on each add/edit/delete in their own
+        // editor (see buildMailRoutingWidget()) rather than batched here.
         try {
             Map<String, String> live = new LinkedHashMap<>();
-            live.put(AppSettings.KEY_LDM_FOLDER, tfLdmFolder.getText().trim());
-            live.put(AppSettings.KEY_PTM_FOLDER, tfPtmFolder.getText().trim());
-            live.put(AppSettings.KEY_OTHERS_FOLDER, tfOthersFolder.getText().trim());
             live.put(AppSettings.KEY_DEFAULT_STATION_ADDR, tfDefaultStationAddress.getText().trim());
             live.put(AppSettings.KEY_ATTACHMENT_DOWNLOAD_DIR, tfAttachmentDir.getText().trim());
             live.put(AppSettings.KEY_LOG_LEVEL, String.valueOf(comboLogLevel.getSelectedItem()));
@@ -909,6 +1086,6 @@ public class SettingsPanel extends JPanel {
 
     private void styleBtn(JButton b, Color bg) {
         b.setBackground(bg); b.setForeground(Color.WHITE);
-        b.setFocusPainted(false); b.setOpaque(true); b.setBorderPainted(false);
+        b.setFocusPainted(false); b.setBorderPainted(false);
     }
 }

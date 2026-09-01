@@ -2379,18 +2379,25 @@ public class TransferService {
 
     /**
      * Classifies a message for automatic post-processing folder routing:
-     * checks Subject, attachment text, and body TOGETHER, case-insensitively
-     * ("LDM", "Ldm", "LDm", etc. all count), for "LDM" or "PTM" — checked in
-     * that order, so a message containing both (unlikely) routes as LDM.
+     * checks Subject, attachment text, and body TOGETHER, case-insensitively,
+     * against every configured rule's key (see Settings → Message Routing),
+     * in the order those rules are listed — so if a message could match more
+     * than one key, whichever rule is listed first wins. The "Others"
+     * fallback rule's key is never matched against (it's the catch-all, not
+     * a marker to search for).
      *
      * Deliberately separate from findMessageTypeMarker (used for the SITA
      * header): that one is a strict, single-source, case-sensitive match
      * against the structured message content, because getting the header
      * wrong has real consequences. This one is a looser "does this message
-     * relate to LDM/PTM at all" check across everywhere that word could
-     * appear, since misrouting a message to the wrong folder because of a
-     * stray lowercase letter or because the word only appeared in the
-     * subject is the actual reported problem.
+     * relate to this classification at all" check across everywhere the
+     * marker could appear, since misrouting a message to the wrong folder
+     * because of a stray lowercase letter or because the word only appeared
+     * in the subject is the actual reported problem.
+     *
+     * @return the matching rule's key (e.g. "LDM", "PTM", or any custom key
+     *         configured in Settings), or {@code null} if nothing matched
+     *         (routes to the "Others" folder).
      */
     private String classifyForFolderRouting(GraphMailService.MailMessage m) {
         String subject = m.subject != null ? m.subject : "";
@@ -2398,24 +2405,27 @@ public class TransferService {
         String body = toPlainText(m.bodyContent, m.bodyType);
 
         String combined = (subject + "\n" + attachment + "\n" + body).toUpperCase(Locale.ROOT);
-        if (combined.contains("LDM")) return "LDM";
-        if (combined.contains("PTM")) return "PTM";
+        for (util.MailRoutingRule rule : AppSettings.getMailRoutingRules()) {
+            if (rule.isOthers()) continue;
+            String key = rule.getKey();
+            if (key != null && !key.trim().isEmpty() && combined.contains(key.trim().toUpperCase(Locale.ROOT))) {
+                return key.trim();
+            }
+        }
         return null;
     }
 
     /**
      * Resolves the destination folder name for automatic post-processing
-     * move: LDM/PTM messages go to their respective configured folder,
-     * anything else (including MVT, until it has its own rule) goes to the
-     * configured "Others" folder. Folder names come from the live
-     * app-settings.json (see {@link AppSettings}) so a change made in the
-     * Settings panel takes effect on the very next message processed — no
-     * restart needed.
+     * move: looks up the folder configured for this classification (LDM,
+     * PTM, or any custom key added in Settings), falling back to the
+     * "Others" rule's folder if nothing matches. Folder names come from the
+     * live app-settings database (see {@link AppSettings#getMailRoutingRules()})
+     * so a change made in the Settings panel takes effect on the very next
+     * message processed — no restart needed.
      */
     private String resolveMoveFolderName(String messageType) {
-        if ("LDM".equals(messageType)) return AppSettings.getLdmFolder();
-        if ("PTM".equals(messageType)) return AppSettings.getPtmFolder();
-        return AppSettings.getOthersFolder();
+        return AppSettings.resolveRoutingFolder(messageType);
     }
 
     // Lines matching any of these mark the start of a signature, footer/

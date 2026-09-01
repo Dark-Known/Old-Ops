@@ -237,7 +237,7 @@ public final class DirectoryBrowserDialog {
         statusLabel.setForeground(muted);
 
         // ── Bottom: OK / Cancel ──────────────────────────────────────────────
-        JButton btnOk = new JButton(windows ? "Select Folder" : "select");
+        JButton btnOk = windows ? new GradientButton("Select Folder") : new JButton("select");
         JButton btnCancel = new JButton(windows ? "Cancel" : "cancel");
         btnOk.setFont(baseFont);
         btnCancel.setFont(baseFont);
@@ -248,8 +248,6 @@ public final class DirectoryBrowserDialog {
         if (windows) {
             btnOk.setBackground(accent);
             btnOk.setForeground(Color.WHITE);
-            btnOk.setOpaque(true);
-            btnOk.setBorderPainted(false);
         } else {
             btnOk.setBackground(new Color(0x2D2D2D));
             btnOk.setForeground(accent);

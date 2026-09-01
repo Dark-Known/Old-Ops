@@ -171,7 +171,7 @@ public class TaskDialog extends JDialog {
                 ? existing.getTransferMode().name() : "ENTIRE_FOLDER";
 
         JPanel main = new JPanel(new BorderLayout(0, 12));
-        main.setBackground(new Color(0xF2F4F8));
+        main.setBackground(UIManager.getColor("Panel.background"));
         main.setBorder(new EmptyBorder(12, 12, 12, 12));
 
         // ── Page header ───────────────────────────────────────────────────────
@@ -186,7 +186,7 @@ public class TaskDialog extends JDialog {
         JLabel pageSubTitle = new JLabel(
                 "Configure the task, schedule, credentials, and inbound watcher settings.");
         pageSubTitle.setFont(pageSubTitle.getFont().deriveFont(Font.PLAIN, 12f));
-        pageSubTitle.setForeground(new Color(0x555555));
+        pageSubTitle.setForeground(UIManager.getColor("Label.disabledForeground"));
         pageSubTitle.setAlignmentX(Component.LEFT_ALIGNMENT);
 
         header.add(pageTitle);
@@ -212,8 +212,8 @@ public class TaskDialog extends JDialog {
         tfSourcePath = makeField(new JTextField(
                 existing != null && existing.getSourcePath() != null ? existing.getSourcePath() : "", 28));
 
-        tfSourceHost.setForeground(new Color(0x555555));
-        tfSourceUser.setForeground(new Color(0x555555));
+        tfSourceHost.setForeground(UIManager.getColor("Label.disabledForeground"));
+        tfSourceUser.setForeground(UIManager.getColor("Label.disabledForeground"));
 
         addRow(sourcePanel, "Hostname / IP",             tfSourceHost, 0);
         addRow(sourcePanel, "Username",                  tfSourceUser, 1);
@@ -614,6 +614,16 @@ public class TaskDialog extends JDialog {
         sched.add(scheduleDetailsPanel, gc);
 
         // ── Tabbed pane ───────────────────────────────────────────────────────
+        // Anchor every GridBagLayout tab's content to the top — see anchorTop()'s
+        // javadoc for why this matters (short tabs like General otherwise render
+        // with their fields vertically centered out of the visible viewport).
+        anchorTop(general,     2);
+        anchorTop(backupPanel, 11);
+        anchorTop(targetPanel, 6);
+        anchorTop(mailPanel,   23);
+        anchorTop(sched,       2);
+        anchorTop(retryPanel,  2);
+
         tabbedPane = new JTabbedPane(JTabbedPane.TOP);
         tabbedPane.setFont(tabbedPane.getFont().deriveFont(Font.PLAIN, 12f));
         tabbedPane.addTab("General",   general);
@@ -678,7 +688,7 @@ public class TaskDialog extends JDialog {
         add(scroll, BorderLayout.CENTER);
 
         // ── Buttons ───────────────────────────────────────────────────────────
-        JButton btnSave   = new JButton(existing == null ? "Create Task" : "Save Changes");
+        JButton btnSave   = new GradientButton(existing == null ? "Create Task" : "Save Changes");
         JButton btnCancel = new JButton("Cancel");
         styleBtn(btnSave, AppTheme.EARTH_SIENNA);
         btnCancel.addActionListener(e -> dispose());
@@ -1337,11 +1347,11 @@ public class TaskDialog extends JDialog {
             }
         };
         p.setBorder(BorderFactory.createCompoundBorder(
-                BorderFactory.createLineBorder(new Color(0xD1D9E6)),
+                BorderFactory.createLineBorder(UIManager.getColor("Component.borderColor")),
                 BorderFactory.createCompoundBorder(
                         new TitledBorder(title),
                         new EmptyBorder(10, 10, 10, 10))));
-        p.setBackground(Color.WHITE);
+        p.setBackground(UIManager.getColor("Panel.background"));
         p.setOpaque(true);
         p.setAlignmentX(Component.LEFT_ALIGNMENT);
         return p;
@@ -1496,9 +1506,30 @@ public class TaskDialog extends JDialog {
         return c;
     }
 
+    /**
+     * Absorbs any leftover vertical space in a GridBagLayout tab panel by adding an
+     * invisible filler row that claims all of it (weighty = 1, fill = BOTH).
+     *
+     * <p>Without this, a short tab like General (just 2 rows) still gets stretched to
+     * the JTabbedPane's shared height — sized to whichever tab is TALLEST (Mail/IMAP,
+     * with 20+ rows) — and GridBagLayout's default behavior is to vertically CENTER a
+     * panel's rows within whatever extra height it's given. That pushes General's two
+     * fields down into the middle of a ~900px-tall area, well below the dialog's
+     * initially-visible scroll viewport — so the tab looks completely empty even
+     * though the fields are really there, just scrolled out of view. Anchoring every
+     * GridBagLayout tab's content to the top fixes this for all of them at once.
+     */
+    private void anchorTop(JPanel panel, int afterRow) {
+        GridBagConstraints gc = new GridBagConstraints();
+        gc.gridx = 0; gc.gridy = afterRow; gc.gridwidth = 2;
+        gc.weighty = 1.0;
+        gc.fill = GridBagConstraints.BOTH;
+        panel.add(Box.createGlue(), gc);
+    }
+
     private void styleBtn(JButton b, Color bg) {
         b.setBackground(bg); b.setForeground(Color.WHITE);
-        b.setFocusPainted(false); b.setOpaque(true); b.setBorderPainted(false);
+        b.setFocusPainted(false); b.setBorderPainted(false);
     }
 
     private void msg(String text) {
