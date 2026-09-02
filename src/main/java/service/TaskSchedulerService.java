@@ -271,8 +271,26 @@ public class TaskSchedulerService {
         metrics.setCurrentThreadCount(THREAD_BEAN.getThreadCount());
     }
 
-    /** Start the event-driven scheduler: worker pool + safety-net reconcile sweep. */
+    // Whether this instance's worker pool/reconcile loop has actually been
+    // started. Lets a caller (see ui.MainWindow) hold a scheduler object for
+    // read-only access (task list, run history) without it firing anything —
+    // e.g. while a headless Daemon process is the active scheduler for this
+    // data directory — and later promote it to active with a plain start()
+    // call. TaskWorkerPool.start() is only safe to call once per instance
+    // (see its own javadoc), so this flag also guards against a double
+    // start() accidentally tearing that invariant.
+    private volatile boolean started = false;
+
+    /** True once {@link #start()} has actually started the worker pool. */
+    public boolean isStarted() {
+        return started;
+    }
+
+    /** Start the event-driven scheduler: worker pool + safety-net reconcile sweep.
+     *  Safe to call more than once — every call after the first is a no-op. */
     public void start() {
+        if (started) return;
+        started = true;
         workerPool.start();
         // Reconcile is a self-healing safety net only (new/edited tasks, stale
         // RUNNING recovery, clock skew) — it is NOT the firing mechanism.
@@ -285,6 +303,7 @@ public class TaskSchedulerService {
     }
 
     public void stop() {
+        started = false;
         workerPool.stop();
         if (statusExportFuture != null) statusExportFuture.cancel(false);
         scheduler.shutdownNow();

@@ -26,6 +26,31 @@ import java.util.List;
  */
 public final class SchedulerStatusSnapshot {
 
+    /**
+     * How stale a status file can be before the exporting process is
+     * considered offline/dead. The exporter (see {@link SchedulerStatusExporter})
+     * writes every 2s (see {@code TaskSchedulerService#enableStatusExport}),
+     * so anything past ~4x that interval most likely means the process died
+     * mid-tick rather than just being between writes.
+     *
+     * Shared here so every consumer — {@code ui.MainWindow}'s scheduler
+     * badge, {@code ui.EventMonitorWindow}'s worker chip, and
+     * {@code ui.EventMonitorPanel}'s tabs — agrees on the same threshold
+     * instead of each hard-coding its own copy.
+     */
+    public static final long DEFAULT_STALE_MS = 8_000L;
+
+    /**
+     * True if {@code file} holds a fresh (non-stale) snapshot right now —
+     * i.e. the process exporting it is alive and actively scheduling.
+     * Convenience wrapper around {@link #read} + {@link #isFresh} for
+     * callers that only care about the yes/no "is it alive" question.
+     */
+    public static boolean isAlive(Path file, long maxAgeMillis) {
+        SchedulerStatusSnapshot snap = read(file);
+        return snap != null && snap.isFresh(maxAgeMillis);
+    }
+
     /** One task's pending occurrence, as exported. */
     public record PendingEntry(String taskId, int attempt, LocalDateTime dueAt) {}
 

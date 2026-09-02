@@ -101,10 +101,30 @@ public class EventMonitorWindow extends JFrame {
 
     private void refreshChip() {
         if (scheduler == null || workerChip == null) return;
-        int size = scheduler.getWorkerPoolSize();
-        int active = scheduler.getActiveWorkerCount();
-        Color dot = active == 0 ? new Color(0x9CB380) : new Color(0xE0A458);
-        restyleChip(workerChip, "Workers: " + active + " / " + size + " busy", dot);
+
+        // Only one scheduler is ever actually active at a time (Daemon
+        // primary, GUI on standby — see ui.MainWindow), so this chip should
+        // reflect whichever one that is rather than always showing the
+        // local GUI worker pool, which sits at 0/0 while on standby.
+        if (scheduler.isStarted()) {
+            int size = scheduler.getWorkerPoolSize();
+            int active = scheduler.getActiveWorkerCount();
+            Color dot = active == 0 ? new Color(0x9CB380) : new Color(0xE0A458);
+            restyleChip(workerChip, "Workers (GUI): " + active + " / " + size + " busy", dot);
+            return;
+        }
+
+        java.nio.file.Path daemonStatusFile = scheduler.getStorage().getDataDir().toPath()
+                .resolve("scheduler-status-daemon.dat");
+        service.queue.SchedulerStatusSnapshot snap = service.queue.SchedulerStatusSnapshot.isAlive(
+                daemonStatusFile, service.queue.SchedulerStatusSnapshot.DEFAULT_STALE_MS)
+                ? service.queue.SchedulerStatusSnapshot.read(daemonStatusFile) : null;
+        if (snap != null) {
+            Color dot = snap.getActiveWorkers() == 0 ? new Color(0x9CB380) : new Color(0xE0A458);
+            restyleChip(workerChip, "Workers (Daemon): " + snap.getActiveWorkers() + " / " + snap.getPoolSize() + " busy", dot);
+        } else {
+            restyleChip(workerChip, "No scheduler active", new Color(0xD9785C));
+        }
     }
 
     // ── Chip helpers — mirrors MainWindow's header status-pill pattern so

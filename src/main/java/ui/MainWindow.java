@@ -30,6 +30,21 @@ public class MainWindow extends JFrame {
     private java.util.function.Consumer<model.TaskRunRecord> runListener;
     private javax.swing.Timer bellRefreshTimer;
 
+    // ── Daemon vs GUI scheduler hand-off ─────────────────────────────────
+    // The headless Daemon (see Daemon.java) is the primary scheduler when
+    // it's running: if setup.ps1 registered it, it fires tasks from system
+    // startup independently of whether this GUI is even open. Running a
+    // second, in-GUI scheduler on top of that is redundant — worse, it
+    // doubles log/toast noise (the cross-process file lock in
+    // TaskSchedulerService#executeTask still prevents a task from actually
+    // running twice, but every skipped duplicate still shows up as an
+    // event). So: only start the GUI's own scheduler if the Daemon doesn't
+    // look alive right now; if it later goes offline, this window promotes
+    // itself to active so scheduling doesn't just stop.
+    private final java.nio.file.Path daemonStatusFile;
+    private JLabel schedulerBadge;
+    private javax.swing.Timer schedulerBadgeTimer;
+
     public MainWindow() {
         String dataDir = loadDataDir();
         this.storage = new XmlStorageService(dataDir);
@@ -38,6 +53,7 @@ public class MainWindow extends JFrame {
         Preferences prefs = Preferences.userNodeForPackage(SettingsPanel.class);
         int poll = prefs.getInt("poll_interval_seconds", 60);
         this.scheduler = new TaskSchedulerService(storage, transferService, poll);
+        this.daemonStatusFile = java.nio.file.Path.of(dataDir, "scheduler-status-daemon.dat");
 
         setTitle("Monitoring tool");
         setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);
@@ -56,6 +72,17 @@ public class MainWindow extends JFrame {
         }
 
         setIconImage(buildAppIcon());
+
+        scheduler.enableStatusExport(dataDir, "gui");
+        // Daemon is primary: only take over scheduling ourselves if it isn't
+        // already alive and exporting a fresh status snapshot right now.
+        // Decided before buildUI() so the badge it creates already reflects
+        // the right state on first paint instead of flashing "checking...".
+        if (!service.queue.SchedulerStatusSnapshot.isAlive(daemonStatusFile,
+                service.queue.SchedulerStatusSnapshot.DEFAULT_STALE_MS)) {
+            scheduler.start();
+        }
+
         buildUI();
 
         addWindowListener(new WindowAdapter() {
@@ -71,8 +98,6 @@ public class MainWindow extends JFrame {
             }
         });
 
-        scheduler.enableStatusExport(dataDir, "gui");
-        scheduler.start();
         showStartupFailures();
     }
     private String loadDataDir() {
@@ -161,6 +186,10 @@ public class MainWindow extends JFrame {
             bellRefreshTimer.stop();
             bellRefreshTimer = null;
         }
+        if (schedulerBadgeTimer != null) {
+            schedulerBadgeTimer.stop();
+            schedulerBadgeTimer = null;
+        }
 
         Color bgBase = UIManager.getColor("Panel.background");
         boolean dark = AppTheme.isDark();
@@ -193,11 +222,10 @@ public class MainWindow extends JFrame {
         JPanel badges = new JPanel(new FlowLayout(FlowLayout.RIGHT, 10, 0));
         badges.setOpaque(false);
 
-        JLabel guiBadge = statusChip("GUI Scheduler Running", new Color(0x9CB380));
-        JLabel daemonBadge = statusChip("Daemon: checking...", new Color(0xE0A458));
-
-        badges.add(guiBadge);
-        badges.add(daemonBadge);
+        // Single badge for whichever scheduler is actually active — see the
+        // "Daemon vs GUI scheduler hand-off" note above the field declarations.
+        schedulerBadge = statusChip("Scheduler: checking...", new Color(0xE0A458));
+        badges.add(schedulerBadge);
 
         notificationBell = new NotificationBell(storage, scheduler);
         badges.add(notificationBell);
@@ -239,28 +267,15 @@ public class MainWindow extends JFrame {
         });
         badges.add(themeToggle);
 
-        // Check daemon status in background
-        new javax.swing.SwingWorker<String, Void>() {
-            protected String doInBackground() {
-                try {
-                    Process p = Runtime.getRuntime().exec(
-                        new String[]{"schtasks", "/Query", "/TN", "Monitoring-Tool-Daemon", "/FO", "LIST"});
-                    p.waitFor();
-                    return p.exitValue() == 0 ? "registered" : "not registered";
-                } catch (Exception e) { return "unknown"; }
-            }
-            protected void done() {
-                try {
-                    String s = get();
-                    if ("registered".equals(s)) {
-                        restyleChip(daemonBadge, "Daemon: Active", new Color(0x9CB380));
-                    } else {
-                        restyleChip(daemonBadge, "Daemon: Not registered", new Color(0xD9785C));
-                        daemonBadge.setToolTipText("Go to Settings to register the background daemon");
-                    }
-                } catch (Exception ignored) {}
-            }
-        }.execute();
+        // Keep the single badge live, and self-heal: if the GUI is on
+        // standby (Daemon was primary) and the Daemon later goes quiet, the
+        // GUI promotes itself so scheduling doesn't just stop. Runs at
+        // roughly the same cadence as the status exporter's write interval
+        // (2s) plus the staleness window, so a real Daemon shutdown is
+        // detected within a few seconds.
+        refreshSchedulerBadge();
+        schedulerBadgeTimer = new javax.swing.Timer(3000, e -> refreshSchedulerBadge());
+        schedulerBadgeTimer.start();
 
         header.add(titleStack, BorderLayout.WEST);
         header.add(badges, BorderLayout.EAST);
@@ -458,6 +473,37 @@ public class MainWindow extends JFrame {
     private void restyleChip(JLabel chip, String text, Color dotColor) {
         String hex = String.format("#%02X%02X%02X", dotColor.getRed(), dotColor.getGreen(), dotColor.getBlue());
         chip.setText("<html><span style='color:" + hex + "'>\u25CF</span>&nbsp;&nbsp;" + text + "</html>");
+    }
+
+    /**
+     * Updates the single scheduler badge to reflect whichever process is
+     * actually driving scheduling right now, and promotes the GUI scheduler
+     * from standby to active if the Daemon has gone offline since the last
+     * check. Called on startup and on a periodic timer (see buildUI()).
+     */
+    private void refreshSchedulerBadge() {
+        if (schedulerBadge == null) return;
+
+        if (scheduler.isStarted()) {
+            restyleChip(schedulerBadge, "Scheduler: GUI Active", new Color(0x9CB380));
+            schedulerBadge.setToolTipText("This window is running the task scheduler.");
+            return;
+        }
+
+        boolean daemonAlive = service.queue.SchedulerStatusSnapshot.isAlive(
+                daemonStatusFile, service.queue.SchedulerStatusSnapshot.DEFAULT_STALE_MS);
+        if (daemonAlive) {
+            restyleChip(schedulerBadge, "Scheduler: Daemon Active", new Color(0x7FA7C9));
+            schedulerBadge.setToolTipText("The background Daemon is handling scheduling; this window is on standby.");
+            return;
+        }
+
+        // Neither is alive — the Daemon must have stopped since we last
+        // checked. Take over so tasks keep firing instead of silently
+        // stalling until the app is restarted.
+        scheduler.start();
+        restyleChip(schedulerBadge, "Scheduler: GUI Active", new Color(0x9CB380));
+        schedulerBadge.setToolTipText("Daemon not detected — this window took over scheduling.");
     }
 
     private static Color withAlpha(Color c, int alpha) {

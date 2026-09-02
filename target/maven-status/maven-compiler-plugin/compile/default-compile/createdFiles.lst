@@ -152,7 +152,6 @@ ui\DirectoryBrowserDialog$4.class
 ui\RunHistoryPanel$2.class
 ui\CredentialManagerPanel$2.class
 ui\EventMonitorWindow$2.class
-ui\MainWindow$4.class
 ui\DirectoryBrowserDialog$Provider.class
 service\TransferService$MarkerMatch.class
 ui\DirectoryBrowserDialog$FolderIcon.class
