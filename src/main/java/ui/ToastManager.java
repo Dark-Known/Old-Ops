@@ -41,7 +41,18 @@ public class ToastManager {
             case FAILED:  accent = AppTheme.EARTH_RUST; icon = "\u2717"; break; // ✗
             default:      accent = new Color(0xF9A825); icon = "\u23ED"; break; // ⏭ (skipped)
         }
+        showToast(r.getTaskName() + " — " + r.getStatus(),
+                r.getReason() != null && !r.getReason().isEmpty() ? r.getReason() : "(no details)",
+                accent, icon);
+    }
 
+    /**
+     * Displays a generic toast with the given title, body, accent color, and
+     * a short leading icon/emoji. Same popup styling and stacking as
+     * {@link #showToast(TaskRunRecord)} — that overload is now just a thin
+     * wrapper around this one. Must be called on the EDT.
+     */
+    public void showToast(String title, String body, Color accent, String icon) {
         JWindow toast = new JWindow(owner);
         toast.setType(Window.Type.POPUP);
         toast.setAlwaysOnTop(true);
@@ -52,18 +63,17 @@ public class ToastManager {
                 BorderFactory.createLineBorder(accent, 2),
                 BorderFactory.createEmptyBorder(8, 10, 8, 10)));
 
-        JLabel title = new JLabel(icon + "  " + r.getTaskName() + " — " + r.getStatus());
-        title.setFont(title.getFont().deriveFont(Font.BOLD, 13f));
-        title.setForeground(accent);
+        JLabel titleLabel = new JLabel(icon + "  " + title);
+        titleLabel.setFont(titleLabel.getFont().deriveFont(Font.BOLD, 13f));
+        titleLabel.setForeground(accent);
 
-        String reasonText = r.getReason() != null && !r.getReason().isEmpty() ? r.getReason() : "(no details)";
-        JLabel body = new JLabel("<html><div style='width:" + (TOAST_WIDTH - 40) + "px'>"
-                + escape(reasonText) + "</div></html>");
-        body.setFont(body.getFont().deriveFont(Font.PLAIN, 11f));
-        body.setForeground(new Color(0x424242));
+        JLabel bodyLabel = new JLabel("<html><div style='width:" + (TOAST_WIDTH - 40) + "px'>"
+                + escape(body) + "</div></html>");
+        bodyLabel.setFont(bodyLabel.getFont().deriveFont(Font.PLAIN, 11f));
+        bodyLabel.setForeground(new Color(0x424242));
 
-        content.add(title, BorderLayout.NORTH);
-        content.add(body, BorderLayout.CENTER);
+        content.add(titleLabel, BorderLayout.NORTH);
+        content.add(bodyLabel, BorderLayout.CENTER);
 
         // Click a toast to dismiss it immediately.
         content.addMouseListener(new java.awt.event.MouseAdapter() {

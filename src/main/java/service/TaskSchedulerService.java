@@ -6,7 +6,10 @@ import model.TaskRunRecord;
 import service.TaskLogService;
 import service.queue.TaskDueEvent;
 import service.queue.TaskEventQueue;
+import service.queue.SchedulerStatusSnapshot;
 import service.queue.TaskWorkerPool;
+import service.watch.LocalWatchManager;
+import service.watch.RemotePushWatcher;
 
 import java.io.IOException;
 import java.nio.channels.FileChannel;
@@ -24,6 +27,7 @@ import java.lang.management.ThreadMXBean;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
 import java.util.ArrayList;
+import java.util.Map;
 import java.util.concurrent.*;
 import java.util.function.BiConsumer;
 import java.util.logging.Logger;
@@ -76,6 +80,24 @@ public class TaskSchedulerService {
     // is controlled by pool size, same knob as before (AppSettings.getMaxConcurrentTaskThreads()).
     private final TaskWorkerPool workerPool = new TaskWorkerPool(
             eventQueue, Math.max(4, util.AppSettings.getMaxConcurrentTaskThreads()), this::onTaskDue);
+    // Push-notification producers that feed eventQueue directly, in addition
+    // to (not instead of) the normal poll-based publishNextOccurrence path —
+    // see each class's javadoc for exactly what it replaces and what it
+    // leaves as a safety net.
+    //   - LocalWatchManager:   OUTBOUND watcher tasks — OS-level directory
+    //     notifications (ReadDirectoryChangesW/inotify/FSEvents) via
+    //     java.nio.file.WatchService. Always available, no polling left
+    //     once native watch registration succeeds.
+    //   - RemotePushWatcher: INBOUND watcher tasks — best-effort remote
+    //     push via SSH-exec: inotifywait when the target is Linux,
+    //     PowerShell FileSystemWatcher when it's Windows, provided the SSH
+    //     server allows exec; otherwise it gets out of the way and the
+    //     existing scheduled poll (computeNextFireDelayMs) keeps running
+    //     unchanged.
+    // Constructed here (not as a plain field initializer) because both need
+    // this.storage, which isn't assigned until the constructor body runs.
+    private final LocalWatchManager localWatchManager = new LocalWatchManager(this::onWatchWakeup);
+    private final RemotePushWatcher remotePushWatcher;
     // Tracks currently running task futures so they can be cancelled on request
      private final ConcurrentMap<String, Future<?>> runningTaskFutures = new ConcurrentHashMap<>();
      private final ConcurrentMap<String, TaskMetrics> taskMetrics = new ConcurrentHashMap<>();
@@ -114,6 +136,134 @@ public class TaskSchedulerService {
         // default; adjust here if a different retention window is needed.
         this.runHistoryService.pruneOlderThan(90);
         this.pollIntervalSeconds = Math.max(1, pollIntervalSeconds);
+        this.remotePushWatcher = new RemotePushWatcher(storage, this::onWatchWakeup);
+    }
+
+    /**
+     * Called by {@link LocalWatchManager} or {@link RemotePushWatcher} the
+     * moment they observe a change for a watcher-enabled task. Publishes a
+     * "due now" event through the normal queue — {@link #onTaskDue} then
+     * re-validates the task's live status and does all the real filtering
+     * (only-if-actually-changed, batching, etc.), so this is safe to call
+     * even on a false alarm (e.g. a temp file that got deleted again) or
+     * while the task happens to already be running (onTaskDue no-ops then).
+     */
+    private void onWatchWakeup(String taskId) {
+        eventQueue.publish(new TaskDueEvent(taskId, LocalDateTime.now(), 0));
+    }
+
+    /** How a watcher-enabled task is currently being triggered — for UI display only. */
+    public enum WatchMode {
+        /** OUTBOUND task with a live OS-level directory watch registered — instant. */
+        NATIVE_WATCH,
+        /** INBOUND task with a live remote push listener (inotifywait on Linux,
+         *  PowerShell FileSystemWatcher on Windows) — instant. */
+        REMOTE_PUSH,
+        /** No push mechanism currently active; relying solely on the scheduled poll interval. */
+        POLLING_ONLY,
+        /** Push was attempted for this task but the remote host doesn't support it
+         *  (no inotify-tools, or exec refused) — same as POLLING_ONLY but distinguishes
+         *  "tried and can't" from "not applicable yet" for the UI. */
+        POLLING_ONLY_UNSUPPORTED,
+        /** Not a watcher-enabled FILE_TRANSFER task. */
+        NOT_APPLICABLE
+    }
+
+    /**
+     * {@code mode} plus a short human-readable {@code detail} explaining *why*
+     * — critical for telling "never attempted" apart from "tried and this is
+     * exactly what went wrong" apart from "confirmed working". See
+     * {@link #getWatchStatus}.
+     */
+    public record WatchStatus(WatchMode mode, String detail) {}
+
+    /** Convenience wrapper around {@link #getWatchStatus} for callers that
+     *  only need the mode, not the explanation. Prefer getWatchStatus in new code. */
+    public WatchMode getWatchMode(ScheduledTask task) {
+        return getWatchStatus(task).mode();
+    }
+
+    /**
+     * Best-effort, point-in-time read of how {@code task} is currently being
+     * triggered, with a plain-English reason attached at every branch — so the
+     * UI never has to show a bare "Polling only" without being able to say
+     * whether that's because push was never eligible, was tried and failed
+     * (and why), or just hasn't been evaluated yet.
+     *
+     * <p>Reflects only this process's watch managers — if the headless Daemon
+     * (not this GUI process) is the active scheduler, this will under-report
+     * (it can't see another process's live SSH/watch state); see
+     * {@code SchedulerStatusExporter}/{@code SchedulerStatusSnapshot} for the
+     * cross-process version of this same information.
+     */
+    public WatchStatus getWatchStatus(ScheduledTask task) {
+        if (task == null || task.getTaskType() != ScheduledTask.TaskType.FILE_TRANSFER) {
+            return new WatchStatus(WatchMode.NOT_APPLICABLE, "not a file-transfer task");
+        }
+        if (!task.isWatcherEnabled()) {
+            return new WatchStatus(WatchMode.NOT_APPLICABLE, "watcher is not enabled for this task");
+        }
+
+        if (task.getTransferDirection() == ScheduledTask.TransferDirection.OUTBOUND) {
+            if (localWatchManager.isWatching(task.getId())) {
+                return new WatchStatus(WatchMode.NATIVE_WATCH, "native OS directory watch is active");
+            }
+            String reason = localWatchManager.getReason(task.getId());
+            return new WatchStatus(WatchMode.POLLING_ONLY,
+                    reason != null ? reason : "not yet evaluated — waiting for the next reconcile pass");
+        }
+
+        if (task.getTransferDirection() == ScheduledTask.TransferDirection.INBOUND) {
+            if (task.getTransferMode() != ScheduledTask.TransferMode.LATEST_ONLY) {
+                // This is the single most common reason remote push never even
+                // gets attempted — surface it explicitly rather than letting it
+                // look identical to "tried and it's not supported".
+                return new WatchStatus(WatchMode.POLLING_ONLY,
+                        "remote push requires transfer mode \"Latest Only\" (current: "
+                                + task.getTransferMode() + ") — not attempted");
+            }
+            if (remotePushWatcher.isPushActive(task.getId())) {
+                String reason = remotePushWatcher.getReason(task.getId());
+                return new WatchStatus(WatchMode.REMOTE_PUSH, reason != null ? reason : "connected");
+            }
+            if (remotePushWatcher.isRecentlyUnsupported(task.getId())) {
+                String reason = remotePushWatcher.getReason(task.getId());
+                return new WatchStatus(WatchMode.POLLING_ONLY_UNSUPPORTED,
+                        reason != null ? reason : "remote push unavailable");
+            }
+            return new WatchStatus(WatchMode.POLLING_ONLY, "not yet attempted — waiting for the next reconcile pass");
+        }
+
+        return new WatchStatus(WatchMode.NOT_APPLICABLE, "");
+    }
+
+    /**
+     * Forces an immediate reconnect attempt for a single watcher task — the
+     * "Reconnect" action in the UI's watcher-info popup. Re-registers the
+     * native directory watch (OUTBOUND) or restarts the remote SSH push
+     * listener (INBOUND) right now, rather than waiting for the next
+     * reconcile sweep (up to ~30s) or, for a remote push that was recently
+     * marked unsupported, the 1-hour backoff window. Safe to call for any
+     * task id — no-ops harmlessly if the task doesn't exist or isn't
+     * watcher-eligible (with the reason updated accordingly, visible via
+     * the next {@link #getWatchStatus} call).
+     *
+     * <p>Returns immediately — the actual reconnect (filesystem watch
+     * registration, or SSH connect) may still be in progress when this
+     * returns; callers should re-check {@link #getWatchStatus} a couple of
+     * seconds later for the outcome.
+     */
+    public void reconnectWatch(String taskId) {
+        if (taskId == null) return;
+        ScheduledTask task = storage.loadTasks().stream()
+                .filter(t -> taskId.equals(t.getId()))
+                .findFirst().orElse(null);
+        if (task == null) return;
+        if (task.getTransferDirection() == ScheduledTask.TransferDirection.OUTBOUND) {
+            localWatchManager.forceReconnect(task);
+        } else if (task.getTransferDirection() == ScheduledTask.TransferDirection.INBOUND) {
+            remotePushWatcher.forceReconnect(task);
+        }
     }
 
     public void setLogCallback(BiConsumer<String, String> cb) {
@@ -168,6 +318,20 @@ public class TaskSchedulerService {
     // service.queue.SchedulerStatusExporter / SchedulerStatusSnapshot.
     private service.queue.SchedulerStatusExporter statusExporter;
     private ScheduledFuture<?> statusExportFuture;
+    // Populated at the top of every reconcileSchedules() sweep; read by
+    // exportStatus() (which runs on its own faster 2s tick) so the "watch
+    // mode" line in each status export doesn't need its own storage.loadTasks()
+    // call every 2s — reconcile's 30s-ish cadence is fresh enough for a
+    // status display, and volatile gives exportStatus a safe, tear-free read
+    // of whatever reconcile last saw.
+    private volatile List<ScheduledTask> lastLoadedTasks = java.util.Collections.emptyList();
+    // Last WatchMode we logged for each task, purely so exportStatus() can log
+    // a clear line the moment a task's trigger mode changes (e.g. "push
+    // stopped working, now polling") instead of the Daemon's log silently
+    // saying nothing — this is the same signal ui.WatchStatusMonitor polls
+    // for cross-process, but logging it here too means it's visible even
+    // when no GUI is attached to a headless Daemon at all.
+    private final Map<String, WatchMode> lastLoggedWatchMode = new ConcurrentHashMap<>();
 
     /**
      * Enables periodic status export to {@code <dataDir>/scheduler-status-<processLabel>.dat},
@@ -188,9 +352,35 @@ public class TaskSchedulerService {
     private void exportStatus() {
         if (statusExporter == null) return;
         try {
-            statusExporter.export(getWorkerPoolSize(), getActiveWorkerCount(), getPendingEvents(), getRecentActivity(30));
+            List<SchedulerStatusSnapshot.WatchEntry> watchEntries = new ArrayList<>();
+            for (ScheduledTask t : lastLoadedTasks) {
+                WatchStatus status = getWatchStatus(t);
+                if (status.mode() == WatchMode.NOT_APPLICABLE) continue;
+                watchEntries.add(new SchedulerStatusSnapshot.WatchEntry(t.getId(), status.mode().name(), status.detail()));
+                logWatchTransitionIfNotable(t, status);
+            }
+            statusExporter.export(getWorkerPoolSize(), getActiveWorkerCount(), getPendingEvents(),
+                    getRecentActivity(30), watchEntries);
         } catch (Exception e) {
             log.fine("Status export tick failed: " + e.getMessage());
+        }
+    }
+
+    /** Logs a WARNING the moment a watcher task's trigger mode degrades from
+     *  push (NATIVE_WATCH/REMOTE_PUSH) to polling, or is newly confirmed
+     *  unsupported — so it's visible in this process's own log even with no
+     *  GUI attached. Silent otherwise (including on the very first observation
+     *  of a task, and on POLLING_ONLY -> POLLING_ONLY re-evaluations, both of
+     *  which are non-events here). */
+    private void logWatchTransitionIfNotable(ScheduledTask t, WatchStatus status) {
+        WatchMode prev = lastLoggedWatchMode.put(t.getId(), status.mode());
+        if (prev == null || prev == status.mode()) return;
+        boolean wasPushing = prev == WatchMode.NATIVE_WATCH || prev == WatchMode.REMOTE_PUSH;
+        boolean nowPolling = status.mode() == WatchMode.POLLING_ONLY || status.mode() == WatchMode.POLLING_ONLY_UNSUPPORTED;
+        boolean newlyUnsupported = status.mode() == WatchMode.POLLING_ONLY_UNSUPPORTED && prev != WatchMode.POLLING_ONLY_UNSUPPORTED;
+        if ((wasPushing && nowPolling) || newlyUnsupported) {
+            log.warning("Watcher task '" + t.getName() + "' (" + t.getId() + "): trigger mode changed "
+                    + prev + " -> " + status.mode() + " — " + status.detail());
         }
     }
 
@@ -292,6 +482,8 @@ public class TaskSchedulerService {
         if (started) return;
         started = true;
         workerPool.start();
+        localWatchManager.start();
+        remotePushWatcher.start();
         // Reconcile is a self-healing safety net only (new/edited tasks, stale
         // RUNNING recovery, clock skew) — it is NOT the firing mechanism.
         // The 30s cadence is deliberately decoupled from pollIntervalSeconds:
@@ -305,6 +497,8 @@ public class TaskSchedulerService {
     public void stop() {
         started = false;
         workerPool.stop();
+        localWatchManager.stop();
+        remotePushWatcher.stop();
         if (statusExportFuture != null) statusExportFuture.cancel(false);
         scheduler.shutdownNow();
         executor.shutdownNow();
@@ -390,6 +584,14 @@ public class TaskSchedulerService {
     private void reconcileSchedules() {
         try {
             List<ScheduledTask> tasks = storage.loadTasks();
+            lastLoadedTasks = tasks;
+
+            // Cheap, idempotent — registers/deregisters native watches to
+            // match current task config. Does not itself decide when a task
+            // fires; see onWatchWakeup().
+            localWatchManager.sync(tasks);
+            remotePushWatcher.sync(tasks);
+
             LocalDateTime now = LocalDateTime.now();
 
             for (ScheduledTask task : tasks) {

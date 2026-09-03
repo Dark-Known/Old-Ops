@@ -44,6 +44,13 @@ public class MainWindow extends JFrame {
     private final java.nio.file.Path daemonStatusFile;
     private JLabel schedulerBadge;
     private javax.swing.Timer schedulerBadgeTimer;
+    // Cross-process: notices when a watcher task's trigger mode falls back
+    // from push (native watch / remote SSH push) to plain polling, wherever
+    // that task is actually running (Daemon or this GUI) — see its javadoc.
+    // Constructed early so NotificationBell can hold a reference to it;
+    // started later, once toastManager/notificationBell both exist (its
+    // callback uses both).
+    private final WatchStatusMonitor watchStatusMonitor;
 
     public MainWindow() {
         String dataDir = loadDataDir();
@@ -54,6 +61,7 @@ public class MainWindow extends JFrame {
         int poll = prefs.getInt("poll_interval_seconds", 60);
         this.scheduler = new TaskSchedulerService(storage, transferService, poll);
         this.daemonStatusFile = java.nio.file.Path.of(dataDir, "scheduler-status-daemon.dat");
+        this.watchStatusMonitor = new WatchStatusMonitor(storage, scheduler, this::onWatchFallback);
 
         setTitle("Monitoring tool");
         setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);
@@ -92,6 +100,7 @@ public class MainWindow extends JFrame {
                     "Exit", JOptionPane.YES_NO_OPTION);
                 if (choice == JOptionPane.YES_OPTION) {
                     scheduler.stop();
+                    watchStatusMonitor.stop();
                     dispose();
                     System.exit(0);
                 }
@@ -227,7 +236,7 @@ public class MainWindow extends JFrame {
         schedulerBadge = statusChip("Scheduler: checking...", new Color(0xE0A458));
         badges.add(schedulerBadge);
 
-        notificationBell = new NotificationBell(storage, scheduler);
+        notificationBell = new NotificationBell(storage, scheduler, watchStatusMonitor);
         badges.add(notificationBell);
 
         JButton eventMonitorBtn = new JButton("Event Monitor", VectorIcons.pulse(Color.WHITE, 16));
@@ -414,6 +423,10 @@ public class MainWindow extends JFrame {
                 });
         scheduler.getRunHistoryService().addRunListener(runListener);
 
+        // Now that both toastManager and notificationBell exist, safe to start
+        // the watch-fallback monitor — its callback (onWatchFallback) uses both.
+        watchStatusMonitor.start();
+
         // Belt-and-suspenders periodic refresh for the bell badge, in case a
         // task's status changes some way other than a recorded run (e.g. the
         // Restart buttons in the failure-recovery dialog set status directly).
@@ -526,6 +539,34 @@ public class MainWindow extends JFrame {
                 && record.getReason() != null
                 && (record.getReason().contains("already running in another process")
                     || record.getReason().contains("already running elsewhere in this same application instance"));
+    }
+
+    /**
+     * Called by {@link WatchStatusMonitor} (already on the EDT — it runs on a
+     * Swing {@code Timer}) the moment a watcher task's trigger mode falls back
+     * from push to polling, or is newly confirmed unsupported. Pops an amber
+     * toast — same visual language as the fingerprint bar's "unsupported" tag
+     * — and bumps the notification bell so it's visible even if the operator
+     * is looking at a different tab entirely.
+     */
+    private void onWatchFallback(WatchStatusMonitor.Event ev) {
+        toastManager.showToast(
+                ev.taskName() + " \u2014 watch fallback",
+                "Was " + prettyMode(ev.fromMode()) + ", now " + prettyMode(ev.toMode()) + ". " + ev.detail(),
+                new Color(0xE65100), // same amber used for "Polling only — unavailable" elsewhere in the UI
+                "\u26A0" // ⚠
+        );
+        notificationBell.refreshCount();
+    }
+
+    private static String prettyMode(String rawWatchModeName) {
+        return switch (rawWatchModeName) {
+            case "NATIVE_WATCH" -> "live (native watch)";
+            case "REMOTE_PUSH" -> "live (remote push)";
+            case "POLLING_ONLY_UNSUPPORTED" -> "polling only (unsupported)";
+            case "POLLING_ONLY" -> "polling only";
+            default -> rawWatchModeName;
+        };
     }
 
     private Image buildAppIcon() {

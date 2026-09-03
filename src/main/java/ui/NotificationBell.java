@@ -21,6 +21,7 @@ public class NotificationBell extends JButton {
 
     private final XmlStorageService storage;
     private final TaskSchedulerService scheduler;
+    private final WatchStatusMonitor watchStatusMonitor; // nullable-safe; may be null in contexts without one
     private int failedCount = 0;
 
     // Facebook's header bell: a plain outline icon sitting directly on the
@@ -34,8 +35,13 @@ public class NotificationBell extends JButton {
     private boolean hovering = false;
 
     public NotificationBell(XmlStorageService storage, TaskSchedulerService scheduler) {
+        this(storage, scheduler, null);
+    }
+
+    public NotificationBell(XmlStorageService storage, TaskSchedulerService scheduler, WatchStatusMonitor watchStatusMonitor) {
         this.storage = storage;
         this.scheduler = scheduler;
+        this.watchStatusMonitor = watchStatusMonitor;
         setFocusPainted(false);
         setContentAreaFilled(false);
         setBorderPainted(false);
@@ -43,7 +49,7 @@ public class NotificationBell extends JButton {
         setFont(getFont().deriveFont(Font.PLAIN, 18f));
         setText("\uD83D\uDD14"); // 🔔
         setForeground(Color.WHITE); // plain white icon reads clearly on the navy header, Facebook-style
-        setToolTipText("Failed tasks");
+        setToolTipText("Failed tasks & watcher alerts");
         setMargin(new Insets(4, 4, 4, 4));
         addActionListener(e -> showDropdown());
         addMouseListener(new java.awt.event.MouseAdapter() {
@@ -53,7 +59,8 @@ public class NotificationBell extends JButton {
         refreshCount();
     }
 
-    /** Re-reads the current failed/retrying task count from storage and repaints the badge. Cheap — call freely. */
+    /** Re-reads the current failed/retrying task count from storage, plus any
+     *  recent watch-fallback events, and repaints the badge. Cheap — call freely. */
     public void refreshCount() {
         int count = 0;
         for (ScheduledTask t : storage.loadTasks()) {
@@ -61,6 +68,9 @@ public class NotificationBell extends JButton {
                     || t.getStatus() == ScheduledTask.TaskStatus.RETRYING) {
                 count++;
             }
+        }
+        if (watchStatusMonitor != null) {
+            count += watchStatusMonitor.getEventCount();
         }
         this.failedCount = count;
         repaint();
@@ -123,7 +133,7 @@ public class NotificationBell extends JButton {
                 JMenuItem item = new JMenuItem("<html><b>" + escape(t.getName()) + "</b><br>"
                         + "<span style='color:gray;font-size:90%'>" + t.getStatus()
                         + (t.getLastRunAt() != null ? " · " + t.getLastRunAt() : "") + "</span></html>");
-                item.addActionListener(e -> openManageDialog());
+                item.addActionListener(e -> openManageDialog(0));
                 popup.add(item);
             }
         }
@@ -136,18 +146,41 @@ public class NotificationBell extends JButton {
             more.setEnabled(false);
             popup.add(more);
         }
+
+        if (watchStatusMonitor != null && watchStatusMonitor.getEventCount() > 0) {
+            popup.addSeparator();
+            JMenuItem header = new JMenuItem("Watcher push \u2192 polling fallbacks");
+            header.setEnabled(false);
+            header.setFont(header.getFont().deriveFont(Font.BOLD, 11f));
+            popup.add(header);
+            int shownEvents = 0;
+            for (WatchStatusMonitor.Event ev : watchStatusMonitor.getRecentEvents()) {
+                shownEvents++;
+                if (shownEvents > 5) break; // keep the dropdown short; the manage dialog shows the rest
+                JMenuItem item = new JMenuItem("<html><b>" + escape(ev.taskName()) + "</b><br>"
+                        + "<span style='color:gray;font-size:90%'>" + escape(ev.detail()) + "</span></html>");
+                item.addActionListener(e -> openManageDialog(1));
+                popup.add(item);
+            }
+        }
+
         popup.addSeparator();
         JMenuItem manage = new JMenuItem("Manage failures...");
-        manage.addActionListener(e -> openManageDialog());
+        manage.addActionListener(e -> openManageDialog(0));
         popup.add(manage);
 
         popup.show(this, 0, getHeight());
     }
 
     private void openManageDialog() {
+        openManageDialog(0);
+    }
+
+    private void openManageDialog(int initialTab) {
         Window ownerWindow = SwingUtilities.getWindowAncestor(this);
         JDialog dialog = new JDialog(ownerWindow, "Failure Recovery", Dialog.ModalityType.MODELESS);
-        NotificationPanel panel = new NotificationPanel(storage, scheduler);
+        NotificationPanel panel = new NotificationPanel(storage, scheduler, watchStatusMonitor);
+        panel.selectTab(initialTab);
         dialog.getContentPane().add(panel);
         dialog.setSize(900, 600);
         dialog.setLocationRelativeTo(ownerWindow);

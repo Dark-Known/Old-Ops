@@ -35,6 +35,15 @@ public class TaskManagerPanel extends JPanel {
 
     private final XmlStorageService storage;
     private final TaskSchedulerService scheduler;
+    // Same cross-process pattern EventMonitorPanel/MainWindow already use:
+    // the Daemon (if running) is the authoritative scheduler, and it drops
+    // its live state — including, now, per-task watch mode — to this file
+    // every 2s. watchModeTagHtml() prefers a fresh read of this over asking
+    // this process's own (possibly-inactive) scheduler, so the tag reflects
+    // reality regardless of whether the GUI or the Daemon is actually
+    // running the task.
+    private final java.nio.file.Path daemonStatusFile;
+    private static final long DAEMON_STALE_MS = service.queue.SchedulerStatusSnapshot.DEFAULT_STALE_MS;
     private DefaultTableModel tableModel;
     private JTable table;
     private JTextArea logArea;
@@ -66,6 +75,7 @@ public class TaskManagerPanel extends JPanel {
     public TaskManagerPanel(XmlStorageService storage, TaskSchedulerService scheduler) {
         this.storage   = storage;
         this.scheduler = scheduler;
+        this.daemonStatusFile = storage.getDataDir().toPath().resolve("scheduler-status-daemon.dat");
         setLayout(new BorderLayout(8, 8));
         setBorder(new EmptyBorder(10, 10, 10, 10));
         buildUI();
@@ -87,6 +97,17 @@ public class TaskManagerPanel extends JPanel {
         // itself produce a log line at the exact moment the count changes).
         Timer sessionCountTimer = new Timer(500, e -> refreshActiveSessionLabel());
         sessionCountTimer.start();
+
+        // Separate slow timer purely for the "live watch mode" tag in the
+        // watcher fingerprint bar — native-watch/remote-push registration
+        // happens asynchronously on the scheduler's reconcile cadence (~30s
+        // worst case, usually much sooner), so this needs its own tick to
+        // pick that transition up without waiting for the user to reselect
+        // the row or a log line to arrive. 2s is frequent enough to feel
+        // live without adding meaningful load from the storage.loadTasks()
+        // call inside updateWatcherFingerprintBar().
+        Timer watchModeTimer = new Timer(2000, e -> updateWatcherFingerprintBar());
+        watchModeTimer.start();
     }
 
     private void refreshActiveSessionLabel() {
@@ -269,6 +290,28 @@ public class TaskManagerPanel extends JPanel {
             }
         });
 
+        // Clicking directly on a watcher-enabled row pops up its live status
+        // (mode + reason + a manual Reconnect action) — see WatcherInfoPopup.
+        // Non-watcher rows are unaffected; this is purely additive on top of
+        // the existing selection-driven log/fingerprint-bar behavior above.
+        table.addMouseListener(new java.awt.event.MouseAdapter() {
+            @Override public void mouseClicked(java.awt.event.MouseEvent e) {
+                int row = table.rowAtPoint(e.getPoint());
+                if (row < 0 || row >= taskIds.size()) return;
+                String taskId = taskIds.get(row);
+                ScheduledTask task = storage.loadTasks().stream()
+                        .filter(t -> t.getId().equals(taskId))
+                        .findFirst().orElse(null);
+                if (task == null || task.getTaskType() != ScheduledTask.TaskType.FILE_TRANSFER
+                        || !task.isWatcherEnabled()) {
+                    return; // not a watcher task — normal selection/log behavior only
+                }
+                Point screenPoint = new Point(e.getPoint());
+                SwingUtilities.convertPointToScreen(screenPoint, table);
+                WatcherInfoPopup.show(table, screenPoint, task, storage, scheduler);
+            }
+        });
+
         JScrollPane tableScroll = new JScrollPane(table);
         tableScroll.setPreferredSize(new Dimension(900, 220));
 
@@ -418,7 +461,8 @@ public class TaskManagerPanel extends JPanel {
         String html;
         if (epoch <= 0) {
             html = "<html><b style='color:#757575'>Watcher:</b> "
-                    + "<i style='color:#757575'>no baseline stored - first run will always transfer.</i></html>";
+                    + "<i style='color:#757575'>no baseline stored - first run will always transfer.</i>"
+                    + watchModeTagHtml(task) + "</html>";
         } else {
             String dateStr = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
                     .format(new java.util.Date(epoch));
@@ -426,12 +470,12 @@ public class TaskManagerPanel extends JPanel {
                 html = String.format(
                         "<html><b style='color:#E65100'>Watcher baseline:</b> "
                                 + "<i style='color:#E65100'>last seen %s &nbsp;|&nbsp; size: not tracked "
-                                + "(reset baseline to fix)</i></html>", dateStr);
+                                + "(reset baseline to fix)</i>%s</html>", dateStr, watchModeTagHtml(task));
             } else {
                 html = String.format(
                         "<html><b style='color:#2E7D32'>Watcher baseline:</b> "
-                                + "<i style='color:#2E7D32'>last seen %s &nbsp;|&nbsp; size: %,d bytes</i></html>",
-                        dateStr, size);
+                                + "<i style='color:#2E7D32'>last seen %s &nbsp;|&nbsp; size: %,d bytes</i>%s</html>",
+                        dateStr, size, watchModeTagHtml(task));
             }
         }
 
@@ -439,6 +483,79 @@ public class TaskManagerPanel extends JPanel {
         watcherBar.setVisible(true);
         watcherBar.revalidate();
         watcherBar.repaint();
+    }
+
+    /**
+     * Small trailing HTML fragment (no surrounding &lt;html&gt; tags) showing
+     * how this watcher-enabled task is currently being triggered — an instant
+     * OS-level directory watch, an instant remote SSH push, or plain polling
+     * on its configured interval.
+     *
+     * <p>Prefers the headless Daemon's own exported status (same cross-process
+     * file EventMonitorPanel/MainWindow already read) when it's alive and
+     * fresh, since the Daemon — not this GUI process — is the one actually
+     * running the task in the normal "Daemon is primary" setup (see
+     * MainWindow's constructor). Falls back to asking this process's own
+     * scheduler directly, which is correct when the GUI itself is the active
+     * scheduler (Daemon not running) or simply hasn't found the task in the
+     * Daemon's export yet (e.g. right after the Daemon adds a brand-new task,
+     * before its next 2s export tick).
+     */
+    private String watchModeTagHtml(ScheduledTask task) {
+        String label;
+        String color;
+
+        String modeName = readDaemonWatchMode(task.getId());
+        if (modeName != null) {
+            TaskSchedulerService.WatchMode mode;
+            try {
+                mode = TaskSchedulerService.WatchMode.valueOf(modeName);
+            } catch (IllegalArgumentException e) {
+                mode = TaskSchedulerService.WatchMode.NOT_APPLICABLE; // forward-compat: unknown mode name
+            }
+            switch (mode) {
+                case NATIVE_WATCH -> { label = "\u26A1 Live (native watch) \u2022 daemon"; color = "#2E7D32"; }
+                case REMOTE_PUSH -> { label = "\u26A1 Live (remote push) \u2022 daemon"; color = "#2E7D32"; }
+                case POLLING_ONLY_UNSUPPORTED -> {
+                    label = "Polling only \u2014 remote push unavailable on this host \u2022 daemon";
+                    color = "#E65100";
+                }
+                case POLLING_ONLY -> { label = "Polling only \u2022 daemon"; color = "#757575"; }
+                default -> { return ""; }
+            }
+            return "&nbsp;&nbsp;&nbsp;<b style='color:" + color + "'>" + label + "</b>";
+        }
+
+        // No fresh Daemon export mentioning this task — fall back to this
+        // process's own scheduler (correct when the GUI itself is primary).
+        TaskSchedulerService.WatchMode mode = scheduler.getWatchMode(task);
+        switch (mode) {
+            case NATIVE_WATCH -> { label = "\u26A1 Live (native watch)"; color = "#2E7D32"; }
+            case REMOTE_PUSH -> { label = "\u26A1 Live (remote push)"; color = "#2E7D32"; }
+            case POLLING_ONLY_UNSUPPORTED -> {
+                label = "Polling only \u2014 remote push unavailable on this host";
+                color = "#E65100";
+            }
+            case POLLING_ONLY -> { label = "Polling only"; color = "#757575"; }
+            default -> { return ""; }
+        }
+        return "&nbsp;&nbsp;&nbsp;<b style='color:" + color + "'>" + label + "</b>";
+    }
+
+    /**
+     * Returns the raw {@code TaskSchedulerService.WatchMode} name the Daemon
+     * last exported for {@code taskId}, or {@code null} if the Daemon isn't
+     * alive right now, its export is stale, or it doesn't mention this task
+     * (e.g. task isn't watcher-enabled, or was created after its last tick).
+     */
+    private String readDaemonWatchMode(String taskId) {
+        if (!service.queue.SchedulerStatusSnapshot.isAlive(daemonStatusFile, DAEMON_STALE_MS)) return null;
+        service.queue.SchedulerStatusSnapshot snap = service.queue.SchedulerStatusSnapshot.read(daemonStatusFile);
+        if (snap == null) return null;
+        for (service.queue.SchedulerStatusSnapshot.WatchEntry w : snap.getWatchEntries()) {
+            if (w.taskId().equals(taskId)) return w.mode();
+        }
+        return null;
     }
 
     /**

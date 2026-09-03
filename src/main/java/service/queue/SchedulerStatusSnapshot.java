@@ -58,6 +58,23 @@ public final class SchedulerStatusSnapshot {
     public record ActivityEntry(String taskId, int attempt, LocalDateTime startedAt,
                                  LocalDateTime finishedAt, boolean errored, String errorMessage) {}
 
+    /**
+     * One watcher-enabled task's current trigger mode, as exported by
+     * {@code TaskSchedulerService#getWatchStatus}. {@code mode} is the raw
+     * {@code TaskSchedulerService.WatchMode} enum name (e.g.
+     * {@code "NATIVE_WATCH"}, {@code "REMOTE_PUSH"}, {@code "POLLING_ONLY"}) —
+     * kept as a plain string here rather than referencing that enum directly
+     * so this package doesn't need a compile-time dependency on
+     * {@code service.TaskSchedulerService}. {@code detail} is the matching
+     * human-readable reason (e.g. "not yet attempted", "remote host has no
+     * inotifywait installed"), so a reader never has to show a bare mode name
+     * without being able to say why. Only tasks the exporting process
+     * actually considers watcher-eligible are included; a task absent from
+     * this list should be treated as "unknown to that process", not
+     * necessarily "not applicable".
+     */
+    public record WatchEntry(String taskId, String mode, String detail) {}
+
     private final String processLabel;
     private final long pid;
     private final LocalDateTime writtenAt;
@@ -65,9 +82,11 @@ public final class SchedulerStatusSnapshot {
     private final int activeWorkers;
     private final List<PendingEntry> pending;
     private final List<ActivityEntry> activity;
+    private final List<WatchEntry> watchEntries;
 
     private SchedulerStatusSnapshot(String processLabel, long pid, LocalDateTime writtenAt, int poolSize,
-                                     int activeWorkers, List<PendingEntry> pending, List<ActivityEntry> activity) {
+                                     int activeWorkers, List<PendingEntry> pending, List<ActivityEntry> activity,
+                                     List<WatchEntry> watchEntries) {
         this.processLabel = processLabel;
         this.pid = pid;
         this.writtenAt = writtenAt;
@@ -75,6 +94,7 @@ public final class SchedulerStatusSnapshot {
         this.activeWorkers = activeWorkers;
         this.pending = pending;
         this.activity = activity;
+        this.watchEntries = watchEntries;
     }
 
     public String getProcessLabel() { return processLabel; }
@@ -84,6 +104,7 @@ public final class SchedulerStatusSnapshot {
     public int getActiveWorkers() { return activeWorkers; }
     public List<PendingEntry> getPending() { return pending; }
     public List<ActivityEntry> getActivity() { return activity; }
+    public List<WatchEntry> getWatchEntries() { return watchEntries; }
 
     /** Whether this snapshot is fresh enough to trust — i.e. the exporting process is still alive and running. */
     public boolean isFresh(long maxAgeMillis) {
@@ -108,6 +129,7 @@ public final class SchedulerStatusSnapshot {
             int poolSize = 0, active = 0;
             List<PendingEntry> pending = new ArrayList<>();
             List<ActivityEntry> activity = new ArrayList<>();
+            List<WatchEntry> watchEntries = new ArrayList<>();
 
             for (String line : lines) {
                 if (line.isBlank()) continue;
@@ -133,12 +155,17 @@ public final class SchedulerStatusSnapshot {
                                 epochMillisToLocalDateTime(Long.parseLong(parts[4])),
                                 "1".equals(parts[5]), unescape(parts[6])));
                     }
+                    case "W" -> {
+                        if (parts.length < 4) continue;
+                        watchEntries.add(new WatchEntry(unescape(parts[1]), unescape(parts[2]), unescape(parts[3])));
+                    }
                     default -> { /* forward-compatible: ignore unknown record types */ }
                 }
             }
             if (writtenAt == null) return null; // no PROC header line — treat as unusable
             return new SchedulerStatusSnapshot(label, pid, writtenAt, poolSize, active,
-                    Collections.unmodifiableList(pending), Collections.unmodifiableList(activity));
+                    Collections.unmodifiableList(pending), Collections.unmodifiableList(activity),
+                    Collections.unmodifiableList(watchEntries));
         } catch (IOException | NumberFormatException | ArrayIndexOutOfBoundsException e) {
             // Most commonly: caught mid-write by the exporter on the other
             // process. The exporter writes atomically (temp file + move) to
