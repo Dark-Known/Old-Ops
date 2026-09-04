@@ -27,6 +27,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Consumer;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -126,6 +127,21 @@ public class TransferService {
 
     public boolean executeTransfer(ScheduledTask task, Consumer<String> logLine)
             throws WatcherSkipException {
+        return executeTransfer(task, logLine, Collections.emptySet());
+    }
+
+    /**
+     * @param eventFileNames filenames the push-watch layer (LocalWatchManager /
+     *     RemotePushWatcher) actually observed changing for this run, or empty if
+     *     this is an ordinary scheduled/manual run or the watcher only knows
+     *     "something changed" without naming it (e.g. an OVERFLOW event). When
+     *     non-empty and the task is watcher-enabled LATEST_ONLY, {@link
+     *     #executeWatcherTransfer} transfers exactly these named files instead of
+     *     deriving the file list from a directory scan filtered against the stored
+     *     baseline — see that method's javadoc for why that distinction matters.
+     */
+    public boolean executeTransfer(ScheduledTask task, Consumer<String> logLine, Set<String> eventFileNames)
+            throws WatcherSkipException {
 
         Credential target = resolveTargetCredential(task, logLine);
         logTransferPaths(task, target, logLine);
@@ -133,7 +149,7 @@ public class TransferService {
         // ── Watcher path: fires for BOTH directions when LATEST_ONLY + watcher enabled
         if (task.isWatcherEnabled()
                 && task.getTransferMode() == TransferMode.LATEST_ONLY) {
-            return executeWatcherTransfer(task, target, logLine);
+            return executeWatcherTransfer(task, target, logLine, eventFileNames);
         }
 
         // ── Non-watcher remote path ───────────────────────────────────────────
@@ -359,10 +375,23 @@ public class TransferService {
      *
      * <p>In both cases an empty result throws {@link WatcherSkipException}.
      * On success the newest file's epoch and size are persisted.
+     *
+     * <p><b>Event-driven fast path:</b> when {@code eventFileNames} is non-empty
+     * (the push watcher actually named the file(s) it saw change), those exact
+     * files are transferred directly — the baseline "modified after" filter below
+     * is bypassed entirely for them. This matters because that filter is a
+     * dedupe/safety mechanism for the *scan*, not a gate on "did a real event
+     * happen": a stale or clock-skewed baseline can otherwise silently exclude
+     * the very file that just triggered the watch event, which looks from the
+     * outside like "the watcher fired but nothing transferred". If none of the
+     * named files can actually be found in the watch directory (e.g. it was a
+     * transient temp file that's already gone), this falls back to the normal
+     * baseline scan below rather than skipping the run outright.
      */
     private boolean executeWatcherTransfer(ScheduledTask task,
                                            Credential target,
-                                           Consumer<String> logLine)
+                                           Consumer<String> logLine,
+                                           Set<String> eventFileNames)
             throws WatcherSkipException {
 
         boolean isOutbound = task.getTransferDirection() == TransferDirection.OUTBOUND;
@@ -372,13 +401,26 @@ public class TransferService {
                 ? Instant.ofEpochMilli(lastKnownEpochMillis)
                 : Instant.EPOCH;
 
+        boolean eventDriven = eventFileNames != null && !eventFileNames.isEmpty();
         logLine.accept("[INFO] Watcher enabled (LATEST_ONLY, "
                 + (isOutbound ? "OUTBOUND" : "INBOUND")
-                + "). Querying files modified after: " + modifiedAfter
-                + " (epoch=" + lastKnownEpochMillis + ")");
+                + "). " + (eventDriven
+                    ? "Event named " + eventFileNames.size() + " file(s) directly: " + eventFileNames
+                    : "Querying files modified after: " + modifiedAfter + " (epoch=" + lastKnownEpochMillis + ")"));
 
-        List<RemoteFileMetadata> newFiles;
+        List<RemoteFileMetadata> newFiles = null;
 
+        if (eventDriven) {
+            newFiles = resolveEventNamedFiles(task, target, isOutbound, eventFileNames, logLine);
+        }
+
+        if (newFiles != null && newFiles.isEmpty()) {
+            logLine.accept("[INFO] None of the event-named file(s) currently exist in the watch "
+                    + "directory — falling back to a full baseline scan.");
+            newFiles = null;
+        }
+
+        if (newFiles == null) {
         if (isOutbound) {
             // OUTBOUND: always scan the LOCAL source directory
             String watchDir = resolveOutboundWatchDirectory(task);
@@ -454,6 +496,7 @@ public class TransferService {
                 newFiles = latestOnly;
             }
         }
+        }
 
         // ── Skip check ────────────────────────────────────────────────────────
         if (newFiles.isEmpty()) {
@@ -486,7 +529,15 @@ public class TransferService {
         }
 
         // ── Persist new baseline ──────────────────────────────────────────────
-        if (success) {
+        // Guard against the event-driven path (which bypasses the "modified after
+        // baseline" filter above) moving the baseline backward — e.g. a stray
+        // MODIFY event on a file older than what's already been transferred.
+        // The non-event scan path can't hit this: it only ever returns files
+        // already known to be >= baseline, so newest is always >= baseline there too.
+        if (success && newest.lastModified().toEpochMilli() < lastKnownEpochMillis) {
+            logLine.accept("[INFO] Event-named file's timestamp is older than the current baseline "
+                    + "(epoch=" + lastKnownEpochMillis + ") — leaving baseline unchanged.");
+        } else if (success) {
             long newEpoch = newest.lastModified().toEpochMilli();
             long countWithSameTs = newFiles.stream()
                     .filter(f -> f.lastModified().toEpochMilli() == newEpoch)
@@ -507,6 +558,56 @@ public class TransferService {
         }
 
         return success;
+    }
+
+    /**
+     * Resolves {@code names} to their live {@link RemoteFileMetadata} by listing
+     * the watch directory (local for OUTBOUND, SFTP for INBOUND) and keeping only
+     * the entries whose filename the watcher actually named — used by the
+     * event-driven fast path in {@link #executeWatcherTransfer} instead of a
+     * baseline-filtered scan. Deliberately re-lists rather than {@code stat}-ing
+     * each name individually: the existing {@link RemoteFileMetadataService}
+     * implementations only expose "list everything after a cutoff", and calling
+     * that once with {@link Instant#EPOCH} and filtering client-side avoids
+     * needing a new per-file stat method on the SFTP implementation just for
+     * this path. Returns an empty list if none of the named files currently
+     * exist, or {@code null} on a hard connection/listing failure — the caller
+     * treats both the same way (fall back to the ordinary baseline scan below),
+     * in keeping with this class's existing "push is an optimization, the
+     * baseline scan is always the safety net" pattern elsewhere.
+     */
+    private List<RemoteFileMetadata> resolveEventNamedFiles(ScheduledTask task,
+                                                             Credential target,
+                                                             boolean isOutbound,
+                                                             Set<String> names,
+                                                             Consumer<String> logLine) {
+        try {
+            List<RemoteFileMetadata> all;
+            if (isOutbound) {
+                String watchDir = resolveOutboundWatchDirectory(task);
+                all = new LocalFileMetadataService().getFilesModifiedAfter(watchDir, Instant.EPOCH);
+            } else {
+                try (ManagedMetadataService managed = metadataServiceFactory.create(task, target)) {
+                    all = managed.service().getFilesModifiedAfter(managed.watchDirectory(), Instant.EPOCH);
+                }
+            }
+            List<RemoteFileMetadata> matched = all.stream()
+                    .filter(f -> names.contains(f.fileName()))
+                    .collect(Collectors.toList());
+            Set<String> foundNames = matched.stream().map(RemoteFileMetadata::fileName).collect(Collectors.toSet());
+            for (String name : names) {
+                if (!foundNames.contains(name)) {
+                    logLine.accept("[INFO]   (event-named file no longer present, skipping: " + name + ")");
+                }
+            }
+            return matched;
+        } catch (RemoteFileException ex) {
+            logLine.accept("[ERROR] Failed to resolve event-named file(s): " + ex.getMessage());
+            return null;
+        } catch (Exception ex) {
+            logLine.accept("[ERROR] Unexpected error resolving event-named file(s): " + ex.getMessage());
+            return null;
+        }
     }
 
     private void probeWindowsRemotePaths(com.jcraft.jsch.Session session,

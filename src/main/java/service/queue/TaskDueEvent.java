@@ -2,7 +2,9 @@ package service.queue;
 
 import java.time.Duration;
 import java.time.LocalDateTime;
+import java.util.Collections;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.Delayed;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
@@ -33,16 +35,32 @@ public final class TaskDueEvent implements Delayed {
     // is. Defaults to false via the 3-arg constructor for every other caller.
     private final boolean immediate;
     private final long sequence; // tiebreaker for events with identical dueAt, and identity for cancellation
+    // Filenames the push watcher (LocalWatchManager / RemotePushWatcher) actually
+    // observed changing, when it was able to report them — e.g. from a WatchEvent's
+    // context Path, or a streamed inotifywait/FileSystemWatcher line. Empty/null
+    // means "no specific file info" (ordinary poll-schedule publish, an OVERFLOW
+    // event, or a watcher that only knows "something changed"): TransferService
+    // falls back to its normal full baseline scan in that case. When non-empty,
+    // TransferService transfers exactly these named files instead of re-deriving
+    // the file list from a directory scan + baseline filter — see
+    // TransferService#executeWatcherTransfer.
+    private final Set<String> changedFileNames;
 
     public TaskDueEvent(String taskId, LocalDateTime dueAt, int attempt) {
-        this(taskId, dueAt, attempt, false);
+        this(taskId, dueAt, attempt, false, null);
     }
 
     public TaskDueEvent(String taskId, LocalDateTime dueAt, int attempt, boolean immediate) {
+        this(taskId, dueAt, attempt, immediate, null);
+    }
+
+    public TaskDueEvent(String taskId, LocalDateTime dueAt, int attempt, boolean immediate, Set<String> changedFileNames) {
         this.taskId = Objects.requireNonNull(taskId, "taskId");
         this.dueAt = Objects.requireNonNull(dueAt, "dueAt");
         this.attempt = attempt;
         this.immediate = immediate;
+        this.changedFileNames = (changedFileNames == null || changedFileNames.isEmpty())
+                ? Collections.emptySet() : Set.copyOf(changedFileNames);
         this.sequence = SEQ.incrementAndGet();
     }
 
@@ -50,6 +68,8 @@ public final class TaskDueEvent implements Delayed {
     public LocalDateTime getDueAt() { return dueAt; }
     public int getAttempt() { return attempt; }
     public boolean isImmediate() { return immediate; }
+    /** Filenames the watcher actually observed changing, or empty if unknown. Never null. */
+    public Set<String> getChangedFileNames() { return changedFileNames; }
     long getSequence() { return sequence; }
 
     @Override

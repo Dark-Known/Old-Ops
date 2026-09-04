@@ -148,8 +148,8 @@ public class TaskSchedulerService {
      * even on a false alarm (e.g. a temp file that got deleted again) or
      * while the task happens to already be running (onTaskDue no-ops then).
      */
-    private void onWatchWakeup(String taskId) {
-        eventQueue.publish(new TaskDueEvent(taskId, LocalDateTime.now(), 0, true));
+    private void onWatchWakeup(String taskId, java.util.Set<String> changedFileNames) {
+        eventQueue.publish(new TaskDueEvent(taskId, LocalDateTime.now(), 0, true, changedFileNames));
     }
 
     /** How a watcher-enabled task is currently being triggered — for UI display only. */
@@ -793,7 +793,7 @@ public class TaskSchedulerService {
             task.setLastStartedAt(now);
             storage.saveTask(task);
             refreshMetrics(task.getId(), true);
-            executeTask(task);
+            executeTask(task, event.getChangedFileNames());
         }, () -> { /* task deleted since the event was published — nothing to do */ });
     }
 
@@ -865,6 +865,17 @@ public class TaskSchedulerService {
     }
 
     private void executeTask(ScheduledTask task) {
+        executeTask(task, java.util.Collections.emptySet());
+    }
+
+    /**
+     * @param changedFileNames filenames the watch layer actually observed changing
+     *     for this run (empty if this is an ordinary scheduled/manual run, or the
+     *     watcher only knows "something changed" — e.g. an OVERFLOW event). Passed
+     *     straight through to {@link TransferService#executeTransfer(ScheduledTask,
+     *     java.util.function.Consumer, java.util.Set)} — see that method for how it's used.
+     */
+    private void executeTask(ScheduledTask task, java.util.Set<String> changedFileNames) {
         final long startNanos = System.nanoTime();
         final long startCpuNanos = THREAD_BEAN.isCurrentThreadCpuTimeSupported() ? THREAD_BEAN.getCurrentThreadCpuTime() : 0L;
         final LocalDateTime runStartedAt = LocalDateTime.now();
@@ -953,7 +964,7 @@ public class TaskSchedulerService {
             switch (task.getTaskType()) {
                 case FILE_TRANSFER:
                     try {
-                        success = transferService.executeTransfer(task, emitCap);
+                        success = transferService.executeTransfer(task, emitCap, changedFileNames);
                     }
                     catch (TransferService.WatcherSkipException e) {
                         emitCap.accept("[INFO] Inbound watcher skipped transfer: " + e.getMessage());

@@ -6,7 +6,7 @@ import java.io.IOException;
 import java.nio.file.*;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.function.Consumer;
+import java.util.function.BiConsumer;
 import java.util.logging.Logger;
 
 /**
@@ -44,7 +44,9 @@ public class LocalWatchManager {
     private static final long DEFAULT_SETTLE_MILLIS = 3000L;
 
     private final long settleMillis;
-    private final Consumer<String> onSettled; // taskId -> caller wakes the task up
+    // taskId, changedFileNames -> caller wakes the task up and (when non-empty)
+    // transfers exactly those named files instead of re-scanning the directory.
+    private final BiConsumer<String, Set<String>> onSettled;
 
     private WatchService watchService;
     private Thread watchThread;
@@ -65,14 +67,18 @@ public class LocalWatchManager {
     private final Map<String, String> reasonByTaskId = new ConcurrentHashMap<>();
     // Pending debounce timers, keyed by taskId (one outstanding "about to fire" per task)
     private final Map<String, ScheduledFuture<?>> pendingFires = new ConcurrentHashMap<>();
+    // Filenames accumulated for a task's pending fire, merged across every event
+    // that arrives before the debounce settles — e.g. three files dropped within
+    // the same settle window all end up in one fire, all three named.
+    private final Map<String, Set<String>> pendingNamesByTaskId = new ConcurrentHashMap<>();
 
     private volatile boolean running = false;
 
-    public LocalWatchManager(Consumer<String> onSettled) {
+    public LocalWatchManager(BiConsumer<String, Set<String>> onSettled) {
         this(onSettled, DEFAULT_SETTLE_MILLIS);
     }
 
-    public LocalWatchManager(Consumer<String> onSettled, long settleMillis) {
+    public LocalWatchManager(BiConsumer<String, Set<String>> onSettled, long settleMillis) {
         this.onSettled = onSettled;
         this.settleMillis = settleMillis;
     }
@@ -111,6 +117,7 @@ public class LocalWatchManager {
         registeredPathByTaskId.clear();
         reasonByTaskId.clear();
         pendingFires.clear();
+        pendingNamesByTaskId.clear();
     }
 
     /**
@@ -223,6 +230,7 @@ public class LocalWatchManager {
         if (clearReason) reasonByTaskId.remove(taskId);
         ScheduledFuture<?> pending = pendingFires.remove(taskId);
         if (pending != null) pending.cancel(false);
+        pendingNamesByTaskId.remove(taskId);
     }
 
     private void watchLoop() {
@@ -235,13 +243,23 @@ public class LocalWatchManager {
             }
             String taskId = taskIdByKey.get(key);
             if (taskId != null) {
-                // We don't need to inspect individual event kinds/contexts —
-                // any CREATE/MODIFY (or OVERFLOW, which means "too many to
-                // enumerate, something definitely changed") is treated the
-                // same way: wake the task, let its own file-metadata scan
-                // work out exactly what's new.
-                if (!key.pollEvents().isEmpty()) {
-                    scheduleFire(taskId);
+                // Read each event's context Path to get the actual filename that
+                // changed, so the fire can carry "transfer exactly these files"
+                // instead of just "something changed, go rescan the directory".
+                // OVERFLOW carries no context (the OS dropped events because too
+                // many piled up) — we still wake the task, just without a name,
+                // which tells the caller to fall back to a full directory scan.
+                List<WatchEvent<?>> events = key.pollEvents();
+                if (!events.isEmpty()) {
+                    Set<String> names = new HashSet<>();
+                    for (WatchEvent<?> ev : events) {
+                        if (ev.kind() == StandardWatchEventKinds.OVERFLOW) continue;
+                        Object ctx = ev.context();
+                        if (ctx instanceof Path) {
+                            names.add(((Path) ctx).getFileName().toString());
+                        }
+                    }
+                    scheduleFire(taskId, names);
                 }
             }
             boolean valid = key.reset();
@@ -258,17 +276,23 @@ public class LocalWatchManager {
         }
     }
 
-    private void scheduleFire(String taskId) {
+    private void scheduleFire(String taskId, Set<String> names) {
         // Coalesce bursts of events (e.g. many files dropped at once) into a
         // single wake-up, settleMillis after the *last* observed change —
         // avoids hammering the scheduler with one event per file and avoids
-        // racing a file that's still being written.
+        // racing a file that's still being written. Filenames from every event
+        // in the burst are merged, so a debounced fire still names every file
+        // involved, not just the last one.
+        if (!names.isEmpty()) {
+            pendingNamesByTaskId.computeIfAbsent(taskId, k -> ConcurrentHashMap.newKeySet()).addAll(names);
+        }
         ScheduledFuture<?> existing = pendingFires.get(taskId);
         if (existing != null) existing.cancel(false);
         ScheduledFuture<?> fut = debounceExecutor.schedule(() -> {
             pendingFires.remove(taskId);
+            Set<String> fired = pendingNamesByTaskId.remove(taskId);
             try {
-                onSettled.accept(taskId);
+                onSettled.accept(taskId, fired != null ? fired : Collections.emptySet());
             } catch (Exception e) {
                 log.warning("Watcher task " + taskId + ": onSettled callback failed: " + e.getMessage());
             }

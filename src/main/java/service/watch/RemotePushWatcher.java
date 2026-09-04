@@ -14,7 +14,7 @@ import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.function.Consumer;
+import java.util.function.BiConsumer;
 import java.util.logging.Logger;
 
 /**
@@ -73,20 +73,25 @@ public class RemotePushWatcher {
     private static final String UNAVAILABLE_MARKER = "__WATCH_UNAVAILABLE__";
 
     private final XmlStorageService storage;
-    private final Consumer<String> onSettled; // taskId -> wake the task up now
+    // taskId, changedFileNames -> wake the task up now, naming exactly the file(s)
+    // inotifywait/FileSystemWatcher reported.
+    private final BiConsumer<String, Set<String>> onSettled;
 
     private ExecutorService listenerExecutor;
     private ScheduledExecutorService debounceExecutor;
 
     private final Map<String, ListenerHandle> activeByTaskId = new ConcurrentHashMap<>();
     private final Map<String, Long> unsupportedUntil = new ConcurrentHashMap<>();
+    // Filenames accumulated for a task's pending fire, merged across every
+    // streamed line that arrives before the debounce settles.
+    private final Map<String, Set<String>> pendingNamesByTaskId = new ConcurrentHashMap<>();
     // taskId -> a short human-readable reason for the *current* state — "never
     // attempted" vs. "tried and failed, here's why" vs. "connected and
     // listening" are otherwise indistinguishable from the UI's point of view.
     private final Map<String, String> reasonByTaskId = new ConcurrentHashMap<>();
     private volatile boolean running = false;
 
-    public RemotePushWatcher(XmlStorageService storage, Consumer<String> onSettled) {
+    public RemotePushWatcher(XmlStorageService storage, BiConsumer<String, Set<String>> onSettled) {
         this.storage = storage;
         this.onSettled = onSettled;
     }
@@ -115,6 +120,7 @@ public class RemotePushWatcher {
         activeByTaskId.clear();
         if (listenerExecutor != null) listenerExecutor.shutdownNow();
         if (debounceExecutor != null) debounceExecutor.shutdownNow();
+        pendingNamesByTaskId.clear();
     }
 
     /** Same reconcile-driven pattern as {@link LocalWatchManager}: cheap,
@@ -283,9 +289,13 @@ public class RemotePushWatcher {
                     markUnsupported(taskId, reason);
                     break;
                 }
-                // Any filename line = something changed; debounce + wake the task.
+                // Each line IS the changed filename (inotifywait's --format '%f',
+                // or the PowerShell script's $e.SourceEventArgs.Name) — pass it
+                // straight through instead of discarding it, so the transfer step
+                // can fetch exactly this file instead of re-deriving "what's new"
+                // from a baseline-filtered directory scan.
                 reasonByTaskId.put(taskId, "connected (" + os + "), streaming remote change events");
-                scheduleFire(taskId);
+                scheduleFire(taskId, line);
             }
             if (!sawAnyLine && !handle.closed) {
                 // Channel closed with no output at all — most likely exec was
@@ -383,10 +393,17 @@ public class RemotePushWatcher {
         reasonByTaskId.put(taskId, reason);
     }
 
-    private void scheduleFire(String taskId) {
+    private void scheduleFire(String taskId, String fileName) {
+        // Merge filenames across the whole debounce window the same way
+        // LocalWatchManager does, so several rapid remote changes fire once
+        // with every name attached rather than clobbering each other.
+        if (fileName != null && !fileName.isEmpty()) {
+            pendingNamesByTaskId.computeIfAbsent(taskId, k -> ConcurrentHashMap.newKeySet()).add(fileName);
+        }
         debounceExecutor.schedule(() -> {
+            Set<String> fired = pendingNamesByTaskId.remove(taskId);
             try {
-                onSettled.accept(taskId);
+                onSettled.accept(taskId, fired != null ? fired : Collections.emptySet());
             } catch (Exception e) {
                 log.warning("Watcher task " + taskId + ": onSettled callback failed: " + e.getMessage());
             }
