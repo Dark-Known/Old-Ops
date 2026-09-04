@@ -69,7 +69,11 @@ public class RemotePushWatcher {
 
     private static final Logger log = Logger.getLogger(RemotePushWatcher.class.getName());
     private static final long UNSUPPORTED_RETRY_MS = TimeUnit.HOURS.toMillis(1);
-    private static final long SETTLE_MILLIS = 2000L;
+    // Quiet period after the last observed remote change before firing —
+    // same purpose as LocalWatchManager's settle window. Kept short (1.2s,
+    // down from an earlier 2s) so this sits well under the transfer's overall
+    // detected-to-started budget.
+    private static final long SETTLE_MILLIS = 1200L;
     private static final String UNAVAILABLE_MARKER = "__WATCH_UNAVAILABLE__";
 
     private final XmlStorageService storage;

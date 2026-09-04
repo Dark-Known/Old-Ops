@@ -2,6 +2,8 @@ package service;
 
 import model.ScheduledTask.*;
 import model.ScheduledTask;
+import model.ScheduledTask.TaskStatus;
+import model.ScheduledTask.ScheduleType;
 import model.TaskRunRecord;
 import service.TaskLogService;
 import service.queue.TaskDueEvent;
@@ -242,7 +244,7 @@ public class TaskSchedulerService {
      * "Reconnect" action in the UI's watcher-info popup. Re-registers the
      * native directory watch (OUTBOUND) or restarts the remote SSH push
      * listener (INBOUND) right now, rather than waiting for the next
-     * reconcile sweep (up to ~30s) or, for a remote push that was recently
+     * reconcile sweep (up to ~8s) or, for a remote push that was recently
      * marked unsupported, the 1-hour backoff window. Safe to call for any
      * task id — no-ops harmlessly if the task doesn't exist or isn't
      * watcher-eligible (with the reason updated accordingly, visible via
@@ -321,7 +323,7 @@ public class TaskSchedulerService {
     // Populated at the top of every reconcileSchedules() sweep; read by
     // exportStatus() (which runs on its own faster 2s tick) so the "watch
     // mode" line in each status export doesn't need its own storage.loadTasks()
-    // call every 2s — reconcile's 30s-ish cadence is fresh enough for a
+    // call every 2s — reconcile's 8s-ish cadence is fresh enough for a
     // status display, and volatile gives exportStatus a safe, tear-free read
     // of whatever reconcile last saw.
     private volatile List<ScheduledTask> lastLoadedTasks = java.util.Collections.emptyList();
@@ -485,11 +487,16 @@ public class TaskSchedulerService {
         localWatchManager.start();
         remotePushWatcher.start();
         // Reconcile is a self-healing safety net only (new/edited tasks, stale
-        // RUNNING recovery, clock skew) — it is NOT the firing mechanism.
-        // The 30s cadence is deliberately decoupled from pollIntervalSeconds:
-        // it no longer determines how promptly tasks fire, since publish()
-        // schedules each task's own precise TaskDueEvent immediately.
-        scheduler.scheduleAtFixedRate(this::reconcileSchedules, 5, 30, TimeUnit.SECONDS);
+        // RUNNING recovery, clock skew, re-registering a native watch that
+        // silently died) — it is NOT the firing mechanism. The cadence is
+        // deliberately decoupled from pollIntervalSeconds: it no longer
+        // determines how promptly tasks fire, since publish() schedules each
+        // task's own precise TaskDueEvent immediately. Kept short (8s, down
+        // from the previous 30s) purely so that this safety net itself is
+        // never the reason a watcher-detected change takes longer than a few
+        // seconds to actually transfer, even in the fallback cases where
+        // something does have to wait for it.
+        scheduler.scheduleAtFixedRate(this::reconcileSchedules, 5, 8, TimeUnit.SECONDS);
         reconcileSchedules();
         log.info("Task scheduler started (event-driven; " + eventQueue.size() + " task(s) pending).");
     }
@@ -699,7 +706,7 @@ public class TaskSchedulerService {
                 // still ahead of now; bounded loop (max 7 steps) so a bad/
                 // unmatched day name can never spin forever.
                 for (int i = 0; i < 8 && (next.getDayOfWeek() != targetDay || !next.isAfter(now)); i++) {
-                    next = next.plusDays(1).with(target);
+                    next = next.plusDays(1).toLocalDate().atTime(target);
                 }
                 return millisUntil(next, now);
             }
@@ -759,13 +766,16 @@ public class TaskSchedulerService {
             if (event.isImmediate()) {
                 // Push wake-up (LocalWatchManager / RemotePushWatcher saw a
                 // real change) — a file genuinely changed, so this must run
-                // now, not be deferred back to the nominal poll interval.
-                // The only reason to bail here is if the task is no longer
-                // schedulable/watchable at all (e.g. watcher was just
-                // disabled, or the task was edited into an invalid state) —
-                // computeNextFireDelayMs returning null is exactly that
-                // signal, regardless of what delay it would otherwise report.
-                if (computeNextFireDelayMs(task, now) == null) {
+                // now, bypassing the schedule type entirely (RUN_NOW already
+                // having fired once, a ONCE task's window having passed,
+                // DAILY/WEEKLY being outside their configured time, etc. are
+                // all irrelevant here — the watcher observed a live change
+                // and that's reason enough to transfer). The only reason to
+                // bail is if the watcher itself is no longer live for this
+                // task — i.e. it was disabled (or the task deleted/edited
+                // away from FILE_TRANSFER) between the wake-up firing and
+                // this delivery — since only then is the wake-up stale.
+                if (!task.isWatcherEnabled() || task.getTaskType() != ScheduledTask.TaskType.FILE_TRANSFER) {
                     eventQueue.cancel(task.getId());
                     return;
                 }

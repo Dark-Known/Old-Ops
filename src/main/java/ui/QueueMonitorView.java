@@ -8,6 +8,7 @@ import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
+import java.util.function.BiConsumer;
 
 /**
  * Reusable "pending events + recent activity" table pair for one process's
@@ -42,6 +43,13 @@ public class QueueMonitorView extends JPanel {
     private DefaultTableModel activityModel;
     private JTable activityTable;
     private JLabel offlineLabel;
+
+    // Most-recently-rendered activity rows, in the same order as
+    // activityModel's rows — lets the click handler map a clicked table row
+    // straight back to its full ActivityRow (error message included, which
+    // the table itself only shows truncated). See setActivityRowClickListener.
+    private List<ActivityRow> currentActivity = List.of();
+    private BiConsumer<ActivityRow, Point> activityClickListener;
 
     public QueueMonitorView() {
         setLayout(new BorderLayout(8, 8));
@@ -139,6 +147,22 @@ public class QueueMonitorView extends JPanel {
             }
         });
         panel.add(new JScrollPane(activityTable), BorderLayout.CENTER);
+
+        // Click a row to see a small summary popup for that one event (task,
+        // timing, full outcome/error) — same idea as the Logs panel's
+        // double-click-for-details, but a single click here since this is
+        // already a lightweight "just tell me what happened" glance rather
+        // than a big detail dialog. See setActivityRowClickListener.
+        activityTable.addMouseListener(new java.awt.event.MouseAdapter() {
+            @Override public void mouseClicked(java.awt.event.MouseEvent e) {
+                if (activityClickListener == null) return;
+                int viewRow = activityTable.rowAtPoint(e.getPoint());
+                if (viewRow < 0) return;
+                int modelRow = activityTable.convertRowIndexToModel(viewRow);
+                if (modelRow < 0 || modelRow >= currentActivity.size()) return;
+                activityClickListener.accept(currentActivity.get(modelRow), e.getLocationOnScreen());
+            }
+        });
         return panel;
     }
 
@@ -183,6 +207,7 @@ public class QueueMonitorView extends JPanel {
 
         int aSel = activityTable.getSelectedRow();
         activityModel.setRowCount(0);
+        currentActivity = activity;
         for (ActivityRow row : activity) {
             Duration d = Duration.between(row.startedAt(), row.finishedAt());
             String outcome = row.errored() ? "ERROR: " + shorten(row.errorMessage(), 60) : "OK";
@@ -195,6 +220,17 @@ public class QueueMonitorView extends JPanel {
             });
         }
         if (aSel >= 0 && aSel < activityModel.getRowCount()) activityTable.setRowSelectionInterval(aSel, aSel);
+    }
+
+    /**
+     * Registers a callback fired when the operator clicks a row in the
+     * Recent Activity table — passed the full {@link ActivityRow} (including
+     * the untruncated error message) and the click's screen location, so the
+     * caller can anchor a small detail popup right there. See
+     * {@link EventMonitorPanel} for the popup itself.
+     */
+    public void setActivityRowClickListener(BiConsumer<ActivityRow, Point> listener) {
+        this.activityClickListener = listener;
     }
 
     static String formatCountdown(LocalDateTime dueAt, LocalDateTime now) {

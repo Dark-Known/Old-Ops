@@ -40,8 +40,11 @@ public class LocalWatchManager {
     private static final Logger log = Logger.getLogger(LocalWatchManager.class.getName());
 
     /** Default quiet period after the last observed change before treating a
-     * file as "settled" and safe to transfer — avoids racing an in-progress write. */
-    private static final long DEFAULT_SETTLE_MILLIS = 3000L;
+     * file as "settled" and safe to transfer — avoids racing an in-progress
+     * write. Kept short (1.5s, down from an earlier 3s) since most local
+     * filesystem writes complete well within that window and this delay sits
+     * directly on the "change detected" → "transfer starts" critical path. */
+    private static final long DEFAULT_SETTLE_MILLIS = 1500L;
 
     private final long settleMillis;
     // taskId, changedFileNames -> caller wakes the task up and (when non-empty)

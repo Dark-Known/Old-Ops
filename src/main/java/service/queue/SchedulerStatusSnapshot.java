@@ -75,6 +75,12 @@ public final class SchedulerStatusSnapshot {
      */
     public record WatchEntry(String taskId, String mode, String detail) {}
 
+    /** One observed push wake-up (a discrete "watch fired" event, not
+     *  current state — see {@link WatchEntry} for that). Exported so the
+     *  GUI's Event Monitor can stream the Daemon's own watch fires, not just
+     *  its own in-process ones. */
+    public record FireEntry(String taskId, LocalDateTime firedAt) {}
+
     private final String processLabel;
     private final long pid;
     private final LocalDateTime writtenAt;
@@ -83,10 +89,11 @@ public final class SchedulerStatusSnapshot {
     private final List<PendingEntry> pending;
     private final List<ActivityEntry> activity;
     private final List<WatchEntry> watchEntries;
+    private final List<FireEntry> fireEntries;
 
     private SchedulerStatusSnapshot(String processLabel, long pid, LocalDateTime writtenAt, int poolSize,
                                      int activeWorkers, List<PendingEntry> pending, List<ActivityEntry> activity,
-                                     List<WatchEntry> watchEntries) {
+                                     List<WatchEntry> watchEntries, List<FireEntry> fireEntries) {
         this.processLabel = processLabel;
         this.pid = pid;
         this.writtenAt = writtenAt;
@@ -95,6 +102,7 @@ public final class SchedulerStatusSnapshot {
         this.pending = pending;
         this.activity = activity;
         this.watchEntries = watchEntries;
+        this.fireEntries = fireEntries;
     }
 
     public String getProcessLabel() { return processLabel; }
@@ -105,6 +113,7 @@ public final class SchedulerStatusSnapshot {
     public List<PendingEntry> getPending() { return pending; }
     public List<ActivityEntry> getActivity() { return activity; }
     public List<WatchEntry> getWatchEntries() { return watchEntries; }
+    public List<FireEntry> getFireEntries() { return fireEntries; }
 
     /** Whether this snapshot is fresh enough to trust — i.e. the exporting process is still alive and running. */
     public boolean isFresh(long maxAgeMillis) {
@@ -130,6 +139,7 @@ public final class SchedulerStatusSnapshot {
             List<PendingEntry> pending = new ArrayList<>();
             List<ActivityEntry> activity = new ArrayList<>();
             List<WatchEntry> watchEntries = new ArrayList<>();
+            List<FireEntry> fireEntries = new ArrayList<>();
 
             for (String line : lines) {
                 if (line.isBlank()) continue;
@@ -159,13 +169,17 @@ public final class SchedulerStatusSnapshot {
                         if (parts.length < 4) continue;
                         watchEntries.add(new WatchEntry(unescape(parts[1]), unescape(parts[2]), unescape(parts[3])));
                     }
+                    case "F" -> {
+                        if (parts.length < 3) continue;
+                        fireEntries.add(new FireEntry(unescape(parts[1]), epochMillisToLocalDateTime(Long.parseLong(parts[2]))));
+                    }
                     default -> { /* forward-compatible: ignore unknown record types */ }
                 }
             }
             if (writtenAt == null) return null; // no PROC header line — treat as unusable
             return new SchedulerStatusSnapshot(label, pid, writtenAt, poolSize, active,
                     Collections.unmodifiableList(pending), Collections.unmodifiableList(activity),
-                    Collections.unmodifiableList(watchEntries));
+                    Collections.unmodifiableList(watchEntries), Collections.unmodifiableList(fireEntries));
         } catch (IOException | NumberFormatException | ArrayIndexOutOfBoundsException e) {
             // Most commonly: caught mid-write by the exporter on the other
             // process. The exporter writes atomically (temp file + move) to

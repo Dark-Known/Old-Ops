@@ -44,7 +44,8 @@ public final class SchedulerStatusExporter {
     /** Writes the current snapshot. Safe to call from any thread; never throws. */
     public void export(int poolSize, int activeWorkers, List<TaskDueEvent> pending,
                         List<TaskWorkerPool.ActivityEntry> activity,
-                        List<SchedulerStatusSnapshot.WatchEntry> watchEntries) {
+                        List<SchedulerStatusSnapshot.WatchEntry> watchEntries,
+                        List<SchedulerStatusSnapshot.FireEntry> fireEntries) {
         try {
             StringBuilder sb = new StringBuilder(512);
             sb.append("PROC|").append(SchedulerStatusSnapshot.escape(processLabel)).append('|')
@@ -70,6 +71,10 @@ public final class SchedulerStatusExporter {
                 sb.append("W|").append(SchedulerStatusSnapshot.escape(w.taskId())).append('|')
                         .append(SchedulerStatusSnapshot.escape(w.mode())).append('|')
                         .append(SchedulerStatusSnapshot.escape(w.detail())).append('\n');
+            }
+            for (SchedulerStatusSnapshot.FireEntry f : fireEntries) {
+                sb.append("F|").append(SchedulerStatusSnapshot.escape(f.taskId())).append('|')
+                        .append(toEpochMillis(f.firedAt())).append('\n');
             }
 
             Path dir = targetFile.toAbsolutePath().getParent();
