@@ -149,7 +149,7 @@ public class TaskSchedulerService {
      * while the task happens to already be running (onTaskDue no-ops then).
      */
     private void onWatchWakeup(String taskId) {
-        eventQueue.publish(new TaskDueEvent(taskId, LocalDateTime.now(), 0));
+        eventQueue.publish(new TaskDueEvent(taskId, LocalDateTime.now(), 0, true));
     }
 
     /** How a watcher-enabled task is currently being triggered — for UI display only. */
@@ -756,23 +756,38 @@ public class TaskSchedulerService {
                     || task.getStatus() == TaskStatus.RUNNING) {
                 return; // reconcile sweep will pick it back up if it becomes eligible again
             }
-            // Re-validate against freshly computed state rather than the old
-            // strict "current minute" isDue() check: an event is delivered
-            // essentially exactly at its target instant, but a saturated
-            // worker pool could hand it to a thread a little late. A tight
-            // exact-minute match (fine for a 60s poll tick) would then wrongly
-            // treat a DAILY/WEEKLY task as "missed" and skip a whole day/week.
-            // DUE_TOLERANCE_MS absorbs that scheduling jitter; anything beyond
-            // it really does mean the task was edited/cancelled meanwhile, so
-            // we re-arm against the fresh config instead of firing stale.
-            Long freshDelayMs = computeNextFireDelayMs(task, now);
-            if (freshDelayMs == null) {
-                eventQueue.cancel(task.getId());
-                return;
-            }
-            if (freshDelayMs > DUE_TOLERANCE_MS) {
-                publishNextOccurrence(task, now);
-                return;
+            if (event.isImmediate()) {
+                // Push wake-up (LocalWatchManager / RemotePushWatcher saw a
+                // real change) — a file genuinely changed, so this must run
+                // now, not be deferred back to the nominal poll interval.
+                // The only reason to bail here is if the task is no longer
+                // schedulable/watchable at all (e.g. watcher was just
+                // disabled, or the task was edited into an invalid state) —
+                // computeNextFireDelayMs returning null is exactly that
+                // signal, regardless of what delay it would otherwise report.
+                if (computeNextFireDelayMs(task, now) == null) {
+                    eventQueue.cancel(task.getId());
+                    return;
+                }
+            } else {
+                // Re-validate against freshly computed state rather than the old
+                // strict "current minute" isDue() check: an event is delivered
+                // essentially exactly at its target instant, but a saturated
+                // worker pool could hand it to a thread a little late. A tight
+                // exact-minute match (fine for a 60s poll tick) would then wrongly
+                // treat a DAILY/WEEKLY task as "missed" and skip a whole day/week.
+                // DUE_TOLERANCE_MS absorbs that scheduling jitter; anything beyond
+                // it really does mean the task was edited/cancelled meanwhile, so
+                // we re-arm against the fresh config instead of firing stale.
+                Long freshDelayMs = computeNextFireDelayMs(task, now);
+                if (freshDelayMs == null) {
+                    eventQueue.cancel(task.getId());
+                    return;
+                }
+                if (freshDelayMs > DUE_TOLERANCE_MS) {
+                    publishNextOccurrence(task, now);
+                    return;
+                }
             }
             task.setStatus(TaskStatus.RUNNING);
             task.setLastStartedAt(now);

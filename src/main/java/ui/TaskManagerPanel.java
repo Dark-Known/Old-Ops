@@ -239,7 +239,8 @@ public class TaskManagerPanel extends JPanel {
         // ── Table ─────────────────────────────────────────────────────────────
         String[] cols = {
             "Name", "Type", "Direction", "Mode", "Status",
-            "Schedule", "Last Run", "Next Run", "Last Result"
+            "Schedule", "Last Run", "Next Run", "Last Result",
+            "Watch Status", "Watch Detail"
         };
         tableModel = new DefaultTableModel(cols, 0) {
             public boolean isCellEditable(int r, int c) { return false; }
@@ -282,6 +283,8 @@ public class TaskManagerPanel extends JPanel {
         table.getColumnModel().getColumn(6).setPreferredWidth(115); // Last Run
         table.getColumnModel().getColumn(7).setPreferredWidth(115); // Next Run
         table.getColumnModel().getColumn(8).setPreferredWidth(85);  // Last Result
+        table.getColumnModel().getColumn(9).setPreferredWidth(150); // Watch Status
+        table.getColumnModel().getColumn(10).setPreferredWidth(260); // Watch Detail
 
         table.getSelectionModel().addListSelectionListener(e -> {
             if (!e.getValueIsAdjusting()) {
@@ -650,6 +653,20 @@ public class TaskManagerPanel extends JPanel {
 
         List<ScheduledTask> tasks = storage.loadTasks();
 
+        // Read the Daemon's exported watch state once per refresh (not once
+        // per row) — same cross-process preference the fingerprint bar and
+        // WatcherInfoPopup already use, just batched here since this loop
+        // may touch many watcher-enabled rows at once.
+        Map<String, service.queue.SchedulerStatusSnapshot.WatchEntry> daemonWatchEntries = new HashMap<>();
+        if (service.queue.SchedulerStatusSnapshot.isAlive(daemonStatusFile, DAEMON_STALE_MS)) {
+            service.queue.SchedulerStatusSnapshot snap = service.queue.SchedulerStatusSnapshot.read(daemonStatusFile);
+            if (snap != null) {
+                for (service.queue.SchedulerStatusSnapshot.WatchEntry w : snap.getWatchEntries()) {
+                    daemonWatchEntries.put(w.taskId(), w);
+                }
+            }
+        }
+
         for (ScheduledTask t : tasks) {
             String schedDesc  = buildScheduleDescription(t);
             String lastResult = t.getLastRunResult() != null ? t.getLastRunResult() : "";
@@ -664,16 +681,54 @@ public class TaskManagerPanel extends JPanel {
                 ? (t.getTransferMode() != null ? t.getTransferMode().name() : "")
                 : "";
 
+            // Watch status: prefer the Daemon's live cross-process reading,
+            // fall back to this process's own scheduler when the Daemon
+            // hasn't mentioned this task (not alive, or task too new).
+            String watchMode = "NOT_APPLICABLE";
+            String watchDetail = "";
+            if (t.getTaskType() == TaskType.FILE_TRANSFER && t.isWatcherEnabled()) {
+                service.queue.SchedulerStatusSnapshot.WatchEntry daemonEntry = daemonWatchEntries.get(t.getId());
+                if (daemonEntry != null) {
+                    watchMode = daemonEntry.mode();
+                    watchDetail = daemonEntry.detail();
+                } else {
+                    TaskSchedulerService.WatchStatus s = scheduler.getWatchStatus(t);
+                    watchMode = s.mode().name();
+                    watchDetail = s.detail();
+                }
+            }
+            boolean watcherLive = watchMode.equals("NATIVE_WATCH") || watchMode.equals("REMOTE_PUSH");
+
+            // Schedule / Next Run only mean something while polling is what's
+            // actually driving the task — while push is live, that column
+            // would just show a stale/misleading interval nobody's using, so
+            // it's replaced with a short marker. The moment a watcher task
+            // falls back to polling (or was never eligible for push), these
+            // columns go back to showing the real schedule, because at that
+            // point the schedule genuinely is what's driving execution again.
+            String scheduleCell = watcherLive ? "\u2014 (watcher-driven)" : schedDesc;
+            String nextRunCell  = watcherLive ? "\u2014" : calculateNextRun(t);
+
+            String watchStatusCell = switch (watchMode) {
+                case "NATIVE_WATCH" -> "\u26A1 Live (native watch)";
+                case "REMOTE_PUSH" -> "\u26A1 Live (remote push)";
+                case "POLLING_ONLY_UNSUPPORTED" -> "Polling \u2014 unsupported";
+                case "POLLING_ONLY" -> "Polling only";
+                default -> "";
+            };
+
             tableModel.addRow(new Object[]{
                 t.getName(),
                 t.getTaskType().name().replace("_", " "),
                 directionCell,
                 modeCell,
                 t.getStatus().name(),
-                schedDesc,
+                scheduleCell,
                 t.getLastRunAt() != null ? t.getLastRunAt().format(DT) : "Never",
-                calculateNextRun(t),
-                displayResult
+                nextRunCell,
+                displayResult,
+                watchStatusCell,
+                watchDetail
             });
             taskIds.add(t.getId());
         }

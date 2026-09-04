@@ -261,9 +261,23 @@ public class RemotePushWatcher {
                 if (line.isEmpty()) continue;
                 sawAnyLine = true;
                 if (line.contains(UNAVAILABLE_MARKER)) {
-                    String reason = os == RemoteOs.WINDOWS
-                            ? "remote PowerShell couldn't watch the path (missing/inaccessible, or exec refused)"
-                            : "remote host has no inotifywait installed (or exec was refused)";
+                    // Windows side now appends ":<real PS error text>" after the
+                    // marker (path-not-found message, or $_.Exception.Message
+                    // from the catch block) — surface that instead of guessing,
+                    // so "why is this unsupported" has a real answer instead of
+                    // a generic "missing/inaccessible, or exec refused".
+                    int markerIdx = line.indexOf(UNAVAILABLE_MARKER);
+                    String extra = line.substring(markerIdx + UNAVAILABLE_MARKER.length());
+                    if (extra.startsWith(":")) extra = extra.substring(1);
+                    extra = extra.trim();
+                    String reason;
+                    if (os == RemoteOs.WINDOWS) {
+                        reason = extra.isEmpty()
+                                ? "remote PowerShell couldn't watch the path (missing/inaccessible, or exec refused)"
+                                : "remote PowerShell reported: " + extra;
+                    } else {
+                        reason = "remote host has no inotifywait installed (or exec was refused)";
+                    }
                     log.info("Watcher task " + taskId + ": " + reason + "; falling back to scheduled polling only for "
                             + (UNSUPPORTED_RETRY_MS / 60000) + " min.");
                     markUnsupported(taskId, reason);
@@ -322,6 +336,15 @@ public class RemotePushWatcher {
      * <p>The script watches for Created/Changed/Renamed and prints just the
      * changed file's name per event — the Java side treats any line the
      * same way it treats an inotifywait line: "something changed, go check."
+     *
+     * <p>{@code Wait-Event}'s {@code -SourceIdentifier} parameter only
+     * accepts a single string, not an array — passing it a comma-separated
+     * list of our three subscription names throws
+     * "Cannot convert 'System.Object[]' to the type 'System.String'".
+     * Calling {@code Wait-Event} with no filter at all is the correct fix:
+     * it waits for the next event from *any* registered subscription in this
+     * session, which is exactly the three Created/Changed/Renamed
+     * registrations above (nothing else is registered in this script).
      */
     private String buildWindowsCommand(String rawTargetPath) {
         String dir = normalizeWindowsPath(rawTargetPath);
@@ -330,7 +353,7 @@ public class RemotePushWatcher {
                 "try {\n" +
                 "  $p = '" + psQuoteSingle(dir) + "'\n" +
                 "  if (-not (Test-Path -LiteralPath $p -PathType Container)) {\n" +
-                "    Write-Output '" + UNAVAILABLE_MARKER + "'\n" +
+                "    Write-Output ('" + UNAVAILABLE_MARKER + ":path not found or not a directory: ' + $p)\n" +
                 "    exit\n" +
                 "  }\n" +
                 "  $w = New-Object System.IO.FileSystemWatcher $p\n" +
@@ -340,12 +363,12 @@ public class RemotePushWatcher {
                 "  Register-ObjectEvent -InputObject $w -EventName Changed -SourceIdentifier PushChange | Out-Null\n" +
                 "  Register-ObjectEvent -InputObject $w -EventName Renamed -SourceIdentifier PushRename | Out-Null\n" +
                 "  while ($true) {\n" +
-                "    $e = Wait-Event -SourceIdentifier PushCreate,PushChange,PushRename\n" +
+                "    $e = Wait-Event\n" +
                 "    Write-Output $e.SourceEventArgs.Name\n" +
                 "    Remove-Event -EventIdentifier $e.EventIdentifier\n" +
                 "  }\n" +
                 "} catch {\n" +
-                "  Write-Output '" + UNAVAILABLE_MARKER + "'\n" +
+                "  Write-Output ('" + UNAVAILABLE_MARKER + ":' + $_.Exception.Message)\n" +
                 "}\n";
 
         String encoded = Base64.getEncoder().encodeToString(script.getBytes(StandardCharsets.UTF_16LE));
@@ -408,10 +431,29 @@ public class RemotePushWatcher {
     /** Native Windows-style path (backslashes, drive letter as-is — NOT the
      *  SFTP-subsystem "/C:/..." form the Linux/SFTP paths use) for the
      *  PowerShell branch, since this runs as a plain shell command, not
-     *  through the sftp subsystem. */
+     *  through the sftp subsystem.
+     *
+     *  <p>Critically, {@code task.getTargetPath()} is very likely already in
+     *  that SFTP-subsystem form — the "Browse..." button in the task dialog
+     *  goes through {@code SftpBrowseService}, which talks to the remote
+     *  over the sftp subsystem, and Win32-OpenSSH's sftp-server represents
+     *  Windows paths with a leading slash before the drive letter
+     *  ("/C:/Daily Changes"), matching what
+     *  {@code RemoteFileMetadataServiceFactory} already normalizes to for
+     *  real transfers. A plain PowerShell command isn't going through the
+     *  sftp subsystem, so that leading slash has to come back off first —
+     *  otherwise "/C:/Daily Changes" becomes the invalid "\C:\Daily Changes"
+     *  after the slash-to-backslash conversion below, {@code Test-Path}
+     *  correctly reports it doesn't exist, and every single Windows INBOUND
+     *  watcher task ends up POLLING_ONLY_UNSUPPORTED regardless of whether
+     *  the directory is real. */
     private static String normalizeWindowsPath(String path) {
         if (path == null) return "";
-        String normalized = path.trim().replace("/", "\\").replaceAll("\\\\+", "\\\\");
+        String normalized = path.trim();
+        if (normalized.matches("^/[A-Za-z]:(/.*)?$")) {
+            normalized = normalized.substring(1); // drop the sftp-subsystem leading slash
+        }
+        normalized = normalized.replace("/", "\\").replaceAll("\\\\+", "\\\\");
         if (normalized.endsWith("*")) {
             int idx = normalized.lastIndexOf('\\');
             normalized = idx >= 0 ? normalized.substring(0, idx) : normalized;

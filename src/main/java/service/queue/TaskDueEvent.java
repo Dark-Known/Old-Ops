@@ -24,18 +24,32 @@ public final class TaskDueEvent implements Delayed {
     private final String taskId;
     private final LocalDateTime dueAt;
     private final int attempt;   // 0 = normal scheduled occurrence, >0 = retry attempt N
+    // True for events published by a push wake-up (LocalWatchManager /
+    // RemotePushWatcher observed a real filesystem/remote change) rather
+    // than the normal poll-schedule publisher. See onTaskDue's use of this:
+    // a push wake-up must actually run the task now — a file genuinely
+    // changed — rather than being re-validated against "is this due per the
+    // nominal poll interval yet?" the way an ordinary scheduled occurrence
+    // is. Defaults to false via the 3-arg constructor for every other caller.
+    private final boolean immediate;
     private final long sequence; // tiebreaker for events with identical dueAt, and identity for cancellation
 
     public TaskDueEvent(String taskId, LocalDateTime dueAt, int attempt) {
+        this(taskId, dueAt, attempt, false);
+    }
+
+    public TaskDueEvent(String taskId, LocalDateTime dueAt, int attempt, boolean immediate) {
         this.taskId = Objects.requireNonNull(taskId, "taskId");
         this.dueAt = Objects.requireNonNull(dueAt, "dueAt");
         this.attempt = attempt;
+        this.immediate = immediate;
         this.sequence = SEQ.incrementAndGet();
     }
 
     public String getTaskId() { return taskId; }
     public LocalDateTime getDueAt() { return dueAt; }
     public int getAttempt() { return attempt; }
+    public boolean isImmediate() { return immediate; }
     long getSequence() { return sequence; }
 
     @Override
