@@ -1,5 +1,6 @@
 package service;
 
+import com.jcraft.jsch.ChannelSftp;
 import model.Credential;
 import model.RemoteFileException;
 import model.RemoteFileMetadata;
@@ -7,6 +8,7 @@ import model.ScheduledTask;
 import model.ScheduledTask.TransferDirection;
 import model.ScheduledTask.TransferMode;
 import service.RemoteFileMetadataServiceFactory.ManagedMetadataService;
+import service.watch.PersistentSftpConnectionManager;
 import util.MailFetchMode;
 import util.MiniJson;
 import util.AppConfig;
@@ -88,6 +90,12 @@ public class TransferService {
     // per concurrently-running batch).
     private final ConcurrentMap<String, java.util.Set<Process>> activeProcesses = new ConcurrentHashMap<>();
 
+    // Kept-warm SFTP connections for watcher-triggered (LATEST_ONLY + watcher
+    // enabled) transfers only — see class javadoc on that path. Every other
+    // transfer mode still goes through WinSCP.com via runBatchedWinScpCommands,
+    // since those aren't on the "instant detection" latency-critical path.
+    private final PersistentSftpConnectionManager persistentSftp = new PersistentSftpConnectionManager();
+
     public TransferService(XmlStorageService storage) {
         this.storage                = storage;
         this.metadataServiceFactory = new RemoteFileMetadataServiceFactory(storage);
@@ -104,6 +112,13 @@ public class TransferService {
 
     public void   setWinScpPath(String path) { this.winScpPath = path; }
     public String getWinScpPath()            { return winScpPath; }
+
+    /** Closes and forgets any kept-warm watcher SFTP connection for this task —
+     *  call when a task is deleted, disabled, or its target credential changes. */
+    public void closeWatcherConnection(String taskId) { persistentSftp.close(taskId); }
+
+    /** Closes every kept-warm watcher SFTP connection — call on scheduler/app shutdown. */
+    public void shutdownWatcherConnections() { persistentSftp.shutdown(); }
 
     private String detectWinScp() {
         for (String p : WINSCP_PATHS) {
@@ -457,31 +472,37 @@ public class TransferService {
             }
 
         } else {
-            // INBOUND: scan the remote source directory over SFTP
-            try (ManagedMetadataService managed =
-                         metadataServiceFactory.create(task, target)) {
-
-                String watchDir = managed.watchDirectory();
-                logLine.accept("[INFO] Metadata service: SFTP | watch directory: " + watchDir);
+            // INBOUND: scan the remote source directory over SFTP, reusing the
+            // same kept-warm connection the transfer itself will use (see
+            // executeWinScpWatcherInbound / PersistentSftpConnectionManager)
+            // instead of opening-and-closing a brand-new SSH session just for
+            // this listing on every single watcher fire.
+            try {
+                ChannelSftp channel = persistentSftp.getChannel(task.getId(), target);
+                RemoteFileMetadataService svc = new SftpRemoteFileMetadataService(channel);
+                String watchDir = resolveRemoteWatchDirectoryFor(task);
+                logLine.accept("[INFO] Metadata service: SFTP (kept-warm connection) | watch directory: " + watchDir);
 
                 if (lastKnownEpochMillis > 0 && task.getLastKnownRemoteFileSize() >= 0) {
                     Instant modifiedAfterInclusive = Instant.ofEpochMilli(lastKnownEpochMillis - 1);
                     List<RemoteFileMetadata> candidates =
-                            managed.service().getFilesModifiedAfter(watchDir, modifiedAfterInclusive);
+                            svc.getFilesModifiedAfter(watchDir, modifiedAfterInclusive);
                     long baselineSize = task.getLastKnownRemoteFileSize();
                     newFiles = candidates.stream()
                             .filter(f -> f.lastModified().isAfter(modifiedAfter)
                                     || (f.lastModified().equals(modifiedAfter) && f.size() != baselineSize))
                             .collect(Collectors.toList());
                 } else {
-                    newFiles = managed.service().getFilesModifiedAfter(watchDir, modifiedAfter);
+                    newFiles = svc.getFilesModifiedAfter(watchDir, modifiedAfter);
                 }
 
             } catch (RemoteFileException ex) {
                 logLine.accept("[ERROR] Failed to query file metadata: " + ex.getMessage());
+                persistentSftp.close(task.getId());
                 return false;
             } catch (Exception ex) {
                 logLine.accept("[ERROR] Unexpected error opening metadata service: " + ex.getMessage());
+                persistentSftp.close(task.getId());
                 return false;
             }
 
@@ -587,9 +608,9 @@ public class TransferService {
                 String watchDir = resolveOutboundWatchDirectory(task);
                 all = new LocalFileMetadataService().getFilesModifiedAfter(watchDir, Instant.EPOCH);
             } else {
-                try (ManagedMetadataService managed = metadataServiceFactory.create(task, target)) {
-                    all = managed.service().getFilesModifiedAfter(managed.watchDirectory(), Instant.EPOCH);
-                }
+                ChannelSftp channel = persistentSftp.getChannel(task.getId(), target);
+                RemoteFileMetadataService svc = new SftpRemoteFileMetadataService(channel);
+                all = svc.getFilesModifiedAfter(resolveRemoteWatchDirectoryFor(task), Instant.EPOCH);
             }
             List<RemoteFileMetadata> matched = all.stream()
                     .filter(f -> names.contains(f.fileName()))
@@ -603,9 +624,11 @@ public class TransferService {
             return matched;
         } catch (RemoteFileException ex) {
             logLine.accept("[ERROR] Failed to resolve event-named file(s): " + ex.getMessage());
+            if (!isOutbound) persistentSftp.close(task.getId());
             return null;
         } catch (Exception ex) {
             logLine.accept("[ERROR] Unexpected error resolving event-named file(s): " + ex.getMessage());
+            if (!isOutbound) persistentSftp.close(task.getId());
             return null;
         }
     }
@@ -660,8 +683,106 @@ public class TransferService {
         return path;
     }
 
+    /**
+     * Remote watch directory for an INBOUND task — mirrors
+     * {@code RemoteFileMetadataServiceFactory#resolveRemoteWatchDirectory},
+     * duplicated locally so the persistent-connection watcher path
+     * (which bypasses that factory entirely, see {@link #executeWatcherTransfer})
+     * doesn't need to depend on it.
+     */
+    private String resolveRemoteWatchDirectoryFor(ScheduledTask task) {
+        String path = normalizeRemotePath(task.getTargetPath());
+        if (path.isEmpty()) return "/";
+        if (path.endsWith("*")) {
+            path = path.substring(0, path.lastIndexOf('/') + 1);
+        } else if (!path.endsWith("/")) {
+            int lastSlash = path.lastIndexOf('/');
+            if (lastSlash >= 0 && path.substring(lastSlash + 1).contains(".")) {
+                path = path.substring(0, lastSlash + 1);
+            } else {
+                path = path + "/";
+            }
+        }
+        return path;
+    }
+
     // ─── WinSCP outbound watcher transfer ────────────────────────────────────
 
+    /**
+     * A single file's transfer over an already-open {@link ChannelSftp} —
+     * the unit of work {@link #transferFilesConcurrently} spreads across
+     * however many worker threads/channel slots a given fire warrants.
+     * Returns bytes transferred (for the running total).
+     */
+    @FunctionalInterface
+    private interface PerFileTransfer {
+        long transfer(ChannelSftp channel, RemoteFileMetadata meta) throws Exception;
+    }
+
+    /**
+     * Transfers {@code files} using {@code op}, spreading them across up to
+     * {@link util.AppSettings#getTransferBatchConcurrency()} concurrent SFTP
+     * channel slots on the task's single kept-warm session (see
+     * {@link PersistentSftpConnectionManager}'s class javadoc) instead of one
+     * file at a time on one thread. A fire naming only one or two files (the
+     * common case) never spins up more than slot 0 — extra worker threads are
+     * only used, on the same session, when a burst actually has enough files
+     * queued up to benefit from it.
+     */
+    private long transferFilesConcurrently(ScheduledTask task, Credential target, List<RemoteFileMetadata> files,
+                                            Consumer<String> logLine, PerFileTransfer op) throws Exception {
+        int concurrency = Math.max(1, Math.min(AppSettings.getTransferBatchConcurrency(), files.size()));
+
+        if (concurrency <= 1) {
+            ChannelSftp channel = persistentSftp.getChannel(task.getId(), target);
+            long bytes = 0L;
+            for (RemoteFileMetadata meta : files) bytes += op.transfer(channel, meta);
+            return bytes;
+        }
+
+        logLine.accept("[INFO] " + files.size() + " file(s) in this fire — using " + concurrency
+                + " worker thread(s) on the same SFTP session to transfer them concurrently.");
+
+        List<List<RemoteFileMetadata>> chunks = new ArrayList<>();
+        for (int i = 0; i < concurrency; i++) chunks.add(new ArrayList<>());
+        for (int i = 0; i < files.size(); i++) chunks.get(i % concurrency).add(files.get(i));
+
+        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(concurrency, r -> {
+            Thread t = new Thread(r, "watcher-sftp-worker");
+            t.setDaemon(true);
+            return t;
+        });
+        try {
+            List<java.util.concurrent.Callable<Long>> tasks = new ArrayList<>();
+            for (int slot = 0; slot < concurrency; slot++) {
+                final int s = slot;
+                final List<RemoteFileMetadata> chunk = chunks.get(slot);
+                tasks.add(() -> {
+                    if (chunk.isEmpty()) return 0L;
+                    ChannelSftp channel = persistentSftp.acquireChannel(task.getId(), s, target);
+                    long bytes = 0L;
+                    for (RemoteFileMetadata meta : chunk) bytes += op.transfer(channel, meta);
+                    return bytes;
+                });
+            }
+            List<java.util.concurrent.Future<Long>> results = pool.invokeAll(tasks);
+            long total = 0L;
+            for (java.util.concurrent.Future<Long> f : results) total += f.get(); // rethrows the first worker's exception, if any
+            return total;
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    /**
+     * OUTBOUND watcher-triggered transfer — pushes each file directly over a
+     * kept-warm SFTP connection ({@link #persistentSftp}) instead of spawning
+     * a fresh WinSCP.com process (and paying a fresh SSH handshake) for every
+     * single watcher fire. See {@link PersistentSftpConnectionManager}'s
+     * class javadoc for why this is the fix for "detected instantly, takes
+     * ~30s to actually transfer": detection was already fast, the repeated
+     * per-event connection setup was not.
+     */
     private boolean executeWinScpWatcherOutbound(ScheduledTask task,
                                                  Credential target,
                                                  List<RemoteFileMetadata> files,
@@ -674,41 +795,55 @@ public class TransferService {
         String localSourceDir = resolveOutboundWatchDirectory(task);
         String remotePath     = normalizeRemotePath(task.getTargetPath());
         String remoteDir      = remotePath.endsWith("/") ? remotePath : remotePath + "/";
+        List<String> extraDestFolders = task.getAdditionalTargetPathList();
+        if (!extraDestFolders.isEmpty()) {
+            logLine.accept("[INFO] Also copying to " + extraDestFolders.size()
+                    + " additional destination(s) on the same server: " + String.join(", ", extraDestFolders));
+        }
 
+        int connectsBefore = persistentSftp.getSessionCount(task.getId());
         try {
-            List<SizedCommand> commands = new ArrayList<>();
-            List<String> extraDestFolders = task.getAdditionalTargetPathList();
-            if (!extraDestFolders.isEmpty()) {
-                logLine.accept("[INFO] Also copying to " + extraDestFolders.size()
-                        + " additional destination(s) on the same server: " + String.join(", ", extraDestFolders));
-            }
-            for (RemoteFileMetadata meta : files) {
+            // Warms slot 0 up front purely so the log line below can report
+            // reused-vs-connected accurately even when concurrency > 1 (extra
+            // slots opened inside transferFilesConcurrently are cheap
+            // channel-only opens on this same, already-live session).
+            persistentSftp.getChannel(task.getId(), target);
+            boolean reused = persistentSftp.getSessionCount(task.getId()) == connectsBefore;
+            logLine.accept("[INFO] SFTP connection: " + (reused ? "reused existing warm connection"
+                    : "connected (session #" + persistentSftp.getSessionCount(task.getId()) + " for this task)"));
+
+            int concurrency = Math.max(1, Math.min(AppSettings.getTransferBatchConcurrency(), files.size()));
+            long totalBytes = transferFilesConcurrently(task, target, files, logLine, (channel, meta) -> {
                 String localFile  = normalizeLocalPath(
                         Paths.get(localSourceDir, meta.fileName()).toString());
                 String remoteFile = remoteDir + meta.fileName();
-                commands.add(new SizedCommand(
-                        "put " + escapeWinScpPath(localFile) + " " + escapeWinScpRemotePath(remoteFile),
-                        meta.size()));
                 logLine.accept("[INFO] Queued outbound: " + localFile + " → " + remoteFile);
+                channel.put(localFile, remoteFile);
 
                 for (String extraFolder : extraDestFolders) {
                     String extraRemoteDir = normalizeRemotePath(extraFolder);
                     extraRemoteDir = extraRemoteDir.endsWith("/") ? extraRemoteDir : extraRemoteDir + "/";
-                    String extraRemoteFile = extraRemoteDir + meta.fileName();
-                    commands.add(new SizedCommand(
-                            "put " + escapeWinScpPath(localFile) + " " + escapeWinScpRemotePath(extraRemoteFile),
-                            meta.size()));
+                    channel.put(localFile, extraRemoteDir + meta.fileName());
                 }
-            }
-            return runBatchedWinScpCommands(target, target.getPassword(), commands, logLine, task.getId());
+                return Math.max(meta.size(), 0);
+            });
+
+            logLine.accept("[SUCCESS] Transfer completed successfully.");
+            logLine.accept("[INFO] Transfer summary: " + files.size() + " file(s), "
+                    + humanReadableBytes(totalBytes) + " total, 1 batch(es), 1 session(s), " + concurrency + " worker thread(s).");
+            return true;
         } catch (Exception ex) {
-            logLine.accept("[ERROR] Outbound watcher WinSCP transfer failed: " + ex.getMessage());
+            logLine.accept("[ERROR] Outbound watcher SFTP transfer failed: " + ex.getMessage());
+            // Force a clean reconnect on the next fire rather than reusing a
+            // connection that just proved broken.
+            persistentSftp.close(task.getId());
             return false;
         }
     }
 
-    // ─── WinSCP inbound watcher transfer ─────────────────────────────────────
+    // ─── Persistent-SFTP inbound watcher transfer ────────────────────────────
 
+    /** INBOUND counterpart of {@link #executeWinScpWatcherOutbound} — see its javadoc. */
     private boolean executeWinScpWatcherInbound(ScheduledTask task,
                                                 Credential target,
                                                 List<RemoteFileMetadata> files,
@@ -716,29 +851,40 @@ public class TransferService {
         String localDestDir = normalizeLocalPath(task.getSourcePath());
         String remotePath   = normalizeRemotePath(task.getTargetPath());
         String remoteDir    = remotePath.endsWith("/") ? remotePath : remotePath + "/";
+        List<String> extraDestFolders = task.getAdditionalTargetPathList();
 
+        int connectsBefore = persistentSftp.getSessionCount(task.getId());
+        List<String> downloadedLocalPaths = java.util.Collections.synchronizedList(new ArrayList<>());
         try {
-            List<SizedCommand> commands = new ArrayList<>();
-            List<String> downloadedLocalPaths = new ArrayList<>();
-            for (RemoteFileMetadata meta : files) {
+            persistentSftp.getChannel(task.getId(), target);
+            boolean reused = persistentSftp.getSessionCount(task.getId()) == connectsBefore;
+            logLine.accept("[INFO] SFTP connection: " + (reused ? "reused existing warm connection"
+                    : "connected (session #" + persistentSftp.getSessionCount(task.getId()) + " for this task)"));
+
+            int concurrency = Math.max(1, Math.min(AppSettings.getTransferBatchConcurrency(), files.size()));
+            long totalBytes = transferFilesConcurrently(task, target, files, logLine, (channel, meta) -> {
                 String remoteFile = remoteDir + meta.fileName();
                 String destPath   = buildLocalDestinationPath(localDestDir, meta.fileName());
-                commands.add(new SizedCommand(
-                        "get " + escapeWinScpRemotePath(remoteFile) + " " + escapeWinScpPath(destPath),
-                        meta.size()));
                 logLine.accept("[INFO] Queued inbound: " + remoteFile + " → " + destPath);
+                Path destParent = Paths.get(destPath).getParent();
+                if (destParent != null) Files.createDirectories(destParent);
+                channel.get(remoteFile, destPath);
                 downloadedLocalPaths.add(destPath);
-            }
-            boolean ok = runBatchedWinScpCommands(target, target.getPassword(), commands, logLine, task.getId());
-            List<String> extraDestFolders = task.getAdditionalTargetPathList();
-            if (ok && !extraDestFolders.isEmpty()) {
+                return Math.max(meta.size(), 0);
+            });
+
+            if (!extraDestFolders.isEmpty()) {
                 logLine.accept("[INFO] Also copying downloaded file(s) to " + extraDestFolders.size()
                         + " additional local destination(s): " + String.join(", ", extraDestFolders));
                 copyDownloadedFilesToExtraFolders(downloadedLocalPaths, extraDestFolders, logLine);
             }
-            return ok;
+            logLine.accept("[SUCCESS] Transfer completed successfully.");
+            logLine.accept("[INFO] Transfer summary: " + files.size() + " file(s), "
+                    + humanReadableBytes(totalBytes) + " total, 1 batch(es), 1 session(s), " + concurrency + " worker thread(s).");
+            return true;
         } catch (Exception ex) {
-            logLine.accept("[ERROR] Inbound watcher WinSCP transfer failed: " + ex.getMessage());
+            logLine.accept("[ERROR] Inbound watcher SFTP transfer failed: " + ex.getMessage());
+            persistentSftp.close(task.getId());
             return false;
         }
     }
@@ -1088,19 +1234,28 @@ public class TransferService {
         int intervalSeconds = AppSettings.getTransferBatchIntervalSeconds();
         int concurrency = AppSettings.getTransferBatchConcurrency();
         List<List<SizedCommand>> batches = chunkBySize(sizedCommands, sc -> sc.size, maxBytes);
+        long totalBytes = sizedCommands.stream().mapToLong(sc -> sc.size).sum();
+        int threadsUsed = Math.max(1, Math.min(concurrency, batches.size()));
 
         if (batches.size() > 1) {
-            long totalBytes = sizedCommands.stream().mapToLong(sc -> sc.size).sum();
             logLine.accept("[INFO] " + sizedCommands.size() + " file(s), " + humanReadableBytes(totalBytes)
                     + " total — splitting into " + batches.size() + " batch(es), capped at ~"
                     + humanReadableBytes(maxBytes) + " per batch (configurable in Settings)."
                     + (concurrency > 1 ? " Running up to " + concurrency + " batch(es) at a time." : ""));
         }
 
-        if (concurrency <= 1 || batches.size() <= 1) {
-            return runBatchesSequentially(target, password, batches, intervalSeconds, logLine, taskId);
-        }
-        return runBatchesConcurrently(target, password, batches, concurrency, intervalSeconds, logLine, taskId);
+        boolean allOk = (concurrency <= 1 || batches.size() <= 1)
+                ? runBatchesSequentially(target, password, batches, intervalSeconds, logLine, taskId)
+                : runBatchesConcurrently(target, password, batches, concurrency, intervalSeconds, logLine, taskId);
+
+        // Uniform one-line summary regardless of which path ran — this is what
+        // the Event Monitor's per-run detail popup parses to show files/bytes/
+        // batches/sessions/threads for this run, so every transfer path (watcher
+        // or not, sequential or concurrent) always emits exactly this shape.
+        logLine.accept("[INFO] Transfer summary: " + sizedCommands.size() + " file(s), "
+                + humanReadableBytes(totalBytes) + " total, " + batches.size() + " batch(es), "
+                + batches.size() + " session(s), " + threadsUsed + " worker thread(s).");
+        return allOk;
     }
 
     /** Original one-at-a-time behavior — used when concurrency is 1 (default) or there's only one batch. */

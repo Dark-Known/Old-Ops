@@ -26,8 +26,10 @@ D:\OPS\OpsTransferTool-source\src\main\java\service\SftpBrowseService.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\SftpRemoteFileMetadataService.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\TaskLogService.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\TaskSchedulerService.java
+D:\OPS\OpsTransferTool-source\src\main\java\service\TransferRunStats.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\TransferService.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\watch\LocalWatchManager.java
+D:\OPS\OpsTransferTool-source\src\main\java\service\watch\PersistentSftpConnectionManager.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\watch\RemotePushWatcher.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\XmlStorageService.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\ActivityEventPopup.java
@@ -45,6 +47,7 @@ D:\OPS\OpsTransferTool-source\src\main\java\ui\NotificationPanel.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\OAuthAuthorizeDialog.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\QueueMonitorView.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\RunHistoryPanel.java
+D:\OPS\OpsTransferTool-source\src\main\java\ui\RunLogSummarizer.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\SearchCriteriaPanel.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\SettingsPanel.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\StatisticsPanel.java

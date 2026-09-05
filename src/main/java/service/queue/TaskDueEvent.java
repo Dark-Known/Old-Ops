@@ -2,7 +2,9 @@ package service.queue;
 
 import java.time.Duration;
 import java.time.LocalDateTime;
+import java.util.Collections;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.Delayed;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
@@ -32,6 +34,12 @@ public final class TaskDueEvent implements Delayed {
     // nominal poll interval yet?" the way an ordinary scheduled occurrence
     // is. Defaults to false via the 3-arg constructor for every other caller.
     private final boolean immediate;
+    // Filenames a push-watch layer (LocalWatchManager / RemotePushWatcher)
+    // actually observed changing, for an immediate/push-fired event — see
+    // TaskSchedulerService#onWatchWakeup and TransferService#executeTransfer's
+    // eventFileNames parameter. Empty (never null) for every ordinary
+    // scheduled/retry occurrence, which only ever uses the 3-arg constructor.
+    private final Set<String> changedFileNames;
     private final long sequence; // tiebreaker for events with identical dueAt, and identity for cancellation
 
     public TaskDueEvent(String taskId, LocalDateTime dueAt, int attempt) {
@@ -39,10 +47,16 @@ public final class TaskDueEvent implements Delayed {
     }
 
     public TaskDueEvent(String taskId, LocalDateTime dueAt, int attempt, boolean immediate) {
+        this(taskId, dueAt, attempt, immediate, Collections.emptySet());
+    }
+
+    public TaskDueEvent(String taskId, LocalDateTime dueAt, int attempt, boolean immediate,
+                         Set<String> changedFileNames) {
         this.taskId = Objects.requireNonNull(taskId, "taskId");
         this.dueAt = Objects.requireNonNull(dueAt, "dueAt");
         this.attempt = attempt;
         this.immediate = immediate;
+        this.changedFileNames = changedFileNames != null ? changedFileNames : Collections.emptySet();
         this.sequence = SEQ.incrementAndGet();
     }
 
@@ -50,6 +64,8 @@ public final class TaskDueEvent implements Delayed {
     public LocalDateTime getDueAt() { return dueAt; }
     public int getAttempt() { return attempt; }
     public boolean isImmediate() { return immediate; }
+    /** Filenames the push-watch layer named for this fire, or empty for an ordinary scheduled occurrence. */
+    public Set<String> getChangedFileNames() { return changedFileNames; }
     long getSequence() { return sequence; }
 
     @Override

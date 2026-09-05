@@ -362,7 +362,7 @@ public class TaskSchedulerService {
                 logWatchTransitionIfNotable(t, status);
             }
             statusExporter.export(getWorkerPoolSize(), getActiveWorkerCount(), getPendingEvents(),
-                    getRecentActivity(30), watchEntries);
+                    getRecentActivity(30), watchEntries, java.util.Collections.emptyList());
         } catch (Exception e) {
             log.fine("Status export tick failed: " + e.getMessage());
         }
@@ -506,6 +506,7 @@ public class TaskSchedulerService {
         workerPool.stop();
         localWatchManager.stop();
         remotePushWatcher.stop();
+        transferService.shutdownWatcherConnections();
         if (statusExportFuture != null) statusExportFuture.cancel(false);
         scheduler.shutdownNow();
         executor.shutdownNow();

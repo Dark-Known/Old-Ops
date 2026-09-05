@@ -78,6 +78,11 @@ public class EventMonitorPanel extends JPanel {
     private final Set<String> seenDaemonActivityKeys = new LinkedHashSet<>();
     private boolean guiBaselineEstablished = false;
     private boolean daemonBaselineEstablished = false;
+    // Latest task snapshot, refreshed every tick — read by the activity-row
+    // click listeners (registered once, in the constructor) so a click can
+    // always resolve the clicked event's task type (FILE_TRANSFER vs other)
+    // without needing to reload storage synchronously on the EDT.
+    private volatile Map<String, ScheduledTask> latestById = Map.of();
 
     public EventMonitorPanel(TaskSchedulerService scheduler) {
         this.scheduler = scheduler;
@@ -94,9 +99,13 @@ public class EventMonitorPanel extends JPanel {
         guiView = new QueueMonitorView();
         daemonView = new QueueMonitorView();
         statsPanel = new StatisticsPanel();
+        guiView.setProcessLabel("GUI");
+        daemonView.setProcessLabel("Daemon");
 
-        guiView.setActivityRowClickListener((row, screenLoc) -> ActivityEventPopup.show(guiView, screenLoc, row));
-        daemonView.setActivityRowClickListener((row, screenLoc) -> ActivityEventPopup.show(daemonView, screenLoc, row));
+        guiView.setActivityRowClickListener((row, screenLoc) ->
+                ActivityEventPopup.show(guiView, screenLoc, row, latestById, scheduler.getRunHistoryService()));
+        daemonView.setActivityRowClickListener((row, screenLoc) ->
+                ActivityEventPopup.show(daemonView, screenLoc, row, latestById, scheduler.getRunHistoryService()));
 
         tabs = new JTabbedPane();
         tabs.addTab("GUI Process", VectorIcons.pulse(new Color(0x5C7A45), 14), wrap(guiView));
@@ -131,6 +140,7 @@ public class EventMonitorPanel extends JPanel {
         } catch (Exception e) {
             byId = Map.of();
         }
+        latestById = byId;
 
         boolean daemonFresh = SchedulerStatusSnapshot.isAlive(daemonStatusFile, DAEMON_STALE_MS);
         boolean guiActive = scheduler.isStarted();
@@ -174,7 +184,7 @@ public class EventMonitorPanel extends JPanel {
                         scheduleType(byId, e.getTaskId()), e.getAttempt(), e.getDueAt()))
                 .collect(Collectors.toList());
         List<QueueMonitorView.ActivityRow> activityRows = activity.stream()
-                .map(a -> new QueueMonitorView.ActivityRow(taskName(byId, a.getTaskId()), a.getAttempt(),
+                .map(a -> new QueueMonitorView.ActivityRow(a.getTaskId(), taskName(byId, a.getTaskId()), a.getAttempt(),
                         a.getStartedAt(), a.getFinishedAt(), a.isErrored(), a.getErrorMessage()))
                 .collect(Collectors.toList());
 
@@ -200,7 +210,7 @@ public class EventMonitorPanel extends JPanel {
                         scheduleType(byId, e.taskId()), e.attempt(), e.dueAt()))
                 .collect(Collectors.toList());
         List<QueueMonitorView.ActivityRow> activityRows = snap.getActivity().stream()
-                .map(a -> new QueueMonitorView.ActivityRow(taskName(byId, a.taskId()), a.attempt(),
+                .map(a -> new QueueMonitorView.ActivityRow(a.taskId(), taskName(byId, a.taskId()), a.attempt(),
                         a.startedAt(), a.finishedAt(), a.errored(), a.errorMessage()))
                 .collect(Collectors.toList());
 

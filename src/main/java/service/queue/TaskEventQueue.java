@@ -31,11 +31,27 @@ public class TaskEventQueue {
      * removed first — this is what makes "task was edited, interval changed"
      * or "reconcile sweep re-published the same task" safe: only the most
      * recently published occurrence for a task can ever actually fire.
+     *
+     * <p>Exception: if both the pending event and this new one are watcher
+     * fires ({@code immediate=true}), the pending one's named files are
+     * merged into this one rather than discarded. Without this, a burst of
+     * changes that settles (see {@code LocalWatchManager}'s debounce window)
+     * before a worker thread has actually taken the previous fire off the
+     * queue would silently drop that first burst's file names — outwardly
+     * looking like "several files changed but only the last one got
+     * transferred", even though nothing was actually wrong with detection.
      */
     public void publish(TaskDueEvent event) {
-        TaskDueEvent previous = pendingByTaskId.put(event.getTaskId(), event);
-        if (previous != null) {
-            queue.remove(previous);
+        TaskDueEvent previous = pendingByTaskId.get(event.getTaskId());
+        if (previous != null && previous.isImmediate() && event.isImmediate()
+                && !previous.getChangedFileNames().isEmpty()) {
+            java.util.Set<String> merged = new java.util.LinkedHashSet<>(previous.getChangedFileNames());
+            merged.addAll(event.getChangedFileNames());
+            event = new TaskDueEvent(event.getTaskId(), event.getDueAt(), event.getAttempt(), true, merged);
+        }
+        TaskDueEvent removed = pendingByTaskId.put(event.getTaskId(), event);
+        if (removed != null) {
+            queue.remove(removed);
         }
         queue.put(event);
     }

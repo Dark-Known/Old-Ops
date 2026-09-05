@@ -22,7 +22,7 @@ public class QueueMonitorView extends JPanel {
 
     public record PendingRow(String taskName, String scheduleType, int attempt, LocalDateTime dueAt) {}
 
-    public record ActivityRow(String taskName, int attempt, LocalDateTime startedAt,
+    public record ActivityRow(String taskId, String taskName, int attempt, LocalDateTime startedAt,
                                LocalDateTime finishedAt, boolean errored, String errorMessage) {}
 
     private static final Color COLOR_ERROR   = new Color(0xF5E0DC); // pale rust
@@ -35,14 +35,15 @@ public class QueueMonitorView extends JPanel {
     private static final String CARD_CONTENT = "content";
     private static final String CARD_OFFLINE = "offline";
 
-    private JLabel lblWorkerStatus;
-    private JLabel lblQueueStatus;
-    private JProgressBar workerBar;
+    private DefaultTableModel schedulerModel;
+    private JTable schedulerTable;
     private DefaultTableModel pendingModel;
     private JTable pendingTable;
     private DefaultTableModel activityModel;
     private JTable activityTable;
     private JLabel offlineLabel;
+    /** Human label for this view's process, set via {@link #update}'s caller before the first refresh — e.g. "GUI Process" / "Daemon Process". */
+    private String processLabel = "Scheduler";
 
     // Most-recently-rendered activity rows, in the same order as
     // activityModel's rows — lets the click handler map a clicked table row
@@ -53,27 +54,36 @@ public class QueueMonitorView extends JPanel {
 
     public QueueMonitorView() {
         setLayout(new BorderLayout(8, 8));
-        add(buildSummaryBar(), BorderLayout.NORTH);
+        add(buildSchedulerSection(), BorderLayout.NORTH);
 
         cardHost.add(buildContent(), CARD_CONTENT);
         cardHost.add(buildOfflineCard(), CARD_OFFLINE);
         add(cardHost, BorderLayout.CENTER);
     }
 
-    private JComponent buildSummaryBar() {
-        JPanel bar = new JPanel(new FlowLayout(FlowLayout.LEFT, 16, 4));
-        lblWorkerStatus = new JLabel("Workers: —");
-        lblWorkerStatus.setFont(lblWorkerStatus.getFont().deriveFont(Font.BOLD));
-        workerBar = new JProgressBar(0, 1);
-        workerBar.setPreferredSize(new Dimension(140, 14));
-        lblQueueStatus = new JLabel("Pending events: —");
-        lblQueueStatus.setFont(lblQueueStatus.getFont().deriveFont(Font.BOLD));
+    /** Sets the process label shown in the Active Scheduler table's "Process" column — e.g. "GUI" / "Daemon". Call once, before the first {@link #update}. */
+    public void setProcessLabel(String label) {
+        this.processLabel = label;
+    }
 
-        bar.add(lblWorkerStatus);
-        bar.add(workerBar);
-        bar.add(new JSeparator(SwingConstants.VERTICAL));
-        bar.add(lblQueueStatus);
-        return bar;
+    private JComponent buildSchedulerSection() {
+        JPanel panel = new JPanel(new BorderLayout(4, 4));
+        panel.add(sectionHeader("Active Scheduler"), BorderLayout.NORTH);
+
+        schedulerModel = new DefaultTableModel(
+                new Object[]{"Process", "Status", "Workers Busy", "Pending Events"}, 0) {
+            @Override public boolean isCellEditable(int row, int col) { return false; }
+        };
+        schedulerModel.addRow(new Object[]{processLabel, "—", "—", "—"});
+        schedulerTable = new JTable(schedulerModel);
+        schedulerTable.setRowHeight(24);
+        schedulerTable.setFillsViewportHeight(false);
+        schedulerTable.getTableHeader().setReorderingAllowed(false);
+        schedulerTable.setPreferredScrollableViewportSize(new Dimension(10, 24));
+        panel.add(new JScrollPane(schedulerTable,
+                ScrollPaneConstants.VERTICAL_SCROLLBAR_NEVER, ScrollPaneConstants.HORIZONTAL_SCROLLBAR_AS_NEEDED),
+                BorderLayout.CENTER);
+        return panel;
     }
 
     private JComponent buildContent() {
@@ -124,7 +134,7 @@ public class QueueMonitorView extends JPanel {
 
     private JComponent buildActivitySection() {
         JPanel panel = new JPanel(new BorderLayout(4, 4));
-        panel.add(sectionHeader("Recent Activity — newest first"), BorderLayout.NORTH);
+        panel.add(sectionHeader("Events — newest first (click a row for details)"), BorderLayout.NORTH);
 
         activityModel = new DefaultTableModel(new Object[]{"Task", "Attempt", "Started", "Duration", "Outcome"}, 0) {
             @Override public boolean isCellEditable(int row, int col) { return false; }
@@ -177,19 +187,14 @@ public class QueueMonitorView extends JPanel {
     public void showUnavailable(String message) {
         offlineLabel.setText(message);
         cards.show(cardHost, CARD_OFFLINE);
-        lblWorkerStatus.setText("Workers: —");
-        lblQueueStatus.setText("Pending events: —");
-        workerBar.setValue(0);
+        setSchedulerRow("Offline / unavailable", "—", "—");
     }
 
     /** Pushes a fresh snapshot into the tables. */
     public void update(int poolSize, int activeWorkers, List<PendingRow> pending, List<ActivityRow> activity) {
         cards.show(cardHost, CARD_CONTENT);
 
-        lblWorkerStatus.setText("Workers: " + activeWorkers + " / " + poolSize + " busy");
-        workerBar.setMaximum(Math.max(1, poolSize));
-        workerBar.setValue(Math.min(activeWorkers, Math.max(1, poolSize)));
-        lblQueueStatus.setText("Pending events: " + pending.size());
+        setSchedulerRow("Active", activeWorkers + " / " + poolSize + " busy", String.valueOf(pending.size()));
 
         int pSel = pendingTable.getSelectedRow();
         pendingModel.setRowCount(0);
@@ -220,6 +225,14 @@ public class QueueMonitorView extends JPanel {
             });
         }
         if (aSel >= 0 && aSel < activityModel.getRowCount()) activityTable.setRowSelectionInterval(aSel, aSel);
+    }
+
+    private void setSchedulerRow(String status, String workers, String pendingCount) {
+        if (schedulerModel.getRowCount() == 0) schedulerModel.addRow(new Object[4]);
+        schedulerModel.setValueAt(processLabel, 0, 0);
+        schedulerModel.setValueAt(status, 0, 1);
+        schedulerModel.setValueAt(workers, 0, 2);
+        schedulerModel.setValueAt(pendingCount, 0, 3);
     }
 
     /**
