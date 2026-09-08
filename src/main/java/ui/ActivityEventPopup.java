@@ -155,12 +155,17 @@ final class ActivityEventPopup {
         sb.append("WinSCP/SFTP sessions: ").append(s.sessionCount() > 0 ? s.sessionCount() : 1).append('\n');
         sb.append("Worker threads used: ").append(s.workerThreads() > 0 ? s.workerThreads() : 1).append('\n');
 
-        List<String> names = s.fileNames();
-        if (!names.isEmpty()) {
-            sb.append('\n').append("File(s):\n");
-            int shown = Math.min(names.size(), 15);
-            for (int i = 0; i < shown; i++) sb.append("  \u2022 ").append(names.get(i)).append('\n');
-            if (names.size() > shown) sb.append("  \u2026 and ").append(names.size() - shown).append(" more\n");
+        List<RunLogSummarizer.FileEntry> files = s.files();
+        if (!files.isEmpty()) {
+            sb.append('\n').append("File(s) detected/transferred:\n");
+            int shown = Math.min(files.size(), 15);
+            for (int i = 0; i < shown; i++) {
+                RunLogSummarizer.FileEntry f = files.get(i);
+                sb.append("  \u2022 ").append(f.name());
+                if (f.sizeFormatted() != null) sb.append("  —  ").append(f.sizeFormatted());
+                sb.append('\n');
+            }
+            if (files.size() > shown) sb.append("  \u2026 and ").append(files.size() - shown).append(" more\n");
         }
     }
 

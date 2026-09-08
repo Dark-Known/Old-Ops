@@ -100,6 +100,7 @@ public final class AppSettings {
     // byte-size batch cap above still lets a single "small" batch contain
     // thousands of files. 1 = old sequential behavior (default, safest).
     public static final String KEY_TRANSFER_BATCH_CONCURRENCY = "transferBatchConcurrency";
+    public static final String KEY_WATCHER_FILES_PER_WORKER_THREAD = "watcherFilesPerWorkerThread";
 
     // How long a task may sit in RUNNING before the scheduler assumes it
     // crashed/hung and force-cancels it. For long-running transfers/backups
@@ -161,6 +162,7 @@ public final class AppSettings {
         HARD_DEFAULTS.put(KEY_TRANSFER_BATCH_MAX_BYTES, "0"); // 0 = derive from the two settings above
         HARD_DEFAULTS.put(KEY_TRANSFER_BATCH_INTERVAL_SECONDS, "5");
         HARD_DEFAULTS.put(KEY_TRANSFER_BATCH_CONCURRENCY, "1"); // 1 = sequential (old behavior)
+        HARD_DEFAULTS.put(KEY_WATCHER_FILES_PER_WORKER_THREAD, "5");
         HARD_DEFAULTS.put(KEY_STALE_RUNNING_THRESHOLD_MINUTES, "30");
         HARD_DEFAULTS.put(KEY_STALE_INACTIVITY_THRESHOLD_MINUTES, "5");
         HARD_DEFAULTS.put(KEY_MAX_CONCURRENT_TASK_THREADS, "20");
@@ -182,6 +184,7 @@ public final class AppSettings {
         XML_SEED_TAG.put(KEY_TRANSFER_BATCH_MAX_BYTES, "transferBatchMaxBytes");
         XML_SEED_TAG.put(KEY_TRANSFER_BATCH_INTERVAL_SECONDS, "transferBatchIntervalSeconds");
         XML_SEED_TAG.put(KEY_TRANSFER_BATCH_CONCURRENCY, "transferBatchConcurrency");
+        XML_SEED_TAG.put(KEY_WATCHER_FILES_PER_WORKER_THREAD, "watcherFilesPerWorkerThread");
         XML_SEED_TAG.put(KEY_STALE_RUNNING_THRESHOLD_MINUTES, "staleRunningThresholdMinutes");
         XML_SEED_TAG.put(KEY_STALE_INACTIVITY_THRESHOLD_MINUTES, "staleInactivityThresholdMinutes");
     }
@@ -480,6 +483,22 @@ public final class AppSettings {
      */
     public static int getTransferBatchConcurrency() {
         return Math.max(1, intOrDefault(KEY_TRANSFER_BATCH_CONCURRENCY));
+    }
+
+    /**
+     * How many changed files a watcher fire needs to name, per extra worker
+     * thread, before that thread is actually worth spinning up. Defaults to
+     * 5. This is what makes watcher-transfer concurrency scale <i>with burst
+     * size</i> rather than jumping straight to {@link #getTransferBatchConcurrency()}
+     * threads the moment there's more than one file: with the default of 5,
+     * a 2-file fire still runs on a single thread (2 &lt; 5), while a 20-file
+     * burst uses 4 threads (20 / 5), capped at whatever
+     * {@link #getTransferBatchConcurrency()} allows. Read live — editable
+     * from the Settings panel, app-settings.json, or app-config.xml — no
+     * restart required.
+     */
+    public static int getWatcherFilesPerWorkerThread() {
+        return Math.max(1, intOrDefault(KEY_WATCHER_FILES_PER_WORKER_THREAD));
     }
 
     /**

@@ -13,51 +13,64 @@ import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
 
 /**
- * Keeps one live JSch SSH {@link Session} per watcher-enabled task, reused
- * across every watcher fire, instead of paying a brand-new TCP connect + SSH
- * key exchange + authentication round trip (previously: a brand-new
- * WinSCP.com process spawn on top of that) every single time a file change
- * is detected.
+ * Manages the one SSH/SFTP session a watcher-triggered fire needs for its
+ * duration — opened when the fire starts needing to talk to the server
+ * (a stat check, a listing, or the transfer itself), reused across every
+ * step <i>within that one fire</i> (stat → transfer, or multiple concurrent
+ * batches each on their own channel — see below), and closed as soon as
+ * that fire is done with it, successful or not.
  *
- * <p>This is the fix for the "detected instantly but takes ~30s to actually
- * transfer" gap: OS-level file-change detection ({@code LocalWatchManager}) and
- * the event queue ({@code TaskEventQueue}/{@code TaskWorkerPool}) were already
- * effectively instant (sub-2s settle time, zero-poll dispatch) — the ~30s was
- * being spent re-establishing a fresh SSH/SFTP connection (and, on the old
- * WinSCP-per-event path, a fresh external process) for every single watcher
- * fire, even when the previous fire had only just finished talking to the
- * exact same server a moment earlier. With a connection kept warm per task,
- * that cost is paid once, the first time a task's watcher fires (or after an
- * idle connection is reaped / a real network hiccup forces a reconnect) —
- * every fire after that reuses the live session and only pays for the actual
- * file transfer itself.
+ * <p>This used to be a longer-lived, kept-warm-across-fires design — one
+ * session held open per task, reused by every subsequent fire until an idle
+ * timeout reaped it. That traded server-side cost for avoiding a repeated
+ * handshake on every fire. It turned out to be the wrong trade: an idle SFTP
+ * session isn't free on the <i>server</i> side — each one keeps its own
+ * {@code sftp-server} child process alive under {@code sshd} for as long as
+ * the session lives, and across several watcher-enabled tasks each holding
+ * their own idle session, that adds up to real, needless memory on the
+ * server. Now that the actual cause of slow watcher-triggered transfers (a
+ * full directory listing on every fire) is fixed — see
+ * {@code SftpRemoteFileMetadataService#statFile} — a fresh reconnect per
+ * fire is just a normal, fast SSH handshake, so there's no longer a good
+ * reason to hold a connection (and the server-side process behind it) open
+ * between fires "just in case."
  *
- * <p><b>Multiple channels, one session:</b> when a fire names enough files to
- * be worth parallelizing (see {@code TransferService#executeWinScpWatcherOutbound}
- * / {@code ...Inbound}), each concurrent worker thread gets its own SFTP
- * "slot" — a {@link ChannelSftp} opened on the SSH connection's SFTP
+ * <p>Callers are expected to call {@link #close(String)} themselves once a
+ * fire is fully done with a task's session (success, failure, or "nothing to
+ * do this time" all count) — see {@code TransferService}'s watcher transfer
+ * methods. The idle-reap mechanism below still exists purely as a defensive
+ * safety net for a code path that doesn't get to that {@code close()} call
+ * (an unexpected exception, a crash mid-fire), not as the primary cleanup
+ * mechanism anymore.
+ *
+ * <p><b>Multiple channels, one session:</b> when a single fire names enough
+ * files to be worth parallelizing (see
+ * {@code TransferService#executeWinScpWatcherOutbound} / {@code ...Inbound}),
+ * each concurrent worker thread gets its own SFTP "slot" — a
+ * {@link ChannelSftp} opened on that fire's one SSH connection's SFTP
  * subsystem — via {@link #acquireChannel(String, int, Credential)}. The SSH
  * protocol supports any number of channels multiplexed over a single
- * connection, so this scales worker-thread concurrency up without opening a
- * second SSH connection (a second handshake, a second login) per extra
- * thread: still exactly one session per task, just more channels riding on
- * it. Slot 0 is the same channel {@link #getChannel(String, Credential)}
+ * connection, so this scales worker-thread concurrency up within one fire
+ * without opening a second SSH connection (a second handshake, a second
+ * login, a second server-side process) per extra thread — still exactly one
+ * session per fire, just more channels riding on it for that fire's
+ * duration. Slot 0 is the same channel {@link #getChannel(String, Credential)}
  * returns, so a single-file fire (the common case) never pays for a slot it
  * doesn't use.
  *
- * <p>Thread-safe. One session is kept per {@code taskId}; a credential
- * change (host/username/password edited in the task) is detected and forces
- * a clean reconnect (all slots) rather than reusing a session against the
- * old target.
+ * <p>Thread-safe. A credential change (host/username/password edited in the
+ * task) is detected and forces a clean reconnect rather than reusing a
+ * session against the old target.
  */
 public class PersistentSftpConnectionManager {
 
     private static final Logger log = Logger.getLogger(PersistentSftpConnectionManager.class.getName());
 
     /** How long a connection may sit completely unused before being proactively
-     *  closed, so a watcher task that's gone quiet for a long stretch doesn't
-     *  hold an idle SSH session open forever. The next fire after this simply
-     *  reconnects (paying the one-time handshake cost again). */
+     *  closed — a defensive safety net, not the primary cleanup mechanism; see
+     *  the class javadoc. Callers are expected to {@link #close(String)}
+     *  their own session once a fire is done with it, so in normal operation
+     *  this reaper should rarely find anything left to reap. */
     private static final long IDLE_CLOSE_MILLIS = 10 * 60 * 1000L; // 10 minutes
 
     /** Connect timeout for establishing (or re-establishing) a connection, and
@@ -192,6 +205,14 @@ public class PersistentSftpConnectionManager {
         config.put("StrictHostKeyChecking", "no");
         session.setConfig(config);
         session.connect(CONNECT_TIMEOUT_MILLIS);
+        // Keep the connection alive across long idle gaps between watcher
+        // fires — without this, some firewalls/NAT devices silently drop a
+        // quiet TCP connection well before our own idle-close window, and the
+        // first .put()/.get() after that just hangs until it times out rather
+        // than failing fast, which would look exactly like "still slow"
+        // even with the persistent-connection fix in place.
+        session.setServerAliveInterval(15_000);
+        session.setServerAliveCountMax(4);
         return new Entry(session, fingerprint(credential), connectCount);
     }
 

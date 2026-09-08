@@ -47,13 +47,13 @@ export\XlsxWriter.class
 util\CryptoUtil.class
 util\AppSettings.class
 ui\DirectoryBrowserDialog$7.class
-ui\EventMonitorPanel$ToastableActivity.class
 ui\NotificationBell$1.class
 ui\MainWindow$2.class
 service\TransferService$WatcherSkipException.class
 service\watch\LocalWatchManager.class
 ui\DirectoryBrowserDialog$2.class
 ui\QueueMonitorView$PendingRow.class
+ui\RunLogSummarizer$FileEntry.class
 ui\WatcherInfoPopup$Result.class
 util\ImapSearchCriteria$TextCriteria.class
 service\RemoteFileMetadataServiceFactory$ManagedMetadataService.class
@@ -174,7 +174,6 @@ ui\RunLogSummarizer$FileTransferSummary.class
 service\queue\SchedulerStatusSnapshot$ActivityEntry.class
 ui\GradientToggleButton.class
 ui\EventMonitorWindow.class
-ui\QueueMonitorView$6.class
 util\ImapSearchCriteria$SimpleCriteria.class
 service\GraphMailService$AttachmentFile.class
 ui\NotificationPanel$1.class
@@ -188,6 +187,7 @@ util\ImapSearchCriteria$Builder.class
 ui\RunHistoryPanel$2.class
 ui\EventMonitorWindow$2.class
 ui\DirectoryBrowserDialog$Provider.class
+service\queue\TaskWorkerPool$HandlerOutcome.class
 ui\DirectoryBrowserDialog$FolderIcon.class
 ui\NotificationPanel$2.class
 service\TaskSchedulerService$1.class

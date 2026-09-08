@@ -9,6 +9,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 import java.util.logging.Logger;
 
 /**
@@ -33,6 +34,25 @@ public class TaskWorkerPool {
     private static final Logger log = Logger.getLogger(TaskWorkerPool.class.getName());
     private static final int MAX_ACTIVITY_ENTRIES = 200;
 
+    /**
+     * What the handler wants to tell the pool about the event it just
+     * finished handling, beyond "did it throw" — set via a {@code Supplier}
+     * the handler-owning code (e.g. {@code TaskSchedulerService}) hands in,
+     * since the handler itself is a plain {@code Consumer} with no return
+     * value. {@code suppress=true} means "this wasn't actually an attempted
+     * run — pure scheduling bookkeeping (task disabled, deleted, already
+     * running elsewhere, a watcher fire that arrived mid-run, etc.) — don't
+     * add a row to the Events feed for it at all"; {@code errored} lets a
+     * handler report a real failure it handled internally (returned false
+     * rather than throwing) so it's badged the same as a thrown exception
+     * instead of quietly looking like a success; {@code note} is a short
+     * human-readable reason shown in place of a bare "OK"/"ERROR" for
+     * anything worth explaining (a skip reason, a failure reason, etc.).
+     */
+    public record HandlerOutcome(boolean suppress, boolean errored, String note) {
+        public static final HandlerOutcome DEFAULT = new HandlerOutcome(false, false, null);
+    }
+
     /** One row of the recent-activity feed, for UI display only. */
     public static final class ActivityEntry {
         private final String taskId;
@@ -40,7 +60,7 @@ public class TaskWorkerPool {
         private final LocalDateTime startedAt;
         private final LocalDateTime finishedAt;
         private final boolean errored;
-        private final String errorMessage; // null unless errored
+        private final String errorMessage; // error text if errored, otherwise an optional informational note (e.g. a skip reason) or null
 
         ActivityEntry(String taskId, int attempt, LocalDateTime startedAt, LocalDateTime finishedAt,
                       boolean errored, String errorMessage) {
@@ -62,6 +82,7 @@ public class TaskWorkerPool {
 
     private final TaskEventQueue queue;
     private final Consumer<TaskDueEvent> handler;
+    private final Supplier<HandlerOutcome> outcomeSupplier;
     private final ExecutorService workers;
     private final int workerCount;
     private final AtomicInteger activeWorkers = new AtomicInteger(0);
@@ -72,8 +93,14 @@ public class TaskWorkerPool {
     private volatile boolean running = false;
 
     public TaskWorkerPool(TaskEventQueue queue, int workerCount, Consumer<TaskDueEvent> handler) {
+        this(queue, workerCount, handler, () -> HandlerOutcome.DEFAULT);
+    }
+
+    public TaskWorkerPool(TaskEventQueue queue, int workerCount, Consumer<TaskDueEvent> handler,
+                           Supplier<HandlerOutcome> outcomeSupplier) {
         this.queue = queue;
         this.handler = handler;
+        this.outcomeSupplier = outcomeSupplier != null ? outcomeSupplier : () -> HandlerOutcome.DEFAULT;
         this.workerCount = Math.max(1, workerCount);
         this.workers = Executors.newFixedThreadPool(this.workerCount, r -> {
             Thread t = new Thread(r, "task-worker");
@@ -98,19 +125,26 @@ public class TaskWorkerPool {
                 activeWorkers.incrementAndGet();
                 LocalDateTime startedAt = LocalDateTime.now();
                 boolean errored = false;
-                String errorMessage = null;
+                String message = null;
+                boolean suppress = false;
                 try {
                     handler.accept(event);
+                    HandlerOutcome outcome = outcomeSupplier.get();
+                    errored = outcome.errored();
+                    message = outcome.note();
+                    suppress = outcome.suppress();
                 } catch (Exception e) {
                     // A failure handling one event must never kill the worker
                     // thread — it just goes back to take()-ing the next one.
                     errored = true;
-                    errorMessage = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
+                    message = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
                     log.warning("Worker error handling task event " + event + ": " + e.getMessage());
                 } finally {
                     activeWorkers.decrementAndGet();
-                    recordActivity(new ActivityEntry(event.getTaskId(), event.getAttempt(),
-                            startedAt, LocalDateTime.now(), errored, errorMessage));
+                    if (!suppress) {
+                        recordActivity(new ActivityEntry(event.getTaskId(), event.getAttempt(),
+                                startedAt, LocalDateTime.now(), errored, message));
+                    }
                 }
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();

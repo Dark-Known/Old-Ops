@@ -5,7 +5,6 @@ import model.TaskRunRecord;
 import service.TaskSchedulerService;
 import service.queue.SchedulerStatusSnapshot;
 import service.queue.TaskDueEvent;
-import service.queue.TaskWorkerPool.ActivityEntry;
 
 import javax.swing.*;
 import java.awt.*;
@@ -21,28 +20,30 @@ import java.util.stream.Collectors;
  * Live dashboard for the event-driven scheduler — see
  * {@link service.queue.TaskEventQueue} / {@link service.queue.TaskWorkerPool}.
  *
- * Only one scheduler is ever meant to be active at a time — the Daemon is
+ * <p>Only one scheduler is ever meant to be active at a time — the Daemon is
  * primary when it's alive, the GUI only schedules on standby (see
- * {@code ui.MainWindow}) — so the header line and the two tabs' titles are
- * relabeled every refresh to say which one that currently is, rather than
- * presenting both as always-live:
- *  - <b>GUI Process</b> — this JVM's own scheduler, observed directly
- *    through {@link TaskSchedulerService}'s live accessors. Shows a
- *    "standby" placeholder while the Daemon is the one actually scheduling.
- *  - <b>Daemon Process</b> — the headless background daemon, a separate
- *    JVM. It can't be reached in-process, so this tab reads back the
- *    snapshot file the Daemon periodically exports (see
- *    {@link SchedulerStatusSnapshot}) to the shared data directory. Shows
- *    an "offline" placeholder if that file is missing or stale.
- *  - <b>Statistics</b> — aggregate numbers pulled from the shared
- *    run-history database, which both processes write to, so these totals
- *    reflect activity from either process regardless of which one is
- *    running right now.
+ * {@code ui.MainWindow}) — so rather than two always-visible tabs each
+ * showing its own possibly-empty/standby state, this is a single "Events"
+ * tab whose title is relabeled every refresh to say which one is currently
+ * doing the scheduling ("GUI", "Daemon", or "No Scheduler Active").
  *
- * All three tabs, plus the header line, refresh on a 1s timer.
- * Purely observational: nothing here mutates scheduler state (beyond
- * TaskSchedulerService's own standby→active promotion, which is driven by
- * MainWindow, not by this panel).
+ * <p>Pending events are necessarily live — read straight from whichever
+ * process is actually running right now (in-process for the GUI, or from
+ * the Daemon's periodically-exported snapshot file). The <b>completed</b>
+ * events table, though, is backed by {@link service.RunHistoryService} — the
+ * shared, on-disk run-history database both processes write to — rather
+ * than either process's own in-memory activity feed. Two things fall out of
+ * that: this survives an app restart/redeploy (an in-memory feed can't), and
+ * it's already a unified history across both processes without needing to
+ * merge two separate feeds.
+ *
+ * <p>Statistics tab: aggregate numbers pulled from the same shared
+ * run-history database, so its totals reflect activity from either process
+ * regardless of which one is running right now.
+ *
+ * Both tabs refresh on a 1s timer. Purely observational: nothing here
+ * mutates scheduler state (beyond TaskSchedulerService's own standby→active
+ * promotion, which is driven by MainWindow, not by this panel).
  */
 public class EventMonitorPanel extends JPanel {
 
@@ -59,10 +60,8 @@ public class EventMonitorPanel extends JPanel {
     private final TaskSchedulerService scheduler;
     private final Path daemonStatusFile;
 
-    private JLabel activeSchedulerLabel;
     private JTabbedPane tabs;
-    private QueueMonitorView guiView;
-    private QueueMonitorView daemonView;
+    private QueueMonitorView eventsView;
     private StatisticsPanel statsPanel;
 
     private Timer refreshTimer;
@@ -71,15 +70,13 @@ public class EventMonitorPanel extends JPanel {
     // popEventToasts(). Lazily created once this panel is actually showing
     // in a window (needs a Window ancestor to anchor to).
     private ToastManager eventToasts;
-    // Keys of activity entries already popped, so the same run doesn't toast
+    // Run-history row ids already popped, so the same run doesn't toast
     // twice on the next 1s refresh tick. Bounded/trimmed alongside the feed
     // itself so this can't grow unbounded over a long-running session.
-    private final Set<String> seenGuiActivityKeys = new LinkedHashSet<>();
-    private final Set<String> seenDaemonActivityKeys = new LinkedHashSet<>();
-    private boolean guiBaselineEstablished = false;
-    private boolean daemonBaselineEstablished = false;
+    private final Set<Long> seenRunIds = new LinkedHashSet<>();
+    private boolean baselineEstablished = false;
     // Latest task snapshot, refreshed every tick — read by the activity-row
-    // click listeners (registered once, in the constructor) so a click can
+    // click listener (registered once, in the constructor) so a click can
     // always resolve the clicked event's task type (FILE_TRANSFER vs other)
     // without needing to reload storage synchronously on the EDT.
     private volatile Map<String, ScheduledTask> latestById = Map.of();
@@ -91,25 +88,14 @@ public class EventMonitorPanel extends JPanel {
         setLayout(new BorderLayout());
         setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
 
-        activeSchedulerLabel = new JLabel("Active scheduler: checking...");
-        activeSchedulerLabel.setFont(activeSchedulerLabel.getFont().deriveFont(Font.BOLD));
-        activeSchedulerLabel.setBorder(BorderFactory.createEmptyBorder(0, 2, 8, 2));
-        add(activeSchedulerLabel, BorderLayout.NORTH);
-
-        guiView = new QueueMonitorView();
-        daemonView = new QueueMonitorView();
+        eventsView = new QueueMonitorView();
         statsPanel = new StatisticsPanel();
-        guiView.setProcessLabel("GUI");
-        daemonView.setProcessLabel("Daemon");
 
-        guiView.setActivityRowClickListener((row, screenLoc) ->
-                ActivityEventPopup.show(guiView, screenLoc, row, latestById, scheduler.getRunHistoryService()));
-        daemonView.setActivityRowClickListener((row, screenLoc) ->
-                ActivityEventPopup.show(daemonView, screenLoc, row, latestById, scheduler.getRunHistoryService()));
+        eventsView.setActivityRowClickListener((row, screenLoc) ->
+                ActivityEventPopup.show(eventsView, screenLoc, row, latestById, scheduler.getRunHistoryService()));
 
         tabs = new JTabbedPane();
-        tabs.addTab("GUI Process", VectorIcons.pulse(new Color(0x5C7A45), 14), wrap(guiView));
-        tabs.addTab("Daemon Process", VectorIcons.pulse(new Color(0x596F6F), 14), wrap(daemonView));
+        tabs.addTab("Scheduler", VectorIcons.pulse(new Color(0x5C7A45), 14), wrap(eventsView));
         tabs.addTab("Statistics", VectorIcons.sliders(new Color(0x8A7A66), 14), wrap(statsPanel));
         add(tabs, BorderLayout.CENTER);
 
@@ -145,81 +131,82 @@ public class EventMonitorPanel extends JPanel {
         boolean daemonFresh = SchedulerStatusSnapshot.isAlive(daemonStatusFile, DAEMON_STALE_MS);
         boolean guiActive = scheduler.isStarted();
 
-        refreshHeader(guiActive, daemonFresh);
-        refreshGuiTab(byId, guiActive);
-        refreshDaemonTab(byId, daemonFresh);
+        refreshEventsTab(byId, guiActive, daemonFresh);
         refreshStatsTab();
     }
 
     /**
      * Only one scheduler is ever meant to be firing tasks at a time — the
      * Daemon takes priority, and the GUI only runs its own scheduler when
-     * the Daemon isn't alive (see ui.MainWindow). This summary line, plus
-     * the "(Active)"/"(Standby)"/"(Offline)" tab suffixes below, make that
-     * hand-off visible here too instead of implying both are always live.
+     * the Daemon isn't alive (see ui.MainWindow). This is what determines
+     * both the "Scheduler" tab's title and where pending events come from;
+     * the completed-events table below it always comes from the shared
+     * run-history database regardless of which process is currently active.
      */
-    private void refreshHeader(boolean guiActive, boolean daemonFresh) {
+    private void refreshEventsTab(Map<String, ScheduledTask> byId, boolean guiActive, boolean daemonFresh) {
+        String activeName;
+        List<QueueMonitorView.PendingRow> pendingRows;
+        int poolSize = 0, activeWorkers = 0;
+        boolean anyActive;
+
         if (guiActive) {
-            activeSchedulerLabel.setText("Active scheduler: GUI (this window)");
+            activeName = "GUI";
+            anyActive = true;
+            List<TaskDueEvent> pending = scheduler.getPendingEvents();
+            pendingRows = pending.stream()
+                    .map(e -> new QueueMonitorView.PendingRow(taskName(byId, e.getTaskId()),
+                            scheduleType(byId, e.getTaskId()), e.getAttempt(), e.getDueAt()))
+                    .collect(Collectors.toList());
+            poolSize = scheduler.getWorkerPoolSize();
+            activeWorkers = scheduler.getActiveWorkerCount();
         } else if (daemonFresh) {
-            activeSchedulerLabel.setText("Active scheduler: Daemon (background process)");
+            activeName = "Daemon";
+            SchedulerStatusSnapshot snap = SchedulerStatusSnapshot.read(daemonStatusFile);
+            anyActive = snap != null;
+            if (snap != null) {
+                pendingRows = snap.getPending().stream()
+                        .map(e -> new QueueMonitorView.PendingRow(taskName(byId, e.taskId()),
+                                scheduleType(byId, e.taskId()), e.attempt(), e.dueAt()))
+                        .collect(Collectors.toList());
+                poolSize = snap.getPoolSize();
+                activeWorkers = snap.getActiveWorkers();
+            } else {
+                pendingRows = List.of();
+            }
         } else {
-            activeSchedulerLabel.setText("Active scheduler: none detected — tasks are not being scheduled");
+            activeName = "No Scheduler Active";
+            anyActive = false;
+            pendingRows = List.of();
         }
-        tabs.setTitleAt(0, "GUI Process" + (guiActive ? " (Active)" : " (Standby)"));
-        tabs.setTitleAt(1, "Daemon Process" + (daemonFresh ? " (Active)" : " (Offline)"));
-    }
 
-    private void refreshGuiTab(Map<String, ScheduledTask> byId, boolean guiActive) {
-        if (!guiActive) {
-            guiView.showUnavailable("GUI scheduler is on standby — the Daemon is currently handling scheduling.");
+        tabs.setTitleAt(0, activeName);
+
+        if (!anyActive) {
+            eventsView.showUnavailable("No scheduler is currently running — tasks are not being scheduled.");
             return;
         }
 
-        List<TaskDueEvent> pending = scheduler.getPendingEvents();
-        List<ActivityEntry> activity = scheduler.getRecentActivity(ACTIVITY_LIMIT);
-
-        List<QueueMonitorView.PendingRow> pendingRows = pending.stream()
-                .map(e -> new QueueMonitorView.PendingRow(taskName(byId, e.getTaskId()),
-                        scheduleType(byId, e.getTaskId()), e.getAttempt(), e.getDueAt()))
-                .collect(Collectors.toList());
-        List<QueueMonitorView.ActivityRow> activityRows = activity.stream()
-                .map(a -> new QueueMonitorView.ActivityRow(a.getTaskId(), taskName(byId, a.getTaskId()), a.getAttempt(),
-                        a.getStartedAt(), a.getFinishedAt(), a.isErrored(), a.getErrorMessage()))
-                .collect(Collectors.toList());
-
-        guiView.update(scheduler.getWorkerPoolSize(), scheduler.getActiveWorkerCount(), pendingRows, activityRows);
-
-        popEventToasts(byId, activity.stream().map(a -> new ToastableActivity(a.getTaskId(), a.getAttempt(),
-                        a.getStartedAt(), a.getFinishedAt(), a.isErrored(), a.getErrorMessage()))
-                .collect(Collectors.toList()), seenGuiActivityKeys, guiBaselineEstablished);
-        guiBaselineEstablished = true;
-    }
-
-    private void refreshDaemonTab(Map<String, ScheduledTask> byId, boolean daemonFresh) {
-        SchedulerStatusSnapshot snap = daemonFresh ? SchedulerStatusSnapshot.read(daemonStatusFile) : null;
-        if (snap == null) {
-            daemonView.showUnavailable(scheduler.isStarted()
-                    ? "Daemon not running — the GUI scheduler is currently handling scheduling."
-                    : "Daemon status unavailable — the background daemon may not be running.");
-            return;
+        List<TaskRunRecord> recentRuns;
+        try {
+            recentRuns = scheduler.getRunHistoryService().getRecentRuns(ACTIVITY_LIMIT);
+        } catch (Exception ignored) {
+            recentRuns = List.of(); // run-history DB briefly locked by a write — next refresh will catch up
         }
 
-        List<QueueMonitorView.PendingRow> pendingRows = snap.getPending().stream()
-                .map(e -> new QueueMonitorView.PendingRow(taskName(byId, e.taskId()),
-                        scheduleType(byId, e.taskId()), e.attempt(), e.dueAt()))
-                .collect(Collectors.toList());
-        List<QueueMonitorView.ActivityRow> activityRows = snap.getActivity().stream()
-                .map(a -> new QueueMonitorView.ActivityRow(a.taskId(), taskName(byId, a.taskId()), a.attempt(),
-                        a.startedAt(), a.finishedAt(), a.errored(), a.errorMessage()))
+        List<QueueMonitorView.ActivityRow> activityRows = recentRuns.stream()
+                .map(this::toActivityRow)
                 .collect(Collectors.toList());
 
-        daemonView.update(snap.getPoolSize(), snap.getActiveWorkers(), pendingRows, activityRows);
+        eventsView.update(poolSize, activeWorkers, pendingRows, activityRows);
+        popEventToasts(byId, recentRuns);
+        baselineEstablished = true;
+    }
 
-        popEventToasts(byId, snap.getActivity().stream().map(a -> new ToastableActivity(a.taskId(), a.attempt(),
-                        a.startedAt(), a.finishedAt(), a.errored(), a.errorMessage()))
-                .collect(Collectors.toList()), seenDaemonActivityKeys, daemonBaselineEstablished);
-        daemonBaselineEstablished = true;
+    private QueueMonitorView.ActivityRow toActivityRow(TaskRunRecord r) {
+        String name = r.getTaskName() != null && !r.getTaskName().isBlank() ? r.getTaskName() : "(unknown task)";
+        boolean errored = r.getStatus() == TaskRunRecord.Status.FAILED;
+        return new QueueMonitorView.ActivityRow(r.getTaskId(), name, 0,
+                r.getStartedAt(), r.getEndedAt(), errored, r.getReason());
     }
 
     private void refreshStatsTab() {
@@ -231,60 +218,52 @@ public class EventMonitorPanel extends JPanel {
         }
     }
 
-    /** Common shape for one activity-feed row, regardless of whether it came
-     *  from the in-process worker pool ({@code TaskWorkerPool.ActivityEntry})
-     *  or the Daemon's exported snapshot ({@code SchedulerStatusSnapshot.ActivityEntry})
-     *  — both are package-private/foreign-package types, so refreshGuiTab/
-     *  refreshDaemonTab map into this before handing off to popEventToasts. */
-    private record ToastableActivity(String taskId, int attempt, java.time.LocalDateTime startedAt,
-                                      java.time.LocalDateTime finishedAt, boolean errored, String errorMessage) {}
-
     /**
-     * Pops a small toast for every activity-feed entry not already seen —
-     * i.e. every task run that just fired (watcher-triggered or scheduled)
+     * Pops a small toast for every run-history row not already seen — i.e.
+     * every task run that just completed (watcher-triggered or scheduled)
      * since the last refresh tick — with a short summary: task name,
-     * success/failure, and timing. Scoped to whichever window this panel is
-     * currently showing in (see {@link #ensureEventToasts}).
+     * success/failure, and timing.
      *
-     * <p>On the very first call for a given feed ({@code baselineEstablished}
-     * false), entries are recorded as seen but nothing is popped — otherwise
-     * opening the Event Monitor on an app that's already been running a
-     * while would instantly dump up to {@link #ACTIVITY_LIMIT} toasts.
+     * <p>On the very first call ({@code baselineEstablished} false), rows
+     * are recorded as seen but nothing is popped — otherwise opening the
+     * Event Monitor on an app that's already been running a while (or has
+     * pre-existing run history from before a restart) would instantly dump
+     * up to {@link #ACTIVITY_LIMIT} toasts.
      */
-    private void popEventToasts(Map<String, ScheduledTask> byId, List<ToastableActivity> activity,
-                                 Set<String> seenKeys, boolean baselineEstablished) {
-        if (activity.isEmpty()) return;
+    private void popEventToasts(Map<String, ScheduledTask> byId, List<TaskRunRecord> recentRuns) {
+        if (recentRuns.isEmpty()) return;
         ToastManager toasts = baselineEstablished ? ensureEventToasts() : null;
 
         // Feed is newest-first; walk it oldest-to-newest so toasts for a
         // burst of events appear (and stack) in the order they happened.
-        for (int i = activity.size() - 1; i >= 0; i--) {
-            ToastableActivity a = activity.get(i);
-            String key = a.taskId() + "|" + a.startedAt();
-            if (!seenKeys.add(key)) continue; // already popped this one
+        for (int i = recentRuns.size() - 1; i >= 0; i--) {
+            TaskRunRecord r = recentRuns.get(i);
+            if (!seenRunIds.add(r.getId())) continue; // already popped this one
             if (toasts != null) {
-                String taskName = taskName(byId, a.taskId());
-                String title = (a.errored() ? "\u26A0 " : "\u2713 ") + taskName;
+                boolean errored = r.getStatus() == TaskRunRecord.Status.FAILED;
+                String taskName = r.getTaskName() != null && !r.getTaskName().isBlank()
+                        ? r.getTaskName() : taskName(byId, r.getTaskId());
+                String title = (errored ? "\u26A0 " : "\u2713 ") + taskName;
                 StringBuilder body = new StringBuilder();
-                if (a.startedAt() != null) body.append("Started ").append(a.startedAt().format(TIME_FMT));
-                if (a.finishedAt() != null) body.append(body.length() > 0 ? " · " : "")
-                        .append("Finished ").append(a.finishedAt().format(TIME_FMT));
-                if (a.errored() && a.errorMessage() != null && !a.errorMessage().isBlank()) {
-                    body.append(" — ").append(a.errorMessage());
-                } else if (!a.errored()) {
-                    body.append(" — transferred successfully");
+                if (r.getStartedAt() != null) body.append("Started ").append(r.getStartedAt().format(TIME_FMT));
+                if (r.getEndedAt() != null) body.append(body.length() > 0 ? " · " : "")
+                        .append("Finished ").append(r.getEndedAt().format(TIME_FMT));
+                if (r.getReason() != null && !r.getReason().isBlank()) {
+                    body.append(" — ").append(r.getReason());
+                } else if (!errored) {
+                    body.append(" — completed successfully");
                 }
                 toasts.showToast(title, body.toString(),
-                        a.errored() ? AppTheme.EARTH_RUST : AppTheme.EARTH_MOSS,
-                        a.errored() ? "\u26A0" : "\u2713");
+                        errored ? AppTheme.EARTH_RUST : AppTheme.EARTH_MOSS,
+                        errored ? "\u26A0" : "\u2713");
             }
         }
 
         // Keep the seen-set from growing forever across a long session —
         // bound it a little above ACTIVITY_LIMIT so entries still in the
         // visible feed are never re-popped after trimming.
-        while (seenKeys.size() > ACTIVITY_LIMIT * 2) {
-            java.util.Iterator<String> it = seenKeys.iterator();
+        while (seenRunIds.size() > ACTIVITY_LIMIT * 2) {
+            java.util.Iterator<Long> it = seenRunIds.iterator();
             it.next();
             it.remove();
         }

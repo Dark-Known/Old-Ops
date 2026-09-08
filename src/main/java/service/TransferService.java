@@ -33,6 +33,9 @@ import java.util.Set;
 import java.util.function.Consumer;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.SynchronousQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -96,6 +99,73 @@ public class TransferService {
     // since those aren't on the "instant detection" latency-critical path.
     private final PersistentSftpConnectionManager persistentSftp = new PersistentSftpConnectionManager();
 
+    // Optional hook: fired the moment a watcher fire's files are confirmed
+    // found — i.e. right as the "Watcher found N new/updated file(s)" log
+    // line is emitted — before any transfer attempt starts. Lets the caller
+    // (TaskSchedulerService) record the detection itself as its own
+    // run-history row, distinct from the transfer's own outcome row, so
+    // "files were seen" and "files were moved" are two separate, separately
+    // timestamped events in the Event Monitor rather than one merged one —
+    // deliberately a ThreadLocal rather than a widened executeTransfer(...)
+    // signature, since only TaskSchedulerService's single call site needs it
+    // and every other caller (backup mkdir/cleanup, etc.) is unaffected.
+    private final ThreadLocal<Consumer<List<RemoteFileMetadata>>> detectionCallback = new ThreadLocal<>();
+
+    /** Set on the current thread just before {@link #executeTransfer}; see {@link #detectionCallback}. */
+    public void setDetectionCallback(Consumer<List<RemoteFileMetadata>> callback) {
+        detectionCallback.set(callback);
+    }
+
+    /** Clears the callback set by {@link #setDetectionCallback} — always call in a {@code finally}. */
+    public void clearDetectionCallback() {
+        detectionCallback.remove();
+    }
+
+    /**
+     * The one and only pool of "extra" worker threads used to parallelize a
+     * single watcher fire's files across multiple SFTP channels (see
+     * {@link #transferFilesConcurrently}) — shared across every task, not
+     * one freshly-created-and-destroyed pool per fire. This is the concrete
+     * shape of "a pool of threads executes the task: one thread for low
+     * load, multiple threads + batches for a big burst":
+     * <ul>
+     *   <li>A quiet task naming 1-2 files never touches this pool at all —
+     *       {@link #transferFilesConcurrently} takes a direct single-thread,
+     *       single-channel path with zero pool overhead.</li>
+     *   <li>A large burst splits into batches (see
+     *       {@link util.AppSettings#getWatcherFilesPerWorkerThread()}) and
+     *       those batches run as tasks submitted <i>here</i> — one shared,
+     *       bounded pool for the whole app.</li>
+     * </ul>
+     * Deliberately elastic rather than a plain fixed-size pool:
+     * {@code corePoolSize=0} means no threads exist at all while every task
+     * is quiet, threads are created on demand up to the ceiling below, and
+     * one that's gone unused for {@link #BATCH_POOL_IDLE_SECONDS} dies again
+     * rather than sitting around forever after one big burst. The ceiling
+     * itself ({@link util.AppSettings#getTransferBatchConcurrency()}) is
+     * re-applied on every fire (see {@link #transferFilesConcurrently}), so
+     * — unlike a plain fixed pool sized once at startup — raising that
+     * setting takes effect on the very next transfer, no restart needed.
+     * The hand-off queue is a {@link SynchronousQueue} (no queueing — either
+     * a thread is free/spun up immediately, or the ceiling is reached) paired
+     * with {@link ThreadPoolExecutor.CallerRunsPolicy}: if every task
+     * currently bursting has genuinely saturated the ceiling, the excess
+     * batch just runs inline on whichever thread submitted it rather than
+     * queueing indefinitely or being rejected — a graceful, self-throttling
+     * degradation instead of unbounded thread growth.
+     */
+    private static final int BATCH_POOL_IDLE_SECONDS = 60;
+    private final ThreadPoolExecutor batchWorkerPool = new ThreadPoolExecutor(
+            0, Math.max(1, AppSettings.getTransferBatchConcurrency()),
+            BATCH_POOL_IDLE_SECONDS, TimeUnit.SECONDS,
+            new SynchronousQueue<>(),
+            r -> {
+                Thread t = new Thread(r, "watcher-sftp-worker");
+                t.setDaemon(true);
+                return t;
+            },
+            new ThreadPoolExecutor.CallerRunsPolicy());
+
     public TransferService(XmlStorageService storage) {
         this.storage                = storage;
         this.metadataServiceFactory = new RemoteFileMetadataServiceFactory(storage);
@@ -118,7 +188,10 @@ public class TransferService {
     public void closeWatcherConnection(String taskId) { persistentSftp.close(taskId); }
 
     /** Closes every kept-warm watcher SFTP connection — call on scheduler/app shutdown. */
-    public void shutdownWatcherConnections() { persistentSftp.shutdown(); }
+    public void shutdownWatcherConnections() {
+        persistentSftp.shutdown();
+        batchWorkerPool.shutdownNow();
+    }
 
     private String detectWinScp() {
         for (String p : WINSCP_PATHS) {
@@ -366,7 +439,7 @@ public class TransferService {
         }
     }
 
-    private static String humanReadableBytes(long bytes) {
+    static String humanReadableBytes(long bytes) {
         if (bytes < 1024) return bytes + " B";
         int exp = (int) (Math.log(bytes) / Math.log(1024));
         String pre = "KMGTPE".charAt(exp - 1) + "";
@@ -477,11 +550,14 @@ public class TransferService {
             // executeWinScpWatcherInbound / PersistentSftpConnectionManager)
             // instead of opening-and-closing a brand-new SSH session just for
             // this listing on every single watcher fire.
+            long listStart = System.nanoTime();
             try {
+                long connStart = System.nanoTime();
                 ChannelSftp channel = persistentSftp.getChannel(task.getId(), target);
                 RemoteFileMetadataService svc = new SftpRemoteFileMetadataService(channel);
                 String watchDir = resolveRemoteWatchDirectoryFor(task);
-                logLine.accept("[INFO] Metadata service: SFTP (kept-warm connection) | watch directory: " + watchDir);
+                logLine.accept("[INFO] Metadata service: SFTP (kept-warm connection, " + elapsedMs(connStart)
+                        + "ms) | watch directory: " + watchDir);
 
                 if (lastKnownEpochMillis > 0 && task.getLastKnownRemoteFileSize() >= 0) {
                     Instant modifiedAfterInclusive = Instant.ofEpochMilli(lastKnownEpochMillis - 1);
@@ -495,6 +571,7 @@ public class TransferService {
                 } else {
                     newFiles = svc.getFilesModifiedAfter(watchDir, modifiedAfter);
                 }
+                logLine.accept("[INFO] Remote directory listing took " + elapsedMs(listStart) + "ms.");
 
             } catch (RemoteFileException ex) {
                 logLine.accept("[ERROR] Failed to query file metadata: " + ex.getMessage());
@@ -524,13 +601,32 @@ public class TransferService {
             String skipMsg = "Watcher skipped: no files modified after "
                     + modifiedAfter + " found in watch directory.";
             logLine.accept("[INFO] " + skipMsg);
+            // No transfer is going to happen this fire — close now rather
+            // than leaving a session open (possibly opened just moments ago,
+            // during the INBOUND listing/stat above) with nothing left to do
+            // on it. Harmless no-op for OUTBOUND, which never opens one here.
+            persistentSftp.close(task.getId());
             throw new WatcherSkipException(skipMsg);
         }
 
-        logLine.accept("[INFO] Watcher found " + newFiles.size() + " new/updated file(s):");
-        newFiles.forEach(f -> logLine.accept("[INFO]   " + f.fileName()
-                + " | lastModified=" + f.lastModified()
-                + " | size=" + f.size()));
+        // Deliberately NOT logged via logLine here (which feeds both the
+        // per-task Logs panel and the eventual transfer run's own history
+        // "details") — the per-file breakdown belongs only in the Event
+        // Monitor's separate detection row, via the callback below, never
+        // duplicated into the raw per-task log under any circumstance. (The
+        // transfer event's own popup still gets file names/sizes
+        // independently, from the "Queued outbound/inbound: ..." lines
+        // logged per file during the actual transfer step further down.)
+        Consumer<List<RemoteFileMetadata>> onDetected = detectionCallback.get();
+        if (onDetected != null) {
+            onDetected.accept(newFiles);
+        }
+        // No "else" fallback log line on purpose — TaskSchedulerService
+        // always wires this callback before calling executeTransfer() for a
+        // FILE_TRANSFER task (see its onTaskDue), so in normal operation this
+        // is never null; if some other caller invokes executeTransfer
+        // without setting one, detection simply isn't recorded anywhere for
+        // that call rather than leaking into the log stream as a fallback.
 
         RemoteFileMetadata newest = newFiles.stream()
                 .max((a, b) -> a.lastModified().compareTo(b.lastModified()))
@@ -538,6 +634,7 @@ public class TransferService {
         if (newest == null) {
             String skipMsg = "Watcher skipped: no files to process after filtering.";
             logLine.accept("[INFO] " + skipMsg);
+            persistentSftp.close(task.getId());
             throw new WatcherSkipException(skipMsg);
         }
 
@@ -582,45 +679,59 @@ public class TransferService {
     }
 
     /**
-     * Resolves {@code names} to their live {@link RemoteFileMetadata} by listing
-     * the watch directory (local for OUTBOUND, SFTP for INBOUND) and keeping only
-     * the entries whose filename the watcher actually named — used by the
-     * event-driven fast path in {@link #executeWatcherTransfer} instead of a
-     * baseline-filtered scan. Deliberately re-lists rather than {@code stat}-ing
-     * each name individually: the existing {@link RemoteFileMetadataService}
-     * implementations only expose "list everything after a cutoff", and calling
-     * that once with {@link Instant#EPOCH} and filtering client-side avoids
-     * needing a new per-file stat method on the SFTP implementation just for
-     * this path. Returns an empty list if none of the named files currently
-     * exist, or {@code null} on a hard connection/listing failure — the caller
-     * treats both the same way (fall back to the ordinary baseline scan below),
-     * in keeping with this class's existing "push is an optimization, the
-     * baseline scan is always the safety net" pattern elsewhere.
+     * Resolves {@code names} to their live {@link RemoteFileMetadata} via a
+     * direct {@code stat} per named file (local for OUTBOUND, SFTP for
+     * INBOUND) — used by the event-driven fast path in
+     * {@link #executeWatcherTransfer} instead of a baseline-filtered scan.
+     * One round trip per named file rather than a full directory listing:
+     * for a small watch directory the difference is negligible, but for a
+     * large one (tens of thousands of files) a full listing can take tens
+     * of seconds all by itself — pure overhead when the watcher already told
+     * us exactly which file(s) to check. Returns an empty list if none of
+     * the named files currently exist, or {@code null} on a hard
+     * connection/stat failure — the caller treats both the same way (fall
+     * back to the ordinary baseline scan below), in keeping with this
+     * class's existing "push is an optimization, the baseline scan is
+     * always the safety net" pattern elsewhere.
      */
     private List<RemoteFileMetadata> resolveEventNamedFiles(ScheduledTask task,
                                                              Credential target,
                                                              boolean isOutbound,
                                                              Set<String> names,
                                                              Consumer<String> logLine) {
+        long statStart = System.nanoTime();
         try {
-            List<RemoteFileMetadata> all;
+            List<RemoteFileMetadata> matched;
             if (isOutbound) {
+                // Local filesystem stat is already effectively free (no network
+                // round trip) — parallelizing it wouldn't meaningfully help, so
+                // this stays a simple sequential loop.
                 String watchDir = resolveOutboundWatchDirectory(task);
-                all = new LocalFileMetadataService().getFilesModifiedAfter(watchDir, Instant.EPOCH);
-            } else {
-                ChannelSftp channel = persistentSftp.getChannel(task.getId(), target);
-                RemoteFileMetadataService svc = new SftpRemoteFileMetadataService(channel);
-                all = svc.getFilesModifiedAfter(resolveRemoteWatchDirectoryFor(task), Instant.EPOCH);
-            }
-            List<RemoteFileMetadata> matched = all.stream()
-                    .filter(f -> names.contains(f.fileName()))
-                    .collect(Collectors.toList());
-            Set<String> foundNames = matched.stream().map(RemoteFileMetadata::fileName).collect(Collectors.toSet());
-            for (String name : names) {
-                if (!foundNames.contains(name)) {
-                    logLine.accept("[INFO]   (event-named file no longer present, skipping: " + name + ")");
+                RemoteFileMetadataService svc = new LocalFileMetadataService();
+                matched = new ArrayList<>();
+                for (String name : names) {
+                    RemoteFileMetadata meta = svc.statFile(watchDir, name);
+                    if (meta != null) {
+                        matched.add(meta);
+                    } else {
+                        logLine.accept("[INFO]   (event-named file no longer present, skipping: " + name + ")");
+                    }
                 }
+            } else {
+                // Remote (SFTP) stat is a real network round trip per file —
+                // spread the named files across multiple channel slots on the
+                // task's one kept-warm session (same pattern, and same shared
+                // batchWorkerPool, as the actual transfer step below) so N
+                // named files cost roughly one round-trip's worth of wall time
+                // instead of N sequential ones.
+                long connStart = System.nanoTime();
+                persistentSftp.getChannel(task.getId(), target); // ensure slot 0 / the session itself is warm first
+                logLine.accept("[INFO] SFTP connection for stat: acquired in " + elapsedMs(connStart) + "ms");
+                String watchDir = resolveRemoteWatchDirectoryFor(task);
+                matched = statNamedFilesConcurrently(task, target, watchDir, names, logLine);
             }
+            logLine.accept("[INFO] Stat'd " + names.size() + " named file(s) (" + matched.size()
+                    + " found) in " + elapsedMs(statStart) + "ms.");
             return matched;
         } catch (RemoteFileException ex) {
             logLine.accept("[ERROR] Failed to resolve event-named file(s): " + ex.getMessage());
@@ -631,6 +742,64 @@ public class TransferService {
             if (!isOutbound) persistentSftp.close(task.getId());
             return null;
         }
+    }
+
+    /**
+     * Stats {@code names} against the remote {@code watchDir}, spread across
+     * up to {@link #computeWatcherConcurrency(int)} channel slots on the
+     * task's single kept-warm SSH session — the same density-scaled,
+     * shared-pool concurrency {@link #transferFilesConcurrently} uses for the
+     * actual transfer, applied here to the stat round trips instead. A
+     * handful of named files (the common case) still runs on slot 0 alone;
+     * only a genuinely large burst of named files spins up extra channels.
+     */
+    private List<RemoteFileMetadata> statNamedFilesConcurrently(ScheduledTask task, Credential target,
+                                                                 String watchDir, Set<String> names,
+                                                                 Consumer<String> logLine) throws Exception {
+        List<String> nameList = new ArrayList<>(names);
+        int concurrency = computeWatcherConcurrency(nameList.size());
+
+        if (concurrency <= 1) {
+            ChannelSftp channel = persistentSftp.getChannel(task.getId(), target);
+            RemoteFileMetadataService svc = new SftpRemoteFileMetadataService(channel);
+            List<RemoteFileMetadata> matched = new ArrayList<>();
+            for (String name : nameList) {
+                RemoteFileMetadata meta = svc.statFile(watchDir, name);
+                if (meta != null) matched.add(meta);
+                else logLine.accept("[INFO]   (event-named file no longer present, skipping: " + name + ")");
+            }
+            return matched;
+        }
+
+        logLine.accept("[INFO] " + nameList.size() + " named file(s) to check — using " + concurrency
+                + " worker thread(s) on the same SFTP session to stat them concurrently.");
+
+        List<List<String>> chunks = new ArrayList<>();
+        for (int i = 0; i < concurrency; i++) chunks.add(new ArrayList<>());
+        for (int i = 0; i < nameList.size(); i++) chunks.get(i % concurrency).add(nameList.get(i));
+
+        batchWorkerPool.setMaximumPoolSize(Math.max(1, AppSettings.getTransferBatchConcurrency()));
+        List<java.util.concurrent.Callable<List<RemoteFileMetadata>>> tasks = new ArrayList<>();
+        for (int slot = 0; slot < concurrency; slot++) {
+            final int s = slot;
+            final List<String> chunk = chunks.get(slot);
+            tasks.add(() -> {
+                if (chunk.isEmpty()) return List.<RemoteFileMetadata>of();
+                ChannelSftp channel = persistentSftp.acquireChannel(task.getId(), s, target);
+                RemoteFileMetadataService svc = new SftpRemoteFileMetadataService(channel);
+                List<RemoteFileMetadata> found = new ArrayList<>();
+                for (String name : chunk) {
+                    RemoteFileMetadata meta = svc.statFile(watchDir, name);
+                    if (meta != null) found.add(meta);
+                    else logLine.accept("[INFO]   (event-named file no longer present, skipping: " + name + ")");
+                }
+                return found;
+            });
+        }
+        List<java.util.concurrent.Future<List<RemoteFileMetadata>>> results = batchWorkerPool.invokeAll(tasks);
+        List<RemoteFileMetadata> matched = new ArrayList<>();
+        for (java.util.concurrent.Future<List<RemoteFileMetadata>> f : results) matched.addAll(f.get());
+        return matched;
     }
 
     private void probeWindowsRemotePaths(com.jcraft.jsch.Session session,
@@ -708,6 +877,29 @@ public class TransferService {
 
     // ─── WinSCP outbound watcher transfer ────────────────────────────────────
 
+    /** Milliseconds since {@code startNanos} (a {@code System.nanoTime()} reading) — for the timing breadcrumbs above. */
+    private static long elapsedMs(long startNanos) {
+        return (System.nanoTime() - startNanos) / 1_000_000L;
+    }
+
+    /** Milliseconds between two {@code System.nanoTime()} readings. */
+    private static long elapsedMs(long startNanos, long endNanos) {
+        return (endNanos - startNanos) / 1_000_000L;
+    }
+
+    /**
+     * How many worker threads/channel slots a watcher fire naming
+     * {@code fileCount} files should use — scales with burst size rather
+     * than jumping straight to the configured concurrency ceiling the
+     * moment there's more than one file. See
+     * {@link util.AppSettings#getWatcherFilesPerWorkerThread()}.
+     */
+    private int computeWatcherConcurrency(int fileCount) {
+        int filesPerThread = AppSettings.getWatcherFilesPerWorkerThread();
+        int wanted = (int) Math.ceil(fileCount / (double) filesPerThread);
+        return Math.max(1, Math.min(AppSettings.getTransferBatchConcurrency(), wanted));
+    }
+
     /**
      * A single file's transfer over an already-open {@link ChannelSftp} —
      * the unit of work {@link #transferFilesConcurrently} spreads across
@@ -731,7 +923,7 @@ public class TransferService {
      */
     private long transferFilesConcurrently(ScheduledTask task, Credential target, List<RemoteFileMetadata> files,
                                             Consumer<String> logLine, PerFileTransfer op) throws Exception {
-        int concurrency = Math.max(1, Math.min(AppSettings.getTransferBatchConcurrency(), files.size()));
+        int concurrency = computeWatcherConcurrency(files.size());
 
         if (concurrency <= 1) {
             ChannelSftp channel = persistentSftp.getChannel(task.getId(), target);
@@ -747,31 +939,36 @@ public class TransferService {
         for (int i = 0; i < concurrency; i++) chunks.add(new ArrayList<>());
         for (int i = 0; i < files.size(); i++) chunks.get(i % concurrency).add(files.get(i));
 
-        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(concurrency, r -> {
-            Thread t = new Thread(r, "watcher-sftp-worker");
-            t.setDaemon(true);
-            return t;
-        });
-        try {
-            List<java.util.concurrent.Callable<Long>> tasks = new ArrayList<>();
-            for (int slot = 0; slot < concurrency; slot++) {
-                final int s = slot;
-                final List<RemoteFileMetadata> chunk = chunks.get(slot);
-                tasks.add(() -> {
-                    if (chunk.isEmpty()) return 0L;
-                    ChannelSftp channel = persistentSftp.acquireChannel(task.getId(), s, target);
-                    long bytes = 0L;
-                    for (RemoteFileMetadata meta : chunk) bytes += op.transfer(channel, meta);
-                    return bytes;
-                });
-            }
-            List<java.util.concurrent.Future<Long>> results = pool.invokeAll(tasks);
-            long total = 0L;
-            for (java.util.concurrent.Future<Long> f : results) total += f.get(); // rethrows the first worker's exception, if any
-            return total;
-        } finally {
-            pool.shutdownNow();
+        List<java.util.concurrent.Callable<Long>> tasks = new ArrayList<>();
+        for (int slot = 0; slot < concurrency; slot++) {
+            final int s = slot;
+            final List<RemoteFileMetadata> chunk = chunks.get(slot);
+            tasks.add(() -> {
+                if (chunk.isEmpty()) return 0L;
+                ChannelSftp channel = persistentSftp.acquireChannel(task.getId(), s, target);
+                long bytes = 0L;
+                for (RemoteFileMetadata meta : chunk) bytes += op.transfer(channel, meta);
+                return bytes;
+            });
         }
+        // Re-applied on every call (cheap) rather than only at construction —
+        // this is what makes the ceiling live-adjustable: raising the
+        // setting takes effect on the very next fire, no restart needed.
+        // setMaximumPoolSize requires >= corePoolSize (0 here), so this is
+        // always safe regardless of ordering.
+        batchWorkerPool.setMaximumPoolSize(Math.max(1, AppSettings.getTransferBatchConcurrency()));
+
+        // Submitted to the one shared, app-wide batchWorkerPool rather than a
+        // pool created (and torn down) for this fire alone — see its javadoc.
+        // invokeAll blocks this calling thread until every batch finishes, so
+        // pool size directly bounds how many of these run at once across the
+        // whole app; CallerRunsPolicy means asking for more than that still
+        // works correctly (just runs some batches inline) rather than
+        // deadlocking or being rejected.
+        List<java.util.concurrent.Future<Long>> results = batchWorkerPool.invokeAll(tasks);
+        long total = 0L;
+        for (java.util.concurrent.Future<Long> f : results) total += f.get(); // rethrows the first worker's exception, if any
+        return total;
     }
 
     /**
@@ -802,6 +999,7 @@ public class TransferService {
         }
 
         int connectsBefore = persistentSftp.getSessionCount(task.getId());
+        long t0 = System.nanoTime();
         try {
             // Warms slot 0 up front purely so the log line below can report
             // reused-vs-connected accurately even when concurrency > 1 (extra
@@ -810,14 +1008,16 @@ public class TransferService {
             persistentSftp.getChannel(task.getId(), target);
             boolean reused = persistentSftp.getSessionCount(task.getId()) == connectsBefore;
             logLine.accept("[INFO] SFTP connection: " + (reused ? "reused existing warm connection"
-                    : "connected (session #" + persistentSftp.getSessionCount(task.getId()) + " for this task)"));
+                    : "connected (session #" + persistentSftp.getSessionCount(task.getId()) + " for this task)")
+                    + " (" + elapsedMs(t0) + "ms)");
 
-            int concurrency = Math.max(1, Math.min(AppSettings.getTransferBatchConcurrency(), files.size()));
+            int concurrency = computeWatcherConcurrency(files.size());
+            long transferStart = System.nanoTime();
             long totalBytes = transferFilesConcurrently(task, target, files, logLine, (channel, meta) -> {
+                long fileStart = System.nanoTime();
                 String localFile  = normalizeLocalPath(
                         Paths.get(localSourceDir, meta.fileName()).toString());
                 String remoteFile = remoteDir + meta.fileName();
-                logLine.accept("[INFO] Queued outbound: " + localFile + " → " + remoteFile);
                 channel.put(localFile, remoteFile);
 
                 for (String extraFolder : extraDestFolders) {
@@ -825,15 +1025,28 @@ public class TransferService {
                     extraRemoteDir = extraRemoteDir.endsWith("/") ? extraRemoteDir : extraRemoteDir + "/";
                     channel.put(localFile, extraRemoteDir + meta.fileName());
                 }
+                logLine.accept("[INFO] Queued outbound: " + localFile + " → " + remoteFile
+                        + " (" + elapsedMs(fileStart) + "ms, " + humanReadableBytes(Math.max(meta.size(), 0)) + ")");
                 return Math.max(meta.size(), 0);
             });
 
             logLine.accept("[SUCCESS] Transfer completed successfully.");
             logLine.accept("[INFO] Transfer summary: " + files.size() + " file(s), "
-                    + humanReadableBytes(totalBytes) + " total, 1 batch(es), 1 session(s), " + concurrency + " worker thread(s).");
+                    + humanReadableBytes(totalBytes) + " total, 1 batch(es), 1 session(s), " + concurrency
+                    + " worker thread(s). Timing — connect: " + elapsedMs(t0, transferStart) + "ms, transfer: "
+                    + elapsedMs(transferStart) + "ms, total: " + elapsedMs(t0) + "ms.");
+            // Session lifetime is scoped to this one fire, not kept warm for
+            // the next one — see PersistentSftpConnectionManager's javadoc:
+            // an idle SFTP session isn't free on the server side (each one
+            // keeps its own sftp-server process alive under sshd), so close
+            // it now rather than leaving that cost sitting there until the
+            // idle reaper eventually gets to it. The next fire simply opens
+            // a fresh one; that's now a normal, fast SSH handshake, not the
+            // bottleneck it once looked like (see SftpRemoteFileMetadataService#statFile).
+            persistentSftp.close(task.getId());
             return true;
         } catch (Exception ex) {
-            logLine.accept("[ERROR] Outbound watcher SFTP transfer failed: " + ex.getMessage());
+            logLine.accept("[ERROR] Outbound watcher SFTP transfer failed after " + elapsedMs(t0) + "ms: " + ex.getMessage());
             // Force a clean reconnect on the next fire rather than reusing a
             // connection that just proved broken.
             persistentSftp.close(task.getId());
@@ -855,21 +1068,26 @@ public class TransferService {
 
         int connectsBefore = persistentSftp.getSessionCount(task.getId());
         List<String> downloadedLocalPaths = java.util.Collections.synchronizedList(new ArrayList<>());
+        long t0 = System.nanoTime();
         try {
             persistentSftp.getChannel(task.getId(), target);
             boolean reused = persistentSftp.getSessionCount(task.getId()) == connectsBefore;
             logLine.accept("[INFO] SFTP connection: " + (reused ? "reused existing warm connection"
-                    : "connected (session #" + persistentSftp.getSessionCount(task.getId()) + " for this task)"));
+                    : "connected (session #" + persistentSftp.getSessionCount(task.getId()) + " for this task)")
+                    + " (" + elapsedMs(t0) + "ms)");
 
-            int concurrency = Math.max(1, Math.min(AppSettings.getTransferBatchConcurrency(), files.size()));
+            int concurrency = computeWatcherConcurrency(files.size());
+            long transferStart = System.nanoTime();
             long totalBytes = transferFilesConcurrently(task, target, files, logLine, (channel, meta) -> {
+                long fileStart = System.nanoTime();
                 String remoteFile = remoteDir + meta.fileName();
                 String destPath   = buildLocalDestinationPath(localDestDir, meta.fileName());
-                logLine.accept("[INFO] Queued inbound: " + remoteFile + " → " + destPath);
                 Path destParent = Paths.get(destPath).getParent();
                 if (destParent != null) Files.createDirectories(destParent);
                 channel.get(remoteFile, destPath);
                 downloadedLocalPaths.add(destPath);
+                logLine.accept("[INFO] Queued inbound: " + remoteFile + " → " + destPath
+                        + " (" + elapsedMs(fileStart) + "ms, " + humanReadableBytes(Math.max(meta.size(), 0)) + ")");
                 return Math.max(meta.size(), 0);
             });
 
@@ -880,10 +1098,15 @@ public class TransferService {
             }
             logLine.accept("[SUCCESS] Transfer completed successfully.");
             logLine.accept("[INFO] Transfer summary: " + files.size() + " file(s), "
-                    + humanReadableBytes(totalBytes) + " total, 1 batch(es), 1 session(s), " + concurrency + " worker thread(s).");
+                    + humanReadableBytes(totalBytes) + " total, 1 batch(es), 1 session(s), " + concurrency
+                    + " worker thread(s). Timing — connect: " + elapsedMs(t0, transferStart) + "ms, transfer: "
+                    + elapsedMs(transferStart) + "ms, total: " + elapsedMs(t0) + "ms.");
+            // See the matching comment in executeWinScpWatcherOutbound — same
+            // "scoped to one fire, closed immediately after" lifecycle.
+            persistentSftp.close(task.getId());
             return true;
         } catch (Exception ex) {
-            logLine.accept("[ERROR] Inbound watcher SFTP transfer failed: " + ex.getMessage());
+            logLine.accept("[ERROR] Inbound watcher SFTP transfer failed after " + elapsedMs(t0) + "ms: " + ex.getMessage());
             persistentSftp.close(task.getId());
             return false;
         }

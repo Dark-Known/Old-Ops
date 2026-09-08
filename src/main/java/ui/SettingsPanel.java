@@ -43,6 +43,7 @@ public class SettingsPanel extends JPanel {
     private javax.swing.JSpinner spinnerBatchIntervalSeconds;
     private JTextField tfBatchMaxBytesOverride;
     private javax.swing.JSpinner spinnerBatchConcurrency;
+    private javax.swing.JSpinner spinnerWatcherFilesPerThread;
     private javax.swing.JSpinner spinnerStaleThresholdMinutes;
     private javax.swing.JSpinner spinnerMaxConcurrentTaskThreads;
     public SettingsPanel(TransferService transferService) {
@@ -333,6 +334,22 @@ public class SettingsPanel extends JPanel {
         chc.gridx = 0; chc.gridy = row++; chc.gridwidth = 3; chc.anchor = GridBagConstraints.WEST;
         chc.insets = new Insets(0, 4, 8, 0);
         panel.add(concurrencyHint, chc);
+
+        spinnerWatcherFilesPerThread = new javax.swing.JSpinner(
+                new javax.swing.SpinnerNumberModel(5, 1, 1000, 1));
+        row = addFieldRow(panel, lc, fc, "Watcher files per worker thread:", spinnerWatcherFilesPerThread, row);
+
+        JLabel filesPerThreadHint = new JLabel("<html><body style='width: 480px'><i style='color:gray'>"
+            + "Only applies to watcher-triggered transfers (the persistent-connection fast path). A single "
+            + "fire doesn't use more than one worker thread until it names at least this many changed files — "
+            + "e.g. with the default of 5, a 2-file fire stays single-threaded, a 20-file burst uses 4 threads "
+            + "(20 \u00f7 5), still capped by \"Batches/files to run at once\" above. Lower this if small bursts "
+            + "should also parallelize; raise it if a handful of files shouldn't need extra threads/connections "
+            + "at all.</i></body></html>");
+        GridBagConstraints fpc = new GridBagConstraints();
+        fpc.gridx = 0; fpc.gridy = row++; fpc.gridwidth = 3; fpc.anchor = GridBagConstraints.WEST;
+        fpc.insets = new Insets(0, 4, 8, 0);
+        panel.add(filesPerThreadHint, fpc);
 
         spinnerStaleThresholdMinutes = new javax.swing.JSpinner(
                 new javax.swing.SpinnerNumberModel(30, 1, 1440, 1));
@@ -962,6 +979,7 @@ public class SettingsPanel extends JPanel {
         spinnerBatchIntervalSeconds.setValue(AppSettings.getTransferBatchIntervalSeconds());
         tfBatchMaxBytesOverride.setText(AppSettings.get(AppSettings.KEY_TRANSFER_BATCH_MAX_BYTES));
         spinnerBatchConcurrency.setValue(AppSettings.getTransferBatchConcurrency());
+        spinnerWatcherFilesPerThread.setValue(AppSettings.getWatcherFilesPerWorkerThread());
         spinnerStaleThresholdMinutes.setValue(AppSettings.getStaleRunningThresholdMinutes());
         spinnerMaxConcurrentTaskThreads.setValue(AppSettings.getMaxConcurrentTaskThreads());
     }
@@ -1004,6 +1022,8 @@ public class SettingsPanel extends JPanel {
             }
             live.put(AppSettings.KEY_TRANSFER_BATCH_CONCURRENCY,
                     String.valueOf((Integer) spinnerBatchConcurrency.getValue()));
+            live.put(AppSettings.KEY_WATCHER_FILES_PER_WORKER_THREAD,
+                    String.valueOf((Integer) spinnerWatcherFilesPerThread.getValue()));
             live.put(AppSettings.KEY_STALE_RUNNING_THRESHOLD_MINUTES,
                     String.valueOf((Integer) spinnerStaleThresholdMinutes.getValue()));
             live.put(AppSettings.KEY_MAX_CONCURRENT_TASK_THREADS,

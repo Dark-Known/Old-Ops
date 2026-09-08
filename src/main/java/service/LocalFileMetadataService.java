@@ -80,4 +80,17 @@ public class LocalFileMetadataService implements RemoteFileMetadataService {
         result.sort(Comparator.comparing(RemoteFileMetadata::lastModified));
         return result;
     }
+
+    /** Direct {@code Files.readAttributes} on the one named file — no directory scan at all. */
+    @Override
+    public RemoteFileMetadata statFile(String remoteDirectory, String fileName) throws RemoteFileException {
+        Path path = Paths.get(remoteDirectory, fileName);
+        if (!Files.isRegularFile(path)) return null;
+        try {
+            BasicFileAttributes attrs = Files.readAttributes(path, BasicFileAttributes.class);
+            return new RemoteFileMetadata(fileName, attrs.lastModifiedTime().toInstant(), attrs.size());
+        } catch (IOException e) {
+            return null; // e.g. deleted between the isRegularFile check and here — not an error, just gone
+        }
+    }
 }

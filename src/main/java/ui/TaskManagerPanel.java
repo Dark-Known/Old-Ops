@@ -47,6 +47,7 @@ public class TaskManagerPanel extends JPanel {
     private DefaultTableModel tableModel;
     private JTable table;
     private JTextArea logArea;
+    private JScrollPane logScrollPane;
     private JLabel lblSelectedTask;
     private JLabel lblActiveSessions;
 
@@ -108,6 +109,66 @@ public class TaskManagerPanel extends JPanel {
         // call inside updateWatcherFingerprintBar().
         Timer watchModeTimer = new Timer(2000, e -> updateWatcherFingerprintBar());
         watchModeTimer.start();
+
+        // The live-feeling update above (pendingLogLines/flushPendingLogLines)
+        // only ever fires when THIS process is the one actually executing the
+        // task — logCallback is an in-process callback, so it's simply never
+        // invoked when the Daemon (a separate JVM) is the active scheduler
+        // and does the executing instead. In that case the log view shown
+        // here is a one-time snapshot from whenever the row was selected,
+        // with no further updates — hence needing a manual reselect/refresh
+        // to see anything the Daemon has since appended.
+        //
+        // Fix: periodically re-read the same on-disk log file both processes
+        // share (service.TaskLogService writes there regardless of which
+        // process is running) and refresh the view if it's grown. Harmless
+        // and redundant-but-cheap when THIS process is the executor (the
+        // callback already keeps it current; this just confirms no drift),
+        // and it's the ONLY thing that keeps the view live when the Daemon is.
+        Timer liveLogPollTimer = new Timer(1500, e -> refreshSelectedTaskLogIfChanged());
+        liveLogPollTimer.start();
+    }
+
+    /**
+     * Re-reads the selected task's on-disk log and refreshes {@code logArea}
+     * only if it actually changed — so this can run on a timer without
+     * fighting the user's scroll position or selection on every tick. Scroll
+     * position is preserved unless the view was already pinned to the
+     * bottom, in which case it stays pinned as new lines arrive.
+     */
+    private void refreshSelectedTaskLogIfChanged() {
+        try {
+            int row = table.getSelectedRow();
+            if (row < 0) return;
+            String id = getSelectedTaskId();
+            if (id == null) return;
+            String name = (String) tableModel.getValueAt(row, 0);
+
+            List<String> logs = showingLatestOnly
+                    ? scheduler.getLogService().getTaskLogsLastN(id, name, 50)
+                    : scheduler.getLogService().getTaskLogs(id, name);
+            String fresh = logs.isEmpty() ? "" : String.join("\n", logs);
+            String current = logArea.getText();
+            // getTaskLogs() returns "" for a placeholder message too — only treat
+            // a genuinely different, non-empty disk read as new content, so an
+            // empty disk read never stomps a "No log entries yet..." placeholder
+            // or an in-memory (taskLogs) fallback that showLogForSelected() may
+            // have shown instead.
+            if (fresh.isEmpty() || fresh.equals(current)) return;
+
+            JScrollBar vbar = logScrollPane.getVerticalScrollBar();
+            boolean wasAtBottom = vbar == null
+                    || vbar.getValue() + vbar.getVisibleAmount() >= vbar.getMaximum() - 8;
+            logArea.setText(fresh);
+            if (wasAtBottom) {
+                logArea.setCaretPosition(logArea.getDocument().getLength());
+            }
+        } catch (Exception e) {
+            // Never let a hiccup here (e.g. a log file mid-rotation) silently
+            // and repeatedly no-op this timer tick after tick with nothing
+            // visible to the user — surface it once to stderr instead.
+            System.err.println("Live log poll failed: " + e);
+        }
     }
 
     private void refreshActiveSessionLabel() {
@@ -325,7 +386,7 @@ public class TaskManagerPanel extends JPanel {
         logArea.setBackground(new Color(0x1E1E1E));
         logArea.setForeground(new Color(0xD4D4D4));
         logArea.setCaretColor(Color.WHITE);
-        JScrollPane logScroll = new JScrollPane(logArea);
+        logScrollPane = new JScrollPane(logArea);
 
         lblSelectedTask = new JLabel("Select a task to view its execution log");
         lblSelectedTask.setFont(lblSelectedTask.getFont().deriveFont(Font.BOLD));
@@ -405,9 +466,9 @@ public class TaskManagerPanel extends JPanel {
         logTop.add(watcherBar, BorderLayout.SOUTH);
 
         logPanel.add(logTop,      BorderLayout.NORTH);
-        logPanel.add(logScroll,   BorderLayout.CENTER);
+        logPanel.add(logScrollPane,   BorderLayout.CENTER);
 
-        logScroll.setPreferredSize(new Dimension(900, 200));
+        logScrollPane.setPreferredSize(new Dimension(900, 200));
 
         JSplitPane split = new JSplitPane(JSplitPane.VERTICAL_SPLIT, tableScroll, logPanel);
         split.setResizeWeight(0.45);
@@ -935,7 +996,15 @@ public class TaskManagerPanel extends JPanel {
 
     // ── Log display ───────────────────────────────────────────────────────────
 
+    // Which of the two log views (full vs latest-50) was last requested for
+    // the currently selected row — so refreshSelectedTaskLogIfChanged() below
+    // re-reads with the matching one instead of always comparing against the
+    // full log (which would never match a "latest 50" view and just fight it
+    // on every tick).
+    private volatile boolean showingLatestOnly = false;
+
     private void showLogForSelected() {
+        showingLatestOnly = false;
         int row = table.getSelectedRow();
         if (row < 0) {
             lblSelectedTask.setText("Select a task to view its execution log");
@@ -973,6 +1042,7 @@ public class TaskManagerPanel extends JPanel {
     }
 
     private void showLatestLogsForSelected() {
+        showingLatestOnly = true;
         int row = table.getSelectedRow();
         if (row < 0) {
             lblSelectedTask.setText("Select a task to view logs");

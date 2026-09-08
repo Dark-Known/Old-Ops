@@ -35,16 +35,11 @@ public class QueueMonitorView extends JPanel {
     private static final String CARD_CONTENT = "content";
     private static final String CARD_OFFLINE = "offline";
 
-    private DefaultTableModel schedulerModel;
-    private JTable schedulerTable;
     private DefaultTableModel pendingModel;
     private JTable pendingTable;
     private DefaultTableModel activityModel;
     private JTable activityTable;
     private JLabel offlineLabel;
-    /** Human label for this view's process, set via {@link #update}'s caller before the first refresh — e.g. "GUI Process" / "Daemon Process". */
-    private String processLabel = "Scheduler";
-
     // Most-recently-rendered activity rows, in the same order as
     // activityModel's rows — lets the click handler map a clicked table row
     // straight back to its full ActivityRow (error message included, which
@@ -54,36 +49,9 @@ public class QueueMonitorView extends JPanel {
 
     public QueueMonitorView() {
         setLayout(new BorderLayout(8, 8));
-        add(buildSchedulerSection(), BorderLayout.NORTH);
-
         cardHost.add(buildContent(), CARD_CONTENT);
         cardHost.add(buildOfflineCard(), CARD_OFFLINE);
         add(cardHost, BorderLayout.CENTER);
-    }
-
-    /** Sets the process label shown in the Active Scheduler table's "Process" column — e.g. "GUI" / "Daemon". Call once, before the first {@link #update}. */
-    public void setProcessLabel(String label) {
-        this.processLabel = label;
-    }
-
-    private JComponent buildSchedulerSection() {
-        JPanel panel = new JPanel(new BorderLayout(4, 4));
-        panel.add(sectionHeader("Active Scheduler"), BorderLayout.NORTH);
-
-        schedulerModel = new DefaultTableModel(
-                new Object[]{"Process", "Status", "Workers Busy", "Pending Events"}, 0) {
-            @Override public boolean isCellEditable(int row, int col) { return false; }
-        };
-        schedulerModel.addRow(new Object[]{processLabel, "—", "—", "—"});
-        schedulerTable = new JTable(schedulerModel);
-        schedulerTable.setRowHeight(24);
-        schedulerTable.setFillsViewportHeight(false);
-        schedulerTable.getTableHeader().setReorderingAllowed(false);
-        schedulerTable.setPreferredScrollableViewportSize(new Dimension(10, 24));
-        panel.add(new JScrollPane(schedulerTable,
-                ScrollPaneConstants.VERTICAL_SCROLLBAR_NEVER, ScrollPaneConstants.HORIZONTAL_SCROLLBAR_AS_NEEDED),
-                BorderLayout.CENTER);
-        return panel;
     }
 
     private JComponent buildContent() {
@@ -187,14 +155,15 @@ public class QueueMonitorView extends JPanel {
     public void showUnavailable(String message) {
         offlineLabel.setText(message);
         cards.show(cardHost, CARD_OFFLINE);
-        setSchedulerRow("Offline / unavailable", "—", "—");
     }
 
-    /** Pushes a fresh snapshot into the tables. */
+    /** Pushes a fresh snapshot into the tables. {@code poolSize}/{@code activeWorkers} are
+     *  currently unused by this view (the Active Scheduler table they used to feed was
+     *  removed — the panel/tab title now conveys which scheduler is active instead — kept
+     *  as parameters so callers don't need to change) but reserved in case a future compact
+     *  "N/M workers busy" indicator is added back in a less redundant form. */
     public void update(int poolSize, int activeWorkers, List<PendingRow> pending, List<ActivityRow> activity) {
         cards.show(cardHost, CARD_CONTENT);
-
-        setSchedulerRow("Active", activeWorkers + " / " + poolSize + " busy", String.valueOf(pending.size()));
 
         int pSel = pendingTable.getSelectedRow();
         pendingModel.setRowCount(0);
@@ -215,7 +184,9 @@ public class QueueMonitorView extends JPanel {
         currentActivity = activity;
         for (ActivityRow row : activity) {
             Duration d = Duration.between(row.startedAt(), row.finishedAt());
-            String outcome = row.errored() ? "ERROR: " + shorten(row.errorMessage(), 60) : "OK";
+            String outcome = row.errored() ? "ERROR: " + shorten(row.errorMessage(), 60)
+                    : (row.errorMessage() != null && !row.errorMessage().isBlank()
+                            ? shorten(row.errorMessage(), 60) : "OK");
             activityModel.addRow(new Object[]{
                     row.taskName(),
                     row.attempt() > 0 ? "retry " + row.attempt() : "—",
@@ -225,14 +196,6 @@ public class QueueMonitorView extends JPanel {
             });
         }
         if (aSel >= 0 && aSel < activityModel.getRowCount()) activityTable.setRowSelectionInterval(aSel, aSel);
-    }
-
-    private void setSchedulerRow(String status, String workers, String pendingCount) {
-        if (schedulerModel.getRowCount() == 0) schedulerModel.addRow(new Object[4]);
-        schedulerModel.setValueAt(processLabel, 0, 0);
-        schedulerModel.setValueAt(status, 0, 1);
-        schedulerModel.setValueAt(workers, 0, 2);
-        schedulerModel.setValueAt(pendingCount, 0, 3);
     }
 
     /**
