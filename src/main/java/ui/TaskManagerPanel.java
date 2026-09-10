@@ -5,11 +5,12 @@ import service.TaskSchedulerService;
 import service.TransferService;
 import service.XmlStorageService;
 import model.ScheduledTask.*;
+import ui.components.IconTile;
+import ui.components.PillBadge;
+import ui.components.StatCard;
 
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
-import javax.swing.table.DefaultTableModel;
-import javax.swing.table.TableCellRenderer;
 import java.awt.*;
 import java.time.format.DateTimeFormatter;
 import java.time.LocalDateTime;
@@ -26,12 +27,9 @@ public class TaskManagerPanel extends JPanel {
 
     private static final DateTimeFormatter DT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm");
 
-    // ── Status colours ────────────────────────────────────────────────────────
-    private static final Color COLOR_RUNNING  = new Color(0xF5E6D3); // pale sand
-    private static final Color COLOR_FAILED   = new Color(0xF5E0DC); // pale rust
-    private static final Color COLOR_SUCCESS  = new Color(0xEAF0E3); // pale moss
-    private static final Color COLOR_DISABLED = new Color(0xF2EEE8); // warm grey
-    private static final Color COLOR_SKIPPED  = new Color(0xFBF3E3); // pale wheat
+    // Status colors now live centrally on AppTheme (RUNNING_FG/BG, FAILED_FG/BG,
+    // SUCCESS_FG/BG, SKIPPED_FG/BG) — PillBadge uses those directly, so the
+    // per-panel constants that used to live here are gone.
 
     private final XmlStorageService storage;
     private final TaskSchedulerService scheduler;
@@ -44,8 +42,18 @@ public class TaskManagerPanel extends JPanel {
     // running the task.
     private final java.nio.file.Path daemonStatusFile;
     private static final long DAEMON_STALE_MS = service.queue.SchedulerStatusSnapshot.DEFAULT_STALE_MS;
-    private DefaultTableModel tableModel;
-    private JTable table;
+    private DefaultListModel<ScheduledTask> listModel;
+    private JList<ScheduledTask> taskList;
+    // Full, unfiltered snapshot from the last refresh() — the filter box
+    // rebuilds listModel's contents from this rather than hiding rows (JList
+    // has no TableRowSorter row-filter equivalent), so filtering never needs
+    // a view/model index translation the way the old sortable JTable did.
+    private List<ScheduledTask> allTasksCache = new ArrayList<>();
+    private JTextField txtFilter;
+    private StatCard cardTotal;
+    private StatCard cardRunning;
+    private StatCard cardFailed;
+    private StatCard cardSuccessRate;
     private JTextArea logArea;
     private JScrollPane logScrollPane;
     private JLabel lblSelectedTask;
@@ -60,7 +68,6 @@ public class TaskManagerPanel extends JPanel {
 
     // taskId -> accumulated in-memory log
     private final Map<String, StringBuilder> taskLogs = new HashMap<>();
-    private final List<String> taskIds = new ArrayList<>();
 
     // Cap how much log text we retain per task so long-running listings
     // (e.g. `ls` over huge remote directories) don't grow memory unboundedly.
@@ -138,11 +145,10 @@ public class TaskManagerPanel extends JPanel {
      */
     private void refreshSelectedTaskLogIfChanged() {
         try {
-            int row = table.getSelectedRow();
-            if (row < 0) return;
-            String id = getSelectedTaskId();
-            if (id == null) return;
-            String name = (String) tableModel.getValueAt(row, 0);
+            ScheduledTask t = getSelectedTask();
+            if (t == null) return;
+            String id = t.getId();
+            String name = t.getName();
 
             List<String> logs = showingLatestOnly
                     ? scheduler.getLogService().getTaskLogsLastN(id, name, 50)
@@ -203,7 +209,7 @@ public class TaskManagerPanel extends JPanel {
         if (batchByTask.isEmpty()) return;
 
         String selectedTaskId = getSelectedTaskId();
-        boolean selectedHasRow = table.getSelectedRow() >= 0;
+        boolean selectedHasRow = selectedTaskId != null;
         boolean appendedToVisibleArea = false;
 
         for (Map.Entry<String, StringBuilder> e : batchByTask.entrySet()) {
@@ -242,22 +248,29 @@ public class TaskManagerPanel extends JPanel {
 
     private void buildUI() {
         // ── Toolbar ──────────────────────────────────────────────────────────
+        // Only "New Task" is accent-styled now — one primary action per view,
+        // same restraint principle a well-designed toolbar follows: everything
+        // else (including the previously-gradient Delete/Run Now/Restart/View
+        // Logs buttons) is now a plain, quiet button so the eye isn't pulled
+        // in five directions at once. Delete keeps a red-tinted label as its
+        // only distinguishing mark — enough to read as destructive without a
+        // loud color block sitting one click from "Run Now".
         JButton btnNew        = new GradientButton("New Task");
         JButton btnEdit       = new JButton("Edit");
-        JButton btnDelete     = new GradientButton("Delete");
-        JButton btnRunNow     = new GradientButton("Run Now");
-        JButton btnRestart    = new GradientButton("Restart Task");
+        JButton btnDelete     = new JButton("Delete");
+        JButton btnRunNow     = new JButton("Run Now");
+        JButton btnRestart    = new JButton("Restart Task");
         JButton btnEnable     = new JButton("Enable/Disable");
-        JButton btnRefresh    = new JButton("Refresh");
-        JButton btnViewLogs   = new GradientButton("View Logs");
-        JButton btnLatestLogs = new GradientButton("Latest Logs");
+        JButton btnViewLogs   = new JButton("View Logs");
+        JButton btnLatestLogs = new JButton("Latest Logs");
+        JButton btnRefresh    = new JButton();
+        btnRefresh.setIcon(null);
+        btnRefresh.setText("\u21BB"); // ↻ — compact icon-style refresh, no label needed in a toolbar this size
+        btnRefresh.setToolTipText("Refresh");
+        btnRefresh.setMargin(new Insets(2, 8, 2, 8));
 
-        styleBtn(btnNew,        AppTheme.EARTH_MOSS);
-        styleBtn(btnRunNow,     AppTheme.EARTH_SIENNA);
-        styleBtn(btnRestart,    AppTheme.EARTH_OCHRE);
-        styleBtn(btnDelete,     AppTheme.EARTH_RUST);
-        styleBtn(btnViewLogs,   AppTheme.EARTH_CLAY);
-        styleBtn(btnLatestLogs, AppTheme.EARTH_TEAL);
+        styleBtn(btnNew, AppTheme.EARTH_MOSS);
+        btnDelete.setForeground(AppTheme.EARTH_RUST);
 
         btnNew.addActionListener(e        -> newTask());
         btnEdit.addActionListener(e       -> editTask());
@@ -273,12 +286,41 @@ public class TaskManagerPanel extends JPanel {
         toolbar.add(btnNew);    toolbar.add(btnEdit);    toolbar.add(btnDelete);
         toolbar.add(new JSeparator(JSeparator.VERTICAL));
         toolbar.add(btnRunNow); toolbar.add(btnRestart); toolbar.add(btnEnable);
-        toolbar.add(Box.createHorizontalStrut(10));
-        toolbar.add(btnRefresh);
         toolbar.add(new JSeparator(JSeparator.VERTICAL));
         toolbar.add(btnViewLogs); toolbar.add(btnLatestLogs);
 
-        JPanel legend = buildLegend();
+        // ── Filter box ───────────────────────────────────────────────────────
+        // Filters the table live by name or type — cheap to add now that
+        // column sorting already needs a TableRowSorter; the same sorter
+        // handles both.
+        JLabel lblFilter = new JLabel("Filter:");
+        lblFilter.setFont(lblFilter.getFont().deriveFont(Font.PLAIN, 12f));
+        txtFilter = new JTextField(16);
+        txtFilter.setToolTipText("Filter by task name or type");
+        txtFilter.getDocument().addDocumentListener(new javax.swing.event.DocumentListener() {
+            @Override public void insertUpdate(javax.swing.event.DocumentEvent e)  { applyFilter(); }
+            @Override public void removeUpdate(javax.swing.event.DocumentEvent e)  { applyFilter(); }
+            @Override public void changedUpdate(javax.swing.event.DocumentEvent e) { applyFilter(); }
+        });
+
+        // ── Legend ───────────────────────────────────────────────────────────
+        // Was a permanently-visible row of color swatches, taking up space
+        // every time regardless of whether anyone needed reminding what the
+        // colors meant. Collapsed to a "?" button — the legend text is now a
+        // tooltip, reference material you check occasionally rather than
+        // something the layout pays rent for permanently.
+        JButton btnLegend = new JButton("?");
+        btnLegend.setToolTipText(legendTooltipHtml());
+        btnLegend.setMargin(new Insets(2, 8, 2, 8));
+
+        JPanel toolbarRow = new JPanel(new BorderLayout());
+        toolbarRow.add(toolbar, BorderLayout.WEST);
+        JPanel filterAndLegend = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 0));
+        filterAndLegend.add(lblFilter);
+        filterAndLegend.add(txtFilter);
+        filterAndLegend.add(btnLegend);
+        filterAndLegend.add(btnRefresh);
+        toolbarRow.add(filterAndLegend, BorderLayout.EAST);
 
         JLabel banner = new JLabel(
             "<html><b>Scheduled Tasks</b> — file transfers, mail fetches, and backup jobs run on a schedule.<br>"
@@ -286,68 +328,40 @@ public class TaskManagerPanel extends JPanel {
             + " create, edit, run, or manage tasks.</span></html>");
         banner.setBorder(new EmptyBorder(0, 0, 8, 0));
 
-        JPanel headerPanel = new JPanel(new BorderLayout(0, 6));
+        // ── Summary strip ────────────────────────────────────────────────────
+        cardTotal       = new StatCard("Tasks", "0", null);
+        cardRunning     = new StatCard("Running", "0", AppTheme.RUNNING_FG);
+        cardFailed      = new StatCard("Failed", "0", AppTheme.FAILED_FG);
+        cardSuccessRate = new StatCard("Success rate", "—", AppTheme.SUCCESS_FG);
+        JPanel statsRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
+        statsRow.setOpaque(false);
+        statsRow.add(cardTotal);
+        statsRow.add(cardRunning);
+        statsRow.add(cardFailed);
+        statsRow.add(cardSuccessRate);
+
+        JPanel headerPanel = new JPanel(new BorderLayout(0, 8));
         headerPanel.add(banner, BorderLayout.NORTH);
-        JPanel toolbarAndLegend = new JPanel();
-        toolbarAndLegend.setLayout(new BoxLayout(toolbarAndLegend, BoxLayout.Y_AXIS));
-        toolbar.setAlignmentX(Component.LEFT_ALIGNMENT);
-        legend.setAlignmentX(Component.LEFT_ALIGNMENT);
-        toolbarAndLegend.add(toolbar);
-        toolbarAndLegend.add(legend);
-        headerPanel.add(toolbarAndLegend, BorderLayout.CENTER);
+        JPanel headerMiddle = new JPanel(new BorderLayout(0, 6));
+        headerMiddle.add(statsRow, BorderLayout.NORTH);
+        headerMiddle.add(toolbarRow, BorderLayout.SOUTH);
+        headerPanel.add(headerMiddle, BorderLayout.CENTER);
         add(headerPanel, BorderLayout.NORTH);
 
-        // ── Table ─────────────────────────────────────────────────────────────
-        String[] cols = {
-            "Name", "Type", "Direction", "Mode", "Status",
-            "Schedule", "Last Run", "Next Run", "Last Result",
-            "Watch Status", "Watch Detail"
-        };
-        tableModel = new DefaultTableModel(cols, 0) {
-            public boolean isCellEditable(int r, int c) { return false; }
-        };
+        // ── Task list ─────────────────────────────────────────────────────────
+        // JList + a custom card renderer, not JTable: a card row (icon tile,
+        // two-line text block, status pill) needs full control over its own
+        // layout per row, which TableCellRenderer's single-JLabel-per-cell
+        // model can't give cleanly. Binding directly to ScheduledTask objects
+        // also removes the parallel taskIds/row-index bookkeeping the JTable
+        // version needed — the selected list value IS the task, no lookup.
+        listModel = new DefaultListModel<>();
+        taskList = new JList<>(listModel);
+        taskList.setCellRenderer(new TaskRowRenderer());
+        taskList.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
+        taskList.setFixedCellHeight(52);
 
-        table = new JTable(tableModel) {
-            @Override
-            public Component prepareRenderer(TableCellRenderer renderer, int row, int col) {
-                Component c = super.prepareRenderer(renderer, row, col);
-                if (!isRowSelected(row)) {
-                    String status = (String) tableModel.getValueAt(row, 4); // col 4 = Status
-                    String result = (String) tableModel.getValueAt(row, 8); // col 8 = Last Result
-                    String mode   = (String) tableModel.getValueAt(row, 3); // col 3 = Mode (LOCAL)
-                    Color special = rowColor(status, result, mode); // null = no special status tint
-                    if (special != null) {
-                        // These status tints are always pale/light regardless of app theme (a
-                        // deliberate highlighter look), so the text on them must always be dark
-                        // too — leaving it at the default (theme-following) color would go
-                        // light-on-light and vanish in dark mode.
-                        c.setBackground(special);
-                        c.setForeground(new Color(0x2B2116));
-                    } else {
-                        c.setBackground(table.getBackground());
-                        c.setForeground(table.getForeground());
-                    }
-                }
-                return c;
-            }
-        };
-
-        table.setRowHeight(26);
-        table.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
-        table.getTableHeader().setReorderingAllowed(false);
-        table.getColumnModel().getColumn(0).setPreferredWidth(180); // Name
-        table.getColumnModel().getColumn(1).setPreferredWidth(110); // Type
-        table.getColumnModel().getColumn(2).setPreferredWidth(80);  // Direction
-        table.getColumnModel().getColumn(3).setPreferredWidth(80);  // Mode
-        table.getColumnModel().getColumn(4).setPreferredWidth(80);  // Status
-        table.getColumnModel().getColumn(5).setPreferredWidth(115); // Schedule
-        table.getColumnModel().getColumn(6).setPreferredWidth(115); // Last Run
-        table.getColumnModel().getColumn(7).setPreferredWidth(115); // Next Run
-        table.getColumnModel().getColumn(8).setPreferredWidth(85);  // Last Result
-        table.getColumnModel().getColumn(9).setPreferredWidth(150); // Watch Status
-        table.getColumnModel().getColumn(10).setPreferredWidth(260); // Watch Detail
-
-        table.getSelectionModel().addListSelectionListener(e -> {
+        taskList.addListSelectionListener(e -> {
             if (!e.getValueIsAdjusting()) {
                 showLogForSelected();
                 updateWatcherFingerprintBar();
@@ -358,25 +372,21 @@ public class TaskManagerPanel extends JPanel {
         // (mode + reason + a manual Reconnect action) — see WatcherInfoPopup.
         // Non-watcher rows are unaffected; this is purely additive on top of
         // the existing selection-driven log/fingerprint-bar behavior above.
-        table.addMouseListener(new java.awt.event.MouseAdapter() {
+        taskList.addMouseListener(new java.awt.event.MouseAdapter() {
             @Override public void mouseClicked(java.awt.event.MouseEvent e) {
-                int row = table.rowAtPoint(e.getPoint());
-                if (row < 0 || row >= taskIds.size()) return;
-                String taskId = taskIds.get(row);
-                ScheduledTask task = storage.loadTasks().stream()
-                        .filter(t -> t.getId().equals(taskId))
-                        .findFirst().orElse(null);
-                if (task == null || task.getTaskType() != ScheduledTask.TaskType.FILE_TRANSFER
-                        || !task.isWatcherEnabled()) {
+                int index = taskList.locationToIndex(e.getPoint());
+                if (index < 0 || !taskList.getCellBounds(index, index).contains(e.getPoint())) return;
+                ScheduledTask task = listModel.getElementAt(index);
+                if (task.getTaskType() != ScheduledTask.TaskType.FILE_TRANSFER || !task.isWatcherEnabled()) {
                     return; // not a watcher task — normal selection/log behavior only
                 }
                 Point screenPoint = new Point(e.getPoint());
-                SwingUtilities.convertPointToScreen(screenPoint, table);
-                WatcherInfoPopup.show(table, screenPoint, task, storage, scheduler);
+                SwingUtilities.convertPointToScreen(screenPoint, taskList);
+                WatcherInfoPopup.show(taskList, screenPoint, task, storage, scheduler);
             }
         });
 
-        JScrollPane tableScroll = new JScrollPane(table);
+        JScrollPane tableScroll = new JScrollPane(taskList);
         tableScroll.setPreferredSize(new Dimension(900, 220));
 
         // ── Log panel ─────────────────────────────────────────────────────────
@@ -471,7 +481,7 @@ public class TaskManagerPanel extends JPanel {
         logScrollPane.setPreferredSize(new Dimension(900, 200));
 
         JSplitPane split = new JSplitPane(JSplitPane.VERTICAL_SPLIT, tableScroll, logPanel);
-        split.setResizeWeight(0.45);
+        split.setResizeWeight(0.55);
         split.setBorder(null);
         add(split, BorderLayout.CENTER);
 
@@ -501,13 +511,12 @@ public class TaskManagerPanel extends JPanel {
      * persisted by TransferService after each successful watcher run.
      */
     private void updateWatcherFingerprintBar() {
-        int row = table.getSelectedRow();
-        if (row < 0 || row >= taskIds.size()) {
+        String taskId = getSelectedTaskId();
+        if (taskId == null) {
             watcherBar.setVisible(false);
             return;
         }
 
-        String taskId = taskIds.get(row);
         ScheduledTask task = storage.loadTasks().stream()
                 .filter(t -> t.getId().equals(taskId))
                 .findFirst().orElse(null);
@@ -655,64 +664,154 @@ public class TaskManagerPanel extends JPanel {
 
     // ── Legend ────────────────────────────────────────────────────────────────
 
-    private JPanel buildLegend() {
-        JPanel p = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 2));
-        p.setOpaque(false);
-        p.add(legendChip(COLOR_RUNNING,  "Running"));
-        p.add(legendChip(COLOR_SUCCESS,  "Success"));
-        p.add(legendChip(COLOR_SKIPPED,  "Skipped (no new file)"));
-        p.add(legendChip(COLOR_FAILED,   "Failed"));
-        p.add(legendChip(COLOR_DISABLED, "Disabled"));
-        return p;
+    /** HTML shown as the "?" button's tooltip — the same status key that used
+     *  to be a permanently-visible row of swatches, now reference material
+     *  you check occasionally rather than something the layout pays rent for
+     *  permanently. Uses the same paired tokens {@link PillBadge} paints
+     *  status pills with, so the key always matches what's actually shown. */
+    private String legendTooltipHtml() {
+        return "<html><b>Status colors</b><br>"
+            + legendRow(AppTheme.RUNNING_FG, AppTheme.RUNNING_BG, "Running")
+            + legendRow(AppTheme.SUCCESS_FG, AppTheme.SUCCESS_BG, "Success")
+            + legendRow(AppTheme.SKIPPED_FG, AppTheme.SKIPPED_BG, "Skipped (no new file)")
+            + legendRow(AppTheme.FAILED_FG, AppTheme.FAILED_BG, "Failed")
+            + legendRow(AppTheme.NEUTRAL_FG, null, "Disabled")
+            + "</html>";
     }
 
-    private JPanel legendChip(Color color, String label) {
-        JPanel chip = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
-        chip.setOpaque(false);
-        JLabel swatch = new JLabel("  ");
-        swatch.setOpaque(true);
-        swatch.setBackground(color);
-        swatch.setBorder(BorderFactory.createLineBorder(new Color(0xBBBBBB)));
-        JLabel text = new JLabel(label);
-        text.setFont(text.getFont().deriveFont(Font.PLAIN, 11f));
-        chip.add(swatch);
-        chip.add(text);
-        return chip;
+    private String legendRow(Color fg, Color bg, String label) {
+        String swatch = bg != null
+            ? "<span style='background:" + toHex(bg) + ";color:" + toHex(fg) + "'>&nbsp;&nbsp;&nbsp;&nbsp;</span>"
+            : "<span style='color:" + toHex(fg) + "'>\u25CF</span>";
+        return swatch + "&nbsp;" + label + "<br>";
     }
 
-    // ── Row colour logic ──────────────────────────────────────────────────────
+    private static String toHex(Color c) {
+        return String.format("#%02X%02X%02X", c.getRed(), c.getGreen(), c.getBlue());
+    }
 
-    /**
-     * Returns the background colour for a table row.
-     */
-    /** Returns a status-tint background for this row, or {@code null} for no special tint
-     *  (meaning: use the table's own theme-following default background/foreground instead). */
-    private Color rowColor(String status, String lastResult, String mode) {
-        if (status == null) return null;
+    // ── Status color mapping ──────────────────────────────────────────────────
+
+    /** {fg, bg} pair for a status pill — {@code bg} may be {@code null}, meaning
+     *  "plain muted text, no pill background" (e.g. Disabled) rather than a
+     *  colored chip, since a chip for every single status (including neutral
+     *  ones) would be noise, not signal. */
+    private Color[] statusColors(String status, String lastResult) {
+        if (status == null) return new Color[]{ AppTheme.NEUTRAL_FG, null };
         switch (status) {
-            case "RUNNING":  return COLOR_RUNNING;
-            case "FAILED":   return COLOR_FAILED;
-            case "DISABLED": return COLOR_DISABLED;
+            case "RUNNING":  return new Color[]{ AppTheme.RUNNING_FG, AppTheme.RUNNING_BG };
+            case "FAILED":   return new Color[]{ AppTheme.FAILED_FG, AppTheme.FAILED_BG };
+            case "DISABLED": return new Color[]{ AppTheme.NEUTRAL_FG, null };
             case "SUCCESS":
-                if (lastResult != null && lastResult.contains("SKIPPED")) return COLOR_SKIPPED;
-                return COLOR_SUCCESS;
+                if (lastResult != null && lastResult.contains("SKIPPED")) {
+                    return new Color[]{ AppTheme.SKIPPED_FG, AppTheme.SKIPPED_BG };
+                }
+                return new Color[]{ AppTheme.SUCCESS_FG, AppTheme.SUCCESS_BG };
             default:
-                if (lastResult != null && lastResult.contains("SKIPPED")) return COLOR_SKIPPED;
-                return null;
+                if (lastResult != null && lastResult.contains("SKIPPED")) {
+                    return new Color[]{ AppTheme.SKIPPED_FG, AppTheme.SKIPPED_BG };
+                }
+                return new Color[]{ AppTheme.NEUTRAL_FG, null };
         }
     }
 
-    // ── Refresh / table population ────────────────────────────────────────────
+    // ── Row view-model / renderer ─────────────────────────────────────────────
+
+    /** Precomputed per-task display strings, refreshed once per {@link #refresh()}
+     *  cycle rather than recomputed on every single row repaint — in particular
+     *  the watcher-live-vs-polling determination reads the Daemon's exported
+     *  status file, which is cheap once per refresh but not something to redo
+     *  on every JList repaint. */
+    private record TaskRowInfo(String typeCell, String scheduleCell, String lastRunCell, String resultLine) {}
+
+    private final Map<String, TaskRowInfo> rowInfoByTaskId = new HashMap<>();
+
+    private static final TaskRowInfo FALLBACK_ROW_INFO =
+            new TaskRowInfo("", "", "", "");
+
+    /**
+     * Card-style row renderer: an {@link IconTile} (task type/direction glyph),
+     * a two-line text block (name + meta line), and a status {@link PillBadge}
+     * on the trailing edge. Reused across rows (standard {@code ListCellRenderer}
+     * pattern) — only the icon tile is rebuilt per call, since its colors
+     * depend on per-row data and it has no public setter for that; the text
+     * labels and badge are mutated in place.
+     */
+    private class TaskRowRenderer extends JPanel implements ListCellRenderer<ScheduledTask> {
+        private final JLabel nameLabel = new JLabel();
+        private final JLabel metaLabel = new JLabel();
+        private final PillBadge statusBadge = new PillBadge("", AppTheme.NEUTRAL_FG, null);
+        private IconTile currentIcon;
+
+        TaskRowRenderer() {
+            setLayout(new BorderLayout(10, 0));
+            setBorder(new EmptyBorder(6, 10, 6, 10));
+
+            nameLabel.setFont(nameLabel.getFont().deriveFont(Font.BOLD, 13f));
+            metaLabel.setFont(metaLabel.getFont().deriveFont(Font.PLAIN, 11f));
+            metaLabel.setForeground(new Color(0x8A8378));
+
+            JPanel textBlock = new JPanel();
+            textBlock.setOpaque(false);
+            textBlock.setLayout(new BoxLayout(textBlock, BoxLayout.Y_AXIS));
+            nameLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+            metaLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+            textBlock.add(nameLabel);
+            textBlock.add(metaLabel);
+            add(textBlock, BorderLayout.CENTER);
+
+            JPanel right = new JPanel(new GridBagLayout());
+            right.setOpaque(false);
+            right.add(statusBadge);
+            add(right, BorderLayout.EAST);
+        }
+
+        @Override
+        public Component getListCellRendererComponent(JList<? extends ScheduledTask> list, ScheduledTask t,
+                                                        int index, boolean isSelected, boolean cellHasFocus) {
+            nameLabel.setText(t.getName());
+
+            String glyph;
+            Color tileBg;
+            if (t.getTaskType() == TaskType.FILE_TRANSFER) {
+                glyph = t.getTransferDirection() == TransferDirection.INBOUND ? "\u2B07" : "\u2B06";
+                tileBg = AppTheme.EARTH_SIENNA;
+            } else if (t.getTaskType() == TaskType.OUTLOOK_MAIL) {
+                glyph = "\u2709";
+                tileBg = AppTheme.EARTH_TEAL;
+            } else {
+                glyph = "\u21BB";
+                tileBg = AppTheme.EARTH_OCHRE;
+            }
+            if (currentIcon != null) remove(currentIcon);
+            currentIcon = new IconTile(glyph, Color.WHITE, tileBg);
+            add(currentIcon, BorderLayout.WEST);
+
+            TaskRowInfo info = rowInfoByTaskId.getOrDefault(t.getId(), FALLBACK_ROW_INFO);
+            metaLabel.setText(info.typeCell() + "  \u00b7  " + info.scheduleCell()
+                    + "  \u00b7  Last run: " + info.lastRunCell() + info.resultLine());
+
+            statusBadge.setText(t.getStatus().name());
+            String lastResult = t.getLastRunResult();
+            Color[] colors = statusColors(t.getStatus().name(), lastResult);
+            statusBadge.setColors(colors[0], colors[1]);
+
+            setBackground(isSelected ? list.getSelectionBackground()
+                    : (index % 2 == 0 ? list.getBackground() : AppTheme.surface2()));
+            setOpaque(true);
+            revalidate();
+            return this;
+        }
+    }
+
+    // ── Refresh / list population ─────────────────────────────────────────────
 
     public void refresh() {
-        int selectedRow = table.getSelectedRow();
-        String selectedId = (selectedRow >= 0 && selectedRow < taskIds.size())
-            ? taskIds.get(selectedRow) : null;
-
-        taskIds.clear();
-        tableModel.setRowCount(0);
+        String selectedId = getSelectedTaskId();
 
         List<ScheduledTask> tasks = storage.loadTasks();
+        allTasksCache = tasks;
+        rowInfoByTaskId.clear();
 
         // Read the Daemon's exported watch state once per refresh (not once
         // per row) — same cross-process preference the fingerprint bar and
@@ -728,83 +827,114 @@ public class TaskManagerPanel extends JPanel {
             }
         }
 
+        int runningCount = 0, failedCount = 0, totalRunCount = 0, successCount = 0;
+
         for (ScheduledTask t : tasks) {
             String schedDesc  = buildScheduleDescription(t);
             String lastResult = t.getLastRunResult() != null ? t.getLastRunResult() : "";
 
-            String displayResult = lastResult;
-            if ("SKIPPED".equals(lastResult)) displayResult = "SKIPPED";
-
-            String directionCell = t.getTaskType() == TaskType.FILE_TRANSFER
-                ? t.getTransferDirection().name() : "";
-
-            String modeCell = t.getTaskType() == TaskType.FILE_TRANSFER
-                ? (t.getTransferMode() != null ? t.getTransferMode().name() : "")
-                : "";
+            // Type/Direction/Mode merged into one line — almost always short
+            // and directly related, so three separate fields just for this
+            // was mostly wasted space. E.g. "File Transfer — Outbound
+            // (Latest Only)", or plain "Outlook Mail" / "Backup" for task
+            // types that don't have a direction/mode at all.
+            String typeCell = t.getTaskType().name().replace("_", " ");
+            if (t.getTaskType() == TaskType.FILE_TRANSFER) {
+                String direction = t.getTransferDirection().name();
+                String mode = t.getTransferMode() != null
+                        ? " (" + t.getTransferMode().name().replace("_", " ") + ")" : "";
+                typeCell += " \u2014 " + direction + mode;
+            }
 
             // Watch status: prefer the Daemon's live cross-process reading,
             // fall back to this process's own scheduler when the Daemon
-            // hasn't mentioned this task (not alive, or task too new).
+            // hasn't mentioned this task (not alive, or task too new). Full
+            // detail text is intentionally not shown inline at all — clicking
+            // any watcher-enabled row already opens WatcherInfoPopup with it
+            // (mode, reason, a manual Reconnect action).
             String watchMode = "NOT_APPLICABLE";
-            String watchDetail = "";
             if (t.getTaskType() == TaskType.FILE_TRANSFER && t.isWatcherEnabled()) {
                 service.queue.SchedulerStatusSnapshot.WatchEntry daemonEntry = daemonWatchEntries.get(t.getId());
-                if (daemonEntry != null) {
-                    watchMode = daemonEntry.mode();
-                    watchDetail = daemonEntry.detail();
-                } else {
-                    TaskSchedulerService.WatchStatus s = scheduler.getWatchStatus(t);
-                    watchMode = s.mode().name();
-                    watchDetail = s.detail();
-                }
+                watchMode = daemonEntry != null ? daemonEntry.mode() : scheduler.getWatchStatus(t).mode().name();
             }
             boolean watcherLive = watchMode.equals("NATIVE_WATCH") || watchMode.equals("REMOTE_PUSH");
 
-            // Schedule / Next Run only mean something while polling is what's
-            // actually driving the task — while push is live, that column
-            // would just show a stale/misleading interval nobody's using, so
-            // it's replaced with a short marker. The moment a watcher task
-            // falls back to polling (or was never eligible for push), these
-            // columns go back to showing the real schedule, because at that
-            // point the schedule genuinely is what's driving execution again.
-            String scheduleCell = watcherLive ? "\u2014 (watcher-driven)" : schedDesc;
-            String nextRunCell  = watcherLive ? "\u2014" : calculateNextRun(t);
+            // Schedule + Next Run merged — while push is live these would
+            // otherwise show the same "watcher-driven"/"—" pair for no
+            // reason; the moment a watcher task falls back to polling (or was
+            // never eligible for push), this goes back to the real schedule
+            // and next-due time, since at that point the schedule genuinely
+            // is what's driving execution again.
+            String scheduleCell = watcherLive
+                    ? "\u26A1 Watcher-driven"
+                    : schedDesc + " \u00b7 next: " + calculateNextRun(t);
 
-            String watchStatusCell = switch (watchMode) {
-                case "NATIVE_WATCH" -> "\u26A1 Live (native watch)";
-                case "REMOTE_PUSH" -> "\u26A1 Live (remote push)";
-                case "POLLING_ONLY_UNSUPPORTED" -> "Polling \u2014 unsupported";
-                case "POLLING_ONLY" -> "Polling only";
-                default -> "";
-            };
+            String lastRunCell = t.getLastRunAt() != null ? t.getLastRunAt().format(DT) : "Never";
+            String resultLine = lastResult.isEmpty() ? ""
+                    : " \u00b7 " + ("SKIPPED".equals(lastResult) ? "Skipped" : lastResult);
 
-            tableModel.addRow(new Object[]{
-                t.getName(),
-                t.getTaskType().name().replace("_", " "),
-                directionCell,
-                modeCell,
-                t.getStatus().name(),
-                scheduleCell,
-                t.getLastRunAt() != null ? t.getLastRunAt().format(DT) : "Never",
-                nextRunCell,
-                displayResult,
-                watchStatusCell,
-                watchDetail
-            });
-            taskIds.add(t.getId());
+            rowInfoByTaskId.put(t.getId(), new TaskRowInfo(typeCell, scheduleCell, lastRunCell, resultLine));
+
+            if (t.getStatus() == TaskStatus.RUNNING) runningCount++;
+            if ("FAILED".equals(lastResult)) failedCount++;
+            if (t.getLastRunAt() != null) {
+                totalRunCount++;
+                if ("SUCCESS".equals(lastResult) || "SKIPPED".equals(lastResult)) successCount++;
+            }
         }
 
-        // Re-select previously selected row
+        cardTotal.setValue(String.valueOf(tasks.size()));
+        cardRunning.setValue(String.valueOf(runningCount));
+        cardFailed.setValue(String.valueOf(failedCount));
+        cardSuccessRate.setValue(totalRunCount == 0 ? "\u2014"
+                : Math.round(100.0 * successCount / totalRunCount) + "%");
+
+        applyFilter();
+
+        // Re-select previously selected task, if it's still present (and
+        // still passes the current filter).
         if (selectedId != null) {
-            for (int i = 0; i < tasks.size(); i++) {
-                if (selectedId.equals(tasks.get(i).getId())) {
-                    table.setRowSelectionInterval(i, i);
+            for (int i = 0; i < listModel.size(); i++) {
+                if (selectedId.equals(listModel.get(i).getId())) {
+                    taskList.setSelectedIndex(i);
                     break;
                 }
             }
         }
 
         updateWatcherFingerprintBar();
+    }
+
+    /**
+     * Rebuilds {@code listModel}'s contents from {@code allTasksCache} filtered
+     * by the current filter box text (matched against name or type, case
+     * insensitive). {@code JList} has no built-in row-filter the way
+     * {@code TableRowSorter} does for {@code JTable}, so filtering here means
+     * swapping the model's contents rather than hiding rows in place.
+     * Preserves the current selection where the selected task still matches.
+     */
+    private void applyFilter() {
+        if (listModel == null || allTasksCache == null) return;
+        String filter = txtFilter != null ? txtFilter.getText().trim().toLowerCase() : "";
+        String selectedId = getSelectedTaskId();
+
+        listModel.clear();
+        for (ScheduledTask t : allTasksCache) {
+            if (filter.isEmpty()
+                    || t.getName().toLowerCase().contains(filter)
+                    || t.getTaskType().name().toLowerCase().replace("_", " ").contains(filter)) {
+                listModel.addElement(t);
+            }
+        }
+
+        if (selectedId != null) {
+            for (int i = 0; i < listModel.size(); i++) {
+                if (selectedId.equals(listModel.get(i).getId())) {
+                    taskList.setSelectedIndex(i);
+                    return;
+                }
+            }
+        }
     }
 
     // ── Schedule description / next-run calculation ───────────────────────────
@@ -895,8 +1025,6 @@ public class TaskManagerPanel extends JPanel {
     }
 
     private void editTask() {
-        int row = table.getSelectedRow();
-        if (row < 0) { JOptionPane.showMessageDialog(this, "Select a task to edit."); return; }
         String id = getSelectedTaskId();
         if (id == null) { JOptionPane.showMessageDialog(this, "Select a task to edit."); return; }
         storage.loadTasks().stream().filter(t -> t.getId().equals(id)).findFirst()
@@ -917,11 +1045,10 @@ public class TaskManagerPanel extends JPanel {
     }
 
     private void deleteTask() {
-        int row = table.getSelectedRow();
-        if (row < 0) { JOptionPane.showMessageDialog(this, "Select a task to delete."); return; }
-        String name = (String) tableModel.getValueAt(row, 0);
-        String id   = getSelectedTaskId();
-        if (id == null) { JOptionPane.showMessageDialog(this, "Select a task to delete."); return; }
+        ScheduledTask selected = getSelectedTask();
+        if (selected == null) { JOptionPane.showMessageDialog(this, "Select a task to delete."); return; }
+        String name = selected.getName();
+        String id   = selected.getId();
 
         int ok = JOptionPane.showConfirmDialog(this,
             "Delete task \"" + name + "\"?",
@@ -936,11 +1063,10 @@ public class TaskManagerPanel extends JPanel {
     }
 
     private void runNow() {
-        int row = table.getSelectedRow();
-        if (row < 0) { JOptionPane.showMessageDialog(this, "Select a task to run."); return; }
-        String id   = getSelectedTaskId();
-        if (id == null) { JOptionPane.showMessageDialog(this, "Select a task to run."); return; }
-        String name = (String) tableModel.getValueAt(row, 0);
+        ScheduledTask selected = getSelectedTask();
+        if (selected == null) { JOptionPane.showMessageDialog(this, "Select a task to run."); return; }
+        String id   = selected.getId();
+        String name = selected.getName();
 
         int ok = JOptionPane.showConfirmDialog(this,
             "Run task \"" + name + "\" immediately?",
@@ -954,8 +1080,6 @@ public class TaskManagerPanel extends JPanel {
     }
 
     private void toggleEnable() {
-        int row = table.getSelectedRow();
-        if (row < 0) { JOptionPane.showMessageDialog(this, "Select a task."); return; }
         String id = getSelectedTaskId();
         if (id == null) { JOptionPane.showMessageDialog(this, "Select a task."); return; }
 
@@ -971,11 +1095,10 @@ public class TaskManagerPanel extends JPanel {
     }
 
     private void restartTask() {
-        int row = table.getSelectedRow();
-        if (row < 0) { JOptionPane.showMessageDialog(this, "Select a task to restart."); return; }
-        String id = getSelectedTaskId();
-        if (id == null) { JOptionPane.showMessageDialog(this, "Select a task to restart."); return; }
-        String name = (String) tableModel.getValueAt(row, 0);
+        ScheduledTask selected = getSelectedTask();
+        if (selected == null) { JOptionPane.showMessageDialog(this, "Select a task to restart."); return; }
+        String id = selected.getId();
+        String name = selected.getName();
 
         ScheduledTask task = storage.loadTasks().stream()
             .filter(t -> t.getId().equals(id)).findFirst().orElse(null);
@@ -1005,21 +1128,16 @@ public class TaskManagerPanel extends JPanel {
 
     private void showLogForSelected() {
         showingLatestOnly = false;
-        int row = table.getSelectedRow();
-        if (row < 0) {
+        ScheduledTask selected = getSelectedTask();
+        if (selected == null) {
             lblSelectedTask.setText("Select a task to view its execution log");
             logArea.setText("");
             return;
         }
-        String name = (String) tableModel.getValueAt(row, 0);
-        String id   = getSelectedTaskId();
-        if (id == null) {
-            lblSelectedTask.setText("Select a task to view its execution log");
-            logArea.setText("");
-            return;
-        }
+        String name = selected.getName();
+        String id   = selected.getId();
 
-        String lastResult = (String) tableModel.getValueAt(row, 8);
+        String lastResult = selected.getLastRunResult();
         if (lastResult != null && lastResult.contains("SKIPPED")) {
             lblSelectedTask.setText("Execution log: " + name
                 + "  ⏭ Last run was skipped (no new file detected)");
@@ -1043,17 +1161,13 @@ public class TaskManagerPanel extends JPanel {
 
     private void showLatestLogsForSelected() {
         showingLatestOnly = true;
-        int row = table.getSelectedRow();
-        if (row < 0) {
+        ScheduledTask selected = getSelectedTask();
+        if (selected == null) {
             lblSelectedTask.setText("Select a task to view logs");
             logArea.setText(""); return;
         }
-        String name = (String) tableModel.getValueAt(row, 0);
-        String id   = getSelectedTaskId();
-        if (id == null) {
-            lblSelectedTask.setText("Select a task to view logs");
-            logArea.setText(""); return;
-        }
+        String name = selected.getName();
+        String id   = selected.getId();
         lblSelectedTask.setText("Latest 50 lines - Execution log: " + name);
         lblSelectedTask.setForeground(UIManager.getColor("Label.foreground"));
 
@@ -1072,17 +1186,13 @@ public class TaskManagerPanel extends JPanel {
     // ── Export / archives ─────────────────────────────────────────────────────
 
     private void exportLogsForSelected() {
-        int row = table.getSelectedRow();
-        if (row < 0) {
+        ScheduledTask selectedTask = getSelectedTask();
+        if (selectedTask == null) {
             JOptionPane.showMessageDialog(this, "Please select a task first.",
                 "No Task Selected", JOptionPane.WARNING_MESSAGE); return;
         }
-        String name = (String) tableModel.getValueAt(row, 0);
-        String id   = getSelectedTaskId();
-        if (id == null) {
-            JOptionPane.showMessageDialog(this, "Please select a task first.",
-                "No Task Selected", JOptionPane.WARNING_MESSAGE); return;
-        }
+        String name = selectedTask.getName();
+        String id   = selectedTask.getId();
 
         JFileChooser fc = new JFileChooser();
         fc.setSelectedFile(new java.io.File(name + "_logs.txt"));
@@ -1103,17 +1213,13 @@ public class TaskManagerPanel extends JPanel {
     }
 
     private void viewLogArchives() {
-        int row = table.getSelectedRow();
-        if (row < 0) {
+        ScheduledTask selectedTask = getSelectedTask();
+        if (selectedTask == null) {
             JOptionPane.showMessageDialog(this, "Please select a task first.",
                 "No Task Selected", JOptionPane.WARNING_MESSAGE); return;
         }
-        String name = (String) tableModel.getValueAt(row, 0);
-        String id   = getSelectedTaskId();
-        if (id == null) {
-            JOptionPane.showMessageDialog(this, "Please select a task first.",
-                "No Task Selected", JOptionPane.WARNING_MESSAGE); return;
-        }
+        String name = selectedTask.getName();
+        String id   = selectedTask.getId();
 
         List<java.io.File> archives = scheduler.getLogService().getTaskLogArchives(id, name);
         if (archives.isEmpty()) {
@@ -1146,10 +1252,17 @@ public class TaskManagerPanel extends JPanel {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
+    /** Currently selected task, or {@code null} if none — the JList's selected
+     *  value IS the task object directly, no row-index/taskIds lookup needed
+     *  (the JTable version needed one; binding the list straight to
+     *  ScheduledTask objects removes that bookkeeping entirely). */
+    private ScheduledTask getSelectedTask() {
+        return taskList != null ? taskList.getSelectedValue() : null;
+    }
+
     private String getSelectedTaskId() {
-        int row = table.getSelectedRow();
-        if (row < 0 || row >= taskIds.size()) return null;
-        return taskIds.get(row);
+        ScheduledTask t = getSelectedTask();
+        return t != null ? t.getId() : null;
     }
 
     private void styleBtn(JButton b, Color bg) {

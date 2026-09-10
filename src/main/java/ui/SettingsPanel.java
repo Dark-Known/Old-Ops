@@ -5,7 +5,6 @@ import util.AppSettings;
 
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
-import javax.swing.border.TitledBorder;
 import javax.swing.table.DefaultTableModel;
 import java.awt.*;
 import java.io.*;
@@ -87,9 +86,11 @@ public class SettingsPanel extends JPanel {
         // full width and stays flush-left regardless of its text length.
         add(banner, BorderLayout.NORTH);
 
+        outer.add(sectionHeader("WinSCP Configuration"));
+
         // WinSCP section
         JPanel winscpPanel = new JPanel(new GridBagLayout());
-        winscpPanel.setBorder(new TitledBorder("WinSCP Configuration"));
+        winscpPanel.setBorder(new EmptyBorder(4, 4, 4, 4));
         winscpPanel.setMaximumSize(new Dimension(Integer.MAX_VALUE, 120));
 
         tfWinScp = new JTextField(transferService.getWinScpPath(), 40);
@@ -125,12 +126,15 @@ public class SettingsPanel extends JPanel {
         outer.add(winscpPanel);
         outer.add(Box.createVerticalStrut(12));
 
+        outer.add(sectionHeader("Message Routing & Attachments (live — no restart needed)"));
         outer.add(buildRoutingPanel());
         outer.add(Box.createVerticalStrut(12));
 
+        outer.add(sectionHeader("Background Scheduler (runs without GUI)"));
+
         // Background Daemon section
         JPanel daemonPanel = new JPanel(new GridBagLayout());
-        daemonPanel.setBorder(new TitledBorder("Background Scheduler (runs without GUI)"));
+        daemonPanel.setBorder(new EmptyBorder(4, 4, 4, 4));
         daemonPanel.setMaximumSize(new Dimension(Integer.MAX_VALUE, 210));
 
         lblDaemonStatus = new JLabel("Checking...");
@@ -203,9 +207,11 @@ public class SettingsPanel extends JPanel {
         outer.add(daemonPanel);
         outer.add(Box.createVerticalStrut(12));
 
+        outer.add(sectionHeader("Application Info"));
+
         // App Info section
         JPanel infoPanel = new JPanel(new GridBagLayout());
-        infoPanel.setBorder(new TitledBorder("Application Info"));
+        infoPanel.setBorder(new EmptyBorder(4, 4, 4, 4));
         infoPanel.setMaximumSize(new Dimension(Integer.MAX_VALUE, 155));
 
         String dataDir = resolveActualDataDir();
@@ -216,6 +222,8 @@ public class SettingsPanel extends JPanel {
         addInfoRow(infoPanel, "Live settings (database):", AppSettings.filePath(), 4);
         outer.add(infoPanel);
         outer.add(Box.createVerticalStrut(12));
+
+        outer.add(sectionHeader("Setup Notes"));
 
         // Notes section
         JTextArea notes = new JTextArea(
@@ -234,7 +242,7 @@ public class SettingsPanel extends JPanel {
         notes.setEditable(false);
         notes.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 11));
         notes.setBackground(AppTheme.isDark() ? new Color(0x2A2A2A) : new Color(0xF5F5F5));
-        notes.setBorder(new TitledBorder("Setup Notes"));
+        notes.setBorder(new EmptyBorder(6, 6, 6, 6));
         outer.add(notes);
 
         // Save button row
@@ -261,7 +269,7 @@ public class SettingsPanel extends JPanel {
      */
     private JPanel buildRoutingPanel() {
         JPanel panel = new JPanel(new GridBagLayout());
-        panel.setBorder(new TitledBorder("Message Routing & Attachments (live — no restart needed)"));
+        panel.setBorder(new EmptyBorder(4, 4, 4, 4));
 
         GridBagConstraints lc = new GridBagConstraints();
         lc.anchor = GridBagConstraints.WEST; lc.insets = new Insets(4, 4, 4, 8);
@@ -595,6 +603,22 @@ public class SettingsPanel extends JPanel {
         });
 
         dlg.setVisible(true);
+    }
+
+    /**
+     * Plain section heading — bold label with generous top/bottom breathing
+     * room, no box or line border around the section beneath it. Replaces
+     * this panel's previous {@code TitledBorder} boxes: a relaxed,
+     * whitespace-separated layout consistently reads clearer than a page of
+     * bordered boxes, and it's what {@code TaskManagerPanel}'s own redesign
+     * moved to as well (a "?" tooltip instead of a boxed legend panel).
+     */
+    private JLabel sectionHeader(String title) {
+        JLabel header = new JLabel(title);
+        header.setFont(header.getFont().deriveFont(Font.BOLD, 13f));
+        header.setAlignmentX(Component.LEFT_ALIGNMENT);
+        header.setBorder(new EmptyBorder(4, 2, 6, 0));
+        return header;
     }
 
     private int addFieldRow(JPanel panel, GridBagConstraints lc, GridBagConstraints fc, String label, JComponent field, int row) {

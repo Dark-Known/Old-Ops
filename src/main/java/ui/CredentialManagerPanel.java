@@ -2,12 +2,15 @@ package ui;
 
 import model.Credential;
 import service.XmlStorageService;
+import ui.components.IconTile;
+import ui.components.PillBadge;
 
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
-import javax.swing.table.DefaultTableModel;
 import java.awt.*;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 /**
@@ -17,12 +20,22 @@ import java.util.UUID;
  *
  * Admins can add / edit / delete credentials here directly.
  * The ops team can also manage them implicitly via the Task Dialog.
+ *
+ * <p>Same {@code JList} + card-row pattern as {@link TaskManagerPanel} (Phase 1
+ * of the row-card redesign) — an icon tile (OS type), a two-line text block
+ * (display name; username · host · OS type), and a trailing pill showing
+ * whether any tasks currently reference this credential.
  */
 public class CredentialManagerPanel extends JPanel {
 
     private final XmlStorageService storage;
-    private DefaultTableModel tableModel;
-    private JTable table;
+    private DefaultListModel<Credential> listModel;
+    private JList<Credential> credList;
+    // taskId-using-count doesn't live on Credential itself — populated once
+    // per refresh() (a DB count query per credential) and looked up by the
+    // row renderer, same "compute once, render many" split TaskManagerPanel
+    // uses for its own per-row daemon-derived fields.
+    private final Map<String, Integer> usageByUsername = new HashMap<>();
 
     public CredentialManagerPanel(XmlStorageService storage) {
         this.storage = storage;
@@ -37,62 +50,39 @@ public class CredentialManagerPanel extends JPanel {
             "<html><b>Server Credentials</b> — stored in <code>credentials.db</code>"
             + " in the data directory.<br>"
             + "<span style='color:gray'>Passwords are plain text. Each Task looks up the"
-            + " matching credential by username at run time. \"Tasks Using\" counts how"
-            + " many tasks currently reference each username.</span></html>");
+            + " matching credential by username at run time.</span></html>");
         banner.setBorder(new EmptyBorder(0, 0, 6, 0));
 
-        // ── Table ─────────────────────────────────────────────────────────────
-        String[] cols = {"Username", "Host", "OS Type", "Display Name", "Tasks Using"};
-        tableModel = new DefaultTableModel(cols, 0) {
-            public boolean isCellEditable(int r, int c) { return false; }
-            public Class<?> getColumnClass(int c) { return c == 4 ? Integer.class : String.class; }
-        };
-        table = new JTable(tableModel);
-        table.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
-        table.setRowHeight(26);
-        table.setAutoCreateRowSorter(true);
-        table.getTableHeader().setReorderingAllowed(false);
-        table.getColumnModel().getColumn(0).setPreferredWidth(120);
-        table.getColumnModel().getColumn(1).setPreferredWidth(160);
-        table.getColumnModel().getColumn(2).setPreferredWidth(80);
-        table.getColumnModel().getColumn(3).setPreferredWidth(160);
-        table.getColumnModel().getColumn(4).setPreferredWidth(90);
-        table.getColumnModel().getColumn(4).setCellRenderer(new javax.swing.table.DefaultTableCellRenderer() {
-            { setHorizontalAlignment(CENTER); }
-            @Override
-            public java.awt.Component getTableCellRendererComponent(JTable t, Object value, boolean isSelected,
-                    boolean hasFocus, int row, int column) {
-                java.awt.Component c = super.getTableCellRendererComponent(t, value, isSelected, hasFocus, row, column);
-                int count = value instanceof Integer ? (Integer) value : 0;
-                if (!isSelected) c.setForeground(count > 0 ? AppTheme.EARTH_SIENNA : new Color(0x9E9E9E));
-                return c;
-            }
-        });
-        JScrollPane scroll = new JScrollPane(table);
+        // ── List ──────────────────────────────────────────────────────────────
+        listModel = new DefaultListModel<>();
+        credList = new JList<>(listModel);
+        credList.setCellRenderer(new CredentialRowRenderer());
+        credList.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
+        credList.setFixedCellHeight(52);
+        JScrollPane scroll = new JScrollPane(credList);
 
         // ── Buttons ───────────────────────────────────────────────────────────
+        // Only "Add Credential" is accent-styled — same one-primary-action
+        // restraint as TaskManagerPanel's toolbar; Delete keeps a red-tinted
+        // label as its only distinguishing mark instead of a loud gradient.
         JButton btnAdd     = new GradientButton("Add Credential");
         JButton btnEdit    = new JButton("Edit");
-        JButton btnDelete  = new GradientButton("Delete");
+        JButton btnDelete  = new JButton("Delete");
         JButton btnRefresh = new JButton("Refresh");
 
-        styleButton(btnAdd,    AppTheme.EARTH_MOSS);
-        styleButton(btnDelete, AppTheme.EARTH_RUST);
+        styleButton(btnAdd, AppTheme.EARTH_MOSS);
+        btnDelete.setForeground(AppTheme.EARTH_RUST);
 
         btnAdd.addActionListener(e -> showDialog(null));
         btnEdit.addActionListener(e -> {
-            int row = table.getSelectedRow();
-            if (row < 0) { JOptionPane.showMessageDialog(this, "Select a credential to edit."); return; }
-            int modelRow = table.convertRowIndexToModel(row);
-            String username = (String) tableModel.getValueAt(modelRow, 0);
-            Credential c = storage.loadCredentialByUsername(username);
-            if (c != null) showDialog(c);
+            Credential c = credList.getSelectedValue();
+            if (c == null) { JOptionPane.showMessageDialog(this, "Select a credential to edit."); return; }
+            showDialog(c);
         });
         btnDelete.addActionListener(e -> {
-            int row = table.getSelectedRow();
-            if (row < 0) { JOptionPane.showMessageDialog(this, "Select a credential to delete."); return; }
-            int modelRow = table.convertRowIndexToModel(row);
-            String username = (String) tableModel.getValueAt(modelRow, 0);
+            Credential c = credList.getSelectedValue();
+            if (c == null) { JOptionPane.showMessageDialog(this, "Select a credential to delete."); return; }
+            String username = c.getUsername();
             int inUse = storage.countTasksUsingCredential(username);
             String warning = inUse > 0
                 ? "\n\nWarning: " + inUse + " task" + (inUse == 1 ? " is" : "s are")
@@ -124,16 +114,87 @@ public class CredentialManagerPanel extends JPanel {
     }
 
     public void refresh() {
-        tableModel.setRowCount(0);
+        Credential selected = credList.getSelectedValue();
+        String selectedUsername = selected != null ? selected.getUsername() : null;
+
+        listModel.clear();
+        usageByUsername.clear();
         List<Credential> creds = storage.loadAllCredentials();
         for (Credential c : creds) {
-            tableModel.addRow(new Object[]{
-                c.getUsername(),
-                c.getHost(),
-                c.getOsType(),
-                c.getName(),
-                storage.countTasksUsingCredential(c.getUsername())
-            });
+            usageByUsername.put(c.getUsername(), storage.countTasksUsingCredential(c.getUsername()));
+            listModel.addElement(c);
+        }
+
+        if (selectedUsername != null) {
+            for (int i = 0; i < listModel.size(); i++) {
+                if (selectedUsername.equals(listModel.get(i).getUsername())) {
+                    credList.setSelectedIndex(i);
+                    break;
+                }
+            }
+        }
+    }
+
+    /** Card row: OS-type icon tile, display name + "username · host · OS type"
+     *  meta line, and a trailing pill for in-use vs unused. */
+    private class CredentialRowRenderer extends JPanel implements ListCellRenderer<Credential> {
+        private final JLabel nameLabel = new JLabel();
+        private final JLabel metaLabel = new JLabel();
+        private final PillBadge usagePill = new PillBadge("", AppTheme.NEUTRAL_FG, null);
+        private IconTile currentIcon;
+
+        CredentialRowRenderer() {
+            setLayout(new BorderLayout(10, 0));
+            setBorder(new EmptyBorder(6, 10, 6, 10));
+
+            nameLabel.setFont(nameLabel.getFont().deriveFont(Font.BOLD, 13f));
+            metaLabel.setFont(metaLabel.getFont().deriveFont(Font.PLAIN, 11f));
+            metaLabel.setForeground(new Color(0x8A8378));
+
+            JPanel textBlock = new JPanel();
+            textBlock.setOpaque(false);
+            textBlock.setLayout(new BoxLayout(textBlock, BoxLayout.Y_AXIS));
+            nameLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+            metaLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+            textBlock.add(nameLabel);
+            textBlock.add(metaLabel);
+            add(textBlock, BorderLayout.CENTER);
+
+            JPanel right = new JPanel(new GridBagLayout());
+            right.setOpaque(false);
+            right.add(usagePill);
+            add(right, BorderLayout.EAST);
+        }
+
+        @Override
+        public Component getListCellRendererComponent(JList<? extends Credential> list, Credential c,
+                                                        int index, boolean isSelected, boolean cellHasFocus) {
+            nameLabel.setText(c.getName() != null && !c.getName().isBlank()
+                    ? c.getName() : c.getUsername() + "@" + c.getHost());
+            metaLabel.setText(c.getUsername() + "  \u00b7  " + c.getHost()
+                    + "  \u00b7  " + (c.getOsType() != null ? c.getOsType() : "?"));
+
+            boolean windows = "WINDOWS".equalsIgnoreCase(c.getOsType());
+            String glyph = windows ? "W" : "L";
+            Color tileBg = windows ? AppTheme.EARTH_TEAL : AppTheme.EARTH_OCHRE;
+            if (currentIcon != null) remove(currentIcon);
+            currentIcon = new IconTile(glyph, Color.WHITE, tileBg);
+            add(currentIcon, BorderLayout.WEST);
+
+            int inUse = usageByUsername.getOrDefault(c.getUsername(), 0);
+            if (inUse > 0) {
+                usagePill.setText(inUse + (inUse == 1 ? " task" : " tasks"));
+                usagePill.setColors(AppTheme.SUCCESS_FG, AppTheme.SUCCESS_BG);
+            } else {
+                usagePill.setText("Unused");
+                usagePill.setColors(AppTheme.NEUTRAL_FG, null);
+            }
+
+            setBackground(isSelected ? list.getSelectionBackground()
+                    : (index % 2 == 0 ? list.getBackground() : AppTheme.surface2()));
+            setOpaque(true);
+            revalidate();
+            return this;
         }
     }
 

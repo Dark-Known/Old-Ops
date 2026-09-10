@@ -46,6 +46,29 @@ public final class AppTheme {
     public static final Color EARTH_CLAY   = new Color(0xBF6952); // tertiary emphasis (View Logs)
     public static final Color EARTH_TEAL   = new Color(0x4A6D5C); // alt action (Latest Logs, deep sage-teal)
 
+    /** Status pill tokens — paired (fg, bg) used by {@link PillBadge} for
+     *  Running/Failed/Success/Skipped everywhere a status needs to read as a
+     *  small colored chip rather than a full-row tint. Bg values are always
+     *  pale regardless of light/dark mode (a deliberate "highlighter"
+     *  look), so fg is always a dark, readable-on-pale color — never the
+     *  theme's normal (light-in-dark-mode) foreground. */
+    public static final Color RUNNING_FG = new Color(0x854F0B);
+    public static final Color RUNNING_BG = new Color(0xFAEEDA);
+    public static final Color FAILED_FG  = new Color(0xA32D2D);
+    public static final Color FAILED_BG  = new Color(0xFCEBEB);
+    public static final Color SUCCESS_FG = new Color(0x3B6D11);
+    public static final Color SUCCESS_BG = new Color(0xEAF3DE);
+    public static final Color SKIPPED_FG = new Color(0x8A6415);
+    public static final Color SKIPPED_BG = new Color(0xFBF3E3);
+    public static final Color NEUTRAL_FG = new Color(0x8A8378); // disabled / no-status text
+
+    /** Base panel background — same as before, just named for symmetry with {@link #surface2()}. */
+    public static Color surface1() { return UIManager.getColor("Panel.background"); }
+
+    /** A step darker/lighter than {@link #surface1()} (depending on light/dark mode) — used for
+     *  hovered/selected row backgrounds and section dividers in the list-card panels. */
+    public static Color surface2() { return isDark() ? new Color(0x2A2A2A) : new Color(0xF6F4F0); }
+
     private AppTheme() {}
 
     /** Installs the theme according to the saved light/dark preference (light by default). */

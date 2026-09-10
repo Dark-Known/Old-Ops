@@ -36,16 +36,17 @@ ui\TaskDialog$4.class
 ui\SettingsPanel$1.class
 util\AppConfig.class
 ui\DirectoryBrowserDialog.class
-ui\TaskManagerPanel$4.class
 ui\MainWindow$1.class
 service\watch\RemotePushWatcher$ListenerHandle.class
 ui\TestConnectionDialog$1.class
 ui\VectorIcons$5.class
 ui\DirectoryBrowserDialog$1.class
 ui\DirectoryBrowserDialog$GoArrowIcon.class
+ui\SettingsRow.class
 export\XlsxWriter.class
 util\CryptoUtil.class
 util\AppSettings.class
+ui\PillBadge.class
 ui\DirectoryBrowserDialog$7.class
 ui\NotificationBell$1.class
 ui\MainWindow$2.class
@@ -57,10 +58,10 @@ ui\RunLogSummarizer$FileEntry.class
 ui\WatcherInfoPopup$Result.class
 util\ImapSearchCriteria$TextCriteria.class
 service\RemoteFileMetadataServiceFactory$ManagedMetadataService.class
-ui\CredentialManagerPanel$1.class
 util\MailFetchMode.class
 ui\SettingsPanel$3.class
 service\XmlStorageService.class
+ui\components\IconTile.class
 ui\SettingsPanel$4.class
 ui\VectorIcons$7.class
 service\TransferRunStats.class
@@ -68,6 +69,7 @@ service\SftpRemoteFileMetadataService.class
 ui\DirectoryBrowserDialog$5.class
 util\MiniJson$Parser.class
 ui\DirectoryBrowserDialog$LocalProvider.class
+ui\QueueMonitorView$EventRowRenderer.class
 service\queue\TaskEventQueue.class
 service\TransferService$PerFileTransfer.class
 ui\DirectoryBrowserDialog$FwdArrowIcon.class
@@ -77,7 +79,6 @@ ui\ToastManager$1.class
 ui\DirectoryBrowserDialog$RefreshIcon.class
 service\ConnectionTestService$Result.class
 ui\DirectoryBrowserDialog$4.class
-ui\CredentialManagerPanel$2.class
 ui\RunLogSummarizer.class
 service\TransferService$MarkerMatch.class
 ui\MainWindow.class
@@ -88,7 +89,7 @@ ui\GradientPanel.class
 service\RunHistoryService.class
 ui\QueueMonitorView$ActivityRow.class
 ui\VectorIcons$8.class
-ui\QueueMonitorView$4.class
+ui\CredentialListModel.class
 ui\ToastManager$2.class
 ui\DirectoryBrowserDialog$3.class
 ui\SettingsPanel.class
@@ -98,6 +99,7 @@ service\queue\SchedulerStatusSnapshot.class
 util\ImapSearchCriteria$SizeCriteria.class
 service\queue\TaskDueEvent.class
 ui\StatisticsPanel$ActivityChart.class
+ui\TaskManagerPanel$TaskRowInfo.class
 service\GraphMailService$MailMessage.class
 util\ImapSearchCriteria$AdvancedCriteria.class
 service\TaskSchedulerService$TaskMetrics.class
@@ -105,6 +107,7 @@ ui\VectorIcons$9.class
 ui\WatchStatusMonitor.class
 model\ScheduledTask$TransferMode.class
 service\queue\TaskWorkerPool.class
+ui\TaskListModel.class
 ui\DirectoryBrowserDialog$9.class
 service\queue\SchedulerStatusSnapshot$WatchEntry.class
 service\TransferService$RemoteFileStat.class
@@ -125,6 +128,7 @@ export\HtmlReportWriter.class
 service\watch\PersistentSftpConnectionManager.class
 ui\DirectoryBrowserDialog$8.class
 ui\ActivityEventPopup.class
+ui\IconTile.class
 ui\VectorIcons$4.class
 service\SftpBrowseService$Entry.class
 model\ScheduledTask$TaskType.class
@@ -132,6 +136,7 @@ model\ScheduledTask$TransferDirection.class
 ui\OAuthAuthorizeDialog.class
 service\TaskSchedulerService$WatchStatus.class
 Daemon$1.class
+ui\components\StatCard.class
 AdminElevation.class
 ui\Theme$4.class
 ui\QueueMonitorView$3.class
@@ -146,7 +151,9 @@ service\TaskSchedulerService.class
 ui\DirectoryBrowserDialog$HomeIcon.class
 util\ImapSearchCriteria.class
 service\queue\SchedulerStatusExporter.class
+ui\CredentialManagerPanel$CredentialRowRenderer.class
 service\queue\SchedulerStatusSnapshot$FireEntry.class
+ui\TaskManagerPanel$TaskRowRenderer.class
 App.class
 ui\StatisticsPanel$1.class
 ui\VectorIcons$2.class
@@ -156,7 +163,6 @@ ui\TaskDialog$3.class
 ui\EventMonitorWindow$1.class
 ui\RunHistoryPanel$5.class
 service\TransferService.class
-ui\QueueMonitorView$5.class
 ui\RunHistoryPanel$ExportTask.class
 util\MiniJson.class
 service\TransferService$SizedCommand.class
@@ -193,4 +199,6 @@ ui\NotificationPanel$2.class
 service\TaskSchedulerService$1.class
 ui\CredentialManagerPanel.class
 model\ScheduledTask$TaskStatus.class
+ui\components\PillBadge.class
 ui\AppTheme.class
+ui\StatCard.class
