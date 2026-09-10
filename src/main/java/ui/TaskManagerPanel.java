@@ -796,6 +796,23 @@ public class TaskManagerPanel extends JPanel {
             Color[] colors = statusColors(t.getStatus().name(), lastResult);
             statusBadge.setColors(colors[0], colors[1]);
 
+            if (isSelected) {
+                // The pale (fg, bg) pairs above are tuned for the row's normal
+                // background — against the selection highlight they can read
+                // as low-contrast or even blend in outright ("text mixes with
+                // highlight color"). Force high-contrast selection colors for
+                // everything, same as JList's own default selected-row
+                // handling, rather than leaving badge/label colors fixed
+                // regardless of what's now behind them.
+                nameLabel.setForeground(list.getSelectionForeground());
+                metaLabel.setForeground(list.getSelectionForeground());
+                statusBadge.setColors(list.getSelectionForeground(), null);
+            } else {
+                nameLabel.setForeground(UIManager.getColor("List.foreground"));
+                metaLabel.setForeground(new Color(0x8A8378));
+                // colors[] already applied above for the unselected case
+            }
+
             setBackground(isSelected ? list.getSelectionBackground()
                     : (index % 2 == 0 ? list.getBackground() : AppTheme.surface2()));
             setOpaque(true);

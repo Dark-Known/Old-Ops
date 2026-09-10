@@ -276,10 +276,21 @@ public class QueueMonitorView extends JPanel {
             Color bg;
             if (isSelected) {
                 bg = list.getSelectionBackground();
+                // Same fix as the task/credential row renderers: force
+                // high-contrast text against the selection highlight instead
+                // of leaving the dot/text/time colors fixed regardless of
+                // what's now behind them.
+                dot.setForeground(list.getSelectionForeground());
+                text.setForeground(list.getSelectionForeground());
+                time.setForeground(list.getSelectionForeground());
             } else if (highlighted) {
                 bg = row.errored() ? AppTheme.FAILED_BG : AppTheme.SUCCESS_BG;
+                text.setForeground(UIManager.getColor("List.foreground"));
+                time.setForeground(new Color(0x8A8378));
             } else {
                 bg = index % 2 == 0 ? list.getBackground() : AppTheme.surface2();
+                text.setForeground(UIManager.getColor("List.foreground"));
+                time.setForeground(new Color(0x8A8378));
             }
             setBackground(bg);
             setOpaque(true);

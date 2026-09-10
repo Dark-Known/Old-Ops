@@ -190,6 +190,20 @@ public class CredentialManagerPanel extends JPanel {
                 usagePill.setColors(AppTheme.NEUTRAL_FG, null);
             }
 
+            if (isSelected) {
+                // Same fix as TaskManagerPanel's row renderer: the pale
+                // (fg, bg) pairs above are tuned for the row's normal
+                // background, not the selection highlight — force
+                // high-contrast selection colors instead of leaving text/pill
+                // colors fixed regardless of what's now behind them.
+                nameLabel.setForeground(list.getSelectionForeground());
+                metaLabel.setForeground(list.getSelectionForeground());
+                usagePill.setColors(list.getSelectionForeground(), null);
+            } else {
+                nameLabel.setForeground(UIManager.getColor("List.foreground"));
+                metaLabel.setForeground(new Color(0x8A8378));
+            }
+
             setBackground(isSelected ? list.getSelectionBackground()
                     : (index % 2 == 0 ? list.getBackground() : AppTheme.surface2()));
             setOpaque(true);
