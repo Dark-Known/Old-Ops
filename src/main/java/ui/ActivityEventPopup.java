@@ -18,11 +18,10 @@ import java.util.Map;
  * same "click outside to dismiss" pattern other lightweight popups in this
  * app use.
  *
- * <p>Looks up the matching {@link TaskRunRecord} (by task id + closest
- * started-at, since the worker pool's own activity feed and the run-history
- * DB each timestamp independently a few milliseconds apart) to get the full
- * captured run log, then renders one of two shapes depending on the task's
- * type:
+ * <p>Looks up the matching {@link TaskRunRecord} by its exact database row
+ * id (now carried directly on {@link QueueMonitorView.ActivityRow#runId()})
+ * to get the full captured run log, then renders one of two shapes
+ * depending on the task's type:
  * <ul>
  *   <li><b>FILE_TRANSFER</b> — parsed via {@link RunLogSummarizer}: files
  *       transferred, source/destination folder, total bytes, batch count,
@@ -51,8 +50,27 @@ final class ActivityEventPopup {
         Color accent = errored ? new Color(0xC0392B) : new Color(0x2E7D32);
 
         ScheduledTask task = byId != null ? byId.get(row.taskId()) : null;
-        TaskRunRecord run = findMatchingRun(runHistoryService, row);
-        boolean isFileTransfer = task != null && task.getTaskType() == ScheduledTask.TaskType.FILE_TRANSFER;
+        TaskRunRecord run = runHistoryService == null ? null
+                : row.source() == QueueMonitorView.RunSource.ACTIVITY
+                        ? runHistoryService.getActivityEventById(row.runId())
+                        : runHistoryService.getRunById(row.runId());
+
+        // A detection/started activity row is still logged against a
+        // FILE_TRANSFER task, so task.getTaskType() alone can't tell these
+        // apart from a real completed transfer — without this check, a
+        // detection row's own file-listing text (name/size per line, no
+        // "Transfer summary: ..." line) was being fed through the same
+        // RunLogSummarizer used for real completions, so both ended up
+        // rendering the exact same shape of detail (files/bytes/batches/
+        // sessions/threads) even though a detection event has no batches,
+        // sessions, or worker threads to report — it's a scan, not a
+        // transfer. See appendDetectionDetail below for what it shows
+        // instead: scan duration up front, then the files found.
+        boolean isDetectionRow = row.errorMessage() != null && row.errorMessage().startsWith("Detected ");
+        boolean isStartedRow = row.errorMessage() != null && row.errorMessage().startsWith("Started \u2014");
+
+        boolean isFileTransfer = !isDetectionRow && !isStartedRow
+                && task != null && task.getTaskType() == ScheduledTask.TaskType.FILE_TRANSFER;
         RunLogSummarizer.FileTransferSummary transferSummary =
                 isFileTransfer && run != null ? RunLogSummarizer.parse(run.getDetails()) : null;
 
@@ -84,6 +102,8 @@ final class ActivityEventPopup {
 
         if (transferSummary != null) {
             appendFileTransferDetail(sb, transferSummary);
+        } else if (isDetectionRow) {
+            appendDetectionDetail(sb, run);
         } else {
             appendGenericDetail(sb, task, run, row, errored);
         }
@@ -143,6 +163,44 @@ final class ActivityEventPopup {
         popup.requestFocus();
     }
 
+    /**
+     * Detail for a detection/scan activity row — deliberately a different
+     * shape than {@link #appendFileTransferDetail}: a detection has no
+     * batches, WinSCP/SFTP sessions, or worker threads to report (that's
+     * what the *eventual completion* row for the same run will show once
+     * the transfer itself runs), just what the scan found and how long the
+     * scan itself took. The "Started/Finished/Duration" lines already
+     * printed above this (see the caller) are the scan's own timing —
+     * {@link service.TaskSchedulerService#recordDetectionEvent} stamps the
+     * real scan start time now rather than a synthetic zero-duration
+     * timestamp, so that duration line is meaningful here.
+     */
+    private static void appendDetectionDetail(StringBuilder sb, TaskRunRecord run) {
+        sb.append('\n').append("File scan \u2014 no transfer has run yet for these files.\n");
+        if (run == null || run.getDetails() == null) return;
+
+        List<String> files = new java.util.ArrayList<>();
+        for (String line : run.getDetails().split("\n")) {
+            String l = line.trim();
+            if (!l.startsWith("[INFO]") || !l.contains("| size=")) continue;
+            String rest = l.substring("[INFO]".length()).trim();
+            int bar = rest.indexOf('|');
+            String name = bar > 0 ? rest.substring(0, bar).trim() : rest;
+            String sizePart = rest.substring(rest.indexOf("size=") + 5).trim();
+            long sizeBytes;
+            try { sizeBytes = Long.parseLong(sizePart); } catch (NumberFormatException nfe) { sizeBytes = -1; }
+            files.add(name + (sizeBytes >= 0 ? "  \u2014  " + RunLogSummarizer.formatBytes(sizeBytes) : ""));
+        }
+        if (files.isEmpty()) return;
+
+        sb.append('\n').append("File(s) found:\n");
+        int shown = Math.min(files.size(), 15);
+        for (int i = 0; i < shown; i++) {
+            sb.append("  \u2022 ").append(files.get(i)).append('\n');
+        }
+        if (files.size() > shown) sb.append("  \u2026 and ").append(files.size() - shown).append(" more\n");
+    }
+
     private static void appendFileTransferDetail(StringBuilder sb, RunLogSummarizer.FileTransferSummary s) {
         sb.append('\n');
         if (s.direction() != null) sb.append("Direction: ").append(s.direction()).append('\n');
@@ -189,26 +247,6 @@ final class ActivityEventPopup {
                 sb.append("This failure marks the task FAILED — surfaced in the Notifications panel "
                         + "until it's re-run or edited.\n");
             }
-        }
-    }
-
-    private static TaskRunRecord findMatchingRun(RunHistoryService runHistoryService, QueueMonitorView.ActivityRow row) {
-        if (runHistoryService == null || row.taskId() == null || row.startedAt() == null) return null;
-        try {
-            List<TaskRunRecord> candidates = runHistoryService.getRunsForTask(row.taskId(), 20);
-            TaskRunRecord best = null;
-            long bestDiffSeconds = Long.MAX_VALUE;
-            for (TaskRunRecord r : candidates) {
-                if (r.getStartedAt() == null) continue;
-                long diff = Math.abs(Duration.between(row.startedAt(), r.getStartedAt()).getSeconds());
-                if (diff < bestDiffSeconds) {
-                    bestDiffSeconds = diff;
-                    best = r;
-                }
-            }
-            return (best != null && bestDiffSeconds <= 5) ? best : null;
-        } catch (Exception e) {
-            return null;
         }
     }
 

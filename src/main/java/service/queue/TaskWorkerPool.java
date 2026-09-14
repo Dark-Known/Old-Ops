@@ -80,6 +80,12 @@ public class TaskWorkerPool {
         public String getErrorMessage() { return errorMessage; }
     }
 
+    /** One worker thread's currently-executing task, for the live activity widget — see {@link #getInFlightSnapshot()}. */
+    public record InFlightTask(String taskId, LocalDateTime startedAt) {}
+
+    private final java.util.concurrent.ConcurrentHashMap<Long, InFlightTask> inFlightByThread =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
     private final TaskEventQueue queue;
     private final Consumer<TaskDueEvent> handler;
     private final Supplier<HandlerOutcome> outcomeSupplier;
@@ -124,6 +130,7 @@ public class TaskWorkerPool {
                 TaskDueEvent event = queue.take(); // blocks here — zero CPU while idle, no polling
                 activeWorkers.incrementAndGet();
                 LocalDateTime startedAt = LocalDateTime.now();
+                inFlightByThread.put(Thread.currentThread().getId(), new InFlightTask(event.getTaskId(), startedAt));
                 boolean errored = false;
                 String message = null;
                 boolean suppress = false;
@@ -141,6 +148,7 @@ public class TaskWorkerPool {
                     log.warning("Worker error handling task event " + event + ": " + e.getMessage());
                 } finally {
                     activeWorkers.decrementAndGet();
+                    inFlightByThread.remove(Thread.currentThread().getId());
                     if (!suppress) {
                         recordActivity(new ActivityEntry(event.getTaskId(), event.getAttempt(),
                                 startedAt, LocalDateTime.now(), errored, message));
@@ -171,6 +179,18 @@ public class TaskWorkerPool {
 
     /** Workers currently blocked inside handler.accept(), i.e. actively executing a task right now. */
     public int getActiveWorkerCount() { return activeWorkers.get(); }
+
+    /**
+     * Snapshot of what every currently-busy worker thread is executing right
+     * now, for a live activity indicator — each entry is one thread's
+     * current task id and when it picked it up. Task name/type/direction
+     * aren't included here since the pool has no reference to the task
+     * definitions themselves; the caller (see EventMonitorPanel's worker
+     * activity strip) resolves those against its own live task snapshot.
+     */
+    public List<InFlightTask> getInFlightSnapshot() {
+        return new ArrayList<>(inFlightByThread.values());
+    }
 
     /** Newest-first snapshot of the last {@code limit} handled events. UI-consumption only. */
     public List<ActivityEntry> getRecentActivity(int limit) {

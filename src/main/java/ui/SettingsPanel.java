@@ -10,6 +10,8 @@ import java.awt.*;
 import java.io.*;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Base64;
+import java.nio.charset.StandardCharsets;
 import java.util.prefs.Preferences;
 
 public class SettingsPanel extends JPanel {
@@ -73,10 +75,7 @@ public class SettingsPanel extends JPanel {
         JPanel outer = new JPanel();
         outer.setLayout(new BoxLayout(outer, BoxLayout.Y_AXIS));
 
-        JLabel banner = new JLabel(
-            "<html><b>Settings</b> — WinSCP path, data directory, daemon registration, and other"
-            + " application-wide preferences.<br>"
-            + "<span style='color:gray'>Changes here apply to both the GUI scheduler and the background daemon.</span></html>");
+        JLabel banner = new JLabel("<html><b>Settings</b></html>");
         banner.setBorder(new EmptyBorder(0, 0, 10, 0));
         // Added directly to `this` (BorderLayout.NORTH) rather than into the BoxLayout
         // column `outer` — BorderLayout.NORTH always stretches its child to the full
@@ -85,8 +84,6 @@ public class SettingsPanel extends JPanel {
         // for the full explanation of that quirk). This guarantees the banner spans
         // full width and stays flush-left regardless of its text length.
         add(banner, BorderLayout.NORTH);
-
-        outer.add(sectionHeader("WinSCP Configuration"));
 
         // WinSCP section
         JPanel winscpPanel = new JPanel(new GridBagLayout());
@@ -104,9 +101,6 @@ public class SettingsPanel extends JPanel {
                 tfWinScp.setText(fc.getSelectedFile().getAbsolutePath());
         });
 
-        JLabel hint = new JLabel("<html><i style='color:gray'>WinSCP.com is the command-line "
-            + "interface. Default: C:\\Program Files (x86)\\WinSCP\\WinSCP.com</i></html>");
-
         GridBagConstraints lc = new GridBagConstraints();
         lc.anchor = GridBagConstraints.WEST; lc.insets = new Insets(6, 4, 4, 8); lc.gridx = 0;
         GridBagConstraints fc2 = new GridBagConstraints();
@@ -119,18 +113,11 @@ public class SettingsPanel extends JPanel {
         winscpPanel.add(new JLabel("WinSCP.com path:"), lc);
         winscpPanel.add(tfWinScp, fc2);
         winscpPanel.add(btnBrowse, bc);
-        GridBagConstraints hintC = new GridBagConstraints();
-        hintC.gridx = 0; hintC.gridy = 1; hintC.gridwidth = 3;
-        hintC.anchor = GridBagConstraints.WEST; hintC.insets = new Insets(0, 4, 4, 0);
-        winscpPanel.add(hint, hintC);
-        outer.add(winscpPanel);
+        outer.add(card("WinSCP Configuration", winscpPanel));
         outer.add(Box.createVerticalStrut(12));
 
-        outer.add(sectionHeader("Message Routing & Attachments (live — no restart needed)"));
-        outer.add(buildRoutingPanel());
+        outer.add(card("Message Routing & Attachments (live \u2014 no restart needed)", buildRoutingPanel()));
         outer.add(Box.createVerticalStrut(12));
-
-        outer.add(sectionHeader("Background Scheduler (runs without GUI)"));
 
         // Background Daemon section
         JPanel daemonPanel = new JPanel(new GridBagLayout());
@@ -139,18 +126,6 @@ public class SettingsPanel extends JPanel {
 
         lblDaemonStatus = new JLabel("Checking...");
         lblDaemonStatus.setFont(lblDaemonStatus.getFont().deriveFont(Font.BOLD));
-
-        JTextArea daemonInfo = new JTextArea(
-            "The background daemon runs via Windows Task Scheduler so scheduled tasks\n"
-          + "execute even when this GUI is closed or you are logged out.\n"
-          + "It shares the same tasks.xml and credentials as the GUI.\n"
-          + "Registering/removing requires Administrator privileges.\n\n"
-          + "Important: scheduled tasks are stored in %USERPROFILE%\\.opstool\\tasks.xml.\n"
-          + "Redeploying the application jar does not disturb this file unless you delete the data folder.");
-        daemonInfo.setEditable(false);
-        daemonInfo.setBackground(AppTheme.isDark() ? new Color(0x2A2E3D) : new Color(0xF0F4FF));
-        daemonInfo.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 12));
-        daemonInfo.setBorder(new EmptyBorder(6, 6, 6, 6));
 
         JButton btnRegister     = new GradientButton("Register Daemon (Admin required)");
         JButton btnRemove       = new GradientButton("Remove Daemon");
@@ -176,14 +151,9 @@ public class SettingsPanel extends JPanel {
         g.gridx = 1; g.gridwidth = 3; g.fill = GridBagConstraints.HORIZONTAL; g.weightx = 1;
         daemonPanel.add(lblDaemonStatus, g);
 
-        g.gridx = 0; g.gridy = 1; g.gridwidth = 4; g.fill = GridBagConstraints.HORIZONTAL;
-        daemonPanel.add(daemonInfo, g);
-
         // Poll interval control
         JLabel lblPoll = new JLabel("GUI poll interval (seconds):");
         spinnerPollInterval = new javax.swing.JSpinner(new javax.swing.SpinnerNumberModel(60, 1, 3600, 1));
-        JLabel pollHint = new JLabel("Lower values (eg. 5s) enable high-frequency tasks - consider using the Daemon for reliability.");
-        pollHint.setFont(pollHint.getFont().deriveFont(Font.ITALIC, 11f));
 
         GridBagConstraints pc = new GridBagConstraints();
         pc.insets = new Insets(6,4,4,4); pc.gridx = 0; pc.gridy = 3;
@@ -191,9 +161,6 @@ public class SettingsPanel extends JPanel {
         GridBagConstraints sc = new GridBagConstraints();
         sc.insets = new Insets(6,0,4,4); sc.gridx = 1; sc.gridy = 3; sc.fill = GridBagConstraints.NONE;
         daemonPanel.add(spinnerPollInterval, sc);
-        GridBagConstraints hc = new GridBagConstraints();
-        hc.insets = new Insets(6,4,4,4); hc.gridx = 0; hc.gridy = 4; hc.gridwidth = 4; hc.fill = GridBagConstraints.HORIZONTAL;
-        daemonPanel.add(pollHint, hc);
 
         JPanel btnRow2 = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
         btnRow2.add(btnRegister);
@@ -204,10 +171,8 @@ public class SettingsPanel extends JPanel {
         g.gridy = 2;
         daemonPanel.add(btnRow2, g);
 
-        outer.add(daemonPanel);
+        outer.add(card("Background Scheduler (runs without GUI)", daemonPanel));
         outer.add(Box.createVerticalStrut(12));
-
-        outer.add(sectionHeader("Application Info"));
 
         // App Info section
         JPanel infoPanel = new JPanel(new GridBagLayout());
@@ -217,33 +182,11 @@ public class SettingsPanel extends JPanel {
         String dataDir = resolveActualDataDir();
         addInfoRow(infoPanel, "Data directory:", dataDir, 0);
         addInfoRow(infoPanel, "Tasks file:",     dataDir + File.separator + "tasks.xml", 1);
-        addInfoRow(infoPanel, "Credentials:",    dataDir + File.separator + "credentials.db", 2);
+        addInfoRow(infoPanel, "Credentials & settings (database):", dataDir + File.separator + "app.db", 2);
         addInfoRow(infoPanel, "Daemon log:",     dataDir + File.separator + resolveDaemonLogFileName(), 3);
-        addInfoRow(infoPanel, "Live settings (database):", AppSettings.filePath(), 4);
-        outer.add(infoPanel);
+        addInfoRow(infoPanel, "Run history (database):", dataDir + File.separator + "run_history.db", 4);
+        outer.add(card("Application Info", infoPanel));
         outer.add(Box.createVerticalStrut(12));
-
-        outer.add(sectionHeader("Setup Notes"));
-
-        // Notes section
-        JTextArea notes = new JTextArea(
-            "WINDOWS file transfer target:\n"
-          + "  OpenSSH Server must be installed (Settings > Apps > Optional Features)\n\n"
-          + "LINUX file transfer target:\n"
-          + "  sshd must be running on port 22\n\n"
-          + "Service Start/Stop/Restart target:\n"
-          + "  WinRM must be enabled: Enable-PSRemoting -Force  (run as admin)\n\n"
-          + "Wildcard transfers:\n"
-          + "  Use * in source path (e.g. C:\\data\\*.csv) or a folder for full sync.\n\n"
-          + "Redeploy safely:\n"
-          + "  Keep %USERPROFILE%\\.opstool unchanged.\n"
-          + "  Use redeploy-safe.ps1 to backup and restore it before upgrading."
-        );
-        notes.setEditable(false);
-        notes.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 11));
-        notes.setBackground(AppTheme.isDark() ? new Color(0x2A2A2A) : new Color(0xF5F5F5));
-        notes.setBorder(new EmptyBorder(6, 6, 6, 6));
-        outer.add(notes);
 
         // Save button row
         lblStatus = new JLabel(" ");
@@ -331,88 +274,17 @@ public class SettingsPanel extends JPanel {
                 new javax.swing.SpinnerNumberModel(1, 1, 50, 1));
         row = addFieldRow(panel, lc, fc, "Batches/files to run at once:", spinnerBatchConcurrency, row);
 
-        JLabel concurrencyHint = new JLabel("<html><body style='width: 480px'><i style='color:gray'>"
-            + "1 = one operation at a time (original behavior) — one WinSCP/SFTP session for remote "
-            + "transfers/backups, one file copy/move at a time for local backups. Raising this runs that "
-            + "many in parallel — the main lever for backlogs with a huge number of small files, where "
-            + "per-file overhead (network round trips, or local open/copy/close calls) is the real "
-            + "bottleneck rather than link speed or disk throughput. Increase gradually; for remote "
-            + "transfers, confirm the server tolerates multiple simultaneous connections.</i></body></html>");
-        GridBagConstraints chc = new GridBagConstraints();
-        chc.gridx = 0; chc.gridy = row++; chc.gridwidth = 3; chc.anchor = GridBagConstraints.WEST;
-        chc.insets = new Insets(0, 4, 8, 0);
-        panel.add(concurrencyHint, chc);
-
         spinnerWatcherFilesPerThread = new javax.swing.JSpinner(
                 new javax.swing.SpinnerNumberModel(5, 1, 1000, 1));
         row = addFieldRow(panel, lc, fc, "Watcher files per worker thread:", spinnerWatcherFilesPerThread, row);
-
-        JLabel filesPerThreadHint = new JLabel("<html><body style='width: 480px'><i style='color:gray'>"
-            + "Only applies to watcher-triggered transfers (the persistent-connection fast path). A single "
-            + "fire doesn't use more than one worker thread until it names at least this many changed files — "
-            + "e.g. with the default of 5, a 2-file fire stays single-threaded, a 20-file burst uses 4 threads "
-            + "(20 \u00f7 5), still capped by \"Batches/files to run at once\" above. Lower this if small bursts "
-            + "should also parallelize; raise it if a handful of files shouldn't need extra threads/connections "
-            + "at all.</i></body></html>");
-        GridBagConstraints fpc = new GridBagConstraints();
-        fpc.gridx = 0; fpc.gridy = row++; fpc.gridwidth = 3; fpc.anchor = GridBagConstraints.WEST;
-        fpc.insets = new Insets(0, 4, 8, 0);
-        panel.add(filesPerThreadHint, fpc);
 
         spinnerStaleThresholdMinutes = new javax.swing.JSpinner(
                 new javax.swing.SpinnerNumberModel(30, 1, 1440, 1));
         row = addFieldRow(panel, lc, fc, "Stale RUNNING task timeout (min):", spinnerStaleThresholdMinutes, row);
 
-        JLabel staleHint = new JLabel("<html><body style='width: 480px'><i style='color:gray'>"
-            + "If a task stays RUNNING longer than this, the scheduler assumes it crashed/hung and "
-            + "force-cancels it, marking it FAILED (stale). Raise this for backups/transfers with large "
-            + "backlogs that legitimately take a long time, so a slow-but-progressing run isn't killed "
-            + "and reported as failed partway through.</i></body></html>");
-        GridBagConstraints shc = new GridBagConstraints();
-        shc.gridx = 0; shc.gridy = row++; shc.gridwidth = 3; shc.anchor = GridBagConstraints.WEST;
-        shc.insets = new Insets(0, 4, 8, 0);
-        panel.add(staleHint, shc);
-
         spinnerMaxConcurrentTaskThreads = new javax.swing.JSpinner(
                 new javax.swing.SpinnerNumberModel(20, 4, 200, 1));
         row = addFieldRow(panel, lc, fc, "Max concurrent task threads (restart required):", spinnerMaxConcurrentTaskThreads, row);
-
-        JLabel threadsHint = new JLabel("<html><body style='width: 480px'><i style='color:gray'>"
-            + "Ceiling on how many tasks can be executing at the exact same instant across the whole "
-            + "app. Most tasks here spend their time waiting on a remote server, not the CPU, so a very "
-            + "high number rarely improves throughput — it mainly affects worst-case memory use, since "
-            + "each worker thread reserves its own stack. Lower this if the app's memory footprint is a "
-            + "concern; raise it only if you have many tasks that genuinely need to run in parallel. "
-            + "Unlike the other settings on this page, this one is read once at startup.</i></body></html>");
-        GridBagConstraints thc = new GridBagConstraints();
-        thc.gridx = 0; thc.gridy = row++; thc.gridwidth = 3; thc.anchor = GridBagConstraints.WEST;
-        thc.insets = new Insets(0, 4, 8, 0);
-        panel.add(threadsHint, thc);
-
-        // Fixed pixel width in the <body> style forces the HTML renderer to wrap
-        // this onto multiple lines instead of laying it out as one long line that
-        // would otherwise force the whole panel (and every field in it) wider.
-        JLabel batchHint = new JLabel("<html><body style='width: 480px'><i style='color:gray'>"
-            + "Transfers and backups (any mode/"
-            + "direction) are split by total FILE SIZE, not file count: each batch is capped so it "
-            + "should complete in roughly the target duration above, given the assumed link speed "
-            + "(cap = target seconds &times; link speed). A single file larger than the cap is still "
-            + "sent alone in its own batch. Between batches the run pauses for the configured "
-            + "interval. Set the override above (&gt;0 bytes) to bypass the derived cap and use an "
-            + "exact byte limit instead.</i></body></html>");
-        GridBagConstraints bhc = new GridBagConstraints();
-        bhc.gridx = 0; bhc.gridy = row++; bhc.gridwidth = 3; bhc.anchor = GridBagConstraints.WEST;
-        bhc.insets = new Insets(0, 4, 8, 0);
-        panel.add(batchHint, bhc);
-
-        JLabel hint = new JLabel("<html><body style='width: 480px'><i style='color:gray'>"
-            + "Attachments are saved to "
-            + "&lt;location&gt;\\LDM|PTM|Others\\&lt;message&gt;\\&lt;file&gt;. Leave blank to keep "
-            + "saving them inside each task's own output folder instead.</i></body></html>");
-        GridBagConstraints hc = new GridBagConstraints();
-        hc.gridx = 0; hc.gridy = row++; hc.gridwidth = 3; hc.anchor = GridBagConstraints.WEST;
-        hc.insets = new Insets(0, 4, 8, 0);
-        panel.add(hint, hc);
 
         // JVM heap — stored in the same file for one consistent place to
         // edit everything, but genuinely cannot apply to the already-running
@@ -424,10 +296,6 @@ public class SettingsPanel extends JPanel {
         heapRow.add(tfJvmMinHeap);
         heapRow.add(new JLabel("JVM max heap:"));
         heapRow.add(tfJvmMaxHeap);
-        JLabel heapHint = new JLabel("  (applies on next app/daemon restart — not live)");
-        heapHint.setFont(heapHint.getFont().deriveFont(Font.ITALIC, 11f));
-        heapHint.setForeground(Color.GRAY);
-        heapRow.add(heapHint);
         GridBagConstraints heapC = new GridBagConstraints();
         heapC.gridx = 0; heapC.gridy = row++; heapC.gridwidth = 3; heapC.anchor = GridBagConstraints.WEST;
         heapC.insets = new Insets(4, 0, 4, 0);
@@ -598,6 +466,7 @@ public class SettingsPanel extends JPanel {
                 updated.add(new util.MailRoutingRule(util.MailRoutingRule.OTHERS_KEY, "Others"));
             }
             AppSettings.setMailRoutingRules(updated);
+            logActivity("Settings saved", "Mail routing rules updated (" + updated.size() + " rule(s))");
             refreshMailRoutingPreview();
             dlg.dispose();
         });
@@ -613,12 +482,26 @@ public class SettingsPanel extends JPanel {
      * bordered boxes, and it's what {@code TaskManagerPanel}'s own redesign
      * moved to as well (a "?" tooltip instead of a boxed legend panel).
      */
-    private JLabel sectionHeader(String title) {
+    /**
+     * Wraps one settings section in a consistent card: a subtly bordered,
+     * padded panel with a bold title row, replacing the old flat
+     * "bold label directly in the scroll column, then the content panel
+     * right below it with its own separate margins" pattern — every section
+     * used slightly different spacing/borders before, which is what made
+     * the page feel inconsistent rather than like one designed screen.
+     */
+    private JComponent card(String title, JComponent content) {
+        JPanel card = new JPanel(new BorderLayout(0, 8));
+        card.setAlignmentX(Component.LEFT_ALIGNMENT);
+        card.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(AppTheme.surface2(), 1, true),
+                new EmptyBorder(12, 14, 14, 14)));
+
         JLabel header = new JLabel(title);
         header.setFont(header.getFont().deriveFont(Font.BOLD, 13f));
-        header.setAlignmentX(Component.LEFT_ALIGNMENT);
-        header.setBorder(new EmptyBorder(4, 2, 6, 0));
-        return header;
+        card.add(header, BorderLayout.NORTH);
+        card.add(content, BorderLayout.CENTER);
+        return card;
     }
 
     private int addFieldRow(JPanel panel, GridBagConstraints lc, GridBagConstraints fc, String label, JComponent field, int row) {
@@ -669,11 +552,6 @@ public class SettingsPanel extends JPanel {
             return;
         }
 
-        // Use schtasks.exe for reliable task registration
-        // This is simpler and more reliable than PowerShell Register-ScheduledTask
-        String taskPath = "C:\\OpsTools\\daemon-register.ps1";
-
-        // Create a temporary PowerShell script that registers the daemon
         String psScript = String.format(
             "$action = New-ScheduledTaskAction -Execute '%s' -Argument '-cp \"%s\" com.opstool.Daemon \"%s\"'\n" +
             "$trigStart = New-ScheduledTaskTrigger -AtStartup\n" +
@@ -686,36 +564,23 @@ public class SettingsPanel extends JPanel {
             dataDir.replace("\\", "\\\\"),
             TASK_NAME);
 
+        // FIX: this used to write psScript to a temp .ps1 file, then launch
+        // it elevated via a hand-built "Start-Process powershell -ArgumentList
+        // '-Command', 'Unblock-File -Path \"...\"; & \"...\"' -Verb RunAs"
+        // string, escaping the embedded double quotes with backticks. That
+        // escaping doesn't work: backtick is only an escape character inside
+        // a PowerShell *double*-quoted string, and the whole thing here was
+        // single-quoted — so every `\"` came out as a literal backtick
+        // followed by a literal quote instead of collapsing to one quote,
+        // corrupting the path on both sides of the semicolon and typically
+        // making Unblock-File (and then the `& "..."` invocation) fail
+        // silently, meaning the actual Register-ScheduledTask logic never
+        // ran at all. runElevatedPowerShell() below sidesteps every layer of
+        // quoting by passing the script as base64 via -EncodedCommand — see
+        // its own doc comment — and also means no temp file or
+        // Unblock-File/execution-policy dance is needed in the first place.
         try {
-            // Write script to temp file
-            File tempScript = File.createTempFile("opstool_daemon_", ".ps1");
-            try (PrintWriter pw = new PrintWriter(new FileWriter(tempScript))) {
-                pw.print(psScript);
-            }
-            tempScript.deleteOnExit();
-
-            // Execute with elevation via PowerShell -Verb RunAs
-            String elevCmd = String.format(
-                "Start-Process powershell -ArgumentList '-NoProfile', '-NonInteractive', '-Command', 'Unblock-File -Path \\\"%s\\\"; & \\\"%s\\\"' -Verb RunAs -Wait",
-                tempScript.getAbsolutePath().replace("\\", "\\\\"),
-                tempScript.getAbsolutePath().replace("\\", "\\\\"));
-
-            ProcessBuilder pb = new ProcessBuilder(
-                "powershell.exe",
-                "-NonInteractive",
-                "-NoProfile",
-                "-Command",
-                elevCmd);
-            pb.redirectErrorStream(true);
-
-            Process p = pb.start();
-            BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream()));
-            StringBuilder output = new StringBuilder();
-            String line;
-            while ((line = br.readLine()) != null) {
-                output.append(line).append("\n");
-            }
-            int rc = p.waitFor();
+            int rc = runElevatedPowerShell(psScript, "Register daemon");
 
             // Give task scheduler a moment to process
             Thread.sleep(2000);
@@ -739,7 +604,7 @@ public class SettingsPanel extends JPanel {
                     + "Account: SYSTEM\n\n"
                     + "Your scheduled tasks will now run automatically.");
             } else {
-                showError("Daemon registration may have failed.\n"
+                showError("Daemon registration may have failed (elevated process exit code " + rc + ").\n"
                     + "Verify manually in Task Scheduler:\n"
                     + "  Win+R > taskschd.msc\n"
                     + "  Look for '" + TASK_NAME + "'\n\n"
@@ -759,7 +624,7 @@ public class SettingsPanel extends JPanel {
             "Confirm Remove", JOptionPane.YES_NO_OPTION);
         if (choice != JOptionPane.YES_OPTION) return;
 
-        int rc = runElevated(
+        int rc = runElevatedPowerShell(
             "schtasks /Delete /TN \"" + TASK_NAME + "\" /F",
             "Remove daemon");
         if (rc == 0)
@@ -773,11 +638,7 @@ public class SettingsPanel extends JPanel {
 
     private void runDaemonNow() {
         try {
-            String ps = "$taskName = '" + TASK_NAME + "'\r\n"
-                + "schtasks /Run /TN $taskName /I 2>&1\r\n"
-                + "exit $LASTEXITCODE\r\n";
-
-            int rc = runElevated("schtasks /Run /TN " + TASK_NAME, "Run Daemon Now");
+            int rc = runElevatedPowerShell("schtasks /Run /TN \"" + TASK_NAME + "\"", "Run Daemon Now");
 
             if (rc == 0) {
                 showInfo("Daemon triggered successfully!\n\n"
@@ -794,16 +655,36 @@ public class SettingsPanel extends JPanel {
         }
     }
 
-    /** Runs a shell command elevated via PowerShell -Verb RunAs (triggers UAC). */
-    private int runElevated(String command, String description) {
+    /**
+     * Runs a PowerShell script elevated (triggers a UAC prompt) and waits
+     * for it to finish. The script reaches the elevated process via
+     * {@code -EncodedCommand} — a base64 blob of its UTF-16LE bytes —
+     * instead of as literal text threaded through several layers of shell
+     * quoting (this class's previous {@code runElevated(String)} built a
+     * "Start-Process cmd -ArgumentList '/c &lt;command&gt;' -Verb RunAs"
+     * string and tried to escape embedded double quotes with backticks,
+     * which doesn't work inside a single-quoted PowerShell string — see
+     * {@link #registerDaemon()}'s doc comment for the full explanation).
+     * Base64 contains none of {@code ' " \ } or whitespace, so there is
+     * nothing left for any layer to misinterpret — this is also why
+     * {@code schtasks /TN "Monitoring-Tool-Daemon"}-style commands (which
+     * contain a literal, load-bearing pair of double quotes) now work
+     * reliably where they didn't before.
+     *
+     * @return the elevated process's exit code, or -1 if it couldn't even be launched
+     */
+    private int runElevatedPowerShell(String script, String description) {
         try {
-            String psCmd = "Start-Process cmd -ArgumentList '/c "
-                + command.replace("'", "''").replace("\"", "`\"")
-                + "' -Verb RunAs -Wait -WindowStyle Hidden";
+            String encoded = Base64.getEncoder().encodeToString(script.getBytes(StandardCharsets.UTF_16LE));
+            String launcher = "Start-Process powershell.exe -ArgumentList "
+                    + "'-NoProfile','-NonInteractive','-EncodedCommand','" + encoded + "' -Verb RunAs -Wait";
             Process p = new ProcessBuilder(
-                "powershell.exe", "-NonInteractive", "-NoProfile", "-Command", psCmd)
+                "powershell.exe", "-NonInteractive", "-NoProfile", "-Command", launcher)
                 .redirectErrorStream(true)
                 .start();
+            try (BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
+                while (br.readLine() != null) { /* drain — the elevated child's own stdout isn't visible to us anyway */ }
+            }
             return p.waitFor();
         } catch (Exception e) {
             showError(description + " failed: " + e.getMessage());
@@ -1008,6 +889,23 @@ public class SettingsPanel extends JPanel {
         spinnerMaxConcurrentTaskThreads.setValue(AppSettings.getMaxConcurrentTaskThreads());
     }
 
+    /**
+     * Records an application-activity note (settings saved) into the Event
+     * Monitor's activity feed — see
+     * {@link service.RunHistoryService#recordActivityEvent}. No-op if this
+     * panel was constructed without a scheduler reference (see the
+     * single-arg constructor's javadoc).
+     */
+    private void logActivity(String title, String detail) {
+        if (scheduler == null) return;
+        try {
+            java.time.LocalDateTime now = java.time.LocalDateTime.now();
+            scheduler.getRunHistoryService().recordActivityEvent("SETTINGS", title, null, detail, detail, now, now);
+        } catch (Exception ignored) {
+            // Best-effort — a failure to log this shouldn't block the actual settings save.
+        }
+    }
+
     private void savePrefs() {
         String path = tfWinScp.getText().trim();
         String previousLogLevel = AppSettings.getLogLevel();
@@ -1053,6 +951,8 @@ public class SettingsPanel extends JPanel {
             live.put(AppSettings.KEY_MAX_CONCURRENT_TASK_THREADS,
                     String.valueOf((Integer) spinnerMaxConcurrentTaskThreads.getValue()));
             AppSettings.setAll(live);
+            logActivity("Settings saved", "Application settings updated (log level: "
+                    + live.get(AppSettings.KEY_LOG_LEVEL) + ")");
         } catch (Exception ex) {
             lblStatus.setText("Could not save live settings: " + ex.getMessage());
             lblStatus.setForeground(Color.RED);

@@ -133,7 +133,7 @@ final class RunLogSummarizer {
 
     /** Matches the app's own byte-formatting convention closely enough for
      *  display purposes (binary/1024-based units, one decimal place). */
-    private static String formatBytes(long bytes) {
+    static String formatBytes(long bytes) {
         if (bytes < 1024) return bytes + " B";
         String[] units = {"KB", "MB", "GB", "TB"};
         double value = bytes;

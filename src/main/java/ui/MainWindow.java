@@ -291,7 +291,7 @@ public class MainWindow extends JFrame {
 
         // ── Sidebar navigation (Tasks / Credentials / Logs / Settings) ─────────
         taskPanel = new TaskManagerPanel(storage, scheduler);
-        credPanel = new CredentialManagerPanel(storage);
+        credPanel = new CredentialManagerPanel(storage, scheduler.getRunHistoryService());
         RunHistoryPanel runHistoryPanel = new RunHistoryPanel(storage, scheduler.getRunHistoryService());
         SettingsPanel settingsPanel = new SettingsPanel(transferService, scheduler);
 

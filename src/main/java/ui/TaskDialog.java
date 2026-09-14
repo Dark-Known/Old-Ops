@@ -78,14 +78,11 @@ public class TaskDialog extends JDialog {
     private JComboBox<String> cbTransferMode;
     private JLabel      lblSourcePath;
     private JLabel      lblTargetFolder;
-    private JLabel      lblSourceHint;
-    private JLabel      lblTargetHint;
     private JTextField  tfTargetFolder;
     private JPanel       additionalDestRowsContainer;
     private final java.util.List<JTextField> additionalDestFields = new java.util.ArrayList<>();
     private JLabel      lblAdditionalTargetFolders;
     private JCheckBox   cbWatcherEnabled;
-    private JLabel      lblWatcherInfo;
     private JLabel      lblWatcherStatus;
     private JButton     btnResetBaseline;
     private JPanel      transferTab;
@@ -114,7 +111,6 @@ public class TaskDialog extends JDialog {
     private JComboBox<String> cbMailFetchScope;
     private JTextField tfMailMaxResults;
     private JLabel   lblMailMaxResults;
-    private JLabel   lblMailFetchScopeNote;
 
     // ── Mail watcher (baseline = newest processed message's receivedDateTime) ──
     private JCheckBox cbMailWatcherEnabled;
@@ -219,8 +215,6 @@ public class TaskDialog extends JDialog {
         addRow(sourcePanel, "Username",                  tfSourceUser, 1);
         addRow(sourcePanel, lblSourcePath = new JLabel(), withBrowseButton(tfSourcePath,
                 () -> browseLocal(tfSourcePath, "This Computer")), 2);
-        lblSourceHint = hint("");
-        addRow(sourcePanel, "", lblSourceHint, 3);
 
         // ── File Transfer panel ───────────────────────────────────────────────
         fileTransferPanel = titledPanel("File Transfer — Destination");
@@ -248,13 +242,6 @@ public class TaskDialog extends JDialog {
 
         // ── Inbound watcher fields ────────────────────────────────────────────
         cbWatcherEnabled = new JCheckBox("Enable watcher task");
-        lblWatcherInfo = new JLabel("<html><div style='width:380px'><i style='color:gray'>"
-                + "The watcher detects files modified after the last successful run. "
-                + "Operates for both OUTBOUND and INBOUND when TransferMode is LATEST_ONLY. "
-                + "For SFTP tasks a JSch channel is used; for local→local tasks "
-                + "Files.newDirectoryStream is used — no WinSCP required."
-                + "</i></div></html>");
-        lblWatcherInfo.setFont(lblWatcherInfo.getFont().deriveFont(Font.PLAIN, 11f));
 
         if (existing != null) {
             cbWatcherEnabled.setSelected(existing.isWatcherEnabled());
@@ -286,17 +273,14 @@ public class TaskDialog extends JDialog {
         // requires a remote target credential (see Target Credentials tab).
 
         lblTargetFolder = new JLabel();
-        lblTargetHint   = hint("");
 
         addRow(fileTransferPanel, "Transfer Direction *",    cbTransferDirection,    0);
         addRow(fileTransferPanel, "Transfer Mode *",         cbTransferMode,         1);
         addRow(fileTransferPanel, lblTargetFolder,           withBrowseButton(tfTargetFolder, () ->
                 browseRemote(tfTargetFolder, tfTargetHost.getText().trim(), tfTargetUser.getText().trim(),
                         new String(pfTargetPass.getPassword()), (String) cbTargetOs.getSelectedItem())),   2);
-        addRow(fileTransferPanel, "",                        lblTargetHint,          3);
         addRow(fileTransferPanel, lblAdditionalTargetFolders, additionalDestinationsField, 4);
         addRow(fileTransferPanel, "",                        cbWatcherEnabled,5);
-        addRow(fileTransferPanel, "",                        lblWatcherInfo,         6);
         addRow(fileTransferPanel, "Watcher baseline",        watcherStatusRow,       7);
 
         transferTab = new JPanel(new GridBagLayout());
@@ -343,15 +327,11 @@ public class TaskDialog extends JDialog {
                 browseBackupSide(tfBackupSourcePath, cbBackupSourceRemote, tfBackupSourceUsername)), 0);
         addRow(backupPanel, "",                     cbBackupSourceRemote, 1);
         addRow(backupPanel, "Source Username",      tfBackupSourceUsername, 2);
-        addRow(backupPanel, "", hint("Only needed if 'Source is remote' is checked — must match a saved credential's username (see Target Credentials on a File Transfer task)."), 3);
         addRow(backupPanel, "Backup Folder *",      withBrowseButton(tfBackupDestinationPath, () ->
                 browseBackupSide(tfBackupDestinationPath, cbBackupDestinationRemote, tfBackupDestinationUsername)), 4);
         addRow(backupPanel, "",                     cbBackupDestinationRemote, 5);
         addRow(backupPanel, "Destination Username", tfBackupDestinationUsername, 6);
-        addRow(backupPanel, "", hint("Only needed if 'Destination is remote' is checked — must match a saved credential's username."), 7);
         addRow(backupPanel, "Days to keep (D..) *", spBackupRetentionDays, 8);
-        addRow(backupPanel, "", hint("If today is D, this many days are kept in the source — D, D-1, ... — and everything older becomes eligible for backup. Note: source and destination cannot both be remote."), 9);
-        addRow(backupPanel, "", hint("Every eligible file is backed up in a single run. Large runs are split into batches by total file size, not day or file count — see Settings for batch size/interval."), 10);
 
         // ── Mail / Outlook panel (Microsoft Graph) ────────────────────────────
         // Reads mail via Microsoft Graph rather than IMAP: Microsoft has disabled
@@ -371,13 +351,11 @@ public class TaskDialog extends JDialog {
                 existing != null && existing.getMailTenantId() != null && !existing.getMailTenantId().isEmpty()
                         ? existing.getMailTenantId() : "common", 28));
         addRow(mailPanel, "Azure AD Tenant ID *", tfMailTenantId, 1);
-        addRow(mailPanel, "", hint("Your organization's Directory (tenant) ID, or \"common\" for any org/personal account."), 2);
 
         tfMailClientId = makeField(new JTextField(
                 existing != null && existing.getMailClientId() != null
                         ? existing.getMailClientId() : "", 28));
         addRow(mailPanel, "Azure AD Client ID *", tfMailClientId, 3);
-        addRow(mailPanel, "", hint("Application (client) ID from a self-registered Azure AD app — see README \u201cOutlook Mail setup\u201d."), 4);
 
         JPanel authRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
         authRow.setOpaque(false);
@@ -386,7 +364,6 @@ public class TaskDialog extends JDialog {
         authRow.add(btnAuthorizeMailbox);
         authRow.add(lblMailAuthStatus);
         addRow(mailPanel, "", authRow, 5);
-        addRow(mailPanel, "", hint("One-time sign-in per mailbox. After this, scheduled runs are unattended."), 6);
 
         btnAuthorizeMailbox.addActionListener(e -> onAuthorizeMailboxClicked());
         tfMailMailboxAddress.getDocument().addDocumentListener(new javax.swing.event.DocumentListener() {
@@ -410,7 +387,6 @@ public class TaskDialog extends JDialog {
         gcCriteria.weightx = 1; gcCriteria.weighty = 1;
         gcCriteria.insets = new Insets(4, 4, 4, 4);
         mailPanel.add(pnlMailSearchCriteria, gcCriteria);
-        addRow(mailPanel, "", hint("Best-effort mapping to Graph: UNSEEN/SEEN, FROM/SUBJECT \"text\", SINCE/BEFORE/ON dd-MMM-yyyy. Unsupported criteria are logged and skipped at run time."), 9);
 
         cbMailFetchMode = makeCombo(new JComboBox<>(
                 new String[]{"BODY_ONLY", "HEADERS_AND_BODY", "FULL_MESSAGE"}));
@@ -423,16 +399,12 @@ public class TaskDialog extends JDialog {
                 existing != null && existing.getMailFetchScope() != null
                         ? existing.getMailFetchScope().name() : "LATEST_ONLY");
         addRow(mailPanel, "Fetch Scope *", cbMailFetchScope, 11);
-        addRow(mailPanel, "", hint("LATEST_ONLY = newest matching message. ALL_MATCHING = every matching message, up to the cap below (paginated)."), 12);
 
         lblMailMaxResults = new JLabel("Max Messages (ALL_MATCHING / watcher cap)");
         tfMailMaxResults = makeField(new JTextField(
                 String.valueOf(existing != null && existing.getMailMaxResults() > 0
                         ? existing.getMailMaxResults() : 50), 6));
         addRow(mailPanel, lblMailMaxResults, tfMailMaxResults, 13);
-
-        lblMailFetchScopeNote = hint("Watcher is enabled below \u2014 Fetch Scope is overridden: every run fetches all messages newer than the last successful run, up to the Max Messages cap.");
-        addRow(mailPanel, "", lblMailFetchScopeNote, 14);
 
         // ── Mail watcher ────────────────────────────────────────────────────
         cbMailWatcherEnabled = new JCheckBox("Enable watcher (only fetch messages newer than last successful run)");
@@ -469,15 +441,11 @@ public class TaskDialog extends JDialog {
         // folder, PTM → the configured PTM folder, anything else → the
         // configured "Others" folder (see app-config.xml <sitaMessaging>,
         // and TransferService#resolveMoveFolderName).
-        addRow(mailPanel, "", hint("Processed messages are automatically moved to a folder based on content "
-                + "(LDM / PTM / Others) — folder names are configured in app-config.xml, not here."), 18);
-
         // ── Output folder (.RCV files) ──────────────────────────────────────
         tfMailOutputFolder = makeField(new JTextField(
                 existing != null && existing.getMailOutputFolder() != null
                         ? existing.getMailOutputFolder() : "", 28));
         addRow(mailPanel, "Output Folder *", tfMailOutputFolder, 21);
-        addRow(mailPanel, "", hint("Local directory where each fetched message is written as a .RCV file. Created automatically if it doesn't exist yet."), 22);
 
         cbMailWatcherEnabled.addActionListener(e -> updateMailFetchScopeVisibility());
 
@@ -491,7 +459,6 @@ public class TaskDialog extends JDialog {
         spinnerRetryCount = makeSpinner(new JSpinner(new SpinnerNumberModel(
                 existing != null ? existing.getRetryCount() : 0, 0, 10, 1)));
         addRow(retryPanel, "Retry attempts on failure:", spinnerRetryCount, 0);
-        addRow(retryPanel, "", hint("0 = no retries; set to 1–10 for automatic recovery."), 1);
 
         // ── Target credentials panel ──────────────────────────────────────────
         targetPanel = titledPanel("Target System Credentials");
@@ -566,10 +533,6 @@ public class TaskDialog extends JDialog {
         JPanel testConnectionRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
         testConnectionRow.add(btnTestConnection);
         addRow(targetPanel, "", testConnectionRow, 4);
-
-        addRow(targetPanel, "",
-                hint("For local→local tasks these fields can be left blank. "
-                        + "Password is saved in plain text in credentials.db"), 5);
 
         // ── Schedule panel ────────────────────────────────────────────────────
         JPanel sched = titledPanel("Schedule");
@@ -785,13 +748,6 @@ public class TaskDialog extends JDialog {
         lblSourcePath.setText(inbound ? "Local Destination Path *" : "Source Path *");
         lblTargetFolder.setText(inbound ? "Remote Source Folder *" : "Destination Folder *");
 
-        lblSourceHint.setText(inbound
-                ? "<html><i style='color:gray'>Local path where files retrieved from the target will be saved.</i></html>"
-                : "<html><i style='color:gray'>Local file or folder to send to the target server.</i></html>");
-        lblTargetHint.setText(inbound
-                ? "<html><i style='color:gray'>Remote source file or folder path on the target server.</i></html>"
-                : "<html><i style='color:gray'>Remote destination folder on the target server.</i></html>");
-
         // Watcher checkbox is available for both directions (watching is supported for inbound and outbound
         // transfers). Keep the checkbox visible whenever the Transfer tab is shown.
         cbWatcherEnabled.setVisible(true);
@@ -814,8 +770,6 @@ public class TaskDialog extends JDialog {
         boolean watcherOn  = cbWatcherEnabled.isSelected();
         boolean latestOnly = "LATEST_ONLY".equals(cbTransferMode.getSelectedItem());
 
-        lblWatcherInfo.setVisible(watcherOn);
-
         boolean showBaseline = watcherOn && latestOnly;
         if (watcherStatusRow != null) watcherStatusRow.setVisible(showBaseline);
         if (lblWatcherStatus  != null) lblWatcherStatus.setVisible(showBaseline);
@@ -830,8 +784,6 @@ public class TaskDialog extends JDialog {
         String stype = (String) cbScheduleType.getSelectedItem();
         switch (stype) {
             case "RUN_NOW":
-                addRowTo(scheduleDetailsPanel, "",
-                        hint("Task will execute on the next scheduler tick (~60 s)"), 0);
                 break;
             case "ONCE":
                 addRowTo(scheduleDetailsPanel, "Run at (yyyy-MM-dd HH:mm) *", tfScheduledAt, 0);
@@ -889,7 +841,6 @@ public class TaskDialog extends JDialog {
         boolean watcherOn = cbMailWatcherEnabled != null && cbMailWatcherEnabled.isSelected();
         boolean isAll = "ALL_MATCHING".equals(cbMailFetchScope.getSelectedItem());
         cbMailFetchScope.setEnabled(!watcherOn);
-        lblMailFetchScopeNote.setVisible(watcherOn);
         lblMailMaxResults.setVisible(isAll || watcherOn);
         tfMailMaxResults.setVisible(isAll || watcherOn);
         mailPanel.revalidate();
@@ -1369,17 +1320,6 @@ public class TaskDialog extends JDialog {
 
     private void addRowTo(JPanel p, String label, JComponent field, int row) {
         addRow(p, label, field, row);
-    }
-
-    private JLabel hint(String text) {
-        // Wrap in a fixed-width div so long sentences wrap onto multiple lines
-        // instead of rendering as one unbroken line. Without this, a JLabel's
-        // HTML content sizes to its full unwrapped text width, which stretches
-        // the GridBagLayout "field" column (weightx=1) — and every text field/
-        // combo box sharing that column — far wider than intended.
-        JLabel l = new JLabel("<html><div style='width:360px'><i style='color:gray'>" + text + "</i></div></html>");
-        l.setFont(l.getFont().deriveFont(Font.PLAIN, 11f));
-        return l;
     }
 
     private JTextField makeField(JTextField field) {

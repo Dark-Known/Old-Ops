@@ -25,7 +25,16 @@ public class TaskLogService {
     
     private static final DateTimeFormatter DT_FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
     private static final DateTimeFormatter FILE_FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd-HHmmss");
-    private static final int MAX_LOG_SIZE_BYTES = 5 * 1024 * 1024; // 5 MB
+    // Was a hardcoded 5 MB, ignoring app-config.xml's <logging><maxLogSizeMB>
+    // entirely (nothing in the codebase ever read it). Now reads
+    // <logRotateMaxBytes>/<logRotateKeepFiles> — bytes rather than MB, since
+    // a 10KB target is well below whole-MB granularity. Read once at
+    // construction: matches the "install-time config, restart to change"
+    // convention the rest of app-config.xml already documents for values
+    // like this, rather than re-parsing the XML file on every single log
+    // line written.
+    private final long maxLogSizeBytes;
+    private final int keepArchiveCount;
 
     // Severity ordering for the app's DEBUG < INFO < WARN < ERROR levels
     // (see util.AppSettings / the Settings panel). A message whose leading
@@ -38,6 +47,30 @@ public class TaskLogService {
     public TaskLogService(String dataDir) {
         this.logsDir = new File(dataDir, "logs");
         this.logsDir.mkdirs();
+        this.maxLogSizeBytes = readConfiguredMaxBytes();
+        this.keepArchiveCount = readConfiguredKeepCount();
+    }
+
+    private static long readConfiguredMaxBytes() {
+        String raw = util.AppConfig.readValue("logRotateMaxBytes");
+        if (raw != null) {
+            try {
+                long v = Long.parseLong(raw.trim());
+                if (v > 0) return v;
+            } catch (NumberFormatException ignored) { /* fall through to default */ }
+        }
+        return 10 * 1024; // 10 KB default, matching app-config.xml's shipped value
+    }
+
+    private static int readConfiguredKeepCount() {
+        String raw = util.AppConfig.readValue("logRotateKeepFiles");
+        if (raw != null) {
+            try {
+                int v = Integer.parseInt(raw.trim());
+                if (v > 0) return v;
+            } catch (NumberFormatException ignored) { /* fall through to default */ }
+        }
+        return 5;
     }
 
     /**
@@ -82,11 +115,28 @@ public class TaskLogService {
             
             File logFile = new File(taskDir, "task.log");
             
-            // Check if we need to rotate
-            if (logFile.exists() && logFile.length() > MAX_LOG_SIZE_BYTES) {
+            // Check if we need to rotate. BUG FIX: this rename used to be
+            // attempted while openWriters still held an open PrintWriter on
+            // the very file being renamed — on Windows that rename silently
+            // fails (the OS won't rename a file that's open for writing
+            // without FILE_SHARE_DELETE, which a plain FileWriter doesn't
+            // request), so rotation never actually happened in practice
+            // despite this code appearing to implement it: task.log just
+            // grew forever. Fixed by closing and evicting the cached writer
+            // for this task BEFORE renaming, so the next write below opens a
+            // fresh writer against a new, empty task.log.
+            if (logFile.exists() && logFile.length() > maxLogSizeBytes) {
+                PrintWriter existing = openWriters.remove(taskId);
+                if (existing != null) existing.close();
+
                 String rotatedName = "task-" + LocalDateTime.now().format(FILE_FMT) + ".log";
                 File rotatedFile = new File(taskDir, rotatedName);
-                logFile.renameTo(rotatedFile);
+                if (logFile.renameTo(rotatedFile)) {
+                    cleanupOldLogs(taskId, taskName, keepArchiveCount);
+                } else {
+                    System.err.println("Failed to rotate log for task " + taskId
+                            + " (rename returned false) — continuing to append to the current file.");
+                }
             }
             
             // Append message with timestamp

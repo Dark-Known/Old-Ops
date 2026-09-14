@@ -336,6 +336,11 @@ public class TaskSchedulerService {
         return workerPool.getRecentActivity(limit);
     }
 
+    /** What every currently-busy worker thread is executing right now — see {@link service.queue.TaskWorkerPool#getInFlightSnapshot()}. */
+    public List<service.queue.TaskWorkerPool.InFlightTask> getInFlightTasks() {
+        return workerPool.getInFlightSnapshot();
+    }
+
     // ── Cross-process status export ─────────────────────────────────────
     // Lets a scheduler running in one JVM (typically the headless Daemon)
     // publish its live state to a shared file that another process
@@ -369,6 +374,7 @@ public class TaskSchedulerService {
     public void enableStatusExport(String dataDir, String processLabel) {
         java.nio.file.Path file = java.nio.file.Path.of(dataDir, "scheduler-status-" + processLabel + ".dat");
         this.statusExporter = new service.queue.SchedulerStatusExporter(file, processLabel);
+        statusExporter.cleanupOrphanedTempFiles();
         if (statusExportFuture == null || statusExportFuture.isCancelled()) {
             statusExportFuture = scheduler.scheduleAtFixedRate(this::exportStatus, 1, 2, TimeUnit.SECONDS);
         }
@@ -817,12 +823,78 @@ public class TaskSchedulerService {
      * and sizes exactly the same way it parses a full transfer run's log —
      * one popup implementation covers both event rows.
      */
-    private void recordDetectionEvent(ScheduledTask task, List<model.RemoteFileMetadata> files) {
+    /**
+     * Records a "files detected" event for the Event Monitor — separate
+     * from the eventual transfer-completion row for the same run, so the
+     * activity feed shows the detection (what was found, and how long the
+     * remote scan took) as its own line rather than only learning about it
+     * after the fact from the completion row's summary.
+     *
+     * <p>{@code scanStartedAt} is when the scan/listing actually began
+     * (captured by the caller just before invoking the transfer), not
+     * {@code now} — previously this method stamped both startedAt and
+     * endedAt as {@code now}, so every detection event showed a flat 0ms
+     * duration regardless of how long the remote directory listing (which
+     * can legitimately take seconds over a slow SFTP link) actually took.
+     *
+     * <p>The row-level {@code reason} — what actually renders inline in the
+     * Event Monitor's one-line-per-event list, not just in the click-through
+     * detail popup — now leads with the detected file names and sizes
+     * rather than only a count and a total, e.g. "Detected 3 file(s) in
+     * 850ms: invoice_01.csv (1.2 MB), invoice_02.csv (890 KB), report.xlsx
+     * (3.4 MB)". The row renderer still truncates long lines, but which
+     * files led the transfer is now visible before ever needing to click
+     * in for the full list (the per-file listing in {@code details} below).
+     */
+    /**
+     * Records a "picked up by a worker thread, about to run" event for the
+     * Event Monitor — one per task type, not just FILE_TRANSFER, so a
+     * backup or mail job consuming a worker thread shows up in the activity
+     * feed at the moment it starts, not only once it completes (previously
+     * the *only* row for a BACKUP/OUTLOOK_MAIL run was its eventual
+     * completion; there was no historical record of when a run actually
+     * began, only of the eventual outcome).
+     *
+     * <p>Recorded via {@link RunHistoryService#recordActivityEvent} into the
+     * separate {@code event_monitor_history} table rather than
+     * {@code run_history} — see that class's doc comment for why: every
+     * real run also eventually records its own completion row via
+     * {@link #onTaskDue}/{@code executeTask}, so a "started" row living
+     * alongside outcomes would double-count every run in the Statistics
+     * tab's totals and skew the success-rate math.
+     */
+    private void recordStartedEvent(ScheduledTask task, LocalDateTime startedAt) {
+        try {
+            String reason = "Started \u2014 picked up by a worker thread ("
+                    + workerPool.getActiveWorkerCount() + "/" + workerPool.getWorkerCount() + " busy).";
+            runHistoryService.recordActivityEvent(task.getId(), task.getName(), task.getTaskType().name(),
+                    reason, reason, startedAt, startedAt);
+        } catch (Exception ignored) {
+            // Best-effort — a failure to log the start event shouldn't affect the run itself.
+        }
+    }
+
+    private void recordDetectionEvent(ScheduledTask task, List<model.RemoteFileMetadata> files, LocalDateTime scanStartedAt) {
         if (files == null || files.isEmpty()) return;
         LocalDateTime now = LocalDateTime.now();
         long totalBytes = files.stream().mapToLong(f -> Math.max(f.size(), 0)).sum();
-        String reason = "Detected " + files.size() + " file(s), "
-                + TransferService.humanReadableBytes(totalBytes) + " total.";
+        long scanMs = java.time.Duration.between(scanStartedAt, now).toMillis();
+
+        StringBuilder namesSummary = new StringBuilder();
+        int shown = 0;
+        for (model.RemoteFileMetadata f : files) {
+            if (shown >= 5) {
+                namesSummary.append(", +").append(files.size() - shown).append(" more");
+                break;
+            }
+            if (shown > 0) namesSummary.append(", ");
+            namesSummary.append(f.fileName()).append(" (")
+                    .append(TransferService.humanReadableBytes(Math.max(f.size(), 0))).append(')');
+            shown++;
+        }
+
+        String reason = "Detected " + files.size() + " file(s), " + TransferService.humanReadableBytes(totalBytes)
+                + " total in " + scanMs + "ms: " + namesSummary;
         StringBuilder details = new StringBuilder(reason).append('\n');
         for (model.RemoteFileMetadata f : files) {
             details.append("[INFO]   ").append(f.fileName())
@@ -830,8 +902,8 @@ public class TaskSchedulerService {
                     .append(" | size=").append(f.size()).append('\n');
         }
         try {
-            runHistoryService.recordRun(task.getId(), task.getName(), task.getTaskType().name(),
-                    TaskRunRecord.Status.SUCCESS, reason, details.toString(), now, now);
+            runHistoryService.recordActivityEvent(task.getId(), task.getName(), task.getTaskType().name(),
+                    reason, details.toString(), scanStartedAt, now);
         } catch (Exception ignored) {
             // Best-effort — a failure to log the detection step shouldn't affect the transfer itself.
         }
@@ -902,6 +974,7 @@ public class TaskSchedulerService {
             task.setLastStartedAt(now);
             storage.saveTask(task);
             refreshMetrics(task.getId(), true);
+            recordStartedEvent(task, now);
             executeTask(task, event.getChangedFileNames());
         }, () -> pendingSuppressActivity.set(true) /* task deleted since the event was published — nothing to do */);
     }
@@ -1074,7 +1147,17 @@ public class TaskSchedulerService {
             switch (task.getTaskType()) {
                 case FILE_TRANSFER:
                     try {
-                        transferService.setDetectionCallback(files -> recordDetectionEvent(task, files));
+                        // Real wall-clock scan time, not the "now == now"
+                        // placeholder recordDetectionEvent used to stamp for
+                        // both its startedAt and endedAt (always showing a
+                        // 0-duration "detection" no matter how long the
+                        // remote directory listing actually took). Captured
+                        // here, just before the scan/listing begins inside
+                        // executeTransfer, rather than inside the callback
+                        // itself (which only fires once the scan is already
+                        // done and files are known).
+                        final LocalDateTime detectionScanStart = LocalDateTime.now();
+                        transferService.setDetectionCallback(files -> recordDetectionEvent(task, files, detectionScanStart));
                         success = transferService.executeTransfer(task, emitCap, changedFileNames);
                     }
                     catch (TransferService.WatcherSkipException e) {
@@ -1206,9 +1289,31 @@ public class TaskSchedulerService {
         return "Failed — see run details for the full log.";
     }
 
-    /** Last "[INFO] ..." line in a captured run log (skipping boilerplate start/debug lines), with the tag stripped. */
+    /**
+     * Last "[INFO] ..." line in a captured run log (skipping boilerplate
+     * start/debug lines), with the tag stripped — used as the run's
+     * one-line summary shown both in the Event Monitor row and as the Logs
+     * tab's Reason column.
+     *
+     * <p>Prefers a "Transfer summary: ..." line if the log has one,
+     * regardless of whether it's truly the last INFO line. FILE_TRANSFER
+     * runs that also copy to additional destination folders
+     * (see TransferService#copyDownloadedFilesToExtraFolders) log their own
+     * per-file "[INFO] Copied ..." lines *after* the transfer summary line,
+     * which used to bury it — the row would then show something like
+     * "Copied invoice_04.csv to extra folder" instead of the actual
+     * files/bytes/batches/sessions/threads summary. Falling back to
+     * "true last INFO line" for every other task type/shape keeps this safe
+     * for logs that never emit a transfer summary at all.
+     */
     private static String lastInfoLine(String runLogText) {
         String[] lines = runLogText.split("\n");
+        for (String rawLine : lines) {
+            String l = rawLine.trim();
+            if (l.startsWith("[INFO] Transfer summary:")) {
+                return l.substring("[INFO]".length()).trim();
+            }
+        }
         for (int i = lines.length - 1; i >= 0; i--) {
             String l = lines[i].trim();
             if (l.startsWith("[INFO]") && !l.startsWith("[INFO] Task reset to PENDING")) {

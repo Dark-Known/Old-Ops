@@ -9,12 +9,14 @@ import service.queue.TaskDueEvent;
 import javax.swing.*;
 import java.awt.*;
 import java.nio.file.Path;
+import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
+import java.util.Comparator;
 
 /**
  * Live dashboard for the event-driven scheduler — see
@@ -53,7 +55,13 @@ public class EventMonitorPanel extends JPanel {
     // mid-tick rather than just being between writes.
     private static final long DAEMON_STALE_MS = SchedulerStatusSnapshot.DEFAULT_STALE_MS;
     private static final int ACTIVITY_LIMIT = 100;
-    private static final int STATS_SAMPLE_LIMIT = 500;
+    // Upper bound on rows pulled per Statistics refresh, covering both the
+    // selected window and the equal-length prior window (for trend deltas)
+    // in one query. Range-bound now (via the `from` param on queryRuns),
+    // not count-bound like the old STATS_SAMPLE_LIMIT=500 was — this is
+    // just a safety ceiling for a very chatty system on the 7d view, not
+    // the thing actually limiting what the stats reflect.
+    private static final int STATS_QUERY_LIMIT = 20_000;
     private static final int REFRESH_MS = 1000;
     private static final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("HH:mm:ss");
 
@@ -63,8 +71,11 @@ public class EventMonitorPanel extends JPanel {
     private JTabbedPane tabs;
     private QueueMonitorView eventsView;
     private StatisticsPanel statsPanel;
+    private WorkerActivityStrip workerStrip;
 
     private Timer refreshTimer;
+    private java.util.function.Consumer<TaskRunRecord> runRecordedListener;
+    private java.util.function.Consumer<TaskRunRecord> activityRecordedListener;
 
     // Small "an event just fired" popup, scoped to this panel/window — see
     // popEventToasts(). Lazily created once this panel is actually showing
@@ -90,18 +101,36 @@ public class EventMonitorPanel extends JPanel {
 
         eventsView = new QueueMonitorView();
         statsPanel = new StatisticsPanel();
+        workerStrip = new WorkerActivityStrip();
 
         eventsView.setActivityRowClickListener((row, screenLoc) ->
                 ActivityEventPopup.show(eventsView, screenLoc, row, latestById, scheduler.getRunHistoryService()));
 
+        // Picking a different range chip changes what refreshStatsTab()
+        // queries on the next tick — no need to force an immediate refresh
+        // here too, the 1s timer will pick it up within a beat.
+        statsPanel.setRangeChangeListener(hours -> refreshStatsTab());
+
         tabs = new JTabbedPane();
         tabs.addTab("Scheduler", VectorIcons.pulse(new Color(0x5C7A45), 14), wrap(eventsView));
         tabs.addTab("Statistics", VectorIcons.sliders(new Color(0x8A7A66), 14), wrap(statsPanel));
+        add(workerStrip, BorderLayout.NORTH);
         add(tabs, BorderLayout.CENTER);
 
         refresh();
         refreshTimer = new Timer(REFRESH_MS, e -> refresh());
         refreshTimer.start();
+
+        // Real event-bus push, not just the 1s poll above: any same-process
+        // write (any tab, since they all share this one TaskSchedulerService)
+        // triggers an immediate refresh instead of waiting for the next tick.
+        // The poll timer stays as a safety net for cross-process activity —
+        // a run the headless Daemon records can never reach these listeners,
+        // since that's a separate JVM entirely.
+        runRecordedListener = rec -> SwingUtilities.invokeLater(this::refresh);
+        activityRecordedListener = rec -> SwingUtilities.invokeLater(this::refresh);
+        scheduler.getRunHistoryService().addRunListener(runRecordedListener);
+        scheduler.getRunHistoryService().addActivityListener(activityRecordedListener);
     }
 
     private JComponent wrap(JComponent inner) {
@@ -114,6 +143,13 @@ public class EventMonitorPanel extends JPanel {
     /** Stops the internal refresh timer. Call when the enclosing window is disposed. */
     public void stopRefreshing() {
         if (refreshTimer != null) refreshTimer.stop();
+        // Each EventMonitorWindow open/close cycle constructs a fresh
+        // EventMonitorPanel (see EventMonitorWindow's class doc) — without
+        // removing these here, every reopen would stack another pair of
+        // listeners onto the shared RunHistoryService, each firing on every
+        // future event forever, a classic listener leak.
+        if (runRecordedListener != null) scheduler.getRunHistoryService().removeRunListener(runRecordedListener);
+        if (activityRecordedListener != null) scheduler.getRunHistoryService().removeActivityListener(activityRecordedListener);
     }
 
     private void refresh() {
@@ -133,6 +169,23 @@ public class EventMonitorPanel extends JPanel {
 
         refreshEventsTab(byId, guiActive, daemonFresh);
         refreshStatsTab();
+
+        // See WorkerActivityStrip's doc comments: whichever process (GUI or
+        // Daemon) is actually on standby vs. actively scheduling determines
+        // where real worker activity is happening, and the GUI can only see
+        // per-task detail for its own in-process pool — a Daemon-owned run
+        // only ever shows up here as an aggregate busy count from the
+        // shared status file, not which task or which direction.
+        if (guiActive) {
+            workerStrip.refresh(scheduler.getInFlightTasks(), byId, scheduler.getWorkerPoolSize());
+        } else if (daemonFresh) {
+            SchedulerStatusSnapshot daemonSnapshot = SchedulerStatusSnapshot.read(daemonStatusFile);
+            if (daemonSnapshot != null) {
+                workerStrip.refreshFromDaemonCounts(daemonSnapshot.getPoolSize(), daemonSnapshot.getActiveWorkers());
+            }
+        } else {
+            workerStrip.refresh(List.of(), byId, scheduler.getWorkerPoolSize());
+        }
     }
 
     /**
@@ -187,14 +240,31 @@ public class EventMonitorPanel extends JPanel {
         }
 
         List<TaskRunRecord> recentRuns;
+        List<TaskRunRecord> recentActivity;
         try {
             recentRuns = scheduler.getRunHistoryService().getRecentRuns(ACTIVITY_LIMIT);
         } catch (Exception ignored) {
             recentRuns = List.of(); // run-history DB briefly locked by a write — next refresh will catch up
         }
+        try {
+            recentActivity = scheduler.getRunHistoryService().queryActivityEvents(null, null, null, ACTIVITY_LIMIT);
+        } catch (Exception ignored) {
+            recentActivity = List.of();
+        }
 
-        List<QueueMonitorView.ActivityRow> activityRows = recentRuns.stream()
-                .map(this::toActivityRow)
+        // Merge both tables into one chronological feed for display — a
+        // "Started"/"Detected" activity row belongs in the same live feed
+        // as the eventual completion row for that same run, even though
+        // they now live in separate tables (see RunHistoryService's class
+        // doc for why they're split). Toasts, below, deliberately stay fed
+        // only from recentRuns (real outcomes) — popping a toast for every
+        // single task start/detection in addition to every completion would
+        // be a lot of extra noise nobody asked for.
+        List<QueueMonitorView.ActivityRow> activityRows = java.util.stream.Stream.concat(
+                        recentRuns.stream().map(r -> toActivityRow(r, QueueMonitorView.RunSource.RUN_HISTORY)),
+                        recentActivity.stream().map(r -> toActivityRow(r, QueueMonitorView.RunSource.ACTIVITY)))
+                .sorted(Comparator.comparing(QueueMonitorView.ActivityRow::startedAt, Comparator.reverseOrder()))
+                .limit(ACTIVITY_LIMIT)
                 .collect(Collectors.toList());
 
         eventsView.update(poolSize, activeWorkers, pendingRows, activityRows);
@@ -202,17 +272,45 @@ public class EventMonitorPanel extends JPanel {
         baselineEstablished = true;
     }
 
-    private QueueMonitorView.ActivityRow toActivityRow(TaskRunRecord r) {
+    private QueueMonitorView.ActivityRow toActivityRow(TaskRunRecord r, QueueMonitorView.RunSource source) {
         String name = r.getTaskName() != null && !r.getTaskName().isBlank() ? r.getTaskName() : "(unknown task)";
         boolean errored = r.getStatus() == TaskRunRecord.Status.FAILED;
-        return new QueueMonitorView.ActivityRow(r.getTaskId(), name, 0,
-                r.getStartedAt(), r.getEndedAt(), errored, r.getReason());
+        // Direction (inbound/outbound) isn't on TaskRunRecord itself — it's
+        // per-task config, so it's looked up from the live task snapshot.
+        // Falls back to null for a since-deleted task (row still renders,
+        // just without a directional icon — see QueueMonitorView's renderer).
+        ScheduledTask task = latestById.get(r.getTaskId());
+        ScheduledTask.TransferDirection direction = task != null ? task.getTransferDirection() : null;
+        return new QueueMonitorView.ActivityRow(r.getId(), source, r.getTaskId(), name, 0,
+                r.getStartedAt(), r.getEndedAt(), errored, r.getReason(), r.getTaskType(), direction);
     }
 
     private void refreshStatsTab() {
         try {
-            List<TaskRunRecord> runs = scheduler.getRunHistoryService().getRecentRuns(STATS_SAMPLE_LIMIT);
-            statsPanel.update(runs);
+            int rangeHours = statsPanel.getSelectedRangeHours();
+            LocalDateTime now = LocalDateTime.now();
+            LocalDateTime windowStart = now.minusHours(rangeHours);
+            LocalDateTime priorWindowStart = now.minusHours((long) rangeHours * 2);
+
+            // One query covering both the current window and the equal-length
+            // period immediately before it (for the trend deltas), split
+            // client-side — cheaper than two round trips, and both windows
+            // need the same status/task filters (none) so there's nothing to
+            // gain from querying them separately. STATS_SAMPLE_LIMIT no longer
+            // caps this: it's now range-bound instead of count-bound, so a 7d
+            // view isn't silently truncated to whatever the last 500 rows
+            // happen to cover across every task in the system.
+            List<TaskRunRecord> both = scheduler.getRunHistoryService()
+                    .queryRuns(null, null, priorWindowStart, null, STATS_QUERY_LIMIT);
+
+            List<TaskRunRecord> current = new java.util.ArrayList<>();
+            List<TaskRunRecord> prior = new java.util.ArrayList<>();
+            for (TaskRunRecord r : both) {
+                if (r.getStartedAt() == null) continue;
+                if (!r.getStartedAt().isBefore(windowStart)) current.add(r);
+                else prior.add(r);
+            }
+            statsPanel.update(current, prior);
         } catch (Exception ignored) {
             // Run-history DB briefly locked by a write — just skip this tick, next refresh will catch up.
         }

@@ -25,15 +25,18 @@ import java.util.logging.Logger;
  *       it can only take effect on install/relaunch, so there's little value
  *       in hot-reloading it, and doing so would risk the installer and the
  *       running app disagreeing about what's "current".</li>
- *   <li><b>app-settings.db</b> (this class, a small SQLite database — see
- *       {@code <dataDir>/app-settings.db}) holds the handful of values that
- *       genuinely are read on every message/task run and can safely change
- *       underneath a running app: mail routing folder names, the default
- *       SITA station address, the attachment download location, and the
- *       log level. Moving this from a hand-edited JSON file to SQLite means
- *       the Settings panel's writes are atomic/durable the same way task
- *       and credential data already are, and there's one consistent place
- *       (and one consistent backup step) for all of the app's persistent
+ *   <li><b>app.db</b>'s {@code settings} table (this class — see
+ *       {@code <dataDir>/app.db}, shared with {@link service.CredentialDbService}'s
+ *       {@code credentials} table in the same file) holds the handful of
+ *       values that genuinely are read on every message/task run and can
+ *       safely change underneath a running app: mail routing folder names,
+ *       the default SITA station address, the attachment download
+ *       location, and the log level. Moving this from a hand-edited JSON
+ *       file to SQLite means the Settings panel's writes are atomic/durable
+ *       the same way task and credential data already are, and there's one
+ *       consistent place (and one consistent backup step — one file,
+ *       {@code app.db} — instead of separate {@code app-settings.db} and
+ *       {@code credentials.db} files) for all of the app's persistent
  *       state instead of a mix of JSON + XML + DB files.</li>
  * </ul>
  *
@@ -62,7 +65,8 @@ import java.util.logging.Logger;
 public final class AppSettings {
 
     private static final Logger log = Logger.getLogger(AppSettings.class.getName());
-    private static final String DB_FILE_NAME = "app-settings.db";
+    private static final String DB_FILE_NAME = "app.db";
+    private static final String LEGACY_STANDALONE_DB_FILE_NAME = "app-settings.db";
     private static final String LEGACY_JSON_FILE_NAME = "app-settings.json";
     private static final long CACHE_TTL_MILLIS = 2000; // live-reload granularity
 
@@ -234,11 +238,50 @@ public final class AppSettings {
                     st.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)");
                 }
                 conn = c;
+                migrateLegacyStandaloneDbIfPresent(dir, c);
                 migrateLegacyJsonIfPresent(dir, c);
             } catch (Exception e) {
                 log.log(Level.SEVERE, "Failed to open/initialize app-settings database", e);
             }
             return conn;
+        }
+    }
+
+    /**
+     * One-time import from a legacy standalone {@code app-settings.db} file
+     * (from before app settings and credentials were merged into one
+     * {@code app.db}), run only if the {@code settings} table in the new
+     * file is currently empty. Uses {@code ATTACH DATABASE} to copy rows
+     * directly. The old file is left on disk afterward (renamed with a
+     * {@code .migrated} suffix) purely as a safety net.
+     */
+    private static void migrateLegacyStandaloneDbIfPresent(File dir, Connection c) {
+        File legacy = new File(dir, LEGACY_STANDALONE_DB_FILE_NAME);
+        if (!legacy.exists()) return;
+
+        try (Statement st = c.createStatement();
+             ResultSet rs = st.executeQuery("SELECT COUNT(*) FROM settings")) {
+            if (rs.next() && rs.getInt(1) > 0) return; // already has data — don't overwrite
+        } catch (SQLException e) {
+            log.log(Level.WARNING, "Could not check settings table before legacy DB migration", e);
+            return;
+        }
+
+        try (Statement st = c.createStatement()) {
+            st.execute("ATTACH DATABASE '" + legacy.getAbsolutePath().replace("'", "''") + "' AS legacy_settings");
+            int migrated;
+            try (ResultSet rs = st.executeQuery("SELECT COUNT(*) FROM legacy_settings.settings")) {
+                migrated = rs.next() ? rs.getInt(1) : 0;
+            }
+            st.execute("INSERT INTO settings SELECT * FROM legacy_settings.settings");
+            st.execute("DETACH DATABASE legacy_settings");
+            if (migrated > 0) {
+                log.info("Migrated " + migrated + " setting(s) from legacy app-settings.db into app.db");
+            }
+            File renamed = new File(legacy.getParentFile(), legacy.getName() + ".migrated");
+            legacy.renameTo(renamed);
+        } catch (SQLException e) {
+            log.log(Level.WARNING, "Failed to migrate legacy app-settings.db into app.db", e);
         }
     }
 

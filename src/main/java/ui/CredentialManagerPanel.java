@@ -1,6 +1,8 @@
 package ui;
 
 import model.Credential;
+import model.TaskRunRecord;
+import service.RunHistoryService;
 import service.XmlStorageService;
 import ui.components.IconTile;
 import ui.components.PillBadge;
@@ -8,6 +10,7 @@ import ui.components.PillBadge;
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
 import java.awt.*;
+import java.time.LocalDateTime;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -29,6 +32,12 @@ import java.util.UUID;
 public class CredentialManagerPanel extends JPanel {
 
     private final XmlStorageService storage;
+    // Nullable — audit trail for credential add/edit/delete, shown in the
+    // Event Monitor feed alongside task activity. Null is tolerated (no-op)
+    // rather than required, since a credential dialog opened outside the
+    // normal MainWindow flow (if any ever exists) shouldn't have to wire one
+    // up just to compile.
+    private final RunHistoryService auditLog;
     private DefaultListModel<Credential> listModel;
     private JList<Credential> credList;
     // taskId-using-count doesn't live on Credential itself — populated once
@@ -37,8 +46,9 @@ public class CredentialManagerPanel extends JPanel {
     // uses for its own per-row daemon-derived fields.
     private final Map<String, Integer> usageByUsername = new HashMap<>();
 
-    public CredentialManagerPanel(XmlStorageService storage) {
+    public CredentialManagerPanel(XmlStorageService storage, RunHistoryService auditLog) {
         this.storage = storage;
+        this.auditLog = auditLog;
         setLayout(new BorderLayout(10, 10));
         setBorder(new EmptyBorder(10, 10, 10, 10));
         buildUI();
@@ -46,11 +56,7 @@ public class CredentialManagerPanel extends JPanel {
 
     private void buildUI() {
         // ── Info banner ───────────────────────────────────────────────────────
-        JLabel banner = new JLabel(
-            "<html><b>Server Credentials</b> — stored in <code>credentials.db</code>"
-            + " in the data directory.<br>"
-            + "<span style='color:gray'>Passwords are plain text. Each Task looks up the"
-            + " matching credential by username at run time.</span></html>");
+        JLabel banner = new JLabel("<html><b>Server Credentials</b></html>");
         banner.setBorder(new EmptyBorder(0, 0, 6, 0));
 
         // ── List ──────────────────────────────────────────────────────────────
@@ -95,6 +101,8 @@ public class CredentialManagerPanel extends JPanel {
                 inUse > 0 ? JOptionPane.WARNING_MESSAGE : JOptionPane.QUESTION_MESSAGE);
             if (ok == JOptionPane.YES_OPTION) {
                 storage.deleteCredential(username);
+                logActivity("Credential deleted", "Deleted credential for " + username
+                        + (inUse > 0 ? " (was in use by " + inUse + " task" + (inUse == 1 ? "" : "s") + ")" : ""));
                 refresh();
             }
         });
@@ -212,6 +220,24 @@ public class CredentialManagerPanel extends JPanel {
         }
     }
 
+    /**
+     * Records an application-activity note (credential added/edited/deleted)
+     * into the Event Monitor's activity feed — see
+     * {@link RunHistoryService#recordActivityEvent}. Uses the fixed
+     * pseudo-task-id "CREDENTIALS" since these aren't tied to any one
+     * scheduled task. No-op if this panel was constructed without an audit
+     * log reference.
+     */
+    private void logActivity(String title, String detail) {
+        if (auditLog == null) return;
+        LocalDateTime now = LocalDateTime.now();
+        try {
+            auditLog.recordActivityEvent("CREDENTIALS", title, null, detail, detail, now, now);
+        } catch (Exception ignored) {
+            // Best-effort — a failure to log this shouldn't block the actual credential change.
+        }
+    }
+
     private void showDialog(Credential existing) {
         JDialog dlg = new JDialog(
             (Frame) SwingUtilities.getWindowAncestor(this),
@@ -283,6 +309,9 @@ public class CredentialManagerPanel extends JPanel {
             c.setPassword(pass);
             c.setOsType((String) cbOs.getSelectedItem());
             storage.saveCredential(c);
+            logActivity(existing == null ? "Credential added" : "Credential edited",
+                    (existing == null ? "Added credential for " : "Edited credential for ")
+                            + user + "@" + host + " (" + c.getOsType() + ")");
             refresh();
             dlg.dispose();
         });

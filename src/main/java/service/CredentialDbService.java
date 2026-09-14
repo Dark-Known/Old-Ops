@@ -13,18 +13,23 @@ import java.util.logging.Logger;
  * Stores server credentials in a small SQLite database instead of one
  * {@code creds_<username>.xml} file per user.
  *
- * <p>Database file lives at {@code <dataDir>/credentials.db}, one row per
- * credential in a {@code credentials} table keyed by username (matching the
- * old one-file-per-username invariant). A single shared {@link Connection}
- * is kept open and all access is synchronized — write volume here is a
- * handful of edits per session, so a connection pool would be overkill, and
- * SQLite only supports one writer at a time regardless.
+ * <p>Database file lives at {@code <dataDir>/app.db} — shared with
+ * {@link util.AppSettings}'s own {@code settings} table, each service using
+ * its own table ({@code credentials} here) in the same file rather than a
+ * separate {@code .db} file per concern. One row per credential in the
+ * {@code credentials} table, keyed by username (matching the old
+ * one-file-per-username invariant). A single shared {@link Connection} is
+ * kept open and all access is synchronized — write volume here is a handful
+ * of edits per session, so a connection pool would be overkill, and SQLite
+ * only supports one writer at a time regardless.
  *
- * <p>On first use, if the table is empty and legacy {@code creds_*.xml}
- * files are found in the data directory, they're imported once (see
- * {@link #migrateLegacyXmlIfPresent}) so upgrading in place doesn't lose
- * anyone's saved credentials. The XML files are left on disk afterward
- * (renamed with a {@code .migrated} suffix) purely as a safety net.
+ * <p>On first use: if a legacy standalone {@code credentials.db} file is
+ * found (from before the merge into {@code app.db}) and the
+ * {@code credentials} table is currently empty, its rows are imported once
+ * via {@code ATTACH DATABASE} (see {@link #migrateLegacyCredentialsDbIfPresent})
+ * and the old file renamed with a {@code .migrated} suffix as a safety net.
+ * Failing that, any legacy {@code creds_*.xml} files are imported the same
+ * way they always were (see {@link #migrateLegacyXmlIfPresent}).
  */
 public class CredentialDbService {
 
@@ -35,7 +40,7 @@ public class CredentialDbService {
 
     public CredentialDbService(File dataDir) {
         this.dataDir = dataDir;
-        File dbFile = new File(dataDir, "credentials.db");
+        File dbFile = new File(dataDir, "app.db");
         Connection c = null;
         try {
             Class.forName("org.sqlite.JDBC");
@@ -51,10 +56,13 @@ public class CredentialDbService {
                         ")");
             }
         } catch (Exception e) {
-            log.log(Level.SEVERE, "Failed to open/initialize credentials database", e);
+            log.log(Level.SEVERE, "Failed to open/initialize credentials table in app.db", e);
         }
         this.conn = c;
-        if (this.conn != null) migrateLegacyXmlIfPresent();
+        if (this.conn != null) {
+            migrateLegacyCredentialsDbIfPresent();
+            migrateLegacyXmlIfPresent();
+        }
     }
 
     /** Look up a credential by username, or null if none is stored. */
@@ -129,6 +137,45 @@ public class CredentialDbService {
     }
 
     /**
+     * One-time import from a legacy standalone {@code credentials.db} file
+     * (from before credentials and app settings were merged into one
+     * {@code app.db}), run only if the {@code credentials} table in the new
+     * file is currently empty. Uses {@code ATTACH DATABASE} to copy rows
+     * directly rather than re-implementing the old file's read logic in
+     * Java. The old file is left on disk afterward (renamed with a
+     * {@code .migrated} suffix) purely as a safety net.
+     */
+    private void migrateLegacyCredentialsDbIfPresent() {
+        File legacy = new File(dataDir, "credentials.db");
+        if (!legacy.exists()) return;
+
+        try (Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery("SELECT COUNT(*) FROM credentials")) {
+            if (rs.next() && rs.getInt(1) > 0) return; // already has data — don't overwrite
+        } catch (SQLException e) {
+            log.log(Level.WARNING, "Could not check credentials table before legacy DB migration", e);
+            return;
+        }
+
+        try (Statement st = conn.createStatement()) {
+            st.execute("ATTACH DATABASE '" + legacy.getAbsolutePath().replace("'", "''") + "' AS legacy_creds");
+            int migrated;
+            try (ResultSet rs = st.executeQuery("SELECT COUNT(*) FROM legacy_creds.credentials")) {
+                migrated = rs.next() ? rs.getInt(1) : 0;
+            }
+            st.execute("INSERT INTO credentials SELECT * FROM legacy_creds.credentials");
+            st.execute("DETACH DATABASE legacy_creds");
+            if (migrated > 0) {
+                log.info("Migrated " + migrated + " credential(s) from legacy credentials.db into app.db");
+            }
+            File renamed = new File(legacy.getParentFile(), legacy.getName() + ".migrated");
+            legacy.renameTo(renamed);
+        } catch (SQLException e) {
+            log.log(Level.WARNING, "Failed to migrate legacy credentials.db into app.db", e);
+        }
+    }
+
+    /**
      * One-time import of any {@code creds_<username>.xml} files found in
      * the data directory, run only if the credentials table is currently
      * empty. Mirrors the parsing XmlStorageService previously did for that
@@ -173,7 +220,7 @@ public class CredentialDbService {
             }
         }
         if (migrated > 0) {
-            log.info("Migrated " + migrated + " credential(s) from legacy creds_*.xml files into credentials.db");
+            log.info("Migrated " + migrated + " credential(s) from legacy creds_*.xml files into app.db");
         }
     }
 

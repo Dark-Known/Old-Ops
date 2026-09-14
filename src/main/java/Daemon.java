@@ -36,7 +36,11 @@ import java.util.logging.*;
 public class Daemon {
 
     private static final DateTimeFormatter DT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+    private static final DateTimeFormatter FILE_DT = DateTimeFormatter.ofPattern("yyyy-MM-dd-HHmmss");
     private static PrintWriter daemonLog;
+    private static String daemonLogPath;
+    private static long maxLogBytes;
+    private static int keepArchiveCount;
 
     public static void main(String[] args) throws Exception {
 
@@ -133,6 +137,9 @@ public class Daemon {
     // ── Logging helpers ──────────────────────────────────────────────────────
 
     private static void setupLogging(String logPath, String dataDir) {
+        daemonLogPath = logPath;
+        maxLogBytes = readConfiguredMaxBytes();
+        keepArchiveCount = readConfiguredKeepCount();
         try {
             daemonLog = new PrintWriter(new FileWriter(logPath, true), true);
         } catch (Exception e) {
@@ -146,7 +153,7 @@ public class Daemon {
             for (Handler h : rootLogger.getHandlers()) rootLogger.removeHandler(h);
 
             FileHandler fh = new FileHandler(
-                dataDir + File.separator + "daemon-%g.log", 5 * 1024 * 1024, 3, true);
+                dataDir + File.separator + "daemon-%g.log", maxLogBytes, keepArchiveCount, true);
             fh.setFormatter(new SimpleFormatter() {
                 @Override public String format(LogRecord r) {
                     return LocalDateTime.now().format(DT) + "  " + r.getMessage() + "\n";
@@ -157,6 +164,47 @@ public class Daemon {
         } catch (Exception e) {
             System.err.println("Could not configure file logger: " + e.getMessage());
         }
+    }
+
+    /**
+     * Rotation size/keep-count for both this class's own {@code daemonLog}
+     * writer and the {@code java.util.logging} {@link FileHandler} above —
+     * read from app-config.xml's {@code <logging><logRotateMaxBytes>} /
+     * {@code <logRotateKeepFiles>}, same values {@link service.TaskLogService}
+     * reads for per-task logs. Previously these two log outputs each had
+     * their own hardcoded 5&nbsp;MB figure baked in — and the one actually
+     * used for the daemon's operational log (the plain {@code daemonLog}
+     * {@link PrintWriter} that every {@link #log(String)} call writes
+     * through) had no rotation logic at all despite this class's own javadoc
+     * claiming "rotating log... max 5 MB, 3 files"; that description only
+     * ever matched the separate, mostly-empty {@code daemon-%g.log} written
+     * by the {@code java.util.logging} root handler below, which only
+     * captures the small number of calls made directly through
+     * {@code java.util.logging.Logger} elsewhere in the app (scheduler/DB
+     * warnings) — not the day-to-day "task started/finished" lines mirrored
+     * via {@link TaskSchedulerService#setLogCallback}, which only ever went
+     * to the non-rotating file.
+     */
+    private static long readConfiguredMaxBytes() {
+        String raw = util.AppConfig.readValue("logRotateMaxBytes");
+        if (raw != null) {
+            try {
+                long v = Long.parseLong(raw.trim());
+                if (v > 0) return v;
+            } catch (NumberFormatException ignored) { /* fall through to default */ }
+        }
+        return 10 * 1024; // 10 KB default, matching app-config.xml's shipped value
+    }
+
+    private static int readConfiguredKeepCount() {
+        String raw = util.AppConfig.readValue("logRotateKeepFiles");
+        if (raw != null) {
+            try {
+                int v = Integer.parseInt(raw.trim());
+                if (v > 0) return v;
+            } catch (NumberFormatException ignored) { /* fall through to default */ }
+        }
+        return 5;
     }
 
     /**
@@ -179,11 +227,66 @@ public class Daemon {
         }
     }
 
-    private static void log(String msg) {
+    private static synchronized void log(String msg) {
         String line = LocalDateTime.now().format(DT) + "  " + msg;
         System.out.println(line);
+        rotateIfNeeded();
         if (daemonLog != null) {
             daemonLog.println(line);
+        }
+    }
+
+    /**
+     * Checked before every line. Closes and reopens {@link #daemonLog}
+     * around the rename — same reasoning as
+     * {@link service.TaskLogService#log}: renaming a file that's still open
+     * for writing silently fails on Windows, which is exactly why this
+     * class's log never actually rotated before despite the class javadoc
+     * claiming it did.
+     */
+    private static void rotateIfNeeded() {
+        if (daemonLogPath == null) return;
+        try {
+            File logFile = new File(daemonLogPath);
+            if (!logFile.exists() || logFile.length() <= maxLogBytes) return;
+
+            if (daemonLog != null) {
+                daemonLog.close();
+                daemonLog = null;
+            }
+
+            File dir = logFile.getParentFile();
+            String base = logFile.getName();
+            int dot = base.lastIndexOf('.');
+            String stem = dot > 0 ? base.substring(0, dot) : base;
+            String ext = dot > 0 ? base.substring(dot) : "";
+            File rotated = new File(dir, stem + "-" + LocalDateTime.now().format(FILE_DT) + ext);
+
+            if (logFile.renameTo(rotated)) {
+                cleanupOldDaemonLogs(dir, stem, ext);
+            } else {
+                System.err.println("Failed to rotate daemon log (rename returned false) — "
+                        + "continuing to append to the current file.");
+            }
+
+            daemonLog = new PrintWriter(new FileWriter(daemonLogPath, true), true);
+        } catch (Exception e) {
+            System.err.println("Daemon log rotation failed: " + e.getMessage());
+            try {
+                if (daemonLog == null) daemonLog = new PrintWriter(new FileWriter(daemonLogPath, true), true);
+            } catch (Exception reopenFailure) {
+                System.err.println("Could not reopen daemon log after failed rotation: " + reopenFailure.getMessage());
+            }
+        }
+    }
+
+    private static void cleanupOldDaemonLogs(File dir, String stem, String ext) {
+        File[] archives = dir.listFiles((d, name) ->
+                name.startsWith(stem + "-") && name.endsWith(ext) && !name.equals(stem + ext));
+        if (archives == null || archives.length <= keepArchiveCount) return;
+        java.util.Arrays.sort(archives, (a, b) -> Long.compare(b.lastModified(), a.lastModified()));
+        for (int i = keepArchiveCount; i < archives.length; i++) {
+            archives[i].delete();
         }
     }
 

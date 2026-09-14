@@ -4,6 +4,7 @@ import javax.swing.*;
 import javax.swing.border.EmptyBorder;
 import javax.swing.table.DefaultTableCellRenderer;
 import javax.swing.table.DefaultTableModel;
+import model.ScheduledTask;
 import java.awt.*;
 import java.time.Duration;
 import java.time.LocalDateTime;
@@ -35,8 +36,12 @@ public class QueueMonitorView extends JPanel {
 
     public record PendingRow(String taskName, String scheduleType, int attempt, LocalDateTime dueAt) {}
 
-    public record ActivityRow(String taskId, String taskName, int attempt, LocalDateTime startedAt,
-                               LocalDateTime finishedAt, boolean errored, String errorMessage) {}
+    /** Which table (see service.RunHistoryService) an ActivityRow's runId refers to — the two tables have independent autoincrement id sequences, so this is required to look the exact row back up (see ActivityEventPopup). */
+    public enum RunSource { RUN_HISTORY, ACTIVITY }
+
+    public record ActivityRow(long runId, RunSource source, String taskId, String taskName, int attempt,
+                               LocalDateTime startedAt, LocalDateTime finishedAt, boolean errored, String errorMessage,
+                               String taskType, ScheduledTask.TransferDirection direction) {}
 
     private static final Color COLOR_OVERDUE = new Color(0xFBF3E3); // pale wheat
     private static final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("HH:mm:ss");
@@ -54,12 +59,18 @@ public class QueueMonitorView extends JPanel {
     private JLabel offlineLabel;
     private BiConsumer<ActivityRow, Point> activityClickListener;
 
-    // Keys (taskId|startedAt) seen in the previous update() call — anything
-    // new this time gets a brief highlight. Keys currently mid-highlight, so
-    // the renderer knows to paint them differently until their Timer clears
+    // Keys (run id) seen in the previous update() call — anything new this
+    // time gets a brief highlight. Keys currently mid-highlight, so the
+    // renderer knows to paint them differently until their Timer clears
     // them back out.
     private Set<String> previousKeys = new HashSet<>();
     private final Set<String> highlightedKeys = new HashSet<>();
+    // False until the first update() call completes — see update() below:
+    // without this, every row already present the moment the panel opens
+    // looks "new" (previousKeys starts empty), so the entire list flashes
+    // and then goes dark together ~1.4s after opening, instead of only
+    // genuinely new rows ever flashing.
+    private boolean baselineEstablished = false;
 
     public QueueMonitorView() {
         setLayout(new BorderLayout(8, 8));
@@ -153,8 +164,13 @@ public class QueueMonitorView extends JPanel {
         cards.show(cardHost, CARD_OFFLINE);
     }
 
+    /** Uniquely identifies one run-history row — the DB row id, once every
+     *  {@link ActivityRow} carries its true {@code runId} rather than being
+     *  derived from task id + started-at (which could collide: SQLite
+     *  timestamps here are second-precision, so two rows for the same task
+     *  starting within the same second previously looked identical). */
     private static String keyOf(ActivityRow row) {
-        return row.taskId() + "|" + row.startedAt();
+        return String.valueOf(row.runId());
     }
 
     /** Pushes a fresh snapshot into the tables. {@code poolSize}/{@code activeWorkers} are
@@ -181,13 +197,20 @@ public class QueueMonitorView extends JPanel {
 
         // New-row detection for the brief highlight — compare this update's
         // keys against the previous update's, before overwriting the model.
+        // Skipped entirely on the very first call: with an empty baseline,
+        // everything already in the feed would otherwise register as "new"
+        // and the whole list would flash together, then go flat ~1.4s after
+        // opening — see baselineEstablished's declaration above.
         Set<String> newKeys = new HashSet<>();
-        for (ActivityRow row : activity) {
-            String key = keyOf(row);
-            if (!previousKeys.contains(key)) newKeys.add(key);
+        if (baselineEstablished) {
+            for (ActivityRow row : activity) {
+                String key = keyOf(row);
+                if (!previousKeys.contains(key)) newKeys.add(key);
+            }
         }
         previousKeys = new HashSet<>();
         for (ActivityRow row : activity) previousKeys.add(keyOf(row));
+        baselineEstablished = true;
 
         ActivityRow selected = activityList.getSelectedValue();
         activityListModel.clear();
@@ -230,19 +253,25 @@ public class QueueMonitorView extends JPanel {
     }
 
     /**
-     * One compact line per event: a severity dot, task name, outcome, and
+     * One compact line per event: a kind symbol, task name, outcome, and
      * timing — density over the two-line card look used elsewhere, since
      * this is a live stream meant to be scanned quickly, not browsed.
+     *
+     * <p>The leading symbol (replacing what used to be a plain colored dot
+     * for every row regardless of what kind of event it was) distinguishes:
+     * a file-detection event, an inbound transfer, an outbound transfer, a
+     * mail check, a backup/local-copy, and the generic fallback for
+     * anything else — colored green/red by outcome same as before.
      */
     private class EventRowRenderer extends JPanel implements ListCellRenderer<ActivityRow> {
-        private final JLabel dot = new JLabel("\u25CF");
+        private final JLabel dot = new JLabel();
         private final JLabel text = new JLabel();
         private final JLabel time = new JLabel();
 
         EventRowRenderer() {
             setLayout(new BorderLayout(8, 0));
             setBorder(new EmptyBorder(2, 8, 2, 8));
-            dot.setFont(dot.getFont().deriveFont(10f));
+            dot.setFont(dot.getFont().deriveFont(Font.BOLD, 12f));
             text.setFont(text.getFont().deriveFont(Font.PLAIN, 12f));
             time.setFont(time.getFont().deriveFont(Font.PLAIN, 11f));
             time.setForeground(new Color(0x8A8378));
@@ -253,6 +282,19 @@ public class QueueMonitorView extends JPanel {
             left.add(text);
             add(left, BorderLayout.CENTER);
             add(time, BorderLayout.EAST);
+        }
+
+        /** Symbol for the kind of event this row represents — see the class doc above. */
+        private String symbolFor(ActivityRow row) {
+            boolean isDetection = row.errorMessage() != null && row.errorMessage().startsWith("Detected ");
+            boolean isStarted = row.errorMessage() != null && row.errorMessage().startsWith("Started \u2014");
+            if (isDetection) return "\u25C9";                                   // ◉ detection
+            if (isStarted) return "\u25B6";                                     // ▶ started (worker picked it up)
+            if ("OUTLOOK_MAIL".equals(row.taskType())) return "\u2709";          // ✉ mail
+            if ("BACKUP".equals(row.taskType())) return "\u25A3";                // ▣ backup / local copy
+            if (row.direction() == ScheduledTask.TransferDirection.INBOUND) return "\u2193";  // ↓ inbound
+            if (row.direction() == ScheduledTask.TransferDirection.OUTBOUND) return "\u2191"; // ↑ outbound
+            return "\u25CF";                                                     // ● generic fallback
         }
 
         @Override
@@ -270,6 +312,7 @@ public class QueueMonitorView extends JPanel {
                     + "  \u2014  " + outcome);
             time.setText(row.startedAt().format(TIME_FMT) + "  \u00b7  " + formatDuration(d));
 
+            dot.setText(symbolFor(row));
             Color dotColor = row.errored() ? AppTheme.FAILED_FG : AppTheme.SUCCESS_FG;
             dot.setForeground(dotColor);
 

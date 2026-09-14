@@ -3,6 +3,7 @@ service\OAuth2TokenService.class
 Daemon.class
 service\OAuth2TokenService$CachedToken.class
 ui\Theme.class
+ui\QueueMonitorView$RunSource.class
 ui\TaskManagerPanel$3.class
 ui\TestConnectionDialog.class
 export\PdfTableWriter.class
@@ -24,6 +25,7 @@ model\RemoteFileException.class
 service\watch\PersistentSftpConnectionManager$Entry.class
 service\CredentialDbService.class
 ui\VectorIcons$6.class
+service\queue\TaskWorkerPool$InFlightTask.class
 service\watch\RemotePushWatcher.class
 ui\GradientButton.class
 service\TaskSchedulerService$WatchMode.class
@@ -48,6 +50,7 @@ util\CryptoUtil.class
 util\AppSettings.class
 ui\PillBadge.class
 ui\DirectoryBrowserDialog$7.class
+ui\StatisticsPanel$BottomHairlineBorder.class
 ui\NotificationBell$1.class
 ui\MainWindow$2.class
 service\TransferService$WatcherSkipException.class
@@ -57,6 +60,7 @@ ui\QueueMonitorView$PendingRow.class
 ui\RunLogSummarizer$FileEntry.class
 ui\WatcherInfoPopup$Result.class
 util\ImapSearchCriteria$TextCriteria.class
+ui\WorkerActivityStrip$Row.class
 service\RemoteFileMetadataServiceFactory$ManagedMetadataService.class
 util\MailFetchMode.class
 ui\SettingsPanel$3.class
@@ -64,7 +68,6 @@ service\XmlStorageService.class
 ui\components\IconTile.class
 ui\SettingsPanel$4.class
 ui\VectorIcons$7.class
-service\TransferRunStats.class
 service\SftpRemoteFileMetadataService.class
 ui\DirectoryBrowserDialog$5.class
 util\MiniJson$Parser.class
@@ -80,6 +83,7 @@ ui\DirectoryBrowserDialog$RefreshIcon.class
 service\ConnectionTestService$Result.class
 ui\DirectoryBrowserDialog$4.class
 ui\RunLogSummarizer.class
+ui\RunHistoryPanel$StatusPillRenderer.class
 service\TransferService$MarkerMatch.class
 ui\MainWindow.class
 service\LocalFileMetadataService.class
@@ -164,6 +168,7 @@ ui\EventMonitorWindow$1.class
 ui\RunHistoryPanel$5.class
 service\TransferService.class
 ui\RunHistoryPanel$ExportTask.class
+ui\WorkerActivityStrip.class
 util\MiniJson.class
 service\TransferService$SizedCommand.class
 ui\TaskManagerPanel$2.class

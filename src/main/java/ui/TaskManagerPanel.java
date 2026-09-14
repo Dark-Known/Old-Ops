@@ -322,10 +322,7 @@ public class TaskManagerPanel extends JPanel {
         filterAndLegend.add(btnRefresh);
         toolbarRow.add(filterAndLegend, BorderLayout.EAST);
 
-        JLabel banner = new JLabel(
-            "<html><b>Scheduled Tasks</b> — file transfers, mail fetches, and backup jobs run on a schedule.<br>"
-            + "<span style='color:gray'>Select a task below to view its execution log, or use the buttons to"
-            + " create, edit, run, or manage tasks.</span></html>");
+        JLabel banner = new JLabel("<html><b>Scheduled Tasks</b></html>");
         banner.setBorder(new EmptyBorder(0, 0, 8, 0));
 
         // ── Summary strip ────────────────────────────────────────────────────
@@ -1027,12 +1024,31 @@ public class TaskManagerPanel extends JPanel {
 
     // ── Task actions ──────────────────────────────────────────────────────────
 
+    /**
+     * Records an application-activity note (task created/edited/deleted)
+     * into the Event Monitor's activity feed — see
+     * {@link service.RunHistoryService#recordActivityEvent}. Uses the fixed
+     * pseudo-task-id "TASKS" since the note is about the management action
+     * itself, not one specific scheduled run.
+     */
+    private void logActivity(String title, String detail) {
+        try {
+            java.time.LocalDateTime now = java.time.LocalDateTime.now();
+            scheduler.getRunHistoryService().recordActivityEvent("TASKS", title, null, detail, detail, now, now);
+        } catch (Exception ignored) {
+            // Best-effort — a failure to log this shouldn't block the actual task change.
+        }
+    }
+
     private void newTask() {
         try {
             TaskDialog dlg = new TaskDialog(
                 (Frame) SwingUtilities.getWindowAncestor(this), storage, null);
             dlg.setVisible(true);
-            if (dlg.getResult() != null) refresh();
+            if (dlg.getResult() != null) {
+                logActivity("Task created", "Created task \"" + dlg.getResult().getName() + "\"");
+                refresh();
+            }
         } catch (Throwable ex) {
             JOptionPane.showMessageDialog(this,
                 "Failed to open New Task dialog:\n" + ex.getMessage(),
@@ -1050,7 +1066,10 @@ public class TaskManagerPanel extends JPanel {
                     TaskDialog dlg = new TaskDialog(
                         (Frame) SwingUtilities.getWindowAncestor(this), storage, t);
                     dlg.setVisible(true);
-                    if (dlg.getResult() != null) refresh();
+                    if (dlg.getResult() != null) {
+                        logActivity("Task edited", "Edited task \"" + dlg.getResult().getName() + "\"");
+                        refresh();
+                    }
                 } catch (Throwable ex) {
                     JOptionPane.showMessageDialog(this,
                         "Failed to open Edit Task dialog:\n" + ex.getMessage(),
@@ -1072,6 +1091,7 @@ public class TaskManagerPanel extends JPanel {
             "Confirm Delete", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
         if (ok == JOptionPane.YES_OPTION) {
             storage.deleteTask(id);
+            logActivity("Task deleted", "Deleted task \"" + name + "\"");
             try { scheduler.cancelTask(id); } catch (Exception ignored) {}
             try { scheduler.refresh();      } catch (Exception ignored) {}
             taskLogs.remove(id);

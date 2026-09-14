@@ -7,12 +7,18 @@ import service.XmlStorageService;
 import export.XlsxWriter;
 import export.PdfTableWriter;
 import export.HtmlReportWriter;
+import ui.components.PillBadge;
+import ui.components.StatCard;
 
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
+import javax.swing.border.MatteBorder;
 import javax.swing.event.ChangeListener;
+import javax.swing.event.DocumentListener;
+import javax.swing.event.DocumentEvent;
 import javax.swing.table.DefaultTableCellRenderer;
 import javax.swing.table.DefaultTableModel;
+import javax.swing.table.TableCellRenderer;
 import java.awt.*;
 import java.io.File;
 import java.time.LocalDate;
@@ -40,9 +46,6 @@ import java.util.List;
  */
 public class RunHistoryPanel extends JPanel {
 
-    private static final Color COLOR_FAILED  = new Color(0xF5E0DC); // pale rust
-    private static final Color COLOR_SUCCESS = new Color(0xEAF0E3); // pale moss
-    private static final Color COLOR_SKIPPED = new Color(0xFBF3E3); // pale wheat
     private static final String HEX_FAILED  = "FFEBEE";
     private static final String HEX_SUCCESS = "E8F5E9";
     private static final String HEX_SKIPPED = "FFF8E1";
@@ -57,9 +60,27 @@ public class RunHistoryPanel extends JPanel {
     private JSpinner spFromDate;
     private JSpinner spToDate;
     private JSpinner spLimit;
+    private JTextField txtSearch;
     private DefaultTableModel tableModel;
     private JTable table;
+    // Rows currently backing the table, AFTER the free-text search filter has
+    // been applied on top of the DB-level task/status/date filters — this is
+    // what row indices in `table` map to, and what gets exported.
     private List<TaskRunRecord> currentRows;
+
+    // Summary strip above the table — counts reflect currentRows (i.e. the
+    // filtered set actually shown), not the whole table.
+    private StatCard cardTotal;
+    private StatCard cardSuccess;
+    private StatCard cardFailed;
+    private StatCard cardSkipped;
+
+    // Docked detail panel (replaces the old blocking JOptionPane on
+    // double-click) — sits below the table, hidden until a row is opened.
+    private JPanel detailPanel;
+    private JLabel lblDetailTitle;
+    private JLabel lblDetailMeta;
+    private JTextArea detailArea;
 
     // Guards against the filter-repopulation in refresh() (removeAllItems /
     // addItem on the task combo) re-triggering itself via the very
@@ -72,18 +93,88 @@ public class RunHistoryPanel extends JPanel {
         setLayout(new BorderLayout(8, 8));
         setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
 
-        add(buildFilterBar(), BorderLayout.NORTH);
-        add(buildTable(), BorderLayout.CENTER);
+        JPanel headerPanel = new JPanel(new BorderLayout(0, 8));
+        headerPanel.add(buildFilterBar(), BorderLayout.NORTH);
+        headerPanel.add(buildStatsStrip(), BorderLayout.SOUTH);
+        add(headerPanel, BorderLayout.NORTH);
+
+        JPanel centerPanel = new JPanel(new BorderLayout(0, 0));
+        centerPanel.add(buildTable(), BorderLayout.CENTER);
+        centerPanel.add(buildDetailPanel(), BorderLayout.SOUTH);
+        add(centerPanel, BorderLayout.CENTER);
 
         refresh();
+    }
+
+    /** Total / success / failed / skipped counts for whatever's currently filtered into view. */
+    private JComponent buildStatsStrip() {
+        cardTotal   = new StatCard("Runs shown", "0", null);
+        cardSuccess = new StatCard("Success", "0", AppTheme.SUCCESS_FG);
+        cardFailed  = new StatCard("Failed", "0", AppTheme.FAILED_FG);
+        cardSkipped = new StatCard("Skipped", "0", AppTheme.SKIPPED_FG);
+
+        JPanel strip = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
+        strip.setOpaque(false);
+        strip.add(cardTotal);
+        strip.add(cardSuccess);
+        strip.add(cardFailed);
+        strip.add(cardSkipped);
+        return strip;
+    }
+
+    /**
+     * A docked panel shown below the table when a row is opened — replaces
+     * the old blocking {@code JOptionPane} on double-click, so you can click
+     * through several runs (e.g. every FAILED row) without a modal
+     * round-trip each time. Hidden (zero-height) until the first row is
+     * opened.
+     */
+    private JComponent buildDetailPanel() {
+        detailPanel = new JPanel(new BorderLayout(0, 6));
+        detailPanel.setBorder(BorderFactory.createCompoundBorder(
+                new MatteBorder(1, 0, 0, 0, AppTheme.surface2()),
+                new EmptyBorder(8, 4, 0, 4)));
+        detailPanel.setVisible(false);
+
+        JPanel titleRow = new JPanel(new BorderLayout());
+        JPanel titleBlock = new JPanel();
+        titleBlock.setLayout(new BoxLayout(titleBlock, BoxLayout.Y_AXIS));
+        lblDetailTitle = new JLabel(" ");
+        lblDetailTitle.setFont(lblDetailTitle.getFont().deriveFont(Font.BOLD, 13f));
+        lblDetailMeta = new JLabel(" ");
+        lblDetailMeta.setFont(lblDetailMeta.getFont().deriveFont(Font.PLAIN, 11f));
+        lblDetailMeta.setForeground(new Color(0x757575));
+        titleBlock.add(lblDetailTitle);
+        titleBlock.add(lblDetailMeta);
+        titleRow.add(titleBlock, BorderLayout.WEST);
+
+        JButton btnClose = new JButton("Close");
+        btnClose.addActionListener(e -> {
+            detailPanel.setVisible(false);
+            table.clearSelection();
+        });
+        JPanel closeWrap = new JPanel(new FlowLayout(FlowLayout.RIGHT, 0, 0));
+        closeWrap.add(btnClose);
+        titleRow.add(closeWrap, BorderLayout.EAST);
+
+        detailArea = new JTextArea();
+        detailArea.setEditable(false);
+        detailArea.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
+        detailArea.setBackground(new Color(0x1E1E1E));
+        detailArea.setForeground(new Color(0xD4D4D4));
+
+        JScrollPane detailScroll = new JScrollPane(detailArea);
+        detailScroll.setPreferredSize(new Dimension(100, 220));
+
+        detailPanel.add(titleRow, BorderLayout.NORTH);
+        detailPanel.add(detailScroll, BorderLayout.CENTER);
+        return detailPanel;
     }
 
     private JComponent buildFilterBar() {
         JPanel bar = new JPanel(new BorderLayout(0, 4));
 
-        JLabel banner = new JLabel(
-            "<html><b>Task Run Logs</b> — every recorded run (success, failure, or skip) for every task.<br>"
-            + "<span style='color:gray'>Filter by task or status below, then export or archive as needed.</span></html>");
+        JLabel banner = new JLabel("<html><b>Task Run Logs</b></html>");
         banner.setBorder(new EmptyBorder(0, 0, 4, 0));
         bar.add(banner, BorderLayout.NORTH);
 
@@ -114,26 +205,36 @@ public class RunHistoryPanel extends JPanel {
         btnRefresh.addActionListener(e -> refresh());
         row1.add(btnRefresh);
 
-        JButton btnExportExcel = new JButton("Export Excel");
-        btnExportExcel.setToolTipText("Export the rows currently shown (with the same status coloring) to a .xlsx file");
-        btnExportExcel.addActionListener(e -> exportExcel());
-        row1.add(btnExportExcel);
+        // Export Excel/PDF/HTML used to be three permanently-visible buttons
+        // competing for toolbar space with the new search field below — now
+        // one button with a dropdown, same three destinations.
+        JButton btnExport = new JButton("Export \u25BE"); // ▾
+        JPopupMenu exportMenu = new JPopupMenu();
+        JMenuItem miExcel = new JMenuItem("Excel (.xlsx)");
+        miExcel.addActionListener(e -> exportExcel());
+        JMenuItem miPdf = new JMenuItem("PDF (.pdf)");
+        miPdf.addActionListener(e -> exportPdf());
+        JMenuItem miHtml = new JMenuItem("HTML report (.html)");
+        miHtml.setToolTipText("Self-contained, offline-viewable report with a collapsible task/run tree, search, and charts");
+        miHtml.addActionListener(e -> exportHtml());
+        exportMenu.add(miExcel);
+        exportMenu.add(miPdf);
+        exportMenu.add(miHtml);
+        btnExport.addActionListener(e -> exportMenu.show(btnExport, 0, btnExport.getHeight()));
+        row1.add(btnExport);
 
-        JButton btnExportPdf = new JButton("Export PDF");
-        btnExportPdf.setToolTipText("Export the rows currently shown (with the same status coloring) to a .pdf file");
-        btnExportPdf.addActionListener(e -> exportPdf());
-        row1.add(btnExportPdf);
-
-        JButton btnExportHtml = new JButton("Export HTML");
-        btnExportHtml.setToolTipText("Export the rows currently shown to a self-contained, offline-viewable .html report "
-                + "with a collapsible task/run tree, search, and charts");
-        btnExportHtml.addActionListener(e -> exportHtml());
-        row1.add(btnExportHtml);
-
-        JLabel hint = new JLabel("Double-click a row for full run details");
-        hint.setFont(hint.getFont().deriveFont(Font.ITALIC, 11f));
-        hint.setForeground(new Color(0x757575));
-        row1.add(hint);
+        // Free-text search over task name and reason — the DB-level filters
+        // above only cover task/status/date, so this is applied client-side
+        // in refresh() on top of whatever query them already returned.
+        row1.add(new JLabel("Search:"));
+        txtSearch = new JTextField(16);
+        txtSearch.setToolTipText("Filter shown rows by task name or reason text");
+        txtSearch.getDocument().addDocumentListener(new DocumentListener() {
+            @Override public void insertUpdate(DocumentEvent e)  { refresh(); }
+            @Override public void removeUpdate(DocumentEvent e)  { refresh(); }
+            @Override public void changedUpdate(DocumentEvent e) { refresh(); }
+        });
+        row1.add(txtSearch);
 
         JPanel row2 = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 2));
         cbUseDateFilter = new JCheckBox("Filter by date range:");
@@ -210,53 +311,82 @@ public class RunHistoryPanel extends JPanel {
         table.getColumnModel().getColumn(4).setPreferredWidth(70);
         table.getColumnModel().getColumn(5).setPreferredWidth(420);
 
-        DefaultTableCellRenderer rowColorRenderer = new DefaultTableCellRenderer() {
+        // Row background is tinted by status (restored — an earlier pass
+        // replaced this with badge-only coloring, but a quick "is this row
+        // red/green/amber" scan across hundreds of rows is faster than
+        // reading each row's badge individually). The badge in the Status
+        // column stays too, since it also carries the actual word
+        // ("FAILED"/"SUCCESS"/"SKIPPED") color alone can't for anyone
+        // relying on that rather than color.
+        DefaultTableCellRenderer plainRenderer = new DefaultTableCellRenderer() {
             @Override
             public Component getTableCellRendererComponent(JTable t, Object value, boolean isSelected,
                     boolean hasFocus, int row, int column) {
                 Component c = super.getTableCellRendererComponent(t, value, isSelected, hasFocus, row, column);
-                if (!isSelected && row < currentRows.size()) {
+                if (!isSelected) {
                     int modelRow = table.convertRowIndexToModel(row);
-                    TaskRunRecord r = currentRows.get(modelRow);
-                    Color special = null;
-                    switch (r.getStatus()) {
-                        case SUCCESS: special = COLOR_SUCCESS; break;
-                        case FAILED:  special = COLOR_FAILED;  break;
-                        case SKIPPED: special = COLOR_SKIPPED; break;
+                    Color bg = table.getBackground();
+                    if (modelRow >= 0 && modelRow < currentRows.size()) {
+                        switch (currentRows.get(modelRow).getStatus()) {
+                            case SUCCESS: bg = AppTheme.SUCCESS_BG; break;
+                            case FAILED:  bg = AppTheme.FAILED_BG;  break;
+                            case SKIPPED: bg = AppTheme.SKIPPED_BG; break;
+                        }
                     }
-                    if (special != null) {
-                        // Pale status tints stay pale regardless of app theme, so force dark
-                        // text on them explicitly — the default (theme-following) foreground
-                        // goes light-on-light and disappears in dark mode otherwise.
-                        c.setBackground(special);
-                        c.setForeground(new Color(0x2B2116));
-                    } else {
-                        c.setBackground(table.getBackground());
-                        c.setForeground(table.getForeground());
-                    }
-                } else if (!isSelected) {
-                    c.setBackground(table.getBackground());
+                    c.setBackground(bg);
                     c.setForeground(table.getForeground());
                 }
                 return c;
             }
         };
         for (int i = 0; i < columns.length; i++) {
-            table.getColumnModel().getColumn(i).setCellRenderer(rowColorRenderer);
+            table.getColumnModel().getColumn(i).setCellRenderer(plainRenderer);
         }
+        table.getColumnModel().getColumn(2).setCellRenderer(new StatusPillRenderer());
 
-        table.addMouseListener(new java.awt.event.MouseAdapter() {
-            @Override public void mouseClicked(java.awt.event.MouseEvent e) {
-                if (e.getClickCount() == 2) {
-                    int viewRow = table.getSelectedRow();
-                    if (viewRow < 0) return;
-                    int modelRow = table.convertRowIndexToModel(viewRow);
-                    showDetails(currentRows.get(modelRow));
-                }
-            }
+        // A single click now opens the docked detail panel (double-click no
+        // longer required) — selection and "show details" are the same
+        // action, so browsing several rows in a row is one click each
+        // instead of a double-click-then-close-modal cycle.
+        table.getSelectionModel().addListSelectionListener(e -> {
+            if (e.getValueIsAdjusting()) return;
+            int viewRow = table.getSelectedRow();
+            if (viewRow < 0) return;
+            int modelRow = table.convertRowIndexToModel(viewRow);
+            if (modelRow < currentRows.size()) showDetails(currentRows.get(modelRow));
         });
 
         return new JScrollPane(table);
+    }
+
+    /** Renders the Status column as a small colored {@link PillBadge} chip instead of plain text. */
+    private class StatusPillRenderer implements TableCellRenderer {
+        private final PillBadge badge = new PillBadge("", AppTheme.NEUTRAL_FG, null);
+        private final JPanel wrapper = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
+        { wrapper.add(badge); }
+
+        @Override
+        public Component getTableCellRendererComponent(JTable t, Object value, boolean isSelected,
+                boolean hasFocus, int row, int column) {
+            String status = String.valueOf(value);
+            Color fg, bg;
+            switch (status) {
+                case "SUCCESS": fg = AppTheme.SUCCESS_FG; bg = AppTheme.SUCCESS_BG; break;
+                case "FAILED":  fg = AppTheme.FAILED_FG;  bg = AppTheme.FAILED_BG;  break;
+                case "SKIPPED": fg = AppTheme.SKIPPED_FG; bg = AppTheme.SKIPPED_BG; break;
+                default:        fg = AppTheme.NEUTRAL_FG; bg = AppTheme.surface2(); break;
+            }
+            badge.setText(status);
+            badge.setColors(fg, bg);
+            // Match column 2's own cell background to the same status tint
+            // the other columns in this row get from plainRenderer — this
+            // renderer replaces plainRenderer for this one column entirely,
+            // so without this the badge would sit in a plain white/table-
+            // colored gap while every other cell in the row is tinted.
+            wrapper.setBackground(isSelected ? t.getSelectionBackground() : bg);
+            wrapper.setOpaque(true);
+            return wrapper;
+        }
     }
 
     /**
@@ -302,7 +432,22 @@ public class RunHistoryPanel extends JPanel {
             to = dateSpinnerToLocalDateTime(spToDate, true);
         }
 
-        currentRows = runHistoryService.queryRuns(taskId, status, from, to, limit);
+        List<TaskRunRecord> dbRows = runHistoryService.queryRuns(taskId, status, from, to, limit);
+
+        // Free-text search isn't a DB-level filter (queryRuns has no text
+        // param) — applied here on top of the task/status/date results
+        // already pulled, over task name and reason.
+        String searchText = txtSearch != null ? txtSearch.getText().trim().toLowerCase() : "";
+        if (searchText.isEmpty()) {
+            currentRows = dbRows;
+        } else {
+            currentRows = new ArrayList<>();
+            for (TaskRunRecord r : dbRows) {
+                String haystack = (r.getTaskName() + " " + (r.getReason() != null ? r.getReason() : ""))
+                        .toLowerCase();
+                if (haystack.contains(searchText)) currentRows.add(r);
+            }
+        }
 
         tableModel.setRowCount(0);
         for (TaskRunRecord r : currentRows) {
@@ -315,6 +460,31 @@ public class RunHistoryPanel extends JPanel {
                     r.getReason() != null ? r.getReason() : ""
             });
         }
+
+        updateStatsStrip();
+
+        // The row a still-open detail panel refers to may no longer exist
+        // in the freshly-filtered set (e.g. a search that now excludes it)
+        // — close it rather than leave it pointing at stale/wrong data.
+        if (detailPanel != null && detailPanel.isVisible() && table.getSelectedRow() < 0) {
+            detailPanel.setVisible(false);
+        }
+    }
+
+    private void updateStatsStrip() {
+        if (cardTotal == null) return; // not built yet (first refresh() call happens mid-constructor)
+        int success = 0, failed = 0, skipped = 0;
+        for (TaskRunRecord r : currentRows) {
+            switch (r.getStatus()) {
+                case SUCCESS: success++; break;
+                case FAILED:  failed++;  break;
+                case SKIPPED: skipped++; break;
+            }
+        }
+        cardTotal.setValue(String.valueOf(currentRows.size()));
+        cardSuccess.setValue(String.valueOf(success));
+        cardFailed.setValue(String.valueOf(failed));
+        cardSkipped.setValue(String.valueOf(skipped));
     }
 
     /**
@@ -327,31 +497,24 @@ public class RunHistoryPanel extends JPanel {
         refresh();
     }
 
+    /**
+     * Populates and reveals the docked detail panel for one run — replaces
+     * the old {@code JOptionPane.showMessageDialog} modal, so browsing
+     * several runs (e.g. clicking down a list of FAILED rows) no longer
+     * needs a close-then-reopen round-trip each time.
+     */
     private void showDetails(TaskRunRecord r) {
-        JTextArea area = new JTextArea();
-        area.setEditable(false);
-        area.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
-        area.setBackground(new Color(0x1E1E1E));
-        area.setForeground(new Color(0xD4D4D4));
+        lblDetailTitle.setText(r.getTaskName() + " (" + r.getTaskType() + ")");
+        lblDetailMeta.setText(r.getStatus() + "  ·  " + r.getStartedAt().format(DT_FMT)
+                + "  ·  " + formatDuration(r.getDurationMs())
+                + (r.getReason() != null && !r.getReason().isEmpty() ? "  ·  " + r.getReason() : ""));
 
-        StringBuilder sb = new StringBuilder();
-        sb.append("Task:     ").append(r.getTaskName()).append(" (").append(r.getTaskType()).append(")\n");
-        sb.append("Status:   ").append(r.getStatus()).append('\n');
-        sb.append("Started:  ").append(r.getStartedAt().format(DT_FMT)).append('\n');
-        sb.append("Ended:    ").append(r.getEndedAt().format(DT_FMT)).append('\n');
-        sb.append("Duration: ").append(formatDuration(r.getDurationMs())).append('\n');
-        sb.append("Reason:   ").append(r.getReason() != null ? r.getReason() : "-").append('\n');
-        sb.append("\n--- Full run log ---\n");
-        sb.append(r.getDetails() != null && !r.getDetails().isEmpty() ? r.getDetails() : "(no detail lines captured)");
-        area.setText(sb.toString());
-        area.setCaretPosition(0);
+        String body = r.getDetails() != null && !r.getDetails().isEmpty()
+                ? r.getDetails() : "(no detail lines captured)";
+        detailArea.setText(body);
+        detailArea.setCaretPosition(0);
 
-        JScrollPane scroll = new JScrollPane(area);
-        scroll.setPreferredSize(new Dimension(700, 450));
-
-        JOptionPane.showMessageDialog(this, scroll,
-                "Run details — " + r.getTaskName() + " @ " + r.getStartedAt().format(DT_FMT),
-                JOptionPane.PLAIN_MESSAGE);
+        detailPanel.setVisible(true);
     }
 
     private static String formatDuration(long ms) {

@@ -145,14 +145,12 @@ public class NotificationPanel extends JPanel {
         watchFallbackScroll.setBorder(BorderFactory.createTitledBorder(
                 "Watcher Push \u2192 Polling Fallbacks (live watch/push stopped working, or was confirmed unsupported)"));
 
-        JLabel note = new JLabel(watchStatusMonitor == null
-                ? "Watcher fallback monitoring is not available in this context."
-                : "Purely informational — restarting a task from the Tasks tab does not affect this history.");
-        note.setFont(note.getFont().deriveFont(Font.ITALIC, 11f));
-        note.setBorder(BorderFactory.createEmptyBorder(4, 4, 4, 4));
-
         body.add(watchFallbackScroll, BorderLayout.CENTER);
-        body.add(note, BorderLayout.NORTH);
+        if (watchStatusMonitor == null) {
+            JLabel note = new JLabel("Watcher fallback monitoring is not available in this context.");
+            note.setBorder(BorderFactory.createEmptyBorder(4, 4, 4, 4));
+            body.add(note, BorderLayout.NORTH);
+        }
         body.add(buildWatcherActionsPanel(), BorderLayout.SOUTH);
         return body;
     }

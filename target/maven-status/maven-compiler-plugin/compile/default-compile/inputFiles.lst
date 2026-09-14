@@ -26,7 +26,6 @@ D:\OPS\OpsTransferTool-source\src\main\java\service\SftpBrowseService.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\SftpRemoteFileMetadataService.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\TaskLogService.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\TaskSchedulerService.java
-D:\OPS\OpsTransferTool-source\src\main\java\service\TransferRunStats.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\TransferService.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\watch\LocalWatchManager.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\watch\PersistentSftpConnectionManager.java
@@ -68,6 +67,7 @@ D:\OPS\OpsTransferTool-source\src\main\java\ui\ToastManager.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\VectorIcons.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\WatcherInfoPopup.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\WatchStatusMonitor.java
+D:\OPS\OpsTransferTool-source\src\main\java\ui\WorkerActivityStrip.java
 D:\OPS\OpsTransferTool-source\src\main\java\util\AppConfig.java
 D:\OPS\OpsTransferTool-source\src\main\java\util\AppSettings.java
 D:\OPS\OpsTransferTool-source\src\main\java\util\CryptoUtil.java
