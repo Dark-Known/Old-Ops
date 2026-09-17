@@ -370,12 +370,24 @@ public class RunHistoryPanel extends JPanel {
                 boolean hasFocus, int row, int column) {
             String status = String.valueOf(value);
             Color fg, bg;
-            switch (status) {
-                case "SUCCESS": fg = AppTheme.SUCCESS_FG; bg = AppTheme.SUCCESS_BG; break;
-                case "FAILED":  fg = AppTheme.FAILED_FG;  bg = AppTheme.FAILED_BG;  break;
-                case "SKIPPED": fg = AppTheme.SKIPPED_FG; bg = AppTheme.SKIPPED_BG; break;
-                default:        fg = AppTheme.NEUTRAL_FG; bg = AppTheme.surface2(); break;
-            }
+            bg = switch (status) {
+                case "SUCCESS" -> {
+                    fg = AppTheme.SUCCESS_FG;
+                    yield AppTheme.SUCCESS_BG;
+                }
+                case "FAILED" -> {
+                    fg = AppTheme.FAILED_FG;
+                    yield AppTheme.FAILED_BG;
+                }
+                case "SKIPPED" -> {
+                    fg = AppTheme.SKIPPED_FG;
+                    yield AppTheme.SKIPPED_BG;
+                }
+                default -> {
+                    fg = AppTheme.NEUTRAL_FG;
+                    yield AppTheme.surface2();
+                }
+            };
             badge.setText(status);
             badge.setColors(fg, bg);
             // Match column 2's own cell background to the same status tint

@@ -102,11 +102,36 @@ public class RunHistoryService {
                 "details TEXT," +
                 "started_at TEXT NOT NULL," +
                 "ended_at TEXT NOT NULL," +
-                "duration_ms INTEGER" +
+                "duration_ms INTEGER," +
+                "failure_category TEXT," +
+                "retryable INTEGER," +
+                "suggested_action TEXT" +
                 ")");
         st.execute("CREATE INDEX IF NOT EXISTS idx_" + table + "_task_id ON " + table + "(task_id)");
         st.execute("CREATE INDEX IF NOT EXISTS idx_" + table + "_started_at ON " + table + "(started_at)");
         st.execute("CREATE INDEX IF NOT EXISTS idx_" + table + "_status ON " + table + "(status)");
+        addColumnIfMissing(st, table, "failure_category", "TEXT");
+        addColumnIfMissing(st, table, "retryable", "INTEGER");
+        addColumnIfMissing(st, table, "suggested_action", "TEXT");
+    }
+
+    /**
+     * Adds {@code column} to an existing {@code table} if it's not already
+     * there — covers upgrading a database created before failure
+     * classification existed, where {@code CREATE TABLE IF NOT EXISTS}
+     * above is a no-op against the already-existing table and so never adds
+     * new columns on its own.
+     */
+    private static void addColumnIfMissing(Statement st, String table, String column, String type) throws SQLException {
+        boolean exists = false;
+        try (ResultSet rs = st.executeQuery("PRAGMA table_info(" + table + ")")) {
+            while (rs.next()) {
+                if (column.equalsIgnoreCase(rs.getString("name"))) { exists = true; break; }
+            }
+        }
+        if (!exists) {
+            st.execute("ALTER TABLE " + table + " ADD COLUMN " + column + " " + type);
+        }
     }
 
     /**
@@ -175,7 +200,38 @@ public class RunHistoryService {
     public synchronized void recordRun(String taskId, String taskName, String taskType,
             TaskRunRecord.Status status, String reason, String details,
             LocalDateTime startedAt, LocalDateTime endedAt) {
-        long durationMs = insertInto(RUN_TABLE, taskId, taskName, taskType, status, reason, details, startedAt, endedAt);
+        recordRun(taskId, taskName, taskType, status, reason, details, startedAt, endedAt, null);
+    }
+
+    /**
+     * Same as the five-arg {@link #recordRun} above, but takes an already-
+     * classified failure (see {@link FailureClassifier#classifyThrowable})
+     * instead of deriving one from {@code reason}'s text — pass the
+     * {@code TaskRunRecord} {@link TransferService#getLastFailureClassification()}
+     * returned right after a FAILED run, when one is available. This is the
+     * reliable path: classifying from the actual exception type where it
+     * was caught, rather than pattern-matching whatever text it eventually
+     * became. {@code preclassified} may be null (falls back to
+     * {@link FailureClassifier#classify(String, String)} on {@code reason}
+     * text, same as before) — most failure sites in the app don't have a
+     * classified exception in hand yet, only {@link TransferService}'s
+     * outer catch blocks do so far.
+     */
+    public synchronized void recordRun(String taskId, String taskName, String taskType,
+            TaskRunRecord.Status status, String reason, String details,
+            LocalDateTime startedAt, LocalDateTime endedAt, TaskRunRecord preclassified) {
+        TaskRunRecord.FailureCategory category = null;
+        boolean retryable = false;
+        String suggestedAction = null;
+        if (status == TaskRunRecord.Status.FAILED) {
+            TaskRunRecord classified = preclassified != null ? preclassified : FailureClassifier.classify(reason, details);
+            category = classified.getFailureCategory();
+            retryable = classified.isRetryable();
+            suggestedAction = classified.getSuggestedAction();
+        }
+
+        long durationMs = insertInto(RUN_TABLE, taskId, taskName, taskType, status, reason, details,
+                startedAt, endedAt, category, retryable, suggestedAction);
         if (durationMs < 0) return; // insert failed; already logged
 
         if (!runListeners.isEmpty()) {
@@ -189,6 +245,9 @@ public class RunHistoryService {
             rec.setStartedAt(startedAt);
             rec.setEndedAt(endedAt);
             rec.setDurationMs(durationMs);
+            rec.setFailureCategory(category);
+            rec.setRetryable(retryable);
+            rec.setSuggestedAction(suggestedAction);
             for (java.util.function.Consumer<TaskRunRecord> listener : runListeners) {
                 try { listener.accept(rec); } catch (Exception ignored) {}
             }
@@ -214,7 +273,7 @@ public class RunHistoryService {
     public synchronized void recordActivityEvent(String taskId, String taskName, String taskType,
             String message, String details, LocalDateTime startedAt, LocalDateTime endedAt) {
         long durationMs = insertInto(ACTIVITY_TABLE, taskId, taskName, taskType, TaskRunRecord.Status.SUCCESS,
-                message, details != null ? details : message, startedAt, endedAt);
+                message, details != null ? details : message, startedAt, endedAt, null, false, null);
         if (durationMs < 0 || activityListeners.isEmpty()) return;
 
         TaskRunRecord rec = new TaskRunRecord();
@@ -235,11 +294,13 @@ public class RunHistoryService {
     /** @return duration in ms on success, or -1 if the insert failed (already logged). */
     private long insertInto(String table, String taskId, String taskName, String taskType,
             TaskRunRecord.Status status, String reason, String details,
-            LocalDateTime startedAt, LocalDateTime endedAt) {
+            LocalDateTime startedAt, LocalDateTime endedAt,
+            TaskRunRecord.FailureCategory category, boolean retryable, String suggestedAction) {
         if (conn == null) return -1;
         String sql = "INSERT INTO " + table +
-                " (task_id, task_name, task_type, status, reason, details, started_at, ended_at, duration_ms) " +
-                "VALUES (?,?,?,?,?,?,?,?,?)";
+                " (task_id, task_name, task_type, status, reason, details, started_at, ended_at, duration_ms," +
+                "  failure_category, retryable, suggested_action) " +
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)";
         long durationMs = java.time.Duration.between(startedAt, endedAt).toMillis();
         try (PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setString(1, taskId);
@@ -251,6 +312,9 @@ public class RunHistoryService {
             ps.setString(7, startedAt.format(TS_FMT));
             ps.setString(8, endedAt.format(TS_FMT));
             ps.setLong(9, durationMs);
+            ps.setString(10, category != null ? category.name() : null);
+            ps.setInt(11, retryable ? 1 : 0);
+            ps.setString(12, suggestedAction);
             ps.executeUpdate();
             return durationMs;
         } catch (SQLException e) {
@@ -401,6 +465,13 @@ public class RunHistoryService {
         r.setStartedAt(LocalDateTime.parse(rs.getString("started_at"), TS_FMT));
         r.setEndedAt(LocalDateTime.parse(rs.getString("ended_at"), TS_FMT));
         r.setDurationMs(rs.getLong("duration_ms"));
+        String category = rs.getString("failure_category");
+        if (category != null) {
+            try { r.setFailureCategory(TaskRunRecord.FailureCategory.valueOf(category)); }
+            catch (IllegalArgumentException ignored) { /* unknown category value from a future version — leave null */ }
+        }
+        r.setRetryable(rs.getInt("retryable") != 0);
+        r.setSuggestedAction(rs.getString("suggested_action"));
         return r;
     }
 

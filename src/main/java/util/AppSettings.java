@@ -136,6 +136,16 @@ public final class AppSettings {
     // cost memory (each thread reserves its own stack).
     public static final String KEY_MAX_CONCURRENT_TASK_THREADS = "maxConcurrentTaskThreads";
 
+    // Moved here from per-user java.util.prefs.Preferences so the Daemon —
+    // and, once it's wrapped as a Windows Service running under a service
+    // account, a process with no access to the interactive user's registry
+    // hive at all — reads the exact same value the GUI's Settings panel
+    // saved, instead of silently falling back to a default. See class
+    // javadoc: this store already propagates to any reader (GUI or daemon)
+    // within CACHE_TTL_MILLIS with no extra wiring needed.
+    public static final String KEY_WINSCP_PATH            = "winScpPath";
+    public static final String KEY_POLL_INTERVAL_SECONDS  = "pollIntervalSeconds";
+
     // Built-in fallbacks, used only if neither app-settings.json nor
     // app-config.xml has a value (keeps behavior identical to before this
     // file existed, for anyone upgrading in place).
@@ -170,6 +180,8 @@ public final class AppSettings {
         HARD_DEFAULTS.put(KEY_STALE_RUNNING_THRESHOLD_MINUTES, "30");
         HARD_DEFAULTS.put(KEY_STALE_INACTIVITY_THRESHOLD_MINUTES, "5");
         HARD_DEFAULTS.put(KEY_MAX_CONCURRENT_TASK_THREADS, "20");
+        HARD_DEFAULTS.put(KEY_WINSCP_PATH, "");
+        HARD_DEFAULTS.put(KEY_POLL_INTERVAL_SECONDS, "60");
     }
 
     // app-config.xml tag each key is seeded from on first run.
@@ -486,6 +498,8 @@ public final class AppSettings {
     /** Base folder attachments are downloaded under (each task's Attachments/&lt;LDM|PTM|Others&gt; subtree is created inside it). Empty/unset = fall back to the task's own output directory. */
     public static String getAttachmentDownloadLocation() { String v = get(KEY_ATTACHMENT_DOWNLOAD_DIR); return v == null || v.isEmpty() ? null : v; }
     public static String getLogLevel()               { return get(KEY_LOG_LEVEL); }
+    public static String getWinScpPath()             { return get(KEY_WINSCP_PATH); }
+    public static int getPollIntervalSeconds()       { return intOrDefault(KEY_POLL_INTERVAL_SECONDS); }
     /** Applies only on the JVM's NEXT start — see class javadoc. */
     public static String getJvmMinHeap()             { return get(KEY_JVM_MIN_HEAP); }
     /** Applies only on the JVM's NEXT start — see class javadoc. */

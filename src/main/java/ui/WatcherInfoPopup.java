@@ -90,7 +90,8 @@ final class WatcherInfoPopup {
         reconnectBtn.addActionListener(e -> {
             reconnectBtn.setEnabled(false);
             reconnectBtn.setText("Reconnecting...");
-            scheduler.reconnectWatch(task.getId());
+            service.CommandQueueService.enqueue(storage.getDataDir(), task.getId(),
+                    service.CommandQueueService.Action.RECONNECT_WATCH, "gui");
             // The actual reconnect (filesystem registration or SSH connect) may
             // still be in flight when reconnectWatch() returns — give it a
             // moment before re-reading status, same 2s cadence the fingerprint

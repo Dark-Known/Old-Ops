@@ -1,0 +1,78 @@
+<!--
+  WinSW (https://github.com/winsw/winsw) service definition for running
+  Daemon.java as a real Windows Service instead of the Scheduled-Task-plus-
+  hourly-restart setup in setup.ps1.
+
+  Why this replaces the Scheduled Task approach:
+    - A Scheduled Task firing "at startup and hourly as a safety net" (see
+      Daemon.java's own class javadoc) has to kill and relaunch the process
+      every hour to guarantee it's alive, using taskkill /F if a previous
+      instance is still running (setup.ps1's registration flow). A real
+      Windows Service just... stays running, and the SCM (Service Control
+      Manager) restarts it automatically on crash via the Recovery tab
+      configured below — no periodic kill-and-relaunch needed.
+    - Services can start before any user logs in and don't depend on a
+      scheduled trigger firing correctly.
+    - Service Control Manager logging integrates with Windows Event Viewer,
+      giving one more place to see "the daemon stopped" independent of
+      daemon.log itself.
+
+  Install (from an elevated PowerShell prompt, in the folder this file and
+  winsw.exe live in — rename the downloaded WinSW executable to match
+  <id> below, i.e. "daemon-service.exe"):
+
+      .\daemon-service.exe install
+      .\daemon-service.exe start
+
+  Uninstall:
+
+      .\daemon-service.exe stop
+      .\daemon-service.exe uninstall
+
+  After install, configure Recovery in services.msc (or via `sc failure`)
+  for "Restart the Service" on first/second/subsequent failures — WinSW
+  does not set this for you.
+-->
+<service>
+  <id>OpsTransferToolDaemon</id>
+  <name>Ops Transfer Tool Daemon</name>
+  <description>Headless scheduler/worker-pool/watcher process for Ops Transfer Tool. The GUI is a thin client that reads this service's status and queues commands for it — it does not schedule or execute tasks itself.</description>
+
+  <!-- Adjust to the actual installed JRE/JDK path and jar location. -->
+  <executable>java</executable>
+  <arguments>-cp "%BASE%\OpsTransferTool.jar" Daemon "C:\OpsTools\Data"</arguments>
+
+  <!--
+    Service account: LocalSystem (the default if <serviceaccount> is
+    omitted) can read/write C:\OpsTools\Data and reach the network, which
+    covers the common case. If SFTP/SSH credentials rely on a specific
+    Windows identity (e.g. domain credentials cached for a particular
+    user), configure a dedicated service account instead:
+
+      <serviceaccount>
+        <domain>YOURDOMAIN</domain>
+        <user>svc-opstool</user>
+        <password>...</password>
+        <allowservicelogon>true</allowservicelogon>
+      </serviceaccount>
+
+    Whichever account runs this, it must NOT rely on
+    java.util.prefs.Preferences (per-user registry hive) for any setting —
+    see AppSettings/app.db, which this daemon now reads WinSCP path and
+    poll interval from instead, specifically so this works under any
+    service account without per-user setup.
+  -->
+
+  <logmode>rotate</logmode>
+  <log mode="roll-by-size">
+    <sizeThreshold>10240</sizeThreshold>
+    <keepFiles>5</keepFiles>
+  </log>
+
+  <onfailure action="restart" delay="10 sec"/>
+  <onfailure action="restart" delay="30 sec"/>
+  <resetfailure>1 hour</resetfailure>
+
+  <startmode>Automatic</startmode>
+  <stoptimeout>15 sec</stoptimeout>
+</service>

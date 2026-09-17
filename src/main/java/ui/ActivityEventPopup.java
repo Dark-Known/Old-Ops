@@ -239,6 +239,14 @@ final class ActivityEventPopup {
         }
 
         if (errored) {
+            if (run != null && run.getFailureCategory() != null) {
+                sb.append('\n').append("Category: ").append(formatCategory(run.getFailureCategory()))
+                        .append(run.isRetryable() ? " (usually clears up on retry)" : " (needs a fix before retrying)")
+                        .append('\n');
+                if (run.getSuggestedAction() != null) {
+                    sb.append("Suggested: ").append(run.getSuggestedAction()).append('\n');
+                }
+            }
             sb.append('\n');
             if (task != null && task.getRetryCount() > 0) {
                 sb.append("This failure schedules a retry and marks the task RETRYING — surfaced "
@@ -248,6 +256,19 @@ final class ActivityEventPopup {
                         + "until it's re-run or edited.\n");
             }
         }
+    }
+
+    private static String formatCategory(TaskRunRecord.FailureCategory c) {
+        return switch (c) {
+            case NETWORK -> "Network";
+            case AUTH -> "Authentication";
+            case PERMISSION -> "Permission";
+            case DISK_SPACE -> "Disk space";
+            case CONFIG -> "Configuration";
+            case TIMEOUT -> "Timeout";
+            case ORPHANED -> "Orphaned (process stopped mid-run)";
+            case UNKNOWN -> "Unclassified";
+        };
     }
 
     private static Point clampToScreen(Point desired, Dimension size, Component invoker) {

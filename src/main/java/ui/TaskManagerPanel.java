@@ -1092,8 +1092,10 @@ public class TaskManagerPanel extends JPanel {
         if (ok == JOptionPane.YES_OPTION) {
             storage.deleteTask(id);
             logActivity("Task deleted", "Deleted task \"" + name + "\"");
-            try { scheduler.cancelTask(id); } catch (Exception ignored) {}
-            try { scheduler.refresh();      } catch (Exception ignored) {}
+            service.CommandQueueService.enqueue(storage.getDataDir(), id,
+                    service.CommandQueueService.Action.CANCEL, "gui");
+            service.CommandQueueService.enqueue(storage.getDataDir(), id,
+                    service.CommandQueueService.Action.REFRESH, "gui");
             taskLogs.remove(id);
             refresh();
         }
@@ -1109,7 +1111,8 @@ public class TaskManagerPanel extends JPanel {
             "Run task \"" + name + "\" immediately?",
             "Confirm Run Now", JOptionPane.YES_NO_OPTION, JOptionPane.QUESTION_MESSAGE);
         if (ok == JOptionPane.YES_OPTION) {
-            scheduler.runNow(id);
+            service.CommandQueueService.enqueue(storage.getDataDir(), id,
+                    service.CommandQueueService.Action.RUN_NOW, "gui");
             JOptionPane.showMessageDialog(this,
                 "Task \"" + name + "\" queued for immediate execution.");
             refresh();
@@ -1124,9 +1127,12 @@ public class TaskManagerPanel extends JPanel {
             t.setStatus(t.getStatus() == TaskStatus.DISABLED
                 ? TaskStatus.PENDING : TaskStatus.DISABLED);
             storage.saveTask(t);
-            try { if (t.getStatus() == TaskStatus.DISABLED) scheduler.cancelTask(t.getId()); }
-            catch (Exception ignored) {}
-            try { scheduler.refresh(); } catch (Exception ignored) {}
+            if (t.getStatus() == TaskStatus.DISABLED) {
+                service.CommandQueueService.enqueue(storage.getDataDir(), t.getId(),
+                        service.CommandQueueService.Action.CANCEL, "gui");
+            }
+            service.CommandQueueService.enqueue(storage.getDataDir(), t.getId(),
+                    service.CommandQueueService.Action.REFRESH, "gui");
             refresh();
         });
     }
@@ -1148,8 +1154,12 @@ public class TaskManagerPanel extends JPanel {
 
         task.setStatus(TaskStatus.PENDING);
         storage.saveTask(task);
-        try { scheduler.cancelTask(task.getId()); scheduler.refresh(); } catch (Exception ignored) {}
-        scheduler.runNow(task.getId());
+        service.CommandQueueService.enqueue(storage.getDataDir(), task.getId(),
+                service.CommandQueueService.Action.CANCEL, "gui");
+        service.CommandQueueService.enqueue(storage.getDataDir(), task.getId(),
+                service.CommandQueueService.Action.REFRESH, "gui");
+        service.CommandQueueService.enqueue(storage.getDataDir(), task.getId(),
+                service.CommandQueueService.Action.RUN_NOW, "gui");
         JOptionPane.showMessageDialog(this, "Task \"" + name + "\" has been restarted.");
         refresh();
     }

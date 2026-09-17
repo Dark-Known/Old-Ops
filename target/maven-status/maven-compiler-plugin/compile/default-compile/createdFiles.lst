@@ -7,11 +7,13 @@ ui\QueueMonitorView$RunSource.class
 ui\TaskManagerPanel$3.class
 ui\TestConnectionDialog.class
 export\PdfTableWriter.class
+model\TaskRunRecord$FailureCategory.class
 ui\StatisticsPanel.class
 ui\QueueMonitorView$1.class
 ui\SearchCriteriaPanel.class
 ui\SettingsPanel$2.class
 model\RemoteFileMetadata.class
+ui\HealthBanner.class
 ui\VectorIcons$10.class
 util\MailRoutingRule.class
 ui\EventMonitorPanel.class
@@ -31,6 +33,7 @@ ui\GradientButton.class
 service\TaskSchedulerService$WatchMode.class
 ui\TaskDialog$5.class
 ui\DirectoryBrowserDialog$6.class
+service\CommandQueueService.class
 model\ScheduledTask$ScheduleType.class
 ui\QueueMonitorView$2.class
 ui\DirectoryBrowserDialog$Item.class
@@ -43,6 +46,7 @@ service\watch\RemotePushWatcher$ListenerHandle.class
 ui\TestConnectionDialog$1.class
 ui\VectorIcons$5.class
 ui\DirectoryBrowserDialog$1.class
+service\CommandQueueService$Action.class
 ui\DirectoryBrowserDialog$GoArrowIcon.class
 ui\SettingsRow.class
 export\XlsxWriter.class
@@ -66,6 +70,7 @@ util\MailFetchMode.class
 ui\SettingsPanel$3.class
 service\XmlStorageService.class
 ui\components\IconTile.class
+ui\HealthBanner$1.class
 ui\SettingsPanel$4.class
 ui\VectorIcons$7.class
 service\SftpRemoteFileMetadataService.class
@@ -154,6 +159,7 @@ service\SftpBrowseService.class
 service\TaskSchedulerService.class
 ui\DirectoryBrowserDialog$HomeIcon.class
 util\ImapSearchCriteria.class
+service\FailureClassifier.class
 service\queue\SchedulerStatusExporter.class
 ui\CredentialManagerPanel$CredentialRowRenderer.class
 service\queue\SchedulerStatusSnapshot$FireEntry.class
@@ -164,6 +170,7 @@ ui\VectorIcons$2.class
 model\ScheduledTask.class
 ui\NotificationPanel$3.class
 ui\TaskDialog$3.class
+service\CommandQueueService$Command.class
 ui\EventMonitorWindow$1.class
 ui\RunHistoryPanel$5.class
 service\TransferService.class
@@ -175,6 +182,7 @@ ui\TaskManagerPanel$2.class
 model\Credential.class
 service\ConnectionTestService.class
 ui\Theme$2.class
+Daemon$2.class
 service\RemoteFileMetadataService.class
 service\TransferService$BackupCandidate.class
 ui\WatcherInfoPopup.class
@@ -182,6 +190,7 @@ ui\TaskDialog$1.class
 util\ImapSearchCriteria$DateCriteria.class
 ui\RunHistoryPanel$3.class
 ui\RunLogSummarizer$FileTransferSummary.class
+service\CommandQueueService$Status.class
 service\queue\SchedulerStatusSnapshot$ActivityEntry.class
 ui\GradientToggleButton.class
 ui\EventMonitorWindow.class
@@ -195,6 +204,7 @@ ui\Theme$1.class
 ui\TaskDialog.class
 ui\VectorIcons$1.class
 util\ImapSearchCriteria$Builder.class
+ui\ActivityEventPopup$2.class
 ui\RunHistoryPanel$2.class
 ui\EventMonitorWindow$2.class
 ui\DirectoryBrowserDialog$Provider.class

@@ -318,8 +318,13 @@ public class NotificationPanel extends JPanel {
 
         task.setStatus(ScheduledTask.TaskStatus.PENDING);
         storage.saveTask(task);
-        try { scheduler.cancelTask(task.getId()); } catch (Exception ignored) {}
-        scheduler.runNow(task.getId());
+        // Ask the daemon/service to actually do this — this window never
+        // runs its own scheduler/worker pool (see MainWindow's thin-client
+        // migration and service.CommandQueueService).
+        service.CommandQueueService.enqueue(storage.getDataDir(), task.getId(),
+                service.CommandQueueService.Action.CANCEL, "gui");
+        service.CommandQueueService.enqueue(storage.getDataDir(), task.getId(),
+                service.CommandQueueService.Action.RUN_NOW, "gui");
         refresh();
     }
 
@@ -333,8 +338,10 @@ public class NotificationPanel extends JPanel {
                 task.setStatus(ScheduledTask.TaskStatus.PENDING);
                 task.setLastStartedAt(null);
                 storage.saveTask(task);
-                try { scheduler.cancelTask(task.getId()); } catch (Exception ignored) {}
-                scheduler.runNow(task.getId());
+                service.CommandQueueService.enqueue(storage.getDataDir(), task.getId(),
+                        service.CommandQueueService.Action.CANCEL, "gui");
+                service.CommandQueueService.enqueue(storage.getDataDir(), task.getId(),
+                        service.CommandQueueService.Action.RUN_NOW, "gui");
                 count++;
             }
         }

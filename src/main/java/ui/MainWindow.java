@@ -81,15 +81,14 @@ public class MainWindow extends JFrame {
 
         setIconImage(buildAppIcon());
 
+        // This window is a thin client: it never calls scheduler.start().
+        // The local TaskSchedulerService instance below is kept only as a
+        // read-only facade (run history, task logs, storage access) for
+        // panels built before this file's thin-client migration — its
+        // executor/poll-loop are simply never engaged. All scheduling and
+        // execution happens in the Daemon/Windows Service; see
+        // service.CommandQueueService for how this window asks it to act.
         scheduler.enableStatusExport(dataDir, "gui");
-        // Daemon is primary: only take over scheduling ourselves if it isn't
-        // already alive and exporting a fresh status snapshot right now.
-        // Decided before buildUI() so the badge it creates already reflects
-        // the right state on first paint instead of flashing "checking...".
-        if (!service.queue.SchedulerStatusSnapshot.isAlive(daemonStatusFile,
-                service.queue.SchedulerStatusSnapshot.DEFAULT_STALE_MS)) {
-            scheduler.start();
-        }
 
         buildUI();
 
@@ -489,34 +488,36 @@ public class MainWindow extends JFrame {
     }
 
     /**
-     * Updates the single scheduler badge to reflect whichever process is
-     * actually driving scheduling right now, and promotes the GUI scheduler
-     * from standby to active if the Daemon has gone offline since the last
-     * check. Called on startup and on a periodic timer (see buildUI()).
+     * Updates the single scheduler badge to reflect the daemon/service's
+     * status. This window is a thin client — it never runs the scheduler
+     * itself, in-process or as a fallback — so there are exactly two honest
+     * states to show: the service is up, or it isn't.
+     *
+     * Previously this method promoted the GUI's own (unstarted-by-default)
+     * {@link TaskSchedulerService} to active whenever the Daemon looked
+     * offline, so scheduling wouldn't silently stall. That made sense when
+     * the Daemon was a Scheduled Task that could legitimately be between
+     * hourly restarts; it does not make sense once the Daemon is a real
+     * Windows Service with its own crash-recovery — at that point "the
+     * service is down" is itself the actionable signal an operator needs to
+     * see and fix (see the service's Recovery tab / SCM), not something a
+     * second, GUI-hosted scheduler should quietly paper over. Called on
+     * startup and on a periodic timer (see buildUI()).
      */
     private void refreshSchedulerBadge() {
         if (schedulerBadge == null) return;
 
-        if (scheduler.isStarted()) {
-            restyleChip(schedulerBadge, "Scheduler: GUI Active", new Color(0x9CB380));
-            schedulerBadge.setToolTipText("This window is running the task scheduler.");
-            return;
-        }
-
         boolean daemonAlive = service.queue.SchedulerStatusSnapshot.isAlive(
                 daemonStatusFile, service.queue.SchedulerStatusSnapshot.DEFAULT_STALE_MS);
         if (daemonAlive) {
-            restyleChip(schedulerBadge, "Scheduler: Daemon Active", new Color(0x7FA7C9));
-            schedulerBadge.setToolTipText("The background Daemon is handling scheduling; this window is on standby.");
-            return;
+            restyleChip(schedulerBadge, "Scheduler: Service Active", new Color(0x7FA7C9));
+            schedulerBadge.setToolTipText("The background service is handling scheduling.");
+        } else {
+            restyleChip(schedulerBadge, "Scheduler: Service Offline", new Color(0xC97F7F));
+            schedulerBadge.setToolTipText(
+                "The background service isn't responding — scheduled tasks are not running right now. "
+                + "Check the \"Monitoring-Tool-Daemon\" Windows Service or its Recovery settings.");
         }
-
-        // Neither is alive — the Daemon must have stopped since we last
-        // checked. Take over so tasks keep firing instead of silently
-        // stalling until the app is restarted.
-        scheduler.start();
-        restyleChip(schedulerBadge, "Scheduler: GUI Active", new Color(0x9CB380));
-        schedulerBadge.setToolTipText("Daemon not detected — this window took over scheduling.");
     }
 
     private static Color withAlpha(Color c, int alpha) {

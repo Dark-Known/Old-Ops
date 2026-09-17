@@ -460,171 +460,47 @@ $daemonEnabled = Get-ConfigValue $xmlConfig "/application/daemon/enabled" "true"
 if ($daemonEnabled -ne "true") {
     SKIP "Daemon registration disabled in configuration"
 } else {
+    # Daemon registration now delegates entirely to
+    # packaging/install-service.ps1, which registers the daemon as a real
+    # Windows Service (via WinSW) instead of the Scheduled Task this
+    # block used to create directly. install-service.ps1 also removes any
+    # existing Scheduled Task registration from a previous setup.ps1 run
+    # before installing the Service, so re-running this script on an
+    # older install migrates it cleanly rather than leaving two things
+    # trying to run the same daemon. See packaging/README.md for details
+    # and for the manual rollback steps if you ever need to go back to
+    # the Scheduled Task.
     $dataDir = Get-ConfigValue $xmlConfig "/application/installation/dataDir" "C:\OpsTools\Data"
-    if (-not (Test-Path $dataDir)) {
-        New-Item -ItemType Directory -Path $dataDir | Out-Null
-        Log "Created data directory: $dataDir"
-    }
-
     $taskName = Get-ConfigValue $xmlConfig "/application/daemon/taskName" "Monitoring-Tool-Daemon"
-    $startupDelayMinutes = Get-ConfigValue $xmlConfig "/application/daemon/startupTrigger/delayMinutes" "1"
-    $periodicIntervalMinutes = Get-ConfigValue $xmlConfig "/application/daemon/periodicTrigger/intervalMinutes" "60"
-    $restartCount = Get-ConfigValue $xmlConfig "/application/daemon/recovery/restartCount" "3"
-    $restartIntervalMinutes = Get-ConfigValue $xmlConfig "/application/daemon/recovery/restartIntervalMinutes" "5"
+    $installServiceScript = Join-Path $ScriptRoot "packaging\install-service.ps1"
+    $winSwExe = Join-Path $InstallDir "daemon-service.exe"
 
-    try {
-        # Stop any already-running daemon process before touching the task
-        # registration. Unregister-ScheduledTask below only removes the task
-        # definition - it does NOT terminate a process the task already
-        # spawned, so without this, every redeploy orphans the previous
-        # daemon process while starting a new one, and they accumulate
-        # across redeploys. Matched by full command line (jar path + "Daemon"
-        # argument) rather than process name alone, so this never touches
-        # unrelated java.exe processes that might be running on the machine
-        # for other reasons. Checks both "java.exe" (older installs, or if
-        # the renamed-copy step below ever falls back to it) and
-        # "MonitoringToolDaemon.exe" (the renamed copy used going forward -
-        # see the daemon launcher section below).
+    if (-not (Test-Path $installServiceScript)) {
+        Log "WARNING: packaging\install-service.ps1 not found next to this script - skipping daemon registration."
+        Log "Register it manually later, or re-run setup with packaging/ present alongside setup.ps1."
+    } elseif (-not (Test-Path $winSwExe)) {
+        # Same "optional local prerequisite" convention as rcedit.exe above:
+        # this isn't fatal, since offline installs may not have fetched
+        # WinSW yet - just tell the operator exactly what to do next.
+        Log "NOTE: daemon-service.exe (WinSW) not found in $InstallDir - skipping daemon registration."
+        Log "Download WinSW-x64.exe from https://github.com/winsw/winsw/releases,"
+        Log "rename it to 'daemon-service.exe', place it in $InstallDir, and re-run setup"
+        Log "(or run packaging\install-service.ps1 directly) to register the daemon."
+    } else {
         try {
-            $daemonProcs = Get-CimInstance Win32_Process -Filter "Name = 'java.exe' OR Name = 'MonitoringToolDaemon.exe'" -ErrorAction SilentlyContinue |
-                Where-Object { $_.CommandLine -and $_.CommandLine -like "*$destJar*" -and $_.CommandLine -like "*Daemon*" }
-            foreach ($proc in $daemonProcs) {
-                Log "Stopping existing daemon process (PID $($proc.ProcessId))"
-                Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
-            }
-            if ($daemonProcs) { Start-Sleep -Milliseconds 500 }
-        } catch {
-            Log "WARNING: could not enumerate/stop existing daemon processes: $($_.Exception.Message)"
-        }
-
-        $existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-        if ($existingTask) {
-            Log "Removing old scheduled task: $taskName"
-            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-            Start-Sleep -Milliseconds 500
-        }
-
-        Log "Registering background daemon task: $taskName"
-        $javaExe = Join-Path $javaBin "java.exe"
-        if (-not (Test-Path $javaExe)) {
-            Log "WARNING: java.exe not found at expected path: $javaExe"
-            Log "Falling back to PATH search for java.exe..."
-            $javaExe = (Get-Command java.exe -ErrorAction SilentlyContinue).Source
-            if (-not $javaExe) {
-                FAIL "java.exe not found in system PATH. Please ensure Java JDK is properly installed."
-            }
-            Log "Found java.exe at: $javaExe"
-        }
-
-        # Task Manager's "Name" column for java.exe is read from the
-        # FileDescription field in the exe's own embedded version resource
-        # ("OpenJDK Platform Binary" for every stock OpenJDK build) - it is
-        # NOT derived from the command line or filename, so simply renaming
-        # a copy of java.exe would still show "OpenJDK Platform Binary"
-        # unless that embedded metadata is actually patched.
-        #
-        # The copy must live in the SAME bin directory as the real java.exe:
-        # the launcher locates jvm.dll and the rest of the JDK via a path
-        # relative to its own location, so copying it elsewhere (e.g. into
-        # $InstallDir) would break it at startup.
-        $daemonExeName = "MonitoringToolDaemon.exe"
-        $daemonExe = Join-Path $javaBin $daemonExeName
-        try {
-            Copy-Item -Path $javaExe -Destination $daemonExe -Force
-            Log "Created daemon launcher copy: $daemonExe"
-
-            # rcedit (https://github.com/electron/rcedit) is the standard
-            # tool for patching a Windows exe's version resource. It's an
-            # OPTIONAL local prerequisite (same offline-only convention as
-            # the rest of this installer) - if it isn't present, the copy is
-            # still used (so the kill-before-redeploy logic above has a
-            # single, precisely-matchable target), it just keeps showing
-            # "OpenJDK Platform Binary" in Task Manager until rcedit.exe is
-            # dropped alongside this script and setup is re-run.
-            $rceditExe = Join-Path $ScriptRoot "rcedit.exe"
-            if (Test-Path $rceditExe) {
-                & $rceditExe $daemonExe --set-version-string "FileDescription" "Monitoring Tool Daemon"
-                & $rceditExe $daemonExe --set-version-string "ProductName" "Monitoring Tool Daemon"
-                & $rceditExe $daemonExe --set-version-string "OriginalFilename" $daemonExeName
-                & $rceditExe $daemonExe --set-version-string "InternalName" "MonitoringToolDaemon"
-                Log "Patched daemon launcher version info via rcedit - Task Manager will show 'Monitoring Tool Daemon'"
+            Log "Registering daemon as a Windows Service via install-service.ps1..."
+            & $installServiceScript -InstallDir $InstallDir -DataDir $dataDir `
+                -WinSwPath $winSwExe -JarPath $destJar -ExistingScheduledTaskName $taskName
+            if ($LASTEXITCODE -ne 0 -and $null -ne $LASTEXITCODE) {
+                Log "WARNING: install-service.ps1 exited with code $LASTEXITCODE - check the output above."
             } else {
-                Log "NOTE: rcedit.exe not found next to this script - daemon process will still show as 'OpenJDK Platform Binary' in Task Manager. Download it from https://github.com/electron/rcedit/releases, place rcedit.exe alongside setup.ps1, and re-run setup to fix this."
+                OK "Daemon registered as Windows Service (see output above for status)."
             }
         } catch {
-            Log "WARNING: could not create/patch daemon launcher copy ($($_.Exception.Message)) - falling back to java.exe directly."
-            $daemonExe = $javaExe
+            $errorMessage = if ($_.Exception) { $_.Exception.Message } else { $_.ToString() }
+            Log "WARNING: Could not register daemon service: $errorMessage"
+            Log "You can register manually later via: packaging\install-service.ps1 -InstallDir `"$InstallDir`""
         }
-
-        Log "Daemon command: $daemonExe -cp `"$destJar`" Daemon `"$dataDir`""
-
-        $daemonArgument = '-cp "' + $destJar + '" Daemon "' + $dataDir + '"'
-        $taskActionParams = @{
-            Execute          = $daemonExe
-            Argument         = $daemonArgument
-            WorkingDirectory = $InstallDir
-        }
-        $taskAction = New-ScheduledTaskAction @taskActionParams
-
-        $trigStart = New-ScheduledTaskTrigger -AtStartup
-        $trigStart.Delay = "PT${startupDelayMinutes}M"
-
-        $trigHourly = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes $periodicIntervalMinutes)
-
-        $settingsParams = @{
-            ExecutionTimeLimit        = [TimeSpan]::Zero
-            RestartCount               = $restartCount
-            RestartInterval             = (New-TimeSpan -Minutes $restartIntervalMinutes)
-            MultipleInstances          = "IgnoreNew"
-            AllowStartIfOnBatteries    = $true
-            DontStopIfGoingOnBatteries = $true
-            StartWhenAvailable         = $true
-        }
-        $settings = New-ScheduledTaskSettingsSet @settingsParams
-
-        $registerParams = @{
-            TaskName = $taskName
-            Action   = $taskAction
-            Trigger  = @($trigStart, $trigHourly)
-            Settings = $settings
-            RunLevel = "Highest"
-            User     = "SYSTEM"
-            Force    = $true
-        }
-        Register-ScheduledTask @registerParams | Out-Null
-
-        OK "Daemon registered as Windows Scheduled Task: $taskName"
-        Log "Trigger 1: At startup ($startupDelayMinutes minute delay)"
-        Log "Trigger 2: Every $periodicIntervalMinutes minutes (redundancy)"
-        Log "Account: SYSTEM (no user login required)"
-        Log "Working directory: $InstallDir"
-
-        Start-Sleep -Milliseconds 1000
-        $registeredTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-        if ($registeredTask) {
-            OK "Verified scheduled task exists: $taskName"
-            Log "Task state: $($registeredTask.State)"
-        } else {
-            Log "WARNING: Scheduled task was not found immediately after registration"
-            Log "This might be normal; task should appear shortly"
-        }
-
-        Log "Starting daemon task now..."
-        Start-Sleep -Milliseconds 1000
-        try {
-            Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
-            OK "Daemon task started from Task Scheduler"
-            Log "Daemon should be running now. Check daemon.log in data directory for details."
-        } catch {
-            Log "WARNING: Could not start daemon immediately (it will run at next trigger)"
-        }
-    } catch {
-        $errorMessage = if ($_.Exception) { $_.Exception.Message } else { $_.ToString() }
-        $errorStack   = if ($_.Exception) { $_.Exception.StackTrace } else { $_ | Out-String }
-        Log "WARNING: Could not register daemon: $errorMessage"
-        Log "WARNING: Registration exception details: $errorStack"
-        Log "You can register manually later via Settings tab or run:"
-        Log "  powershell -Command `".\setup.ps1`" (re-run this script)"
     }
 }
 

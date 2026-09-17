@@ -45,7 +45,8 @@ public final class SchedulerStatusExporter {
     public void export(int poolSize, int activeWorkers, List<TaskDueEvent> pending,
                         List<TaskWorkerPool.ActivityEntry> activity,
                         List<SchedulerStatusSnapshot.WatchEntry> watchEntries,
-                        List<SchedulerStatusSnapshot.FireEntry> fireEntries) {
+                        List<SchedulerStatusSnapshot.FireEntry> fireEntries,
+                        List<String> runningTaskIds) {
         try {
             StringBuilder sb = new StringBuilder(512);
             sb.append("PROC|").append(SchedulerStatusSnapshot.escape(processLabel)).append('|')
@@ -75,6 +76,11 @@ public final class SchedulerStatusExporter {
             for (SchedulerStatusSnapshot.FireEntry f : fireEntries) {
                 sb.append("F|").append(SchedulerStatusSnapshot.escape(f.taskId())).append('|')
                         .append(toEpochMillis(f.firedAt())).append('\n');
+            }
+            if (runningTaskIds != null) {
+                for (String taskId : runningTaskIds) {
+                    sb.append("R|").append(SchedulerStatusSnapshot.escape(taskId)).append('\n');
+                }
             }
 
             Path dir = targetFile.toAbsolutePath().getParent();

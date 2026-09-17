@@ -19,6 +19,12 @@ public class SettingsPanel extends JPanel {
     private static final String PREF_WINSCP   = "winscp_path";
     private static final String PREF_POLLSEC  = "poll_interval_seconds";
     private static final String TASK_NAME     = "Monitoring-Tool-Daemon";
+    // Windows Service id, must match <id> in packaging/daemon-service.xml —
+    // this is what actually runs the daemon now (see setup.ps1 /
+    // packaging/install-service.ps1). TASK_NAME above is kept only for the
+    // startup-fallback .cmd filename and is otherwise unused now that
+    // Scheduled Task registration has been removed from this panel.
+    private static final String SERVICE_NAME  = "OpsTransferToolDaemon";
 
     private final TransferService transferService;
     private final service.TaskSchedulerService scheduler; // may be null if not wired by caller
@@ -127,9 +133,9 @@ public class SettingsPanel extends JPanel {
         lblDaemonStatus = new JLabel("Checking...");
         lblDaemonStatus.setFont(lblDaemonStatus.getFont().deriveFont(Font.BOLD));
 
-        JButton btnRegister     = new GradientButton("Register Daemon (Admin required)");
-        JButton btnRemove       = new GradientButton("Remove Daemon");
-        JButton btnRunNow       = new JButton("Run Daemon Now");
+        JButton btnRegister     = new GradientButton("Install Service (Admin required)");
+        JButton btnRemove       = new GradientButton("Uninstall Service");
+        JButton btnRunNow       = new JButton("Start Service");
         JButton btnViewLog      = new JButton("View Daemon Log");
         JButton btnRefreshStatus = new JButton("Refresh Status");
 
@@ -171,7 +177,7 @@ public class SettingsPanel extends JPanel {
         g.gridy = 2;
         daemonPanel.add(btnRow2, g);
 
-        outer.add(card("Background Scheduler (runs without GUI)", daemonPanel));
+        outer.add(card("Daemon (Windows Service — runs without GUI)", daemonPanel));
         outer.add(Box.createVerticalStrut(12));
 
         // App Info section
@@ -535,123 +541,118 @@ public class SettingsPanel extends JPanel {
 
     // ── Daemon management ────────────────────────────────────────────────────
 
+    /**
+     * Installs the daemon as a Windows Service by invoking
+     * daemon-service.exe (WinSW) / install-service.ps1 alongside the
+     * running jar, elevated. Replaces the old registration logic, which
+     * built its OWN Register-ScheduledTask PowerShell script independent
+     * of setup.ps1 — the daemon is now a Windows Service (see
+     * packaging/daemon-service.xml, packaging/install-service.ps1), not a
+     * Scheduled Task, and this panel's old refreshDaemonStatus() was
+     * checking for a Scheduled Task via schtasks that setup.ps1 no longer
+     * creates at all. That mismatch is exactly why "Not Installed" kept
+     * showing here even with the daemon running fine as a service.
+     */
     private void registerDaemon() {
         String jarPath = getJarPath();
-        String javaExe = getJavaExe();
-        // FIX: previously hardcoded %USERPROFILE%\.opstool, which is NOT where
-        // the rest of the app (MainWindow, AppSettings, tasks.xml) actually
-        // lives — that's app-config.xml's <dataDir>. Since the scheduled task
-        // runs as SYSTEM, %USERPROFILE% there resolves to SYSTEM's own profile
-        // too, so the daemon was silently reading/writing an entirely
-        // different, invisible folder. Use the same real dataDir everywhere.
-        String dataDir = resolveActualDataDir();
-
         if (jarPath == null) {
-            showError("Cannot locate OpsTransferTool.jar.\n"
+            showError("Cannot locate the daemon jar.\n"
                 + "Please run this from the installed location (C:\\OpsTools).");
             return;
         }
+        File installDir = new File(jarPath).getParentFile();
+        File winswExe = new File(installDir, "daemon-service.exe");
+        File installScript = new File(installDir, "install-service.ps1");
+        if (!installScript.exists())
+            installScript = new File(installDir, "packaging" + File.separator + "install-service.ps1");
 
-        String psScript = String.format(
-            "$action = New-ScheduledTaskAction -Execute '%s' -Argument '-cp \"%s\" com.opstool.Daemon \"%s\"'\n" +
-            "$trigStart = New-ScheduledTaskTrigger -AtStartup\n" +
-            "$trigStart.Delay = 'PT1M'\n" +
-            "$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 5) -MultipleInstances IgnoreNew\n" +
-            "Register-ScheduledTask -TaskName '%s' -Action $action -Trigger $trigStart -Settings $settings -RunLevel Highest -User 'SYSTEM' -Force | Out-Null\n" +
-            "Write-Host 'Daemon registered successfully'",
-            javaExe.replace("\\", "\\\\"),
-            jarPath.replace("\\", "\\\\"),
-            dataDir.replace("\\", "\\\\"),
-            TASK_NAME);
-
-        // FIX: this used to write psScript to a temp .ps1 file, then launch
-        // it elevated via a hand-built "Start-Process powershell -ArgumentList
-        // '-Command', 'Unblock-File -Path \"...\"; & \"...\"' -Verb RunAs"
-        // string, escaping the embedded double quotes with backticks. That
-        // escaping doesn't work: backtick is only an escape character inside
-        // a PowerShell *double*-quoted string, and the whole thing here was
-        // single-quoted — so every `\"` came out as a literal backtick
-        // followed by a literal quote instead of collapsing to one quote,
-        // corrupting the path on both sides of the semicolon and typically
-        // making Unblock-File (and then the `& "..."` invocation) fail
-        // silently, meaning the actual Register-ScheduledTask logic never
-        // ran at all. runElevatedPowerShell() below sidesteps every layer of
-        // quoting by passing the script as base64 via -EncodedCommand — see
-        // its own doc comment — and also means no temp file or
-        // Unblock-File/execution-policy dance is needed in the first place.
-        try {
-            int rc = runElevatedPowerShell(psScript, "Register daemon");
-
-            // Give task scheduler a moment to process
-            Thread.sleep(2000);
-
-            // Verify registration by checking if task exists
-            ProcessBuilder checkPb = new ProcessBuilder(
-                "powershell.exe",
-                "-NonInteractive",
-                "-NoProfile",
-                "-Command",
-                "Get-ScheduledTask -TaskName '" + TASK_NAME + "' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty TaskName");
-            Process checkProc = checkPb.start();
-            BufferedReader checkBr = new BufferedReader(new InputStreamReader(checkProc.getInputStream()));
-            String taskStatus = checkBr.readLine();
-            checkProc.waitFor();
-
-            if (taskStatus != null && taskStatus.contains(TASK_NAME)) {
-                showInfo("Daemon registered successfully!\n\n"
-                    + "Scheduled task: " + TASK_NAME + "\n"
-                    + "Trigger: At system startup (1-minute delay)\n"
-                    + "Account: SYSTEM\n\n"
-                    + "Your scheduled tasks will now run automatically.");
-            } else {
-                showError("Daemon registration may have failed (elevated process exit code " + rc + ").\n"
-                    + "Verify manually in Task Scheduler:\n"
-                    + "  Win+R > taskschd.msc\n"
-                    + "  Look for '" + TASK_NAME + "'\n\n"
-                    + "Make sure you clicked Yes on the UAC prompt.");
-            }
-        } catch (Exception e) {
-            showError("Failed to register daemon: " + e.getMessage());
+        if (!winswExe.exists()) {
+            showError("daemon-service.exe (WinSW) not found in " + installDir + ".\n\n"
+                + "Download WinSW-x64.exe from https://github.com/winsw/winsw/releases,\n"
+                + "rename it to 'daemon-service.exe', and place it in:\n" + installDir + "\n\n"
+                + "Then click Install Service again.");
+            return;
+        }
+        if (!installScript.exists()) {
+            showError("install-service.ps1 not found next to the daemon jar.\n"
+                + "Re-run setup.ps1, or place packaging\\install-service.ps1 in:\n" + installDir);
+            return;
         }
 
+        // FIX: previously hardcoded %USERPROFILE%\.opstool, which is NOT
+        // where the rest of the app (MainWindow, AppSettings, tasks.xml)
+        // actually lives — that's app-config.xml's <dataDir>. Use the same
+        // real dataDir everywhere.
+        String dataDir = resolveActualDataDir();
+        String script = "& \"" + installScript.getAbsolutePath() + "\" "
+            + "-InstallDir \"" + installDir.getAbsolutePath() + "\" "
+            + "-DataDir \"" + dataDir + "\" "
+            + "-WinSwPath \"" + winswExe.getAbsolutePath() + "\" "
+            + "-JarPath \"" + jarPath + "\"";
+
+        int rc = runElevatedPowerShell(script, "Install daemon service");
+        try { Thread.sleep(1500); } catch (InterruptedException ignored) {}
+
+        if (serviceExists()) {
+            showInfo("Daemon service installed and started.\n\n"
+                + "Service name: " + SERVICE_NAME + "\n\n"
+                + "It now runs continuously in the background, independent of this window,\n"
+                + "and restarts automatically if it crashes (see the service's Recovery tab\n"
+                + "in services.msc).");
+        } else {
+            showError("Service installation may have failed (elevated process exit code " + rc + ").\n"
+                + "Check services.msc for '" + SERVICE_NAME + "', or re-run install-service.ps1 manually.\n"
+                + "Make sure you clicked Yes on the UAC prompt.");
+        }
         refreshDaemonStatus();
     }
 
     private void removeDaemon() {
         int choice = JOptionPane.showConfirmDialog(this,
-            "Remove the background daemon?\n"
-            + "Scheduled tasks will only run while the GUI is open.",
-            "Confirm Remove", JOptionPane.YES_NO_OPTION);
+            "Uninstall the daemon service?\n"
+            + "Scheduled tasks will only run while this window is open.",
+            "Confirm Uninstall", JOptionPane.YES_NO_OPTION);
         if (choice != JOptionPane.YES_OPTION) return;
 
-        int rc = runElevatedPowerShell(
-            "schtasks /Delete /TN \"" + TASK_NAME + "\" /F",
-            "Remove daemon");
-        if (rc == 0)
-            showInfo("Daemon removed.\nScheduled tasks will only run while the GUI is open.");
+        String jarPath = getJarPath();
+        File installDir = jarPath != null ? new File(jarPath).getParentFile() : new File("C:\\OpsTools");
+        File winswExe = new File(installDir, "daemon-service.exe");
+        if (!winswExe.exists()) {
+            showError("daemon-service.exe not found in " + installDir + " — cannot uninstall the service from here.\n"
+                + "Remove it manually via services.msc, or run:\n"
+                + "  sc.exe delete " + SERVICE_NAME);
+            return;
+        }
+
+        String script = "& \"" + winswExe.getAbsolutePath() + "\" stop; "
+            + "& \"" + winswExe.getAbsolutePath() + "\" uninstall";
+        int rc = runElevatedPowerShell(script, "Uninstall daemon service");
+        if (rc == 0 && !serviceExists())
+            showInfo("Daemon service uninstalled.\nScheduled tasks will only run while this window is open.");
         else
-            showError("Removal failed (exit code " + rc + ").\n"
-                + "You can also remove it manually via Task Scheduler:\n"
-                + "Task Scheduler > Task Scheduler Library > " + TASK_NAME);
+            showError("Uninstall may have failed (exit code " + rc + ").\n"
+                + "You can also remove it manually:\n"
+                + "  services.msc \u2192 " + SERVICE_NAME + ", or: sc.exe delete " + SERVICE_NAME);
         refreshDaemonStatus();
     }
 
     private void runDaemonNow() {
+        // With the old Scheduled Task this forced an immediate trigger
+        // ("schtasks /Run"). A Windows Service isn't triggered periodically
+        // — it just runs continuously once installed — so the equivalent
+        // action here is simply making sure it's started if it was stopped.
         try {
-            int rc = runElevatedPowerShell("schtasks /Run /TN \"" + TASK_NAME + "\"", "Run Daemon Now");
-
+            int rc = runElevatedPowerShell("Start-Service -Name '" + SERVICE_NAME + "'", "Start daemon service");
             if (rc == 0) {
-                showInfo("Daemon triggered successfully!\n\n"
-                    + "It is now running and will check all scheduled tasks\n"
-                    + "for execution. Check the daemon log for details.");
+                showInfo("Daemon service started.\nCheck the daemon log for details.");
             } else {
-                showError("Failed to trigger daemon (exit code " + rc + ").\n"
-                    + "Make sure the daemon is registered first.");
+                showError("Failed to start the service (exit code " + rc + ").\n"
+                    + "Make sure it's installed first (Install Service button above).");
             }
             Thread.sleep(500);
             refreshDaemonStatus();
         } catch (Exception e) {
-            showError("Error triggering daemon: " + e.getMessage());
+            showError("Error starting daemon service: " + e.getMessage());
         }
     }
 
@@ -660,16 +661,8 @@ public class SettingsPanel extends JPanel {
      * for it to finish. The script reaches the elevated process via
      * {@code -EncodedCommand} — a base64 blob of its UTF-16LE bytes —
      * instead of as literal text threaded through several layers of shell
-     * quoting (this class's previous {@code runElevated(String)} built a
-     * "Start-Process cmd -ArgumentList '/c &lt;command&gt;' -Verb RunAs"
-     * string and tried to escape embedded double quotes with backticks,
-     * which doesn't work inside a single-quoted PowerShell string — see
-     * {@link #registerDaemon()}'s doc comment for the full explanation).
-     * Base64 contains none of {@code ' " \ } or whitespace, so there is
-     * nothing left for any layer to misinterpret — this is also why
-     * {@code schtasks /TN "Monitoring-Tool-Daemon"}-style commands (which
-     * contain a literal, load-bearing pair of double quotes) now work
-     * reliably where they didn't before.
+     * quoting. Base64 contains none of {@code ' " \} or whitespace, so
+     * there is nothing left for any layer to misinterpret.
      *
      * @return the elevated process's exit code, or -1 if it couldn't even be launched
      */
@@ -692,58 +685,52 @@ public class SettingsPanel extends JPanel {
         }
     }
 
+    /**
+     * Queries the Windows Service Control Manager for SERVICE_NAME's
+     * current status (e.g. "Running", "Stopped") via Get-Service. This
+     * needs no elevation, unlike install/uninstall/start.
+     *
+     * @return the service's Status string, or null if it isn't installed at all
+     */
+    private String queryServiceStatus() {
+        try {
+            Process p = new ProcessBuilder(
+                "powershell.exe", "-NonInteractive", "-NoProfile", "-Command",
+                "Get-Service -Name '" + SERVICE_NAME + "' -ErrorAction SilentlyContinue "
+                + "| Select-Object -ExpandProperty Status")
+                .redirectErrorStream(true)
+                .start();
+            String line;
+            try (BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
+                line = br.readLine();
+            }
+            p.waitFor();
+            return (line == null || line.isBlank()) ? null : line.trim();
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private boolean serviceExists() {
+        return queryServiceStatus() != null;
+    }
 
     private void refreshDaemonStatus() {
         SwingWorker<String, Void> worker = new SwingWorker<>() {
             protected String doInBackground() {
-                try {
-                    Process p = Runtime.getRuntime().exec(
-                        new String[]{"schtasks", "/Query", "/TN", TASK_NAME, "/FO", "LIST"});
-                    p.waitFor();
-
-                    // Exit code 0 = found, 1 = not found, other = error
-                    if (p.exitValue() == 0) {
-                        java.util.Scanner sc = new java.util.Scanner(p.getInputStream());
-                        StringBuilder sb = new StringBuilder();
-                        String taskStatus = "REGISTERED";
-                        String nextRun = "";
-
-                        while (sc.hasNextLine()) {
-                            String line = sc.nextLine();
-                            if (line.contains("Status:")) {
-                                int idx = line.indexOf(":");
-                                if (idx >= 0) taskStatus = line.substring(idx + 1).trim();
-                            }
-                            if (line.contains("Next Run Time:")) {
-                                int idx = line.indexOf(":");
-                                if (idx >= 0) nextRun = line.substring(idx + 1).trim();
-                            }
-                        }
-                        sc.close();
-
-                        // Return status with next run time if available
-                        if (!nextRun.isEmpty() && !nextRun.equals("N/A")) {
-                            return taskStatus + " (Next: " + nextRun + ")";
-                        }
-                        return taskStatus.isEmpty() ? "REGISTERED" : taskStatus;
-                    } else if (p.exitValue() == 1) {
-                        return "NOT REGISTERED";
-                    } else {
-                        // Other exit codes
-                        return "Unknown (check permissions)";
-                    }
-                } catch (Exception e) {
-                    return "Error: " + e.getMessage();
-                }
+                return queryServiceStatus();
             }
             protected void done() {
                 try {
                     String status = get();
-                    lblDaemonStatus.setText(status);
-                    lblDaemonStatus.setForeground(
-                        status.contains("NOT REGISTERED") ? AppTheme.EARTH_RUST :
-                        status.contains("Error") ? new Color(0xFF9800) :
-                        AppTheme.EARTH_MOSS);
+                    if (status == null) {
+                        lblDaemonStatus.setText("Not Installed");
+                        lblDaemonStatus.setForeground(AppTheme.EARTH_RUST);
+                    } else {
+                        lblDaemonStatus.setText(status);
+                        lblDaemonStatus.setForeground(
+                            status.equalsIgnoreCase("Running") ? AppTheme.EARTH_MOSS : new Color(0xF57C00));
+                    }
                 } catch (Exception e) {
                     lblDaemonStatus.setText("Error checking status");
                 }
@@ -860,12 +847,21 @@ public class SettingsPanel extends JPanel {
     }
 
     private void loadPrefs() {
-        String saved = prefs.get(PREF_WINSCP, null);
-        if (saved != null) {
+        // Read from AppSettings (app.db) — shared with the Daemon/service —
+        // rather than this process's per-user Preferences. If AppSettings
+        // has no value yet but an old per-user Preferences one exists (from
+        // before this change), migrate it in once so nobody's saved WinSCP
+        // path/poll interval appears to reset.
+        String saved = AppSettings.getWinScpPath();
+        if (saved == null || saved.isEmpty()) {
+            saved = prefs.get(PREF_WINSCP, null);
+        }
+        if (saved != null && !saved.isEmpty()) {
             tfWinScp.setText(saved);
             transferService.setWinScpPath(saved);
         }
-        int poll = prefs.getInt(PREF_POLLSEC, 60);
+        int poll = AppSettings.getPollIntervalSeconds();
+        if (poll <= 0) poll = prefs.getInt(PREF_POLLSEC, 60);
         spinnerPollInterval.setValue(poll);
 
         // Live settings (app-settings.db) — loaded fresh every time this
@@ -910,12 +906,6 @@ public class SettingsPanel extends JPanel {
         String path = tfWinScp.getText().trim();
         String previousLogLevel = AppSettings.getLogLevel();
 
-        // Always save poll interval, regardless of WinSCP path
-        try {
-            int poll = (Integer) spinnerPollInterval.getValue();
-            prefs.putInt(PREF_POLLSEC, poll);
-        } catch (Exception ignored) {}
-
         // Live settings — one file write, takes effect immediately for both
         // this process and the daemon's next run. Mail routing rules are
         // saved separately, immediately on each add/edit/delete in their own
@@ -950,6 +940,10 @@ public class SettingsPanel extends JPanel {
                     String.valueOf((Integer) spinnerStaleThresholdMinutes.getValue()));
             live.put(AppSettings.KEY_MAX_CONCURRENT_TASK_THREADS,
                     String.valueOf((Integer) spinnerMaxConcurrentTaskThreads.getValue()));
+            // Poll interval always saved here regardless of WinSCP path below —
+            // shared via app.db so the Daemon/service picks it up too.
+            live.put(AppSettings.KEY_POLL_INTERVAL_SECONDS,
+                    String.valueOf((Integer) spinnerPollInterval.getValue()));
             AppSettings.setAll(live);
             logActivity("Settings saved", "Application settings updated (log level: "
                     + live.get(AppSettings.KEY_LOG_LEVEL) + ")");
@@ -960,7 +954,7 @@ public class SettingsPanel extends JPanel {
         }
 
         if (!path.isEmpty()) {
-            prefs.put(PREF_WINSCP, path);
+            AppSettings.set(AppSettings.KEY_WINSCP_PATH, path);
             transferService.setWinScpPath(path);
             lblStatus.setText("✓  Settings saved.");
             lblStatus.setForeground(AppTheme.EARTH_MOSS);
@@ -988,7 +982,19 @@ public class SettingsPanel extends JPanel {
         if (scheduler == null) return;
         if (previousLevel == null || previousLevel.equals(newLevel)) return;
 
-        java.util.List<String> runningIds = scheduler.getRunningTaskIds();
+        // Tasks now always execute in the Daemon/Windows Service, not this
+        // window's own (never-started) TaskSchedulerService — see
+        // MainWindow's thin-client migration — so "currently running" is
+        // read from the daemon's shared status snapshot, the same
+        // cross-process mechanism the Event Monitor already uses for
+        // worker-pool/pending/watch status, rather than this process's own
+        // (always-empty) in-memory state.
+        java.io.File dataDir = scheduler.getStorage() != null ? scheduler.getStorage().getDataDir() : null;
+        if (dataDir == null) return;
+        java.nio.file.Path daemonStatusFile = dataDir.toPath().resolve("scheduler-status-daemon.dat");
+        service.queue.SchedulerStatusSnapshot snapshot = service.queue.SchedulerStatusSnapshot.read(daemonStatusFile);
+        if (snapshot == null || !snapshot.isFresh(service.queue.SchedulerStatusSnapshot.DEFAULT_STALE_MS)) return;
+        java.util.List<String> runningIds = snapshot.getRunningTaskIds();
         if (runningIds.isEmpty()) return;
 
         java.util.List<model.ScheduledTask> allTasks = null;
@@ -1018,7 +1024,8 @@ public class SettingsPanel extends JPanel {
 
         if (choice == JOptionPane.YES_OPTION) {
             for (String id : runningIds) {
-                try { scheduler.restartTask(id); } catch (Exception ignored) {}
+                service.CommandQueueService.enqueue(scheduler.getStorage().getDataDir(), id,
+                        service.CommandQueueService.Action.RESTART, "gui");
             }
             lblStatus.setText("✓  Settings saved. Restarted " + runningIds.size() + " running task(s) for the new log level.");
             lblStatus.setForeground(AppTheme.EARTH_MOSS);

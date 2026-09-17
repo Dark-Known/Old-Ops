@@ -111,6 +111,27 @@ public class TransferService {
     // and every other caller (backup mkdir/cleanup, etc.) is unaffected.
     private final ThreadLocal<Consumer<List<RemoteFileMetadata>>> detectionCallback = new ThreadLocal<>();
 
+    /**
+     * The most specific classification available for the current thread's
+     * in-progress {@link #executeTransfer} call, if its outer catch blocks
+     * classified one — see {@link #getLastFailureClassification()}. Same
+     * ThreadLocal-per-call pattern as {@link #detectionCallback} just
+     * above, for the same reason: {@code executeTransfer} returns a plain
+     * {@code boolean}, so there's no return-value channel back to the
+     * caller for "and here's specifically why it failed" without either
+     * widening that return type everywhere it's used or threading an
+     * out-parameter through every call in the chain — a thread-local set
+     * right where the exception is still in hand is the smallest change
+     * that gets {@link TaskSchedulerService} a reliable classification
+     * instead of making it re-derive one from text after the fact.
+     */
+    private final ThreadLocal<model.TaskRunRecord> lastFailureClassification = new ThreadLocal<>();
+
+    /** Reliable (exception-type-based, not text-guessed) classification of the most recent failure on this thread, or null if the last {@link #executeTransfer} call didn't fail via a classified exception. */
+    public model.TaskRunRecord getLastFailureClassification() {
+        return lastFailureClassification.get();
+    }
+
     /** Set on the current thread just before {@link #executeTransfer}; see {@link #detectionCallback}. */
     public void setDetectionCallback(Consumer<List<RemoteFileMetadata>> callback) {
         detectionCallback.set(callback);
@@ -231,6 +252,8 @@ public class TransferService {
     public boolean executeTransfer(ScheduledTask task, Consumer<String> logLine, Set<String> eventFileNames)
             throws WatcherSkipException {
 
+        lastFailureClassification.remove(); // fresh for this call — see its own doc comment
+
         Credential target = resolveTargetCredential(task, logLine);
         logTransferPaths(task, target, logLine);
 
@@ -254,6 +277,7 @@ public class TransferService {
             try {
                 return executeBatchedRemoteTransfer(target, task, logLine);
             } catch (Exception e) {
+                lastFailureClassification.set(FailureClassifier.classifyThrowable(e));
                 logLine.accept("[ERROR] Transfer failed: " + e.getMessage());
                 return false;
             }
@@ -276,6 +300,7 @@ public class TransferService {
             }
             return ok;
         } catch (Exception e) {
+            lastFailureClassification.set(FailureClassifier.classifyThrowable(e));
             logLine.accept("[ERROR] Transfer failed: " + e.getMessage());
             return false;
         } finally {
@@ -396,6 +421,13 @@ public class TransferService {
                 try {
                     if (!Boolean.TRUE.equals(r.get())) allOk = false;
                 } catch (Exception e) {
+                    // Unwrap: Future.get() wraps whatever the worker threw in
+                    // an ExecutionException, so classifying the wrapper
+                    // itself would always fall through to UNKNOWN — the
+                    // real, classifiable exception is its cause.
+                    Throwable real = e instanceof java.util.concurrent.ExecutionException && e.getCause() != null
+                            ? e.getCause() : e;
+                    lastFailureClassification.set(FailureClassifier.classifyThrowable(real));
                     allOk = false;
                 }
             }

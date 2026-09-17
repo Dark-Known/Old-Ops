@@ -70,18 +70,21 @@ public class Daemon {
             try { pollInterval = Integer.parseInt(args[1]); } catch (Exception ignored) {}
         }
         
-        // If poll interval not provided as argument, try to read from preferences
+        // If poll interval not provided as argument, read it from app.db via
+        // AppSettings — the same shared store SettingsPanel now saves to.
+        // This replaces a previous java.util.prefs.Preferences read that
+        // pointed at a node ("com/opstool/ui/SettingsPanel") SettingsPanel
+        // never actually wrote to (it writes under Preferences
+        // .userNodeForPackage(SettingsPanel.class), i.e. node "/ui") — so
+        // this value was silently never picked up from the GUI even before
+        // any service migration. AppSettings is a SQLite file in the shared
+        // data directory, not a per-user registry hive, so it also resolves
+        // correctly once the daemon runs as a service account.
         if (args.length <= 1) {
-            try {
-                java.util.prefs.Preferences prefs = java.util.prefs.Preferences
-                    .userRoot().node("com/opstool/ui/SettingsPanel");
-                int saved = prefs.getInt("poll_interval_seconds", 60);
-                if (saved >= 1 && saved <= 3600) {
-                    pollInterval = saved;
-                    log("Poll interval loaded from preferences: " + saved + " seconds");
-                }
-            } catch (Exception e) {
-                log("Could not read poll interval preference, using default 60 seconds");
+            int saved = util.AppSettings.getPollIntervalSeconds();
+            if (saved >= 1 && saved <= 3600) {
+                pollInterval = saved;
+                log("Poll interval loaded from app.db: " + saved + " seconds");
             }
         }
         
@@ -102,6 +105,16 @@ public class Daemon {
         scheduler.start();
         log("Scheduler started — polling every " + pollInterval + " seconds");
 
+        // ── Start the GUI command poller ─────────────────────────────────────
+        // Separate from the scheduling tick above (and deliberately much
+        // faster — 3s vs. the scheduler's own 60s-ish poll interval) so a
+        // "Run now" click from a thin GUI that owns no scheduler of its own
+        // feels responsive, without coupling the two poll loops together.
+        Thread commandPoller = new Thread(() -> runCommandPollerLoop(dataDir, scheduler), "gui-command-poller");
+        commandPoller.setDaemon(true);
+        commandPoller.start();
+        log("Command poller started — checking for GUI-requested actions every 3 seconds");
+
         // ── Keep alive ───────────────────────────────────────────────────────
         // The daemon stays alive until the OS kills it.
         // We sleep in a tight loop so the JVM does not exit.
@@ -112,6 +125,49 @@ public class Daemon {
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
+        }
+    }
+
+    // ── GUI command poller ───────────────────────────────────────────────────
+    // Executes actions a thin GUI queued via service.CommandQueueService
+    // (Run now / Cancel / Restart / Reconnect watch / Refresh) on THIS
+    // process's scheduler — the only one actually holding the worker pool —
+    // instead of the GUI ever running these itself.
+    private static void runCommandPollerLoop(String dataDir, TaskSchedulerService scheduler) {
+        File dbDir = new File(dataDir);
+        while (!Thread.currentThread().isInterrupted()) {
+            try {
+                for (service.CommandQueueService.Command cmd : service.CommandQueueService.pollPending(dbDir)) {
+                    handleCommand(dbDir, scheduler, cmd);
+                }
+                service.CommandQueueService.pruneOldResolved(dbDir);
+            } catch (Exception e) {
+                log("Command poller error: " + e.getMessage());
+            }
+            try {
+                Thread.sleep(3_000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    private static void handleCommand(File dbDir, TaskSchedulerService scheduler,
+                                       service.CommandQueueService.Command cmd) {
+        try {
+            switch (cmd.action()) {
+                case RUN_NOW -> scheduler.runNow(cmd.taskId());
+                case CANCEL -> scheduler.cancelTask(cmd.taskId());
+                case RESTART -> scheduler.restartTask(cmd.taskId());
+                case RECONNECT_WATCH -> scheduler.reconnectWatch(cmd.taskId());
+                case REFRESH -> scheduler.refresh();
+            }
+            log("Executed GUI command " + cmd.action() + " for task " + cmd.taskId()
+                    + " (requested by " + cmd.requestedBy() + ")");
+            service.CommandQueueService.markDone(dbDir, cmd.id());
+        } catch (Exception e) {
+            log("GUI command " + cmd.action() + " for task " + cmd.taskId() + " failed: " + e.getMessage());
+            service.CommandQueueService.markFailed(dbDir, cmd.id(), e.getMessage());
         }
     }
 
@@ -290,26 +346,25 @@ public class Daemon {
         }
     }
 
-    // ── WinSCP preference loader ─────────────────────────────────────────────
-    // Reads the path saved by the GUI's SettingsPanel so the daemon uses the
-    // same WinSCP binary without any extra configuration.
+    // ── WinSCP config loader ─────────────────────────────────────────────
+    // Reads the path saved by the GUI's SettingsPanel from app.db via
+    // AppSettings — shared with the GUI, so it resolves correctly whether
+    // the daemon runs as the interactive user or, once wrapped as a
+    // Windows Service, as a service account with its own separate registry
+    // hive that per-user Preferences would never have been visible from.
     private static void loadWinScpPref(XmlStorageService storage,
                                         TransferService transferSvc,
                                         String dataDir) {
-        // Java Preferences are user-scoped by class — read the key the
-        // SettingsPanel stores under com.opstool.ui.SettingsPanel
         try {
-            java.util.prefs.Preferences prefs = java.util.prefs.Preferences
-                .userRoot().node("com/opstool/ui/SettingsPanel");
-            String saved = prefs.get("winscp_path", null);
-            if (saved != null && !saved.isEmpty()) {
-                transferSvc.setWinScpPath(saved);
-                log("WinSCP path loaded from preferences: " + saved);
+            String saved = util.AppSettings.getWinScpPath();
+            if (saved != null && !saved.trim().isEmpty()) {
+                transferSvc.setWinScpPath(saved.trim());
+                log("WinSCP path loaded from app.db: " + saved.trim());
             } else {
                 log("WinSCP path: using auto-detected default (" + transferSvc.getWinScpPath() + ")");
             }
         } catch (Exception e) {
-            log("Could not read WinSCP preference: " + e.getMessage() + " — using default");
+            log("Could not read WinSCP setting: " + e.getMessage() + " — using default");
         }
     }
 }

@@ -391,7 +391,7 @@ public class TaskSchedulerService {
                 logWatchTransitionIfNotable(t, status);
             }
             statusExporter.export(getWorkerPoolSize(), getActiveWorkerCount(), getPendingEvents(),
-                    getRecentActivity(30), watchEntries, java.util.Collections.emptyList());
+                    getRecentActivity(30), watchEntries, java.util.Collections.emptyList(), getRunningTaskIds());
         } catch (Exception e) {
             log.fine("Status export tick failed: " + e.getMessage());
         }

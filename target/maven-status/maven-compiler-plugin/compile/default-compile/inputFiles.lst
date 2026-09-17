@@ -9,8 +9,10 @@ D:\OPS\OpsTransferTool-source\src\main\java\model\RemoteFileException.java
 D:\OPS\OpsTransferTool-source\src\main\java\model\RemoteFileMetadata.java
 D:\OPS\OpsTransferTool-source\src\main\java\model\ScheduledTask.java
 D:\OPS\OpsTransferTool-source\src\main\java\model\TaskRunRecord.java
+D:\OPS\OpsTransferTool-source\src\main\java\service\CommandQueueService.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\ConnectionTestService.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\CredentialDbService.java
+D:\OPS\OpsTransferTool-source\src\main\java\service\FailureClassifier.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\GraphMailService.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\LocalFileMetadataService.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\OAuth2TokenService.java
@@ -44,6 +46,7 @@ D:\OPS\OpsTransferTool-source\src\main\java\ui\EventMonitorWindow.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\GradientButton.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\GradientPanel.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\GradientToggleButton.java
+D:\OPS\OpsTransferTool-source\src\main\java\ui\HealthBanner.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\IconTile.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\MainWindow.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\NotificationBell.java
