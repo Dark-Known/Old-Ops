@@ -177,7 +177,7 @@ public class SettingsPanel extends JPanel {
         g.gridy = 2;
         daemonPanel.add(btnRow2, g);
 
-        outer.add(card("Daemon (Windows Service — runs without GUI)", daemonPanel));
+        outer.add(card("Daemon", daemonPanel));
         outer.add(Box.createVerticalStrut(12));
 
         // App Info section
