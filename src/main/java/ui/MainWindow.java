@@ -24,11 +24,10 @@ public class MainWindow extends JFrame {
 
     private TaskManagerPanel taskPanel;
     private CredentialManagerPanel credPanel;
-    private NotificationBell notificationBell;
+    private StatusStrip statusStrip;
     private ToastManager toastManager;
     private java.awt.event.ComponentListener sidebarResizeListener;
     private java.util.function.Consumer<model.TaskRunRecord> runListener;
-    private javax.swing.Timer bellRefreshTimer;
 
     // ── Daemon vs GUI scheduler hand-off ─────────────────────────────────
     // The headless Daemon (see Daemon.java) is the primary scheduler when
@@ -48,7 +47,7 @@ public class MainWindow extends JFrame {
     // from push (native watch / remote SSH push) to plain polling, wherever
     // that task is actually running (Daemon or this GUI) — see its javadoc.
     // Constructed early so NotificationBell can hold a reference to it;
-    // started later, once toastManager/notificationBell both exist (its
+    // started later, once toastManager exists (its
     // callback uses both).
     private final WatchStatusMonitor watchStatusMonitor;
 
@@ -190,9 +189,9 @@ public class MainWindow extends JFrame {
             scheduler.getRunHistoryService().removeRunListener(runListener);
             runListener = null;
         }
-        if (bellRefreshTimer != null) {
-            bellRefreshTimer.stop();
-            bellRefreshTimer = null;
+        if (statusStrip != null) {
+            statusStrip.dispose();
+            statusStrip = null;
         }
         if (schedulerBadgeTimer != null) {
             schedulerBadgeTimer.stop();
@@ -235,9 +234,11 @@ public class MainWindow extends JFrame {
         schedulerBadge = statusChip("Scheduler: checking...", new Color(0xE0A458));
         badges.add(schedulerBadge);
 
-        notificationBell = new NotificationBell(storage, scheduler, watchStatusMonitor);
-        badges.add(notificationBell);
-
+        // The failure/notification badge itself now lives inside StatusStrip,
+        // added as a full-width row below this header (see near add(header, ...)
+        // further down) — it replaced the standalone NotificationBell here so
+        // the count badge sits next to its own detail instead of opening a
+        // separate dropdown disconnected from the health summary.
         JButton eventMonitorBtn = new JButton("Event Monitor", VectorIcons.pulse(Color.WHITE, 16));
         eventMonitorBtn.setFocusPainted(false);
         eventMonitorBtn.setBorderPainted(false);
@@ -417,26 +418,29 @@ public class MainWindow extends JFrame {
                         return;
                     }
                     toastManager.showToast(record);
-                    notificationBell.refreshCount();
+                    if (statusStrip != null) statusStrip.refresh();
                     runHistoryPanel.onRunRecorded(record);
                 });
         scheduler.getRunHistoryService().addRunListener(runListener);
 
-        // Now that both toastManager and notificationBell exist, safe to start
-        // the watch-fallback monitor — its callback (onWatchFallback) uses both.
+        // Now that toastManager exists, safe to start the watch-fallback
+        // monitor — its callback (onWatchFallback) uses it, and StatusStrip
+        // (constructed next) polls independently on its own internal timer,
+        // so there's no separate belt-and-suspenders refresh timer needed here.
         watchStatusMonitor.start();
 
-        // Belt-and-suspenders periodic refresh for the bell badge, in case a
-        // task's status changes some way other than a recorded run (e.g. the
-        // Restart buttons in the failure-recovery dialog set status directly).
-        bellRefreshTimer = new javax.swing.Timer(15_000, e -> notificationBell.refreshCount());
-        bellRefreshTimer.start();
+        statusStrip = new StatusStrip(storage, scheduler, watchStatusMonitor);
 
         JPanel body = new JPanel(new BorderLayout());
         body.add(sidebar, BorderLayout.WEST);
         body.add(content, BorderLayout.CENTER);
 
-        add(header, BorderLayout.NORTH);
+        JPanel top = new JPanel();
+        top.setLayout(new BoxLayout(top, BoxLayout.Y_AXIS));
+        top.add(header);
+        top.add(statusStrip);
+
+        add(top, BorderLayout.NORTH);
         add(body, BorderLayout.CENTER);
 
         // ── Status bar ────────────────────────────────────────────────────────
@@ -557,7 +561,7 @@ public class MainWindow extends JFrame {
                 new Color(0xE65100), // same amber used for "Polling only — unavailable" elsewhere in the UI
                 "\u26A0" // ⚠
         );
-        notificationBell.refreshCount();
+        if (statusStrip != null) statusStrip.refresh();
     }
 
     private static String prettyMode(String rawWatchModeName) {

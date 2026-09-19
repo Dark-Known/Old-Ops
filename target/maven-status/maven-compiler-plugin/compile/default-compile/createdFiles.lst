@@ -51,8 +51,10 @@ ui\DirectoryBrowserDialog$GoArrowIcon.class
 ui\SettingsRow.class
 export\XlsxWriter.class
 util\CryptoUtil.class
+ui\StatusStrip.class
 util\AppSettings.class
 ui\PillBadge.class
+ui\StatusStrip$2.class
 ui\DirectoryBrowserDialog$7.class
 ui\StatisticsPanel$BottomHairlineBorder.class
 ui\NotificationBell$1.class
@@ -73,6 +75,7 @@ ui\components\IconTile.class
 ui\HealthBanner$1.class
 ui\SettingsPanel$4.class
 ui\VectorIcons$7.class
+ui\StatusStrip$1.class
 service\SftpRemoteFileMetadataService.class
 ui\DirectoryBrowserDialog$5.class
 util\MiniJson$Parser.class
