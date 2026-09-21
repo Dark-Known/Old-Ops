@@ -32,6 +32,15 @@
   After install, configure Recovery in services.msc (or via `sc failure`)
   for "Restart the Service" on first/second/subsequent failures — WinSW
   does not set this for you.
+
+  <executable> below is a placeholder ("java") — install-service.ps1
+  always overwrites both <executable> and <arguments> at install time
+  with the real jar path and data directory. If rcedit.exe was available
+  at install time, <executable> also gets pointed at a renamed, re-iconed
+  copy of javaw.exe instead of plain "java", so this Service's actual JVM
+  process shows this app's name and icon in Task Manager rather than
+  "OpenJDK Platform Binary" — see the "Rebrand the daemon's actual JVM
+  process" section of install-service.ps1 for how and why.
 -->
 <service>
   <id>OpsTransferToolDaemon</id>

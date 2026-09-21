@@ -333,14 +333,20 @@
             <description>WinSCP offline installer</description>
         </file>
 
-        <!-- Elevation launcher -->
-        <file type="batch" name="test-elevation.bat" required="true">
-            <description>Elevation test/launcher batch file</description>
+        <!-- Application icon (bundled in this repo at the root; used for
+             shortcuts, the GUI's window/taskbar icon, and — together with
+             the optional rcedit.exe below — both the GUI's and the
+             daemon's Task Manager identity) -->
+        <file type="icon" name="Icon.ico" required="false">
+            <description>Application icon for shortcuts and Task Manager branding</description>
         </file>
 
-        <!-- Application icon (optional) -->
-        <file type="icon" name="Icon.ico" required="false">
-            <description>Application icon for shortcuts</description>
+        <!-- Optional: bakes the icon/name above into renamed copies of
+             javaw.exe for both launchers, so Task Manager shows this app
+             instead of "OpenJDK Platform Binary". See
+             packaging\steps\Brand-Executable.ps1. -->
+        <file type="installer" name="rcedit.exe" required="false">
+            <description>Executable resource editor used for Task Manager branding</description>
         </file>
     </prerequisites>
 

@@ -8,6 +8,7 @@ ui\TaskManagerPanel$3.class
 ui\TestConnectionDialog.class
 export\PdfTableWriter.class
 model\TaskRunRecord$FailureCategory.class
+ui\ActionCenterButton$2.class
 ui\StatisticsPanel.class
 ui\QueueMonitorView$1.class
 ui\SearchCriteriaPanel.class
@@ -41,6 +42,7 @@ ui\TaskDialog$4.class
 ui\SettingsPanel$1.class
 util\AppConfig.class
 ui\DirectoryBrowserDialog.class
+ui\ActionCenterButton$3.class
 ui\MainWindow$1.class
 service\watch\RemotePushWatcher$ListenerHandle.class
 ui\TestConnectionDialog$1.class
@@ -48,6 +50,7 @@ ui\VectorIcons$5.class
 ui\DirectoryBrowserDialog$1.class
 service\CommandQueueService$Action.class
 ui\DirectoryBrowserDialog$GoArrowIcon.class
+ui\ActionCenterButton$Snapshot.class
 ui\SettingsRow.class
 export\XlsxWriter.class
 util\CryptoUtil.class
@@ -61,6 +64,7 @@ ui\NotificationBell$1.class
 ui\MainWindow$2.class
 service\TransferService$WatcherSkipException.class
 service\watch\LocalWatchManager.class
+ui\ActionCenterButton.class
 ui\DirectoryBrowserDialog$2.class
 ui\QueueMonitorView$PendingRow.class
 ui\RunLogSummarizer$FileEntry.class
@@ -68,6 +72,7 @@ ui\WatcherInfoPopup$Result.class
 util\ImapSearchCriteria$TextCriteria.class
 ui\WorkerActivityStrip$Row.class
 service\RemoteFileMetadataServiceFactory$ManagedMetadataService.class
+ui\ActionCenterButton$1.class
 util\MailFetchMode.class
 ui\SettingsPanel$3.class
 service\XmlStorageService.class
@@ -187,6 +192,7 @@ service\ConnectionTestService.class
 ui\Theme$2.class
 Daemon$2.class
 service\RemoteFileMetadataService.class
+ui\ActionCenterButton$RoundedLineBorder.class
 service\TransferService$BackupCandidate.class
 ui\WatcherInfoPopup.class
 ui\TaskDialog$1.class

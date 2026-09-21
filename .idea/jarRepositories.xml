@@ -7,6 +7,11 @@
       <option name="url" value="file://D:\OPS\OpsTransferTool-source/libs-repo" />
     </remote-repository>
     <remote-repository>
+      <option name="id" value="project-local-libs" />
+      <option name="name" value="project-local-libs" />
+      <option name="url" value="file://D:\Old-Ops-updated (49)\Old-Ops-clean/libs-repo" />
+    </remote-repository>
+    <remote-repository>
       <option name="id" value="central" />
       <option name="name" value="Central Repository" />
       <option name="url" value="https://repo.maven.apache.org/maven2" />

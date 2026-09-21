@@ -26,15 +26,41 @@
     before running, or pass -WinSwPath explicitly.
 
 .PARAMETER JarPath
-    Full path to the daemon jar. Defaults to "$InstallDir\OpsTransferTool.jar" -
-    override this if your build's jar has a different name (setup.ps1 passes
-    its own $destJar value here automatically, since that name is
-    configurable via /application/installation/jarName in the install XML
-    config and isn't always "OpsTransferTool.jar").
+    Full path to the daemon jar. Auto-resolved if omitted: tries
+    "$InstallDir\Monitoring-Tool.jar" (this project's default jar name)
+    first, then any single *.jar found in $InstallDir, then falls back to
+    the legacy "$InstallDir\OpsTransferTool.jar" name. Pass this
+    explicitly if none of those match your build's actual jar name.
 
 .PARAMETER DataDir
-    Passed through to the daemon as its data directory. Defaults to
-    C:\OpsTools\Data, matching setup.ps1's own default.
+    Passed through to the daemon as its data directory. If not passed
+    explicitly, auto-read from "$InstallDir\app-config.xml"'s
+    /application/installation/dataDir if that file is present (it's
+    deployed there by Deploy-Application.ps1); otherwise defaults to
+    C:\OpsTools\Data.
+
+.PARAMETER RceditPath
+    Path to rcedit.exe, used to rebrand the daemon's actual JVM process so
+    it shows this app's name/icon instead of "OpenJDK Platform Binary" in
+    Task Manager. Entirely optional - auto-detected in $InstallDir, next
+    to setup.ps1, or on PATH; if it can't be found anywhere the daemon
+    still installs and runs fine, just under the plain Java process
+    identity. Get it from https://github.com/electron/rcedit/releases.
+
+.PARAMETER IconPath
+    Icon to bake into the rebranded daemon executable via rcedit.
+    Defaults to "$InstallDir\Icon.ico" (deployed there by
+    Deploy-Application.ps1). Only relevant if rcedit is available.
+
+.PARAMETER DaemonExeName
+    File name for the rebranded daemon executable (a renamed copy of the
+    JRE's own javaw.exe, not a different program). Defaults to
+    "MonitoringToolDaemon.exe".
+
+.PARAMETER DaemonDisplayName
+    Product/description name baked into the rebranded executable's
+    version resources - this is the text Task Manager's "Name"/"Description"
+    columns will show. Defaults to "Monitoring tool".
 
 .EXAMPLE
     .\install-service.ps1 -InstallDir "C:\Program Files\OpsTransferTool"
@@ -48,7 +74,11 @@ param(
     [string]$WinSwPath  = $null,
     [string]$JarPath    = $null,
     [string]$DataDir    = "C:\OpsTools\Data",
-    [string]$ExistingScheduledTaskName = "Monitoring-Tool-Daemon"
+    [string]$ExistingScheduledTaskName = "Monitoring-Tool-Daemon",
+    [string]$RceditPath = $null,
+    [string]$IconPath   = $null,
+    [string]$DaemonExeName     = "MonitoringToolDaemon.exe",
+    [string]$DaemonDisplayName = "Monitoring tool"
 )
 
 $ErrorActionPreference = "Stop"
@@ -62,7 +92,37 @@ if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Adm
     throw "This script must be run as Administrator (right-click PowerShell -> Run as Administrator)."
 }
 
-if (-not $JarPath) { $JarPath = Join-Path $InstallDir "OpsTransferTool.jar" }
+# If -DataDir wasn't explicitly passed, try reading it from app-config.xml
+# in $InstallDir (deployed there by Deploy-Application.ps1) before falling
+# back to the hardcoded default above - so a plain
+# ".\install-service.ps1 -InstallDir X" picks up a customized dataDir
+# without needing to also repeat -DataDir.
+if (-not $PSBoundParameters.ContainsKey('DataDir')) {
+    $deployedConfig = Join-Path $InstallDir "app-config.xml"
+    if (Test-Path $deployedConfig) {
+        try {
+            [xml]$cfg = Get-Content $deployedConfig
+            $node = $cfg.SelectSingleNode("/application/installation/dataDir")
+            if ($node -and -not [string]::IsNullOrEmpty($node.InnerText)) {
+                $DataDir = $node.InnerText
+                Log "Using DataDir from app-config.xml: $DataDir"
+            }
+        } catch { Log "WARNING: Could not read dataDir from ${deployedConfig}: $_" }
+    }
+}
+
+if (-not $JarPath) {
+    # Prefer this project's actual default jar name; fall back to any
+    # single *.jar in InstallDir, then to the old default name (which
+    # will then fail with a clear message below if genuinely not there).
+    $preferredJar = Join-Path $InstallDir "Monitoring-Tool.jar"
+    if (Test-Path $preferredJar) {
+        $JarPath = $preferredJar
+    } else {
+        $anyJar = Get-ChildItem -Path $InstallDir -Filter "*.jar" -File -ErrorAction SilentlyContinue | Select-Object -First 1
+        $JarPath = if ($anyJar) { $anyJar.FullName } else { Join-Path $InstallDir "OpsTransferTool.jar" }
+    }
+}
 $jarPath = $JarPath
 if (-not (Test-Path $jarPath)) {
     throw "Daemon jar not found at '$jarPath'. Pass -JarPath pointing at the actual jar " +
@@ -89,9 +149,15 @@ if ($existingTask) {
     Unregister-ScheduledTask -TaskName $ExistingScheduledTaskName -Confirm:$false
     # The Scheduled Task's own process isn't stopped by Unregister-ScheduledTask -
     # kill any daemon jar still running under the old registration so the new
-    # Service doesn't start alongside a leftover instance.
-    Get-CimInstance Win32_Process -Filter "Name = 'java.exe'" |
-        Where-Object { $_.CommandLine -like "*Daemon*" } |
+    # Service doesn't start alongside a leftover instance. Matched by full
+    # command line (this specific jar path + "Daemon" argument), not just
+    # process name, so this never touches an unrelated java.exe running on
+    # the machine for some other reason. Checks both "java.exe" (an
+    # unbranded old install) and the renamed "MonitoringToolDaemon.exe"
+    # (see the rebrand step below), since either could be what an older
+    # registration was actually running.
+    Get-CimInstance Win32_Process -Filter "Name = 'java.exe' OR Name = '$DaemonExeName'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -and $_.CommandLine -like "*$jarPath*" -and $_.CommandLine -like "*Daemon*" } |
         ForEach-Object {
             Log "Stopping leftover daemon process (PID $($_.ProcessId))"
             Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
@@ -100,10 +166,22 @@ if ($existingTask) {
     Log "No existing '$ExistingScheduledTaskName' Scheduled Task found - nothing to remove."
 }
 
-# ── Ensure the data directory exists ───────────────────────────────────────
+# ── Ensure the data directory exists, and is writable without elevation ────
+# The GUI no longer launches elevated (see Deploy-Application.ps1 - the
+# old test-elevation.bat/UAC-prompt chain existed only to query the
+# now-retired Scheduled Task's status, and is gone entirely), so it needs
+# to be able to read/write tasks.xml, creds_*.xml, and app-settings here
+# as a plain standard user. Granting the built-in "Users" group Modify
+# here is what makes that actually true, not just true in theory.
 if (-not (Test-Path $DataDir)) {
     New-Item -ItemType Directory -Path $DataDir | Out-Null
     Log "Created data directory: $DataDir"
+}
+try {
+    & icacls $DataDir /grant "*S-1-5-32-545:(OI)(CI)M" /T /Q | Out-Null
+    Log "Granted standard users write access to: $DataDir"
+} catch {
+    Log "WARNING: Could not set permissions on ${DataDir}: $_ - the GUI may need to be run elevated if it can't write here."
 }
 
 # ── Stage the WinSW config next to the wrapper executable ──────────────────
@@ -127,6 +205,48 @@ if ($existingService) {
     & $WinSwPath stop
     & $WinSwPath uninstall
     Start-Sleep -Seconds 2
+}
+
+# ── Rebrand the daemon's actual JVM process for Task Manager ───────────────
+# Without this, the SCM-managed process WinSW spawns runs plain
+# "java.exe"/"javaw.exe", which Windows labels "OpenJDK Platform Binary"
+# with the stock Java coffee-cup icon in Task Manager - correct, but
+# indistinguishable from any other Java app on the machine. Delegates the
+# actual copy+rcedit work to Brand-Executable.ps1 (shared with
+# Deploy-Application.ps1's identical need for the GUI launcher) rather
+# than duplicating that logic here. Entirely optional - if rcedit isn't
+# available, Brand-Executable.ps1 logs why and hands back the plain
+# javaw.exe path unchanged, and the daemon installs and runs exactly the
+# same either way; only its Task Manager identity differs.
+$iconCandidate = if ($IconPath -and (Test-Path $IconPath)) { $IconPath } else { Join-Path $InstallDir "Icon.ico" }
+$javaSource = (Get-Command "javaw.exe" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue)
+if (-not $javaSource) {
+    try { $javaSource = Join-Path (Split-Path (Get-Command java.exe).Source) "javaw.exe" } catch { $javaSource = $null }
+}
+
+if (-not $javaSource -or -not (Test-Path $javaSource)) {
+    Log "NOTE: Couldn't locate javaw.exe to rebrand (is Java on PATH?) - daemon will run as plain java.exe in Task Manager."
+} else {
+    $brandScript = Join-Path $PSScriptRoot "steps\Brand-Executable.ps1"
+    if (-not (Test-Path $brandScript)) {
+        Log "NOTE: packaging\steps\Brand-Executable.ps1 not found - skipping Task Manager rebrand."
+    } else {
+        $brandArgs = @{
+            SourceExe   = $javaSource
+            DestExe     = $DaemonExeName
+            IconPath    = $iconCandidate
+            Description = "$DaemonDisplayName - background daemon"
+            ProductName = $DaemonDisplayName
+        }
+        if ($RceditPath) { $brandArgs.RceditPath = $RceditPath }
+        $brandResult = & $brandScript @brandArgs
+        if ($brandResult.Branded) {
+            [xml]$cfg = Get-Content $configTarget
+            $cfg.service.executable = $brandResult.ExePath
+            $cfg.Save($configTarget)
+            Log "Daemon process rebranded for Task Manager: $($brandResult.ExePath)"
+        }
+    }
 }
 
 # ── Install and start ───────────────────────────────────────────────────────

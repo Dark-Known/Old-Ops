@@ -24,7 +24,7 @@ public class MainWindow extends JFrame {
 
     private TaskManagerPanel taskPanel;
     private CredentialManagerPanel credPanel;
-    private StatusStrip statusStrip;
+    private ActionCenterButton actionCenterButton;
     private ToastManager toastManager;
     private java.awt.event.ComponentListener sidebarResizeListener;
     private java.util.function.Consumer<model.TaskRunRecord> runListener;
@@ -189,9 +189,9 @@ public class MainWindow extends JFrame {
             scheduler.getRunHistoryService().removeRunListener(runListener);
             runListener = null;
         }
-        if (statusStrip != null) {
-            statusStrip.dispose();
-            statusStrip = null;
+        if (actionCenterButton != null) {
+            actionCenterButton.dispose();
+            actionCenterButton = null;
         }
         if (schedulerBadgeTimer != null) {
             schedulerBadgeTimer.stop();
@@ -234,11 +234,9 @@ public class MainWindow extends JFrame {
         schedulerBadge = statusChip("Scheduler: checking...", new Color(0xE0A458));
         badges.add(schedulerBadge);
 
-        // The failure/notification badge itself now lives inside StatusStrip,
-        // added as a full-width row below this header (see near add(header, ...)
-        // further down) — it replaced the standalone NotificationBell here so
-        // the count badge sits next to its own detail instead of opening a
-        // separate dropdown disconnected from the health summary.
+        // The action-center pill (small dot + count, no layout footprint
+        // otherwise) is added to `badges` further below, once scheduler and
+        // watchStatusMonitor exist — see near its construction further down.
         JButton eventMonitorBtn = new JButton("Event Monitor", VectorIcons.pulse(Color.WHITE, 16));
         eventMonitorBtn.setFocusPainted(false);
         eventMonitorBtn.setBorderPainted(false);
@@ -418,29 +416,27 @@ public class MainWindow extends JFrame {
                         return;
                     }
                     toastManager.showToast(record);
-                    if (statusStrip != null) statusStrip.refresh();
+                    if (actionCenterButton != null) actionCenterButton.refresh();
                     runHistoryPanel.onRunRecorded(record);
                 });
         scheduler.getRunHistoryService().addRunListener(runListener);
 
         // Now that toastManager exists, safe to start the watch-fallback
-        // monitor — its callback (onWatchFallback) uses it, and StatusStrip
-        // (constructed next) polls independently on its own internal timer,
-        // so there's no separate belt-and-suspenders refresh timer needed here.
+        // monitor — its callback (onWatchFallback) uses it, and
+        // ActionCenterButton (constructed next) polls independently on its
+        // own internal timer, so there's no separate refresh timer needed here.
         watchStatusMonitor.start();
 
-        statusStrip = new StatusStrip(storage, scheduler, watchStatusMonitor);
+        actionCenterButton = new ActionCenterButton(storage, scheduler, watchStatusMonitor);
+        badges.add(actionCenterButton);
+        badges.revalidate();
+        badges.repaint();
 
         JPanel body = new JPanel(new BorderLayout());
         body.add(sidebar, BorderLayout.WEST);
         body.add(content, BorderLayout.CENTER);
 
-        JPanel top = new JPanel();
-        top.setLayout(new BoxLayout(top, BoxLayout.Y_AXIS));
-        top.add(header);
-        top.add(statusStrip);
-
-        add(top, BorderLayout.NORTH);
+        add(header, BorderLayout.NORTH);
         add(body, BorderLayout.CENTER);
 
         // ── Status bar ────────────────────────────────────────────────────────
@@ -561,7 +557,7 @@ public class MainWindow extends JFrame {
                 new Color(0xE65100), // same amber used for "Polling only — unavailable" elsewhere in the UI
                 "\u26A0" // ⚠
         );
-        if (statusStrip != null) statusStrip.refresh();
+        if (actionCenterButton != null) actionCenterButton.refresh();
     }
 
     private static String prettyMode(String rawWatchModeName) {
@@ -574,8 +570,27 @@ public class MainWindow extends JFrame {
         };
     }
 
+    /**
+     * Loads the real app logo (a rounded badge in the app's own umber→olive
+     * header gradient, with a two-arrow "sync/transfer" glyph) bundled as a
+     * classpath resource at src/main/resources/icon.png — same source art
+     * as the deployed Icon.ico used for the Desktop/Start Menu shortcuts,
+     * so the window/taskbar icon, the shortcuts, and (see
+     * packaging/install-service.ps1) the daemon's Task Manager entry all
+     * show the same logo rather than three different things.
+     *
+     * <p>Falls back to a plain placeholder badge only if the resource is
+     * somehow missing from the jar (e.g. a stripped-down dev build), so a
+     * packaging mistake degrades gracefully instead of throwing on startup.
+     */
     private Image buildAppIcon() {
-        // 32x32 programmatic icon
+        try (java.io.InputStream in = getClass().getResourceAsStream("/icon.png")) {
+            if (in != null) {
+                return javax.imageio.ImageIO.read(in);
+            }
+        } catch (Exception e) {
+            // fall through to placeholder below
+        }
         java.awt.image.BufferedImage img =
             new java.awt.image.BufferedImage(32, 32, java.awt.image.BufferedImage.TYPE_INT_ARGB);
         Graphics2D g2 = img.createGraphics();
