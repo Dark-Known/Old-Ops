@@ -48,8 +48,18 @@
     -Description if not given.
 
 .PARAMETER RceditPath
-    Path to rcedit.exe. Auto-detected next to -SourceExe, then on PATH,
-    if not given explicitly.
+    Path to rcedit.exe. If not given, searched for in -SearchDir (if
+    provided) and then on PATH — deliberately NOT searched for next to
+    -SourceExe/-DestExe: rcedit is a completely standalone tool with no
+    relationship to the exe it's editing, so there's no reason it would
+    need to live in the same folder as the JDK, the private runtime, or
+    the branded copy. Point -SearchDir at wherever you actually keep it
+    (e.g. the install directory, per setup.ps1's own prerequisite list).
+
+.PARAMETER SearchDir
+    Folder to look for rcedit.exe in if -RceditPath isn't given — pass
+    your app's install directory here, matching where setup.ps1 tells
+    people to place rcedit.exe.
 
 .PARAMETER LogFile
     Optional path to append timestamped log lines to. Safe to omit.
@@ -72,6 +82,7 @@ param(
     [Parameter(Mandatory = $true)][string]$Description,
     [string]$ProductName = $null,
     [string]$RceditPath  = $null,
+    [string]$SearchDir   = $null,
     [string]$LogFile     = $null
 )
 
@@ -103,13 +114,13 @@ $DestExe    = Join-Path $sourceDir $destExeName
 
 $rcEdit = @(
     $RceditPath,
-    (Join-Path $sourceDir "rcedit.exe"),
+    $(if ($SearchDir) { Join-Path $SearchDir "rcedit.exe" }),
     (Get-Command "rcedit.exe" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue)
 ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
 
 if (-not $rcEdit) {
     Log "NOTE: rcedit.exe not found - '$(Split-Path $SourceExe -Leaf)' will keep its own identity in Task Manager."
-    Log "Download rcedit.exe from https://github.com/electron/rcedit/releases and place it in $sourceDir, or pass -RceditPath, to brand it."
+    Log "Download rcedit.exe from https://github.com/electron/rcedit/releases and place it in $SearchDir (or pass -RceditPath) to brand it."
     return $fallback
 }
 if (-not (Test-Path $IconPath)) {
@@ -130,7 +141,24 @@ try {
         @("--set-version-string", "FileDescription", $Description),
         @("--set-version-string", "ProductName", $ProductName),
         @("--set-version-string", "OriginalFilename", $destExeName),
-        @("--set-version-string", "InternalName", $internalName)
+        @("--set-version-string", "InternalName", $internalName),
+        # Explicit file/product version numbers, in addition to the string
+        # fields above: some Windows builds show a stale, cached
+        # FileDescription from the ORIGINAL exe's version resource (a
+        # separate language/codepage block rcedit's string edits didn't
+        # touch) even after the icon updates correctly, since icon
+        # replacement isn't subject to that per-language duplication the
+        # way string tables are. Setting the numeric version fields tends
+        # to force rcedit to rewrite the whole VS_VERSIONINFO block rather
+        # than patch the existing one in place, which is what actually
+        # clears the stale text. If this still shows the old name after a
+        # redeploy, the fix is simpler than more rcedit flags: any
+        # already-running process keeps the identity it launched with —
+        # Windows doesn't hot-reload PE resources for a live process —
+        # restart the app/service after redeploying, don't just look at
+        # Task Manager for an instance that was already open.
+        @("--set-file-version", "1.0.0.0"),
+        @("--set-product-version", "1.0.0.0")
     )
     $allOk = $true
     foreach ($edit in $edits) {

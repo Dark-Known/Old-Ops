@@ -62,6 +62,25 @@
     version resources - this is the text Task Manager's "Name"/"Description"
     columns will show. Defaults to "Monitoring tool".
 
+.PARAMETER BrandWinSwWrapper
+    Also rebrand the WinSW wrapper executable itself (daemon-service.exe),
+    not just the child JVM process it launches. OFF by default. WinSW v3's
+    daemon-service.exe is typically published as a self-contained
+    single-file .NET "apphost bundle": a normal PE header followed by a
+    bundle manifest whose byte offsets are computed for that exact file's
+    layout/size. Running rcedit against it resizes the PE resource section
+    to inject the icon/version info, but rcedit has no awareness of the
+    .NET bundle footer appended after it, so those offsets go stale.
+    rcedit itself reports success - the icon/name do visibly change - but
+    the .NET host then fails the FIRST time the branded copy actually
+    runs, with "Failure processing application bundle; possible file
+    corruption. Arithmetic overflow while reading bundle.", and WinSW
+    install/start fails with exit code -2147450721. Only pass this switch
+    if you've confirmed your WinSW build is NOT a single-file publish
+    (e.g. a framework-dependent build); otherwise leave it off and accept
+    the default WinSW icon/description on the wrapper's own Task Manager
+    entry - the child JVM process above is still rebranded either way.
+
 .EXAMPLE
     .\install-service.ps1 -InstallDir "C:\Program Files\OpsTransferTool"
 
@@ -78,7 +97,8 @@ param(
     [string]$RceditPath = $null,
     [string]$IconPath   = $null,
     [string]$DaemonExeName     = "MonitoringToolDaemon.exe",
-    [string]$DaemonDisplayName = "Monitoring tool"
+    [string]$DaemonDisplayName = "Monitoring tool",
+    [switch]$BrandWinSwWrapper
 )
 
 $ErrorActionPreference = "Stop"
@@ -211,42 +231,97 @@ if ($existingService) {
 # Without this, the SCM-managed process WinSW spawns runs plain
 # "java.exe"/"javaw.exe", which Windows labels "OpenJDK Platform Binary"
 # with the stock Java coffee-cup icon in Task Manager - correct, but
-# indistinguishable from any other Java app on the machine. Delegates the
-# actual copy+rcedit work to Brand-Executable.ps1 (shared with
-# Deploy-Application.ps1's identical need for the GUI launcher) rather
-# than duplicating that logic here. Entirely optional - if rcedit isn't
-# available, Brand-Executable.ps1 logs why and hands back the plain
-# javaw.exe path unchanged, and the daemon installs and runs exactly the
-# same either way; only its Task Manager identity differs.
+# indistinguishable from any other Java app on the machine. This branded
+# copy needs to live inside its OWN private runtime (built via
+# New-PrivateRuntime.ps1), not the system JDK's bin\ folder — see that
+# script's own docs for why a bare renamed copy of the system javaw.exe
+# can't just be dropped into -InstallDir directly. Entirely optional -
+# if rcedit isn't available, Brand-Executable.ps1 logs why and hands back
+# the plain javaw.exe path unchanged, and the daemon installs and runs
+# exactly the same either way; only its Task Manager identity differs.
 $iconCandidate = if ($IconPath -and (Test-Path $IconPath)) { $IconPath } else { Join-Path $InstallDir "Icon.ico" }
-$javaSource = (Get-Command "javaw.exe" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue)
+$brandScript = Join-Path $PSScriptRoot "steps\Brand-Executable.ps1"
+
+$runtimeScript = Join-Path $PSScriptRoot "steps\New-PrivateRuntime.ps1"
+$javaSource = $null
+if (Test-Path $runtimeScript) {
+    try {
+        $runtimeResult = & $runtimeScript -InstallDir $InstallDir
+        $javaSource = $runtimeResult.Javaw
+    } catch {
+        Log "WARNING: Could not build private runtime: $_"
+    }
+}
 if (-not $javaSource) {
-    try { $javaSource = Join-Path (Split-Path (Get-Command java.exe).Source) "javaw.exe" } catch { $javaSource = $null }
+    # Fallback only — see Deploy-Application.ps1's identical fallback for why.
+    $javaSource = (Get-Command "javaw.exe" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue)
+    if (-not $javaSource) {
+        try { $javaSource = Join-Path (Split-Path (Get-Command java.exe).Source) "javaw.exe" } catch { $javaSource = $null }
+    }
 }
 
 if (-not $javaSource -or -not (Test-Path $javaSource)) {
     Log "NOTE: Couldn't locate javaw.exe to rebrand (is Java on PATH?) - daemon will run as plain java.exe in Task Manager."
+} elseif (-not (Test-Path $brandScript)) {
+    Log "NOTE: packaging\steps\Brand-Executable.ps1 not found - skipping Task Manager rebrand."
 } else {
-    $brandScript = Join-Path $PSScriptRoot "steps\Brand-Executable.ps1"
-    if (-not (Test-Path $brandScript)) {
-        Log "NOTE: packaging\steps\Brand-Executable.ps1 not found - skipping Task Manager rebrand."
-    } else {
-        $brandArgs = @{
-            SourceExe   = $javaSource
-            DestExe     = $DaemonExeName
+    $brandArgs = @{
+        SourceExe   = $javaSource
+        DestExe     = $DaemonExeName
+        IconPath    = $iconCandidate
+        Description = "$DaemonDisplayName - background daemon"
+        ProductName = $DaemonDisplayName
+        SearchDir   = $InstallDir
+    }
+    if ($RceditPath) { $brandArgs.RceditPath = $RceditPath }
+    $brandResult = & $brandScript @brandArgs
+    if ($brandResult.Branded) {
+        [xml]$cfg = Get-Content $configTarget
+        $cfg.service.executable = $brandResult.ExePath
+        $cfg.Save($configTarget)
+        Log "Daemon JVM process rebranded for Task Manager: $($brandResult.ExePath)"
+    }
+}
+
+# ── Rebrand the WinSW WRAPPER itself (daemon-service.exe) ──────────────────
+# OFF BY DEFAULT - pass -BrandWinSwWrapper to enable. See the parameter's
+# own help comment above for the full explanation: WinSW v3's own exe is
+# typically a self-contained single-file .NET "apphost bundle", and
+# running rcedit against it corrupts the bundle's offset table, which
+# fails at daemon-service.exe install/start time with "Arithmetic
+# overflow while reading bundle." (WinSW install exit code -2147450721) -
+# exactly the failure this setup previously hit. The child JVM process
+# above is always rebranded regardless of this switch; only the WinSW
+# wrapper's own Task Manager entry is affected.
+if ($BrandWinSwWrapper) {
+    if ((Test-Path $WinSwPath) -and $brandScript -and (Test-Path $brandScript) -and (Test-Path $iconCandidate)) {
+        $wrapperBrandArgs = @{
+            SourceExe   = $WinSwPath
+            DestExe     = (Split-Path $WinSwPath -Leaf)
             IconPath    = $iconCandidate
             Description = "$DaemonDisplayName - background daemon"
             ProductName = $DaemonDisplayName
+            SearchDir   = $InstallDir
         }
-        if ($RceditPath) { $brandArgs.RceditPath = $RceditPath }
-        $brandResult = & $brandScript @brandArgs
-        if ($brandResult.Branded) {
-            [xml]$cfg = Get-Content $configTarget
-            $cfg.service.executable = $brandResult.ExePath
-            $cfg.Save($configTarget)
-            Log "Daemon process rebranded for Task Manager: $($brandResult.ExePath)"
+        if ($RceditPath) { $wrapperBrandArgs.RceditPath = $RceditPath }
+        # DestExe intentionally has the SAME name as SourceExe here: this brands
+        # daemon-service.exe in place (it's already a per-app renamed copy of
+        # WinSW the operator created during setup, not a shared system binary),
+        # rather than producing a second differently-named copy alongside it.
+        try {
+            Copy-Item -Path $WinSwPath -Destination "$WinSwPath.tmp" -Force
+            $wrapperBrandArgs.SourceExe = "$WinSwPath.tmp"
+            $wrapperResult = & $brandScript @wrapperBrandArgs
+            if ($wrapperResult.Branded) {
+                Log "WinSW wrapper rebranded for Task Manager: $WinSwPath"
+            }
+            Remove-Item "$WinSwPath.tmp" -ErrorAction SilentlyContinue
+        } catch {
+            Log "WARNING: Could not rebrand WinSW wrapper: $_"
         }
     }
+} else {
+    Log "Skipping WinSW wrapper rebrand (default - pass -BrandWinSwWrapper only if your daemon-service.exe is confirmed NOT a single-file .NET publish)."
 }
 
 # ── Install and start ───────────────────────────────────────────────────────

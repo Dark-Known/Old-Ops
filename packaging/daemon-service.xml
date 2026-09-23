@@ -41,11 +41,21 @@
   process shows this app's name and icon in Task Manager rather than
   "OpenJDK Platform Binary" — see the "Rebrand the daemon's actual JVM
   process" section of install-service.ps1 for how and why.
+
+  <id> stays as the internal Windows service name (what sc.exe/
+  Get-Service/services.msc's "Service name" column show, and what
+  install-service.ps1's own start/stop/recovery commands reference by
+  name) — install-service.ps1 has this value hardcoded in three places,
+  so don't change it here without updating those too. <name> and
+  <description>, on the other hand, are purely the human-facing display
+  text (services.msc's "Description" column, Task Manager's Services
+  tab) and are safe to reword freely — they're what a person actually
+  sees, unrelated to <id>.
 -->
 <service>
   <id>OpsTransferToolDaemon</id>
-  <name>Ops Transfer Tool Daemon</name>
-  <description>Headless scheduler/worker-pool/watcher process for Ops Transfer Tool. The GUI is a thin client that reads this service's status and queues commands for it — it does not schedule or execute tasks itself.</description>
+  <name>Monitoring tool</name>
+  <description>Monitoring tool - background daemon</description>
 
   <!-- Adjust to the actual installed JRE/JDK path and jar location. -->
   <executable>java</executable>

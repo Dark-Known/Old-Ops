@@ -220,19 +220,38 @@ if ($IconSource -and (Test-Path $IconSource)) {
     Log "No icon source found. Falling back to default system icon."
 }
 
-# ── Brand a direct GUI launcher (no more test-elevation.bat) ───────────────
-# Find javaw.exe - by this point in the normal setup.ps1 flow,
-# Install-Prerequisites.ps1 already guaranteed one exists; this script can
-# also run standalone, so it re-detects rather than assuming.
-function Find-JavawExe {
-    if ($env:JAVA_HOME -and (Test-Path (Join-Path $env:JAVA_HOME "bin\javaw.exe"))) {
-        return (Join-Path $env:JAVA_HOME "bin\javaw.exe")
+# ── Build/reuse this app's own private Java runtime, then brand a direct
+#    GUI launcher inside it (no more test-elevation.bat). The private
+#    runtime — not the system JDK's own bin\ — is what makes it valid for
+#    the branded copy to live inside -InstallDir: see
+#    New-PrivateRuntime.ps1's own docs for why a bare copy of the system
+#    javaw.exe can't just be dropped into an arbitrary folder.
+$runtimeScript = Join-Path $PSScriptRoot "New-PrivateRuntime.ps1"
+$javawExe = $null
+if (Test-Path $runtimeScript) {
+    try {
+        $runtimeArgs = @{ InstallDir = $InstallDir }
+        if ($LogFile) { $runtimeArgs.LogFile = $LogFile }
+        $runtimeResult = & $runtimeScript @runtimeArgs
+        $javawExe = $runtimeResult.Javaw
+    } catch {
+        Log "WARNING: Could not build private runtime: $_ - falling back to the system javaw.exe (shortcuts will still work, just without a private, self-contained runtime)."
     }
-    $jc = Get-Command javaw.exe -ErrorAction SilentlyContinue
-    if ($jc) { return $jc.Source }
-    return $null
 }
-$javawExe = Find-JavawExe
+if (-not $javawExe) {
+    # Fallback only: same detection Install-Prerequisites.ps1 uses. A
+    # shortcut built from this still launches fine, it just points at the
+    # shared system JDK instead of a private runtime, and (per
+    # Brand-Executable.ps1's own same-directory rule) any branding ends up
+    # placed inside the system JDK's bin\ rather than -InstallDir - not
+    # what was asked for, but better than no shortcut at all.
+    if ($env:JAVA_HOME -and (Test-Path (Join-Path $env:JAVA_HOME "bin\javaw.exe"))) {
+        $javawExe = Join-Path $env:JAVA_HOME "bin\javaw.exe"
+    } else {
+        $jc = Get-Command javaw.exe -ErrorAction SilentlyContinue
+        if ($jc) { $javawExe = $jc.Source }
+    }
+}
 
 $guiExePath    = $null
 $guiExeBranded = $false
@@ -246,6 +265,7 @@ if (-not $javawExe) {
             DestExe     = $GuiExeName
             IconPath    = $installedIcon
             Description = $ShortcutName
+            SearchDir   = $InstallDir
         }
         if ($RceditPath) { $brandArgs.RceditPath = $RceditPath }
         if ($LogFile)     { $brandArgs.LogFile     = $LogFile }
