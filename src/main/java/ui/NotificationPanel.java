@@ -1,38 +1,85 @@
 package ui;
 
 import model.ScheduledTask;
+import model.TaskRunRecord;
+import service.CommandQueueService;
 import service.TaskSchedulerService;
 import service.XmlStorageService;
 
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
-import javax.swing.border.TitledBorder;
-import javax.swing.table.DefaultTableModel;
 import java.awt.*;
+import java.time.LocalDateTime;
 import java.util.List;
+import java.util.*;
 
+/**
+ * The Health Feed — "what needs my attention, in the order it happened" —
+ * v2. Replaces the old two-tab, plain-{@link javax.swing.JTable} layout (a
+ * "Tasks" tab and a separate "Watcher" tab, each its own table + its own
+ * action buttons) with one scrollable, chronologically-sorted feed mixing
+ * all three kinds of thing this app can flag:
+ * <ul>
+ *   <li>Failure groups (see {@link IssueGrouping}) — same grouping/severity/
+ *       credential-impact this panel used to only show inside StatusStrip's
+ *       old inline detail panel, now living here instead.</li>
+ *   <li>Skipped tasks — informational, with a Restart action.</li>
+ *   <li>Watcher push\u2192polling fallback events (see {@link WatchStatusMonitor}) —
+ *       informational only, same as before.</li>
+ * </ul>
+ * Named "Health Feed" (not "Activity Feed") deliberately — {@link EventMonitorPanel}
+ * already has its own, unrelated "activity feed" (a live worker-activity log);
+ * reusing that name here for a completely different view would make both
+ * ambiguous. This one pairs with {@link StatusStrip}, the "health bar" that
+ * opens it.
+ *
+ * <p>Sorted newest-first by whatever timestamp each kind of entry actually has,
+ * so a watcher fallback that happened five minutes ago outranks a failure
+ * group whose most recent occurrence was an hour ago — one list, one sense
+ * of "what's the latest thing I should know about", instead of splitting
+ * attention across separate tabs with no shared ordering.
+ *
+ * <p>Snoozed failure groups are hidden from the main feed and shown, dimmed,
+ * under a "Show snoozed" toggle instead — snooze state itself is owned by
+ * whichever {@link StatusStrip} instance opened this panel (see the 4-arg
+ * constructor), since a fresh NotificationPanel is created every time the
+ * feed dialog is opened and closed, but the snooze should survive across
+ * those opens.
+ */
 public class NotificationPanel extends JPanel {
+
+    private static final int LOOKBACK_HOURS = 24;
+    private static final int QUERY_LIMIT = 500;
 
     private final XmlStorageService storage;
     private final TaskSchedulerService scheduler;
     private final WatchStatusMonitor watchStatusMonitor; // nullable-safe
-    private JTabbedPane tabs;
-    private DefaultTableModel failedTableModel;
-    private JTable failedTable;
-    private DefaultTableModel skippedTableModel;
-    private JTable skippedTable;
-    private DefaultTableModel watchFallbackTableModel;
-    private JTable watchFallbackTable;
-    private JTextArea detailsArea;
+    private final StatusStrip healthBar; // nullable — see snooze()/isSnoozed()/unsnooze() below
+
+    // Only used when healthBar is null (the 2-/3-arg legacy constructors, kept
+    // only so a couple of unwired older experiments — ActionCenterButton,
+    // NotificationBell — still compile; never exercised by the real app,
+    // which always goes through StatusStrip.openFeed()'s 4-arg constructor).
+    private final Map<String, java.time.Instant> localSnoozedUntil = new HashMap<>();
+
+    private JLabel subtitle;
+    private JPanel feedList;
+    private JToggleButton showSnoozedToggle;
 
     public NotificationPanel(XmlStorageService storage, TaskSchedulerService scheduler) {
-        this(storage, scheduler, null);
+        this(storage, scheduler, null, null);
     }
 
     public NotificationPanel(XmlStorageService storage, TaskSchedulerService scheduler, WatchStatusMonitor watchStatusMonitor) {
+        this(storage, scheduler, watchStatusMonitor, null);
+    }
+
+    public NotificationPanel(XmlStorageService storage, TaskSchedulerService scheduler,
+                              WatchStatusMonitor watchStatusMonitor, StatusStrip healthBar) {
         this.storage = storage;
         this.scheduler = scheduler;
         this.watchStatusMonitor = watchStatusMonitor;
+        this.healthBar = healthBar;
         setLayout(new BorderLayout(10, 10));
         setBorder(new EmptyBorder(12, 12, 12, 12));
         add(buildHeader(), BorderLayout.NORTH);
@@ -40,314 +87,409 @@ public class NotificationPanel extends JPanel {
         refresh();
     }
 
-    private Component buildHeader() {
-        JPanel header = new JPanel(new BorderLayout(8, 8));
+    /** No-op — kept only so older, currently-unwired experiments that predate
+     *  the unified feed (a single view has nothing to select between) still
+     *  compile without modification. */
+    public void selectTab(int index) { /* intentionally does nothing */ }
 
-        JLabel title = new JLabel("Notifications & Failure Recovery");
+    private Component buildHeader() {
+        JPanel header = new JPanel(new BorderLayout(8, 4));
+
+        JLabel title = new JLabel("Health Feed");
         title.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 18));
 
-        JLabel description = new JLabel("Failed/skipped tasks and watcher push-to-polling fallbacks, kept on separate tabs.");
-        description.setFont(description.getFont().deriveFont(Font.PLAIN, 12f));
+        subtitle = new JLabel(" ");
+        subtitle.setFont(subtitle.getFont().deriveFont(Font.PLAIN, 12f));
+        subtitle.setForeground(AppTheme.NEUTRAL_FG);
 
         header.add(title, BorderLayout.NORTH);
-        header.add(description, BorderLayout.SOUTH);
+        header.add(subtitle, BorderLayout.SOUTH);
         return header;
     }
 
-    /** Two independent tabs — "Tasks" (failed/stale/skipped scheduled tasks,
-     *  with restart actions) and "Watcher" (push-to-polling fallback history,
-     *  informational only) — deliberately kept apart rather than stacked in
-     *  one view, since they're different kinds of thing an operator cares
-     *  about for different reasons and at different urgency. */
     private Component buildBody() {
-        tabs = new JTabbedPane();
-        tabs.addTab("Tasks", buildTasksTab());
-        tabs.addTab("Watcher", buildWatcherTab());
-        return tabs;
-    }
+        JPanel body = new JPanel(new BorderLayout(8, 8));
 
-    private Component buildTasksTab() {
-        JPanel body = new JPanel(new BorderLayout(10, 10));
-
-        String[] columns = {"Task Name", "Status", "Last Result", "Retries Left", "Last Started"};
-        failedTableModel = new DefaultTableModel(columns, 0) {
-            @Override public boolean isCellEditable(int row, int col) { return false; }
-        };
-        skippedTableModel = new DefaultTableModel(columns, 0) {
-            @Override public boolean isCellEditable(int row, int col) { return false; }
-        };
-
-        failedTable = new JTable(failedTableModel);
-        failedTable.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
-        failedTable.setRowHeight(26);
-        failedTable.getSelectionModel().addListSelectionListener(e -> {
-            if (!e.getValueIsAdjusting()) {
-                if (failedTable.getSelectedRow() >= 0) skippedTable.clearSelection();
-                updateDetailsForSelection();
-            }
-        });
-
-        skippedTable = new JTable(skippedTableModel);
-        skippedTable.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
-        skippedTable.setRowHeight(26);
-        skippedTable.getSelectionModel().addListSelectionListener(e -> {
-            if (!e.getValueIsAdjusting()) {
-                if (skippedTable.getSelectedRow() >= 0) failedTable.clearSelection();
-                updateDetailsForSelection();
-            }
-        });
-
-        JScrollPane failedScroll = new JScrollPane(failedTable);
-        failedScroll.setPreferredSize(new Dimension(800, 220));
-        failedScroll.setBorder(BorderFactory.createTitledBorder("Failure / Stale Running Tasks"));
-
-        JScrollPane skippedScroll = new JScrollPane(skippedTable);
-        skippedScroll.setPreferredSize(new Dimension(800, 180));
-        skippedScroll.setBorder(BorderFactory.createTitledBorder("Skipped Tasks"));
-
-        JPanel tablesPanel = new JPanel();
-        tablesPanel.setLayout(new BoxLayout(tablesPanel, BoxLayout.Y_AXIS));
-        tablesPanel.add(failedScroll);
-        tablesPanel.add(Box.createRigidArea(new Dimension(0, 8)));
-        tablesPanel.add(skippedScroll);
-
-        detailsArea = new JTextArea();
-        detailsArea.setEditable(false);
-        detailsArea.setLineWrap(true);
-        detailsArea.setWrapStyleWord(true);
-        detailsArea.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
-        detailsArea.setBorder(BorderFactory.createTitledBorder("Task Details"));
-
-        JPanel lowerPanel = new JPanel(new BorderLayout(8, 8));
-        lowerPanel.add(new JScrollPane(detailsArea), BorderLayout.CENTER);
-        lowerPanel.add(buildTaskActionsPanel(), BorderLayout.SOUTH);
-
-        body.add(tablesPanel, BorderLayout.CENTER);
-        body.add(lowerPanel, BorderLayout.SOUTH);
+        feedList = new JPanel();
+        feedList.setLayout(new BoxLayout(feedList, BoxLayout.Y_AXIS));
+        JScrollPane scroll = new JScrollPane(feedList,
+                JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED, JScrollPane.HORIZONTAL_SCROLLBAR_NEVER);
+        scroll.getVerticalScrollBar().setUnitIncrement(16);
+        body.add(scroll, BorderLayout.CENTER);
+        body.add(buildToolbar(), BorderLayout.SOUTH);
         return body;
     }
 
-    private Component buildWatcherTab() {
-        JPanel body = new JPanel(new BorderLayout(10, 10));
-
-        String[] watchColumns = {"Task Name", "Was", "Now", "Detail", "When"};
-        watchFallbackTableModel = new DefaultTableModel(watchColumns, 0) {
-            @Override public boolean isCellEditable(int row, int col) { return false; }
-        };
-        watchFallbackTable = new JTable(watchFallbackTableModel);
-        watchFallbackTable.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
-        watchFallbackTable.setRowHeight(26);
-        // No details-pane wiring for this table — the Detail column already
-        // holds the full explanation (e.g. "remote host has no inotifywait"),
-        // so there's nothing further to drill into like the Tasks tab has.
-
-        JScrollPane watchFallbackScroll = new JScrollPane(watchFallbackTable);
-        watchFallbackScroll.setBorder(BorderFactory.createTitledBorder(
-                "Watcher Push \u2192 Polling Fallbacks (live watch/push stopped working, or was confirmed unsupported)"));
-
-        body.add(watchFallbackScroll, BorderLayout.CENTER);
-        if (watchStatusMonitor == null) {
-            JLabel note = new JLabel("Watcher fallback monitoring is not available in this context.");
-            note.setBorder(BorderFactory.createEmptyBorder(4, 4, 4, 4));
-            body.add(note, BorderLayout.NORTH);
-        }
-        body.add(buildWatcherActionsPanel(), BorderLayout.SOUTH);
-        return body;
-    }
-
-    private Component buildTaskActionsPanel() {
+    private Component buildToolbar() {
         JButton btnRefresh = new JButton("Refresh");
-        JButton btnRestart = new JButton("Restart Selected");
-        JButton btnRestartAll = new JButton("Restart All Failed");
-
         btnRefresh.addActionListener(e -> refresh());
-        btnRestart.addActionListener(e -> restartSelected());
+
+        showSnoozedToggle = new JToggleButton("Show snoozed");
+        showSnoozedToggle.addActionListener(e -> refresh());
+
+        JButton btnRestartAll = new JButton("Restart All Failed");
         btnRestartAll.addActionListener(e -> restartAllFailed());
 
         JPanel actions = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
         actions.add(btnRefresh);
-        actions.add(btnRestart);
+        actions.add(showSnoozedToggle);
         actions.add(btnRestartAll);
         return actions;
     }
 
-    private Component buildWatcherActionsPanel() {
-        JButton btnRefresh = new JButton("Refresh");
-        JButton btnClear = new JButton("Clear History");
+    // ------------------------------------------------------------------
+    // Snooze — delegates to the owning StatusStrip when there is one (the
+    // real app always provides one; see class javadoc).
+    // ------------------------------------------------------------------
 
-        btnRefresh.addActionListener(e -> refresh());
-        btnClear.addActionListener(e -> {
-            if (watchStatusMonitor != null) watchStatusMonitor.clearEvents();
-            refresh();
-        });
-        btnClear.setEnabled(watchStatusMonitor != null);
-
-        JPanel actions = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
-        actions.add(btnRefresh);
-        actions.add(btnClear);
-        return actions;
+    private boolean isSnoozed(String groupKey) {
+        if (healthBar != null) return healthBar.isSnoozed(groupKey);
+        purgeExpiredLocalSnoozes();
+        return localSnoozedUntil.containsKey(groupKey);
     }
+
+    private void snooze(String groupKey) {
+        if (healthBar != null) healthBar.snooze(groupKey);
+        else localSnoozedUntil.put(groupKey, java.time.Instant.now().plusSeconds(2 * 3600));
+        refresh();
+    }
+
+    private void unsnooze(String groupKey) {
+        if (healthBar != null) healthBar.unsnooze(groupKey);
+        else localSnoozedUntil.remove(groupKey);
+        refresh();
+    }
+
+    private void purgeExpiredLocalSnoozes() {
+        java.time.Instant now = java.time.Instant.now();
+        localSnoozedUntil.entrySet().removeIf(e -> !e.getValue().isAfter(now));
+    }
+
+    // ------------------------------------------------------------------
+    // Feed assembly
+    // ------------------------------------------------------------------
+
+    /** One row in the merged feed — just enough to sort everything by time and render it. */
+    private record FeedItem(LocalDateTime timestamp, boolean snoozed, JPanel card) {}
 
     private void refresh() {
-        failedTableModel.setRowCount(0);
-        skippedTableModel.setRowCount(0);
-        List<ScheduledTask> tasks = storage.loadTasks();
-        for (ScheduledTask task : tasks) {
-            if (task.getStatus() == ScheduledTask.TaskStatus.FAILED
-                    || task.getStatus() == ScheduledTask.TaskStatus.RETRYING
-                    || task.getStatus() == ScheduledTask.TaskStatus.RUNNING) {
-                failedTableModel.addRow(new Object[] {
-                        task.getName(),
-                        task.getStatus().name(),
-                        task.getLastRunResult() != null ? task.getLastRunResult() : "",
-                        task.getRetryCount(),
-                        task.getLastStartedAt() != null ? task.getLastStartedAt().toString() : ""
-                });
+        feedList.removeAll();
+
+        List<FeedItem> items = new ArrayList<>();
+        int activeIssueCount = 0;
+        int watcherCount = 0;
+
+        if (scheduler != null && scheduler.getRunHistoryService() != null) {
+            try {
+                var history = scheduler.getRunHistoryService();
+                LocalDateTime now = LocalDateTime.now();
+                LocalDateTime since = now.minusHours(LOOKBACK_HOURS);
+                List<TaskRunRecord> failures = history.queryRuns(null, TaskRunRecord.Status.FAILED, since, null, QUERY_LIMIT);
+                Map<String, List<TaskRunRecord>> groups = IssueGrouping.groupByLikelyCause(failures);
+                for (var e : groups.entrySet()) {
+                    boolean snoozed = isSnoozed(e.getKey());
+                    if (!snoozed) activeIssueCount += e.getValue().size();
+                    LocalDateTime ts = IssueGrouping.mostRecent(e.getValue());
+                    items.add(new FeedItem(ts != null ? ts : LocalDateTime.MIN, snoozed,
+                            buildFailureCard(e.getKey(), e.getValue(), snoozed)));
+                }
+            } catch (Exception ignored) {
+                // DB briefly locked by a write — next refresh will catch up
             }
+        }
+
+        for (ScheduledTask task : storage.loadTasks()) {
             if ("SKIPPED".equals(task.getLastRunResult())) {
-                skippedTableModel.addRow(new Object[] {
-                        task.getName(),
-                        task.getStatus() != null ? task.getStatus().name() : "PENDING",
-                        task.getLastRunResult(),
-                        task.getRetryCount(),
-                        task.getLastStartedAt() != null ? task.getLastStartedAt().toString() : ""
-                });
+                LocalDateTime ts = task.getLastStartedAt() != null ? task.getLastStartedAt() : task.getLastRunAt();
+                items.add(new FeedItem(ts != null ? ts : LocalDateTime.MIN, false, buildSkippedCard(task)));
             }
         }
 
-        watchFallbackTableModel.setRowCount(0);
         if (watchStatusMonitor != null) {
-            for (WatchStatusMonitor.Event ev : watchStatusMonitor.getRecentEvents()) {
-                watchFallbackTableModel.addRow(new Object[] {
-                        ev.taskName(),
-                        prettyMode(ev.fromMode()),
-                        prettyMode(ev.toMode()),
-                        ev.detail(),
-                        ev.at().toString()
-                });
+            List<WatchStatusMonitor.Event> events = watchStatusMonitor.getRecentEvents();
+            watcherCount = events.size();
+            for (WatchStatusMonitor.Event ev : events) {
+                items.add(new FeedItem(ev.at() != null ? ev.at() : LocalDateTime.MIN, false, buildWatcherCard(ev)));
             }
         }
 
-        detailsArea.setText("Select a task to view detailed information.");
+        boolean showSnoozed = showSnoozedToggle != null && showSnoozedToggle.isSelected();
+        items.sort((a, b) -> {
+            if (a.snoozed() != b.snoozed()) return a.snoozed() ? 1 : -1; // active first, always
+            return b.timestamp().compareTo(a.timestamp()); // newest first within each group
+        });
 
-        if (tabs != null) {
-            int taskCount = failedTableModel.getRowCount() + skippedTableModel.getRowCount();
-            tabs.setTitleAt(0, taskCount > 0 ? "Tasks (" + taskCount + ")" : "Tasks");
-            int watchCount = watchFallbackTableModel.getRowCount();
-            tabs.setTitleAt(1, watchCount > 0 ? "Watcher (" + watchCount + ")" : "Watcher");
+        int shown = 0;
+        for (FeedItem item : items) {
+            if (item.snoozed() && !showSnoozed) continue;
+            feedList.add(item.card());
+            feedList.add(Box.createVerticalStrut(1));
+            shown++;
         }
+        if (shown == 0) {
+            feedList.add(emptyStateCard());
+        }
+
+        long snoozedCount = items.stream().filter(FeedItem::snoozed).count();
+        if (showSnoozedToggle != null) {
+            showSnoozedToggle.setText(snoozedCount > 0 ? "Show snoozed (" + snoozedCount + ")" : "Show snoozed");
+            showSnoozedToggle.setEnabled(snoozedCount > 0);
+        }
+
+        subtitle.setText(activeIssueCount + " active issue" + (activeIssueCount == 1 ? "" : "s")
+                + " \u00b7 " + watcherCount + " watcher event" + (watcherCount == 1 ? "" : "s")
+                + (snoozedCount > 0 ? " \u00b7 " + snoozedCount + " snoozed" : ""));
+
+        feedList.revalidate();
+        feedList.repaint();
     }
 
-    /** Switches to the "Tasks" (0) or "Watcher" (1) tab — used by
-     *  {@link NotificationBell} so clicking a specific item in the dropdown
-     *  lands on the tab that item actually belongs to, instead of always
-     *  opening to whichever tab happens to be first. */
-    public void selectTab(int index) {
-        if (tabs != null && index >= 0 && index < tabs.getTabCount()) {
-            tabs.setSelectedIndex(index);
+    private JPanel emptyStateCard() {
+        JPanel card = new JPanel(new BorderLayout());
+        card.setBorder(new EmptyBorder(24, 8, 24, 8));
+        JLabel label = new JLabel("Nothing needs attention right now.", SwingConstants.CENTER);
+        label.setFont(label.getFont().deriveFont(Font.PLAIN, 13f));
+        label.setForeground(AppTheme.NEUTRAL_FG);
+        card.add(label, BorderLayout.CENTER);
+        return card;
+    }
+
+    // ------------------------------------------------------------------
+    // Card builders — one per kind of feed entry. Each is a left-accent-bar
+    // + content row, matching the same visual language (severity chip, small
+    // muted timestamp) across all three kinds so the feed reads as one thing
+    // rather than three bolted-together widgets.
+    // ------------------------------------------------------------------
+
+    private JPanel accentCard(Color accent, boolean dimmed) {
+        JPanel card = new JPanel(new BorderLayout(10, 0));
+        card.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createMatteBorder(0, 3, 0, 0, dimmed ? accent.darker() : accent),
+                new EmptyBorder(9, 10, 9, 10)));
+        card.setAlignmentX(Component.LEFT_ALIGNMENT);
+        card.setBackground(AppTheme.isDark() ? new Color(0x24273A) : new Color(0xFAFAFC));
+        card.setOpaque(true);
+        return card;
+    }
+
+    private static JLabel chip(String text, Color bg) {
+        JLabel l = new JLabel(text);
+        l.setOpaque(true);
+        l.setFont(l.getFont().deriveFont(Font.BOLD, 9.5f));
+        l.setForeground(Color.WHITE);
+        l.setBackground(bg);
+        l.setBorder(new EmptyBorder(1, 6, 1, 6));
+        return l;
+    }
+
+    private static String timeAgo(LocalDateTime when) {
+        if (when == null || when == LocalDateTime.MIN) return "";
+        long minutes = java.time.Duration.between(when, LocalDateTime.now()).toMinutes();
+        if (minutes < 1) return "just now";
+        if (minutes < 60) return minutes + " min ago";
+        long hours = minutes / 60;
+        if (hours < 24) return hours + "h ago";
+        return (hours / 24) + "d ago";
+    }
+
+    private JPanel buildFailureCard(String groupKey, List<TaskRunRecord> records, boolean snoozed) {
+        TaskRunRecord example = records.get(0);
+        boolean blocking = IssueGrouping.isBlocking(example);
+        Color accent = blocking ? new Color(0xC62828) : new Color(0xE68A00);
+
+        JPanel card = accentCard(accent, snoozed);
+
+        JPanel left = new JPanel();
+        left.setOpaque(false);
+        left.setLayout(new BoxLayout(left, BoxLayout.Y_AXIS));
+
+        String category = example.getFailureCategory() != null ? example.getFailureCategory().name() : "UNKNOWN";
+        JPanel titleLine = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
+        titleLine.setOpaque(false);
+        titleLine.setAlignmentX(Component.LEFT_ALIGNMENT);
+        titleLine.add(chip(blocking ? "CRITICAL" : "WARNING", accent));
+        JLabel title = new JLabel(example.getTaskName() + "  \u00d7" + records.size() + "   \u2014   " + category);
+        title.setFont(title.getFont().deriveFont(Font.BOLD, 12.5f));
+        if (snoozed) title.setForeground(AppTheme.NEUTRAL_FG);
+        titleLine.add(title);
+        JLabel time = new JLabel(timeAgo(IssueGrouping.mostRecent(records)));
+        time.setFont(time.getFont().deriveFont(Font.PLAIN, 10.5f));
+        time.setForeground(AppTheme.NEUTRAL_FG);
+        titleLine.add(time);
+        left.add(titleLine);
+
+        String action = example.getSuggestedAction() != null ? example.getSuggestedAction() : "No specific suggestion available.";
+        JLabel actionLabel = new JLabel("<html><div style='width:420px'>" + escape(action) + "</div></html>");
+        actionLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        actionLabel.setFont(actionLabel.getFont().deriveFont(Font.PLAIN, 11.5f));
+        actionLabel.setForeground(AppTheme.NEUTRAL_FG);
+        left.add(actionLabel);
+
+        String impact = IssueGrouping.describeCredentialImpact(storage, example);
+        if (impact != null) {
+            JLabel impactLabel = new JLabel(impact);
+            impactLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+            impactLabel.setFont(impactLabel.getFont().deriveFont(Font.ITALIC, 11f));
+            impactLabel.setForeground(blocking ? new Color(0xC62828) : AppTheme.NEUTRAL_FG);
+            left.add(impactLabel);
         }
+        card.add(left, BorderLayout.CENTER);
+
+        JPanel actions = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 0));
+        actions.setOpaque(false);
+        if (snoozed) {
+            JButton unsnooze = new JButton("Un-snooze");
+            unsnooze.setFont(unsnooze.getFont().deriveFont(11.5f));
+            unsnooze.addActionListener(ev -> unsnooze(groupKey));
+            actions.add(unsnooze);
+        } else {
+            JButton viewLog = new JButton("View log");
+            viewLog.setFont(viewLog.getFont().deriveFont(11.5f));
+            viewLog.addActionListener(ev -> showRunDetail(example));
+            actions.add(viewLog);
+
+            JButton retry = new JButton(blocking ? "Fix & retry" : "Retry");
+            retry.setFont(retry.getFont().deriveFont(11.5f));
+            retry.setToolTipText(blocking
+                    ? "This isn't usually transient (e.g. a bad credential) — fix the cause, then retry"
+                    : "Re-run this task now");
+            retry.addActionListener(ev -> retryTask(example.getTaskId(), example.getTaskName()));
+            actions.add(retry);
+
+            JButton snoozeBtn = new JButton("Snooze 2h");
+            snoozeBtn.setFont(snoozeBtn.getFont().deriveFont(11.5f));
+            snoozeBtn.setToolTipText("Stop re-alerting on this group for 2 hours — it keeps running normally, this only quiets the badge");
+            snoozeBtn.addActionListener(ev -> snooze(groupKey));
+            actions.add(snoozeBtn);
+        }
+        card.add(actions, BorderLayout.EAST);
+        return card;
+    }
+
+    private JPanel buildSkippedCard(ScheduledTask task) {
+        JPanel card = accentCard(new Color(0x757575), false);
+
+        JPanel left = new JPanel();
+        left.setOpaque(false);
+        left.setLayout(new BoxLayout(left, BoxLayout.Y_AXIS));
+        JPanel titleLine = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
+        titleLine.setOpaque(false);
+        titleLine.add(chip("SKIPPED", new Color(0x757575)));
+        JLabel title = new JLabel(task.getName());
+        title.setFont(title.getFont().deriveFont(Font.BOLD, 12.5f));
+        titleLine.add(title);
+        LocalDateTime ts = task.getLastStartedAt() != null ? task.getLastStartedAt() : task.getLastRunAt();
+        JLabel time = new JLabel(timeAgo(ts));
+        time.setFont(time.getFont().deriveFont(Font.PLAIN, 10.5f));
+        time.setForeground(AppTheme.NEUTRAL_FG);
+        titleLine.add(time);
+        left.add(titleLine);
+
+        JLabel detail = new JLabel("Last run was skipped.");
+        detail.setFont(detail.getFont().deriveFont(Font.PLAIN, 11.5f));
+        detail.setForeground(AppTheme.NEUTRAL_FG);
+        left.add(detail);
+        card.add(left, BorderLayout.CENTER);
+
+        JButton restart = new JButton("Restart");
+        restart.setFont(restart.getFont().deriveFont(11.5f));
+        restart.addActionListener(ev -> restartTask(task));
+        JPanel actions = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 0));
+        actions.setOpaque(false);
+        actions.add(restart);
+        card.add(actions, BorderLayout.EAST);
+        return card;
+    }
+
+    private JPanel buildWatcherCard(WatchStatusMonitor.Event ev) {
+        JPanel card = accentCard(new Color(0x1565C0), false);
+
+        JPanel left = new JPanel();
+        left.setOpaque(false);
+        left.setLayout(new BoxLayout(left, BoxLayout.Y_AXIS));
+        JPanel titleLine = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
+        titleLine.setOpaque(false);
+        titleLine.add(chip("WATCHER", new Color(0x1565C0)));
+        JLabel title = new JLabel(ev.taskName() + "  \u2014  " + prettyMode(ev.fromMode()) + " \u2192 " + prettyMode(ev.toMode()));
+        title.setFont(title.getFont().deriveFont(Font.BOLD, 12.5f));
+        titleLine.add(title);
+        JLabel time = new JLabel(timeAgo(ev.at()));
+        time.setFont(time.getFont().deriveFont(Font.PLAIN, 10.5f));
+        time.setForeground(AppTheme.NEUTRAL_FG);
+        titleLine.add(time);
+        left.add(titleLine);
+
+        if (ev.detail() != null && !ev.detail().isEmpty()) {
+            JLabel detail = new JLabel("<html><div style='width:420px'>" + escape(ev.detail()) + "</div></html>");
+            detail.setFont(detail.getFont().deriveFont(Font.PLAIN, 11.5f));
+            detail.setForeground(AppTheme.NEUTRAL_FG);
+            left.add(detail);
+        }
+        card.add(left, BorderLayout.CENTER);
+        return card;
     }
 
     private static String prettyMode(String rawWatchModeName) {
+        if (rawWatchModeName == null) return "?";
         return switch (rawWatchModeName) {
-            case "NATIVE_WATCH" -> "Live (native watch)";
-            case "REMOTE_PUSH" -> "Live (remote push)";
-            case "POLLING_ONLY_UNSUPPORTED" -> "Polling only (unsupported)";
-            case "POLLING_ONLY" -> "Polling only";
+            case "NATIVE_WATCH" -> "Live (native)";
+            case "REMOTE_PUSH" -> "Live (push)";
+            case "POLLING_ONLY_UNSUPPORTED" -> "Polling (unsupported)";
+            case "POLLING_ONLY" -> "Polling";
             default -> rawWatchModeName;
         };
     }
 
-    private void updateDetailsForSelection() {
-        int row = failedTable.getSelectedRow();
-        JTable source = failedTable;
-        if (row < 0) {
-            row = skippedTable.getSelectedRow();
-            source = skippedTable;
-        }
-        if (row < 0) {
-            detailsArea.setText("Select a task to view detailed information.");
-            return;
-        }
-
-        String name = (String) source.getValueAt(row, 0);
-        ScheduledTask task = storage.loadTasks().stream()
-                .filter(t -> t.getName().equals(name))
-                .findFirst().orElse(null);
-        if (task == null) {
-            detailsArea.setText("Task details not found.");
-            return;
-        }
-
-        StringBuilder sb = new StringBuilder();
-        sb.append("Task: ").append(task.getName()).append("\n");
-        sb.append("Status: ").append(task.getStatus().name()).append("\n");
-        sb.append("Retries left: ").append(task.getRetryCount()).append("\n");
-        sb.append("Last started: ")
-                .append(task.getLastStartedAt() != null ? task.getLastStartedAt().toString() : "Never").append("\n");
-        sb.append("Last run: ")
-                .append(task.getLastRunAt() != null ? task.getLastRunAt().toString() : "Never").append("\n");
-        sb.append("Result: ").append(task.getLastRunResult() != null ? task.getLastRunResult() : "None").append("\n\n");
-        sb.append("Use the Restart buttons to requeue failed or stale-running tasks.\n");
-        if (task.getStatus() == ScheduledTask.TaskStatus.RUNNING) {
-            sb.append("This task appears to be active or stale. Use Restart Selected to recover it.\n");
-        }
-        detailsArea.setText(sb.toString());
+    private static String escape(String s) {
+        return s == null ? "" : s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
     }
 
-    private void restartSelected() {
-        int row = failedTable.getSelectedRow();
-        JTable source = failedTable;
-        if (row < 0) {
-            row = skippedTable.getSelectedRow();
-            source = skippedTable;
-        }
-        if (row < 0) {
-            JOptionPane.showMessageDialog(this, "Select a task first.", "No Selection", JOptionPane.WARNING_MESSAGE);
-            return;
-        }
+    // ------------------------------------------------------------------
+    // Actions
+    // ------------------------------------------------------------------
 
-        String name = (String) source.getValueAt(row, 0);
-        ScheduledTask task = storage.loadTasks().stream()
-                .filter(t -> t.getName().equals(name))
-                .findFirst().orElse(null);
-        if (task == null) {
-            JOptionPane.showMessageDialog(this, "Task data not found.", "Error", JOptionPane.ERROR_MESSAGE);
-            return;
-        }
+    private void showRunDetail(TaskRunRecord record) {
+        JTextArea area = new JTextArea(record.getDetails() != null ? record.getDetails() : record.getReason());
+        area.setEditable(false);
+        area.setLineWrap(true);
+        area.setWrapStyleWord(true);
+        area.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
+        JScrollPane scroll = new JScrollPane(area);
+        scroll.setPreferredSize(new Dimension(560, 320));
+        JOptionPane.showMessageDialog(this, scroll, record.getTaskName() + " \u2014 run detail", JOptionPane.PLAIN_MESSAGE);
+    }
 
+    private void retryTask(String taskId, String taskName) {
+        if (taskId == null) return;
+        storage.loadTasks().stream().filter(t -> t.getId().equals(taskId)).findFirst().ifPresent(this::restartTask);
+        if (scheduler != null) scheduler.refresh();
+        JOptionPane.showMessageDialog(this, "\"" + taskName + "\" queued for immediate retry.");
+        refresh();
+    }
+
+    private void restartTask(ScheduledTask task) {
         task.setStatus(ScheduledTask.TaskStatus.PENDING);
+        task.setLastStartedAt(null);
         storage.saveTask(task);
         // Ask the daemon/service to actually do this — this window never
         // runs its own scheduler/worker pool (see MainWindow's thin-client
         // migration and service.CommandQueueService).
-        service.CommandQueueService.enqueue(storage.getDataDir(), task.getId(),
-                service.CommandQueueService.Action.CANCEL, "gui");
-        service.CommandQueueService.enqueue(storage.getDataDir(), task.getId(),
-                service.CommandQueueService.Action.RUN_NOW, "gui");
+        CommandQueueService.enqueue(storage.getDataDir(), task.getId(), CommandQueueService.Action.CANCEL, "gui");
+        CommandQueueService.enqueue(storage.getDataDir(), task.getId(), CommandQueueService.Action.RUN_NOW, "gui");
         refresh();
     }
 
     private void restartAllFailed() {
-        List<ScheduledTask> failed = storage.loadTasks();
         int count = 0;
-        for (ScheduledTask task : failed) {
+        for (ScheduledTask task : storage.loadTasks()) {
             if (task.getStatus() == ScheduledTask.TaskStatus.FAILED
                     || task.getStatus() == ScheduledTask.TaskStatus.RETRYING
                     || task.getStatus() == ScheduledTask.TaskStatus.RUNNING) {
-                task.setStatus(ScheduledTask.TaskStatus.PENDING);
-                task.setLastStartedAt(null);
-                storage.saveTask(task);
-                service.CommandQueueService.enqueue(storage.getDataDir(), task.getId(),
-                        service.CommandQueueService.Action.CANCEL, "gui");
-                service.CommandQueueService.enqueue(storage.getDataDir(), task.getId(),
-                        service.CommandQueueService.Action.RUN_NOW, "gui");
+                restartTask(task);
                 count++;
             }
         }
-        JOptionPane.showMessageDialog(this,
-                count + " failed task(s) restarted.",
-                "Restarted", JOptionPane.INFORMATION_MESSAGE);
+        JOptionPane.showMessageDialog(this, count + " failed task(s) restarted.", "Restarted", JOptionPane.INFORMATION_MESSAGE);
         refresh();
     }
 }

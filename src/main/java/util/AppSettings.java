@@ -226,7 +226,7 @@ public final class AppSettings {
                 // app-config.xml's <dataDir> can't be resolved (e.g. process
                 // launched from a working directory where AppConfig can't
                 // locate the XML), this DB would silently end up in a
-                // different folder than tasks.xml/credentials/daemon.log,
+                // different folder than app.db (tasks/credentials/settings)/daemon.log,
                 // and edits made in the Settings panel would look like
                 // they're going nowhere.
                 dataDir = "C:\\OpsTools\\Data";

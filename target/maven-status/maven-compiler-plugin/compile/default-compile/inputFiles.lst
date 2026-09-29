@@ -26,6 +26,7 @@ D:\OPS\OpsTransferTool-source\src\main\java\service\RemoteFileMetadataServiceFac
 D:\OPS\OpsTransferTool-source\src\main\java\service\RunHistoryService.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\SftpBrowseService.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\SftpRemoteFileMetadataService.java
+D:\OPS\OpsTransferTool-source\src\main\java\service\TaskDbService.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\TaskLogService.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\TaskSchedulerService.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\TransferService.java
@@ -49,6 +50,7 @@ D:\OPS\OpsTransferTool-source\src\main\java\ui\GradientPanel.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\GradientToggleButton.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\HealthBanner.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\IconTile.java
+D:\OPS\OpsTransferTool-source\src\main\java\ui\IssueGrouping.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\MainWindow.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\NotificationBell.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\NotificationPanel.java

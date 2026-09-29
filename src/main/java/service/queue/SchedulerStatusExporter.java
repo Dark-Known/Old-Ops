@@ -46,7 +46,8 @@ public final class SchedulerStatusExporter {
                         List<TaskWorkerPool.ActivityEntry> activity,
                         List<SchedulerStatusSnapshot.WatchEntry> watchEntries,
                         List<SchedulerStatusSnapshot.FireEntry> fireEntries,
-                        List<String> runningTaskIds) {
+                        List<String> runningTaskIds,
+                        List<SchedulerStatusSnapshot.SessionEntry> sessionEntries) {
         try {
             StringBuilder sb = new StringBuilder(512);
             sb.append("PROC|").append(SchedulerStatusSnapshot.escape(processLabel)).append('|')
@@ -80,6 +81,12 @@ public final class SchedulerStatusExporter {
             if (runningTaskIds != null) {
                 for (String taskId : runningTaskIds) {
                     sb.append("R|").append(SchedulerStatusSnapshot.escape(taskId)).append('\n');
+                }
+            }
+            if (sessionEntries != null) {
+                for (SchedulerStatusSnapshot.SessionEntry s : sessionEntries) {
+                    sb.append("S|").append(SchedulerStatusSnapshot.escape(s.taskId())).append('|')
+                            .append(s.count()).append('\n');
                 }
             }
 

@@ -143,6 +143,7 @@ public class EventMonitorPanel extends JPanel {
     /** Stops the internal refresh timer. Call when the enclosing window is disposed. */
     public void stopRefreshing() {
         if (refreshTimer != null) refreshTimer.stop();
+        if (workerStrip != null) workerStrip.dispose();
         // Each EventMonitorWindow open/close cycle constructs a fresh
         // EventMonitorPanel (see EventMonitorWindow's class doc) — without
         // removing these here, every reopen would stack another pair of

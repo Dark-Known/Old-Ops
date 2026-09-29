@@ -403,8 +403,15 @@ public class TaskSchedulerService {
                 watchEntries.add(new SchedulerStatusSnapshot.WatchEntry(t.getId(), status.mode().name(), status.detail()));
                 logWatchTransitionIfNotable(t, status);
             }
+            List<SchedulerStatusSnapshot.SessionEntry> sessionEntries = new ArrayList<>();
+            if (transferService != null) {
+                for (var e : transferService.getActiveSessionCountsByTask().entrySet()) {
+                    sessionEntries.add(new SchedulerStatusSnapshot.SessionEntry(e.getKey(), e.getValue()));
+                }
+            }
             statusExporter.export(getWorkerPoolSize(), getActiveWorkerCount(), getPendingEvents(),
-                    getRecentActivity(30), watchEntries, java.util.Collections.emptyList(), getRunningTaskIds());
+                    getRecentActivity(30), watchEntries, java.util.Collections.emptyList(), getRunningTaskIds(),
+                    sessionEntries);
         } catch (Exception e) {
             log.fine("Status export tick failed: " + e.getMessage());
         }
@@ -1085,7 +1092,7 @@ public class TaskSchedulerService {
 
         // ─── Cross-process execution lock ───────────────────────────────────
         // The GUI's in-app scheduler and the standalone Daemon each poll
-        // tasks.xml independently and can both decide the same task is due
+        // app.db's tasks table independently and can both decide the same task is due
         // at nearly the same moment (especially INTERVAL_SECONDS tasks).
         // Without this, BOTH processes actually execute the task — for a
         // mail task that means fetching/marking-as-read/moving the same

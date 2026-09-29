@@ -98,6 +98,7 @@ ui\DirectoryBrowserDialog$4.class
 ui\RunLogSummarizer.class
 ui\RunHistoryPanel$StatusPillRenderer.class
 service\TransferService$MarkerMatch.class
+service\TaskDbService.class
 ui\MainWindow.class
 service\LocalFileMetadataService.class
 ui\OAuthAuthorizeDialog$1.class
@@ -118,6 +119,7 @@ util\ImapSearchCriteria$SizeCriteria.class
 service\queue\TaskDueEvent.class
 ui\StatisticsPanel$ActivityChart.class
 ui\TaskManagerPanel$TaskRowInfo.class
+ui\NotificationPanel$FeedItem.class
 service\GraphMailService$MailMessage.class
 util\ImapSearchCriteria$AdvancedCriteria.class
 service\TaskSchedulerService$TaskMetrics.class
@@ -147,6 +149,7 @@ service\watch\PersistentSftpConnectionManager.class
 ui\DirectoryBrowserDialog$8.class
 ui\ActivityEventPopup.class
 ui\IconTile.class
+ui\IssueGrouping.class
 ui\VectorIcons$4.class
 service\SftpBrowseService$Entry.class
 model\ScheduledTask$TaskType.class
@@ -177,7 +180,6 @@ App.class
 ui\StatisticsPanel$1.class
 ui\VectorIcons$2.class
 model\ScheduledTask.class
-ui\NotificationPanel$3.class
 ui\TaskDialog$3.class
 service\CommandQueueService$Command.class
 ui\EventMonitorWindow$1.class
@@ -206,7 +208,6 @@ ui\GradientToggleButton.class
 ui\EventMonitorWindow.class
 util\ImapSearchCriteria$SimpleCriteria.class
 service\GraphMailService$AttachmentFile.class
-ui\NotificationPanel$1.class
 ui\QueueMonitorView.class
 ui\TaskManagerPanel$1.class
 ui\TaskManagerPanel.class
@@ -220,7 +221,6 @@ ui\EventMonitorWindow$2.class
 ui\DirectoryBrowserDialog$Provider.class
 service\queue\TaskWorkerPool$HandlerOutcome.class
 ui\DirectoryBrowserDialog$FolderIcon.class
-ui\NotificationPanel$2.class
 service\TaskSchedulerService$1.class
 ui\CredentialManagerPanel.class
 model\ScheduledTask$TaskStatus.class

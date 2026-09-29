@@ -177,13 +177,30 @@ public class TaskManagerPanel extends JPanel {
         }
     }
 
+    /**
+     * Active WinSCP/SFTP session count for {@code taskId}, from whichever
+     * process is actually running transfers right now. The GUI is a thin
+     * client (see MainWindow's "thin client" note) — its own in-process
+     * TaskSchedulerService only runs transfers itself if the Daemon isn't
+     * alive, so most of the time {@code scheduler.getActiveSessionCount}
+     * alone would always read 0 even while a task is genuinely mid-transfer
+     * in the Daemon. Same fallback pattern as {@link #readDaemonWatchMode}.
+     */
+    private int activeSessionCount(String taskId) {
+        int local = scheduler.getActiveSessionCount(taskId);
+        if (local > 0 || scheduler.isStarted()) return local;
+        if (!service.queue.SchedulerStatusSnapshot.isAlive(daemonStatusFile, DAEMON_STALE_MS)) return local;
+        service.queue.SchedulerStatusSnapshot snap = service.queue.SchedulerStatusSnapshot.read(daemonStatusFile);
+        return snap != null ? snap.getActiveSessionCount(taskId) : local;
+    }
+
     private void refreshActiveSessionLabel() {
         String taskId = getSelectedTaskId();
         if (taskId == null) {
             lblActiveSessions.setText(" ");
             return;
         }
-        int count = scheduler.getActiveSessionCount(taskId);
+        int count = activeSessionCount(taskId);
         lblActiveSessions.setText(count > 0
                 ? "● " + count + " session" + (count == 1 ? "" : "s") + " open"
                 : " ");

@@ -3030,6 +3030,26 @@ public class TransferService {
         return total;
     }
 
+    /**
+     * Snapshot of every task with a genuinely non-zero session count right
+     * now, keyed by task id — the cross-process counterpart of {@link
+     * #getActiveSessionCount(String)}. Used by {@code TaskSchedulerService}
+     * to export live session counts to the shared status file, so a
+     * thin-client GUI (which never runs the transfers itself when the
+     * Daemon is the active scheduler) can still show a live session badge
+     * for whichever process actually launched the WinSCP process — see
+     * {@code SchedulerStatusSnapshot.SessionEntry}. Empty tasks are
+     * deliberately left out, keeping normal (idle) exports at zero cost.
+     */
+    public java.util.Map<String, Integer> getActiveSessionCountsByTask() {
+        java.util.Map<String, Integer> counts = new java.util.LinkedHashMap<>();
+        for (var entry : activeProcesses.entrySet()) {
+            int size = entry.getValue().size();
+            if (size > 0) counts.put(entry.getKey(), size);
+        }
+        return counts;
+    }
+
     public boolean cancelRunningTask(String taskId) {
         if (taskId == null) return false;
         java.util.Set<Process> procs = activeProcesses.remove(taskId);

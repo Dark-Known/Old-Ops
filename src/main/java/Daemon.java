@@ -20,8 +20,8 @@ import java.util.logging.*;
  * Usage:  java -cp OpsTransferTool.jar com.opstool.Daemon [dataDir]
  *
  * If dataDir is omitted it defaults to %USERPROFILE%\.opstool  (same
- * directory the GUI uses), so both processes share the same tasks.xml
- * and creds_<username>.xml files without any extra configuration.
+ * directory the GUI uses), so both processes share the same app.db
+ * (tasks, credentials, settings) without any extra configuration.
  *
  * The daemon writes its own rotating log to <dataDir>/daemon.log
  * (max 5 MB, 3 files) so you can inspect it independently of the GUI.

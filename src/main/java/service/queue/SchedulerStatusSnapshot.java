@@ -21,7 +21,7 @@ import java.util.List;
  * own in-memory {@link TaskEventQueue}/{@link TaskWorkerPool} that can't be
  * reached directly. Rather than adding sockets/RMI, each process
  * periodically drops a small snapshot of its own state to a shared file
- * (the same {@code dataDir} both processes already use for tasks.xml), and
+ * (the same {@code dataDir} both processes already share via app.db), and
  * any other process — here, the Event Monitor window — reads it back.
  */
 public final class SchedulerStatusSnapshot {
@@ -80,6 +80,22 @@ public final class SchedulerStatusSnapshot {
      *  GUI's Event Monitor can stream the Daemon's own watch fires, not just
      *  its own in-process ones. */
     public record FireEntry(String taskId, LocalDateTime firedAt) {}
+
+    /**
+     * How many WinSCP/SFTP processes the exporting process currently has in
+     * flight for one task — the cross-process counterpart of
+     * {@code TransferService#getActiveSessionCount(String)}. Only tasks with
+     * a genuinely non-zero count are ever exported (see
+     * {@code TaskSchedulerService#exportStatus}), so this list is normally
+     * empty. Needed because a thin-client GUI never runs the transfers
+     * itself when the Daemon is the active scheduler (see {@code
+     * ui.MainWindow}'s "thin client" note) — its own in-process {@code
+     * TransferService} never sees the Daemon's WinSCP processes, so without
+     * this, the session badge always reads 0 no matter what the Daemon is
+     * actually doing.
+     */
+    public record SessionEntry(String taskId, int count) {}
+
     private final String processLabel;
     private final long pid;
     private final LocalDateTime writtenAt;
@@ -90,11 +106,12 @@ public final class SchedulerStatusSnapshot {
     private final List<WatchEntry> watchEntries;
     private final List<FireEntry> fireEntries;
     private final List<String> runningTaskIds;
+    private final List<SessionEntry> sessionEntries;
 
     private SchedulerStatusSnapshot(String processLabel, long pid, LocalDateTime writtenAt, int poolSize,
                                      int activeWorkers, List<PendingEntry> pending, List<ActivityEntry> activity,
                                      List<WatchEntry> watchEntries, List<FireEntry> fireEntries,
-                                     List<String> runningTaskIds) {
+                                     List<String> runningTaskIds, List<SessionEntry> sessionEntries) {
         this.processLabel = processLabel;
         this.pid = pid;
         this.writtenAt = writtenAt;
@@ -105,6 +122,7 @@ public final class SchedulerStatusSnapshot {
         this.watchEntries = watchEntries;
         this.fireEntries = fireEntries;
         this.runningTaskIds = runningTaskIds;
+        this.sessionEntries = sessionEntries;
     }
 
     public String getProcessLabel() { return processLabel; }
@@ -118,6 +136,17 @@ public final class SchedulerStatusSnapshot {
     public List<FireEntry> getFireEntries() { return fireEntries; }
     /** Task IDs currently executing in the exporting process, as of when this snapshot was written. */
     public List<String> getRunningTaskIds() { return runningTaskIds; }
+    /** Per-task active WinSCP/SFTP session counts, exporting-process side. Only non-zero entries are ever included. */
+    public List<SessionEntry> getSessionEntries() { return sessionEntries; }
+
+    /** Convenience lookup: active session count for one task, 0 if not present (i.e. genuinely idle). */
+    public int getActiveSessionCount(String taskId) {
+        if (taskId == null) return 0;
+        for (SessionEntry s : sessionEntries) {
+            if (taskId.equals(s.taskId())) return s.count();
+        }
+        return 0;
+    }
 
     /** Whether this snapshot is fresh enough to trust — i.e. the exporting process is still alive and running. */
     public boolean isFresh(long maxAgeMillis) {
@@ -145,6 +174,7 @@ public final class SchedulerStatusSnapshot {
             List<WatchEntry> watchEntries = new ArrayList<>();
             List<FireEntry> fireEntries = new ArrayList<>();
             List<String> runningTaskIds = new ArrayList<>();
+            List<SessionEntry> sessionEntries = new ArrayList<>();
 
             for (String line : lines) {
                 if (line.isBlank()) continue;
@@ -182,6 +212,10 @@ public final class SchedulerStatusSnapshot {
                         if (parts.length < 2) continue;
                         runningTaskIds.add(unescape(parts[1]));
                     }
+                    case "S" -> {
+                        if (parts.length < 3) continue;
+                        sessionEntries.add(new SessionEntry(unescape(parts[1]), Integer.parseInt(parts[2])));
+                    }
                     default -> { /* forward-compatible: ignore unknown record types */ }
                 }
             }
@@ -189,7 +223,7 @@ public final class SchedulerStatusSnapshot {
             return new SchedulerStatusSnapshot(label, pid, writtenAt, poolSize, active,
                     Collections.unmodifiableList(pending), Collections.unmodifiableList(activity),
                     Collections.unmodifiableList(watchEntries), Collections.unmodifiableList(fireEntries),
-                    Collections.unmodifiableList(runningTaskIds));
+                    Collections.unmodifiableList(runningTaskIds), Collections.unmodifiableList(sessionEntries));
         } catch (IOException | NumberFormatException | ArrayIndexOutOfBoundsException e) {
             // Most commonly: caught mid-write by the exporter on the other
             // process. The exporter writes atomically (temp file + move) to

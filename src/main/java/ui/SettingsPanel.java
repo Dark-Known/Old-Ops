@@ -187,10 +187,9 @@ public class SettingsPanel extends JPanel {
 
         String dataDir = resolveActualDataDir();
         addInfoRow(infoPanel, "Data directory:", dataDir, 0);
-        addInfoRow(infoPanel, "Tasks file:",     dataDir + File.separator + "tasks.xml", 1);
-        addInfoRow(infoPanel, "Credentials & settings (database):", dataDir + File.separator + "app.db", 2);
-        addInfoRow(infoPanel, "Daemon log:",     dataDir + File.separator + resolveDaemonLogFileName(), 3);
-        addInfoRow(infoPanel, "Run history (database):", dataDir + File.separator + "run_history.db", 4);
+        addInfoRow(infoPanel, "Tasks, credentials & settings (database):", dataDir + File.separator + "app.db", 1);
+        addInfoRow(infoPanel, "Daemon log:",     dataDir + File.separator + resolveDaemonLogFileName(), 2);
+        addInfoRow(infoPanel, "Run history (database):", dataDir + File.separator + "run_history.db", 3);
         outer.add(card("Application Info", infoPanel));
         outer.add(Box.createVerticalStrut(12));
 
