@@ -89,6 +89,12 @@ public class RemotePushWatcher {
     // Filenames accumulated for a task's pending fire, merged across every
     // streamed line that arrives before the debounce settles.
     private final Map<String, Set<String>> pendingNamesByTaskId = new ConcurrentHashMap<>();
+    // Pending debounce timers, one outstanding "about to fire" per task. Each new
+    // streamed line cancels and replaces the previous timer, so a burst of events
+    // for one file drop (Windows FileSystemWatcher typically emits Created +
+    // several Changed + Renamed) collapses into a SINGLE wake-up that names every
+    // file, instead of one wake-up per line where only the first carries names.
+    private final Map<String, ScheduledFuture<?>> pendingFires = new ConcurrentHashMap<>();
     // taskId -> a short human-readable reason for the *current* state — "never
     // attempted" vs. "tried and failed, here's why" vs. "connected and
     // listening" are otherwise indistinguishable from the UI's point of view.
@@ -125,6 +131,7 @@ public class RemotePushWatcher {
         if (listenerExecutor != null) listenerExecutor.shutdownNow();
         if (debounceExecutor != null) debounceExecutor.shutdownNow();
         pendingNamesByTaskId.clear();
+        pendingFires.clear();
     }
 
     /** Same reconcile-driven pattern as {@link LocalWatchManager}: cheap,
@@ -225,6 +232,9 @@ public class RemotePushWatcher {
     private void stopListener(String taskId) {
         ListenerHandle h = activeByTaskId.remove(taskId);
         if (h != null) h.close();
+        ScheduledFuture<?> pending = pendingFires.remove(taskId);
+        if (pending != null) pending.cancel(false);
+        pendingNamesByTaskId.remove(taskId);
     }
 
     private void startListener(ScheduledTask task, Credential cred, RemoteOs os) {
@@ -404,14 +414,25 @@ public class RemotePushWatcher {
         if (fileName != null && !fileName.isEmpty()) {
             pendingNamesByTaskId.computeIfAbsent(taskId, k -> ConcurrentHashMap.newKeySet()).add(fileName);
         }
-        debounceExecutor.schedule(() -> {
-            Set<String> fired = pendingNamesByTaskId.remove(taskId);
-            try {
-                onSettled.accept(taskId, fired != null ? fired : Collections.emptySet());
-            } catch (Exception e) {
-                log.warning("Watcher task " + taskId + ": onSettled callback failed: " + e.getMessage());
-            }
-        }, SETTLE_MILLIS, TimeUnit.MILLISECONDS);
+        if (debounceExecutor == null || debounceExecutor.isShutdown()) return;
+        // Cancel the previous timer and start a fresh one: exactly one wake-up,
+        // SETTLE_MILLIS after the *last* event in the burst.
+        pendingFires.compute(taskId, (k, prev) -> {
+            if (prev != null) prev.cancel(false);
+            return debounceExecutor.schedule(() -> {
+                pendingFires.remove(taskId);
+                Set<String> fired = pendingNamesByTaskId.remove(taskId);
+                // Nothing left to report (e.g. the listener was stopped mid-window):
+                // never wake the task with an empty name set — that would force a
+                // baseline scan that can only find "nothing new" and log a skip.
+                if (fired == null || fired.isEmpty()) return;
+                try {
+                    onSettled.accept(taskId, fired);
+                } catch (Exception e) {
+                    log.warning("Watcher task " + taskId + ": onSettled callback failed: " + e.getMessage());
+                }
+            }, SETTLE_MILLIS, TimeUnit.MILLISECONDS);
+        });
     }
 
     private Credential resolveCredential(ScheduledTask task) {

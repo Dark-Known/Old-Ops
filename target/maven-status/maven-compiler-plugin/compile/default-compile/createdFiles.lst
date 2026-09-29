@@ -107,6 +107,7 @@ service\RunHistoryService.class
 ui\QueueMonitorView$ActivityRow.class
 ui\VectorIcons$8.class
 ui\CredentialListModel.class
+service\queue\SchedulerStatusSnapshot$SessionEntry.class
 ui\ToastManager$2.class
 ui\DirectoryBrowserDialog$3.class
 ui\SettingsPanel.class

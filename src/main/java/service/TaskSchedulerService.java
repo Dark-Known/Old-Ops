@@ -291,6 +291,19 @@ public class TaskSchedulerService {
         }
     }
 
+    /**
+     * True when this watcher-enabled FILE_TRANSFER task currently has a live
+     * push mechanism that will wake it on real changes — a registered native
+     * directory watch (OUTBOUND) or a running remote push listener (INBOUND).
+     * When false, the task's configured (fallback) schedule takes over.
+     */
+    private boolean isLiveWatchActive(ScheduledTask task) {
+        if (task.getTransferDirection() == ScheduledTask.TransferDirection.OUTBOUND) {
+            return localWatchManager.isWatching(task.getId());
+        }
+        return remotePushWatcher.isPushActive(task.getId());
+    }
+
     public void setLogCallback(BiConsumer<String, String> cb) {
         this.logCallback = cb;
     }
@@ -688,37 +701,35 @@ public class TaskSchedulerService {
      * task at delivery time.
      */
     /**
-     * A watcher-enabled <b>FILE_TRANSFER</b> task has no periodic occurrence
-     * at all — the OS-level watch ({@code LocalWatchManager}/
-     * {@code RemotePushWatcher}, registered in {@code reconcileSchedules}
-     * regardless of this) is what actually fires it, via
-     * {@code onWatchWakeup} publishing an immediate event directly.
-     * Returning {@code null} here means {@code publishNextOccurrence}
-     * cancels any pending event for it instead of scheduling one — so a
-     * watcher-enabled FILE_TRANSFER task never shows up "Pending, due in
-     * ..." in the Event Monitor like an ordinary scheduled task; it simply
+     * A watcher-enabled <b>FILE_TRANSFER</b> task is normally fired by its
+     * OS-level watch ({@code LocalWatchManager}/{@code RemotePushWatcher},
+     * registered in {@code reconcileSchedules}) via {@code onWatchWakeup}, which
+     * publishes an immediate event directly. While that live watch is active this
+     * method returns {@code null} — no periodic occurrence is scheduled, so the
+     * task never shows up "Pending, due in ..." in the Event Monitor and simply
      * sits idle until a real change wakes it.
+     *
+     * <p><b>Fallback:</b> when the live watch is <i>not</i> active (remote push
+     * refused/unsupported or in its retry backoff, transfer mode not Latest Only,
+     * unknown remote OS, native watch registration failed, ...), nothing would
+     * ever trigger the task. In that case the task's configured schedule (the
+     * "Fallback Settings" tab in the task dialog) is honoured exactly like an
+     * ordinary scheduled task, and the baseline scan picks up whatever changed.
+     * {@code reconcileSchedules} re-evaluates this every few seconds, so the
+     * fallback schedule switches on as soon as the live watch drops and off again
+     * as soon as it is re-established.
      *
      * <p><b>Important:</b> {@code isWatcherEnabled()} is a shared flag also
      * used by OUTLOOK_MAIL tasks, but with completely different semantics
      * there — "Enable watcher" on a mail task just means "only fetch
      * messages newer than last successful run" (an incremental-fetch
      * baseline), not a real push mechanism; nothing ever calls
-     * {@code onWatchWakeup} for a mail task. Applying this same "no
-     * periodic occurrence" rule to a watcher-enabled mail task would leave
-     * it with no schedule <i>and</i> no push trigger — i.e. it would simply
-     * never run again. Hence the explicit {@code FILE_TRANSFER} check below.
-     *
-     * <p>An earlier version of this ran a periodic "backup poll" (e.g. every
-     * 30 minutes) as a safety net for a watcher somehow missing a change.
-     * Removed: the OS-level watch mechanisms here are reliable enough not to
-     * need it, and the backup poll's own presence in the event queue was
-     * itself the direct cause of watcher-enabled tasks visibly looking like
-     * ordinary scheduled jobs in the Event Monitor — the exact confusion it
-     * was meant to quietly guard against, just moved to a different symptom.
+     * {@code onWatchWakeup} for a mail task, so its schedule always applies.
+     * Hence the explicit {@code FILE_TRANSFER} check below.
      */
     private Long computeNextFireDelayMs(ScheduledTask task, LocalDateTime now) {
-        if (task.isWatcherEnabled() && task.getTaskType() == ScheduledTask.TaskType.FILE_TRANSFER) {
+        if (task.isWatcherEnabled() && task.getTaskType() == ScheduledTask.TaskType.FILE_TRANSFER
+                && isLiveWatchActive(task)) {
             return null;
         }
 

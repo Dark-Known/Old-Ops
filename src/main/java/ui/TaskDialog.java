@@ -134,6 +134,13 @@ public class TaskDialog extends JDialog {
     private JPanel backupPanel;
     private JPanel scheduleDetailsPanel;
     private JTabbedPane tabbedPane;
+    // Watcher checkbox lives in the dialog header (above the tabs) so it is the
+    // first thing seen for a file-transfer task; the Schedule tab turns into
+    // "Fallback Settings" while it is ticked.
+    private JPanel      watcherTopRow;
+    private JPanel      schedulePanel;
+    private JLabel      lblScheduleType;
+    private JLabel      lblScheduleFallbackNote;
 
     // ── Watcher epoch reset tracking ──────────────────────────────────────────
     private boolean uiFullyLoaded            = false;
@@ -188,7 +195,16 @@ public class TaskDialog extends JDialog {
         header.add(pageTitle);
         header.add(Box.createRigidArea(new Dimension(0, 6)));
         header.add(pageSubTitle);
-        header.add(Box.createRigidArea(new Dimension(0, 12)));
+        header.add(Box.createRigidArea(new Dimension(0, 8)));
+
+        // Watcher row (FILE_TRANSFER only) — populated below once the checkbox exists.
+        watcherTopRow = new JPanel();
+        watcherTopRow.setLayout(new BoxLayout(watcherTopRow, BoxLayout.Y_AXIS));
+        watcherTopRow.setOpaque(false);
+        watcherTopRow.setAlignmentX(Component.LEFT_ALIGNMENT);
+        watcherTopRow.setBorder(new EmptyBorder(0, 0, 8, 0));
+        header.add(watcherTopRow);
+        header.add(Box.createRigidArea(new Dimension(0, 4)));
         main.add(header, BorderLayout.NORTH);
 
         // ── General tab ───────────────────────────────────────────────────────
@@ -242,10 +258,27 @@ public class TaskDialog extends JDialog {
 
         // ── Inbound watcher fields ────────────────────────────────────────────
         cbWatcherEnabled = new JCheckBox("Enable watcher task");
+        cbWatcherEnabled.setFont(cbWatcherEnabled.getFont().deriveFont(Font.BOLD, 13f));
+        cbWatcherEnabled.setAlignmentX(Component.LEFT_ALIGNMENT);
+        cbWatcherEnabled.setOpaque(false);
+        cbWatcherEnabled.setToolTipText(
+                "Transfer files the moment they appear or change (live directory watch). "
+                        + "If live watching isn't available, the Fallback Settings tab schedule is used instead.");
 
         if (existing != null) {
             cbWatcherEnabled.setSelected(existing.isWatcherEnabled());
         }
+
+        JLabel lblWatcherHint = new JLabel(
+                "<html><body style='width:520px'>Files are transferred as soon as they change. "
+                        + "If live watching isn't available, the <b>Fallback Settings</b> tab schedule is used instead."
+                        + "</body></html>");
+        lblWatcherHint.setFont(lblWatcherHint.getFont().deriveFont(Font.PLAIN, 11f));
+        lblWatcherHint.setForeground(UIManager.getColor("Label.disabledForeground"));
+        lblWatcherHint.setAlignmentX(Component.LEFT_ALIGNMENT);
+        lblWatcherHint.setBorder(new EmptyBorder(0, 24, 0, 0));
+        watcherTopRow.add(cbWatcherEnabled);
+        watcherTopRow.add(lblWatcherHint);
         // ── Watcher baseline status row ───────────────────────────────────────
         lblWatcherStatus = new JLabel();
         lblWatcherStatus.setFont(lblWatcherStatus.getFont().deriveFont(Font.PLAIN, 11f));
@@ -280,7 +313,6 @@ public class TaskDialog extends JDialog {
                 browseRemote(tfTargetFolder, tfTargetHost.getText().trim(), tfTargetUser.getText().trim(),
                         new String(pfTargetPass.getPassword()), (String) cbTargetOs.getSelectedItem())),   2);
         addRow(fileTransferPanel, lblAdditionalTargetFolders, additionalDestinationsField, 4);
-        addRow(fileTransferPanel, "",                        cbWatcherEnabled,5);
         addRow(fileTransferPanel, "Watcher baseline",        watcherStatusRow,       7);
 
         transferTab = new JPanel(new GridBagLayout());
@@ -536,6 +568,7 @@ public class TaskDialog extends JDialog {
 
         // ── Schedule panel ────────────────────────────────────────────────────
         JPanel sched = titledPanel("Schedule");
+        schedulePanel = sched;
         cbScheduleType = makeCombo(new JComboBox<>(new String[]{
                 "RUN_NOW", "ONCE", "DAILY", "WEEKLY", "INTERVAL_MINUTES", "INTERVAL_SECONDS"}));
         if (existing != null) cbScheduleType.setSelectedItem(existing.getScheduleType().name());
@@ -569,9 +602,26 @@ public class TaskDialog extends JDialog {
             }
         }
 
-        addRow(sched, "Schedule Type *", cbScheduleType, 0);
+        lblScheduleFallbackNote = new JLabel(
+                "<html><body style='width:480px'><b>Fallback settings.</b> With the watcher enabled, files are "
+                        + "transferred as soon as they change. This schedule only runs while live watching is "
+                        + "unavailable (for example the remote server refuses the watch connection, or the watch "
+                        + "drops) and stops again once live watching resumes. An interval schedule "
+                        + "(e.g. every 5 minutes) works best as a fallback.</body></html>");
+        lblScheduleFallbackNote.setFont(lblScheduleFallbackNote.getFont().deriveFont(Font.PLAIN, 11f));
+        lblScheduleFallbackNote.setForeground(UIManager.getColor("Label.disabledForeground"));
+        GridBagConstraints ngc = new GridBagConstraints();
+        ngc.gridx = 0; ngc.gridy = 0; ngc.gridwidth = 2;
+        ngc.fill = GridBagConstraints.HORIZONTAL; ngc.weightx = 1;
+        ngc.anchor = GridBagConstraints.NORTHWEST;
+        ngc.insets = new Insets(0, 4, 8, 4);
+        sched.add(lblScheduleFallbackNote, ngc);
+        lblScheduleFallbackNote.setVisible(false);
+
+        lblScheduleType = new JLabel("Schedule Type *");
+        addRow(sched, lblScheduleType, cbScheduleType, 1);
         GridBagConstraints gc = new GridBagConstraints();
-        gc.gridx = 0; gc.gridy = 1; gc.gridwidth = 2;
+        gc.gridx = 0; gc.gridy = 2; gc.gridwidth = 2;
         gc.fill = GridBagConstraints.HORIZONTAL; gc.weightx = 1;
         gc.insets = new Insets(4, 4, 4, 4);
         sched.add(scheduleDetailsPanel, gc);
@@ -584,7 +634,7 @@ public class TaskDialog extends JDialog {
         anchorTop(backupPanel, 11);
         anchorTop(targetPanel, 6);
         anchorTop(mailPanel,   23);
-        anchorTop(sched,       2);
+        anchorTop(sched,       3);
         anchorTop(retryPanel,  2);
 
         tabbedPane = new JTabbedPane(JTabbedPane.TOP);
@@ -612,7 +662,11 @@ public class TaskDialog extends JDialog {
             checkTransferModeChanged(existing);    // auto-resets baseline if needed
         });
 
-        cbWatcherEnabled.addActionListener(e -> updateWatcherFieldsVisibility());
+        cbWatcherEnabled.addActionListener(e -> {
+            updateWatcherFieldsVisibility();
+            applyFallbackDefaultsIfNeeded();
+            updateScheduleFallbackMode();
+        });
 
         cbTaskType.addActionListener(e -> {
             updateVisibility();
@@ -727,6 +781,11 @@ public class TaskDialog extends JDialog {
         enableTabIfPresent(backupPanel,   isBackup);
         enableTabIfPresent(mailPanel,     isMail);
 
+        // Watcher checkbox (header) only applies to file transfers; mail has its
+        // own incremental-fetch checkbox and backup has none.
+        if (watcherTopRow != null) watcherTopRow.setVisible(isTransfer);
+        updateScheduleFallbackMode();
+
         if (tabbedPane != null) {
             Component sel = tabbedPane.getSelectedComponent();
             if (sel != null) {
@@ -777,6 +836,46 @@ public class TaskDialog extends JDialog {
 
         transferTab.revalidate(); transferTab.repaint();
         revalidate(); repaint();
+    }
+
+    /**
+     * While the watcher is enabled on a FILE_TRANSFER task the schedule is no
+     * longer the primary trigger — it only runs when live watching is
+     * unavailable — so the tab, panel border and type label say "Fallback".
+     */
+    private void updateScheduleFallbackMode() {
+        if (schedulePanel == null || tabbedPane == null) return;
+        boolean fallback = cbWatcherEnabled != null && cbWatcherEnabled.isSelected()
+                && "FILE_TRANSFER".equals(cbTaskType.getSelectedItem());
+        int idx = tabbedPane.indexOfComponent(schedulePanel);
+        if (idx >= 0) tabbedPane.setTitleAt(idx, fallback ? "Fallback Settings" : "Schedule");
+        schedulePanel.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(UIManager.getColor("Component.borderColor")),
+                BorderFactory.createCompoundBorder(
+                        new TitledBorder(fallback ? "Fallback Schedule" : "Schedule"),
+                        new EmptyBorder(10, 10, 10, 10))));
+        if (lblScheduleType != null)
+            lblScheduleType.setText(fallback ? "Fallback Schedule Type *" : "Schedule Type *");
+        if (lblScheduleFallbackNote != null) lblScheduleFallbackNote.setVisible(fallback);
+        schedulePanel.revalidate();
+        schedulePanel.repaint();
+        tabbedPane.revalidate();
+        tabbedPane.repaint();
+    }
+
+    /**
+     * "Run now" as a fallback would run exactly once and then never poll, which
+     * defeats the purpose. When the operator turns the watcher on while the
+     * schedule is still RUN_NOW, switch it to a sensible recurring default
+     * (every 5 minutes) — they can still change it in the Fallback Settings tab.
+     */
+    private void applyFallbackDefaultsIfNeeded() {
+        if (!uiFullyLoaded || !cbWatcherEnabled.isSelected()) return;
+        if (!"RUN_NOW".equals(cbScheduleType.getSelectedItem())) return;
+        int current = 0;
+        try { current = Integer.parseInt(tfInterval.getText().trim()); } catch (NumberFormatException ignored) {}
+        if (current <= 0) tfInterval.setText("5");
+        cbScheduleType.setSelectedItem("INTERVAL_MINUTES");   // fires updateScheduleDetails()
     }
 
     private void updateScheduleDetails() {
