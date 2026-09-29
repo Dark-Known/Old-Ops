@@ -46,6 +46,50 @@ public class XmlStorageService {
         return dataDir;
     }
 
+    /**
+     * True only if BOTH the tasks and credentials tables in app.db opened
+     * successfully. Previously a failed connection was invisible: loadTasks()
+     * quietly returned an empty list and saveTask() quietly did nothing, so
+     * "no data in the UI" and "can't create a task" looked identical to an
+     * empty-but-healthy install. Check this at startup (see MainWindow) and
+     * whenever a save unexpectedly appears to do nothing.
+     */
+    public boolean isConnected() {
+        return taskDb.isConnected() && credentialDb.isConnected();
+    }
+
+    /**
+     * Human-readable reason the database isn't connected, or null if it is.
+     * Combines whichever of the two tables failed (usually both, since they
+     * share one connection to the same app.db file) with the exact file path
+     * that was attempted, so the message is actionable without opening a log.
+     */
+    public String getConnectionError() {
+        if (isConnected()) return null;
+        String reason = taskDb.getConnectionError() != null
+                ? taskDb.getConnectionError()
+                : credentialDb.getConnectionError();
+        String path = new File(dataDir, "app.db").getAbsolutePath();
+        return (reason != null ? reason : "unknown error") + "  (" + path + ")";
+    }
+
+    /**
+     * Short reason the most recent {@link #saveTask} call failed even though
+     * the database IS connected — a transient write error (lock contention
+     * with the Daemon, a constraint violation, disk full), not a dropped
+     * connection. Null if the last save succeeded or none was attempted.
+     * Callers should check {@link #isConnected()} first: if that's false the
+     * real story is {@link #getConnectionError()} instead.
+     */
+    public String getLastTaskSaveError() {
+        return taskDb.getLastSaveError();
+    }
+
+    /** Same as {@link #getLastTaskSaveError()}, for {@link #saveCredential}. */
+    public String getLastCredentialSaveError() {
+        return credentialDb.getLastSaveError();
+    }
+
     // ─── Credentials (SQLite-backed — see CredentialDbService) ──────────────
 
     /** Returns the legacy creds_<username>.xml path. Retained only so old migration/cleanup tooling can find it; credentials themselves now live in app.db. */
@@ -60,9 +104,11 @@ public class XmlStorageService {
         return credentialDb.loadByUsername(username);
     }
 
-    /** Save (insert or replace, keyed by username) a credential. */
-    public void saveCredential(Credential cred) {
-        credentialDb.save(cred);
+    /** Save (insert or replace, keyed by username) a credential. Returns
+     *  whether it was actually persisted — false means app.db isn't
+     *  connected; see {@link #getConnectionError()}. */
+    public boolean saveCredential(Credential cred) {
+        return credentialDb.save(cred);
     }
 
     /** Delete the stored credential for the given username. */
@@ -104,9 +150,11 @@ public class XmlStorageService {
         return taskDb.loadAll();
     }
 
-    /** Inserts or replaces (by id) a task. Assigns an id if missing. */
-    public void saveTask(ScheduledTask task) {
-        taskDb.save(task);
+    /** Inserts or replaces (by id) a task. Assigns an id if missing. Returns
+     *  whether it was actually persisted — false means app.db isn't
+     *  connected; see {@link #getConnectionError()}. */
+    public boolean saveTask(ScheduledTask task) {
+        return taskDb.save(task);
     }
 
     /** Deletes the task with the given id, if any. */

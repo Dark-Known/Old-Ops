@@ -258,9 +258,12 @@ public class RunHistoryService {
      * Records one activity-feed entry (worker start-up, watcher detection
      * scan, or an application-activity note) into
      * {@code event_monitor_history}, kept entirely separate from real
-     * SUCCESS/FAILED/SKIPPED outcomes in {@code run_history}. Always stored
-     * with status SUCCESS (there's no failure/skip concept for "something
-     * happened") — the {@code message} carries the actual meaning.
+     * SUCCESS/FAILED/SKIPPED outcomes in {@code run_history}. Convenience
+     * overload for the common case — always SUCCESS, since most activity
+     * notes ("task edited", "credential deleted") don't have a failure
+     * concept. See the 8-arg overload below for notes that DO fail (a test
+     * connection, a credential save) and need to render as a failure in the
+     * feed rather than a neutral note.
      *
      * @param taskId   the related task's id, or a fixed pseudo-id like
      *                 "SETTINGS"/"CREDENTIALS" for application-activity
@@ -272,7 +275,25 @@ public class RunHistoryService {
      */
     public synchronized void recordActivityEvent(String taskId, String taskName, String taskType,
             String message, String details, LocalDateTime startedAt, LocalDateTime endedAt) {
-        long durationMs = insertInto(ACTIVITY_TABLE, taskId, taskName, taskType, TaskRunRecord.Status.SUCCESS,
+        recordActivityEvent(taskId, taskName, taskType, TaskRunRecord.Status.SUCCESS,
+                message, details, startedAt, endedAt);
+    }
+
+    /**
+     * Full form of {@link #recordActivityEvent} that lets an application
+     * activity note report as a genuine failure (status FAILED) rather than
+     * always SUCCESS — the feed (see {@code QueueMonitorView.toActivityRow},
+     * which reads {@code r.getStatus() == FAILED} to decide the row's color
+     * and "Failed: ..." prefix) renders it exactly like a failed task run.
+     * Use this for anything that can meaningfully fail on its own — a test
+     * connection, a credential or task save that didn't persist — so the
+     * reason is visible right in the feed, not just in a modal the operator
+     * may have already dismissed.
+     */
+    public synchronized void recordActivityEvent(String taskId, String taskName, String taskType,
+            TaskRunRecord.Status status, String message, String details,
+            LocalDateTime startedAt, LocalDateTime endedAt) {
+        long durationMs = insertInto(ACTIVITY_TABLE, taskId, taskName, taskType, status,
                 message, details != null ? details : message, startedAt, endedAt, null, false, null);
         if (durationMs < 0 || activityListeners.isEmpty()) return;
 
@@ -280,7 +301,7 @@ public class RunHistoryService {
         rec.setTaskId(taskId);
         rec.setTaskName(taskName);
         rec.setTaskType(taskType);
-        rec.setStatus(TaskRunRecord.Status.SUCCESS);
+        rec.setStatus(status);
         rec.setReason(message);
         rec.setDetails(details != null ? details : message);
         rec.setStartedAt(startedAt);

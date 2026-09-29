@@ -37,11 +37,15 @@ public class CredentialDbService {
 
     private final Connection conn;
     private final File dataDir;
+    // Mirrors TaskDbService's connectionError — see its javadoc for why this
+    // is tracked instead of just logging once and moving on.
+    private final String connectionError;
 
     public CredentialDbService(File dataDir) {
         this.dataDir = dataDir;
         File dbFile = new File(dataDir, "app.db");
         Connection c = null;
+        String initError = null;
         try {
             Class.forName("org.sqlite.JDBC");
             c = DriverManager.getConnection("jdbc:sqlite:" + dbFile.getAbsolutePath());
@@ -57,12 +61,41 @@ public class CredentialDbService {
             }
         } catch (Exception e) {
             log.log(Level.SEVERE, "Failed to open/initialize credentials table in app.db", e);
+            initError = (e.getClass().getSimpleName() + ": " + e.getMessage());
         }
         this.conn = c;
+        this.connectionError = initError;
         if (this.conn != null) {
             migrateLegacyCredentialsDbIfPresent();
             migrateLegacyXmlIfPresent();
         }
+    }
+
+    // See TaskDbService#lastSaveError for why this is tracked separately from
+    // connectionError.
+    private volatile String lastSaveError;
+
+    /** True if app.db's credentials table opened successfully AND the
+     *  connection is still alive right now — see TaskDbService#isConnected
+     *  for why this is checked live rather than from a startup snapshot. */
+    public boolean isConnected() {
+        if (conn == null) return false;
+        try {
+            return conn.isValid(2);
+        } catch (SQLException e) {
+            return false;
+        }
+    }
+
+    /** Short exception summary from the failed connection attempt, or null if connected fine. */
+    public String getConnectionError() {
+        return connectionError;
+    }
+
+    /** Short exception summary from the most recent failed {@link #save}, or
+     *  null if the last save succeeded. See TaskDbService#getLastSaveError. */
+    public String getLastSaveError() {
+        return lastSaveError;
     }
 
     /** Look up a credential by username, or null if none is stored. */
@@ -79,9 +112,13 @@ public class CredentialDbService {
         return null;
     }
 
-    /** Inserts or replaces (by username) a credential. Assigns an id if missing. */
-    public synchronized void save(Credential cred) {
-        if (conn == null) return;
+    /**
+     * Inserts or replaces (by username) a credential. Assigns an id if missing.
+     * Returns whether it was actually persisted (see TaskDbService#save's
+     * javadoc for why this matters).
+     */
+    public synchronized boolean save(Credential cred) {
+        if (conn == null) return false;
         if (cred.getId() == null || cred.getId().isEmpty()) {
             cred.setId(java.util.UUID.randomUUID().toString());
         }
@@ -96,8 +133,12 @@ public class CredentialDbService {
             ps.setString(5, cred.getPassword());
             ps.setString(6, cred.getOsType());
             ps.executeUpdate();
+            lastSaveError = null;
+            return true;
         } catch (SQLException e) {
             log.log(Level.WARNING, "Failed to save credential for username " + cred.getUsername(), e);
+            lastSaveError = e.getClass().getSimpleName() + ": " + e.getMessage();
+            return false;
         }
     }
 

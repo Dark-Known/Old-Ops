@@ -50,16 +50,40 @@ public class TaskDbService {
 
     private final Connection conn;
     private final File dataDir;
+    // Set once, in the constructor, if the connection/table-init below fails.
+    // null means "connected fine". Exposed via getConnectionError() so callers
+    // (XmlStorageService -> UI) can tell "empty because nothing's been created
+    // yet" apart from "empty because the database never actually opened" —
+    // previously indistinguishable from loadAll()'s point of view.
+    private final String connectionError;
 
     public TaskDbService(File dataDir) {
         this.dataDir = dataDir;
         File dbFile = new File(dataDir, "app.db");
         Connection c = null;
+        String initError = null;
         try {
             Class.forName("org.sqlite.JDBC");
             c = DriverManager.getConnection("jdbc:sqlite:" + dbFile.getAbsolutePath());
             try (Statement st = c.createStatement()) {
-                st.execute("CREATE TABLE IF NOT EXISTS tasks (" +
+                st.execute(CREATE_TASKS_TABLE_SQL);
+            }
+            migrateLegacyXmlColumnIfPresent(c);
+        } catch (Exception e) {
+            log.log(Level.SEVERE, "Failed to open/initialize tasks table in app.db", e);
+            initError = (e.getClass().getSimpleName() + ": " + e.getMessage());
+        }
+        this.conn = c;
+        this.connectionError = initError;
+        if (this.conn != null) {
+            migrateLegacyXmlIfPresent();
+        }
+    }
+
+    // Extracted so migrateLegacyXmlColumnIfPresent() can re-run the exact same
+    // DDL when it has to rebuild the table under a pre-existing legacy schema.
+    private static final String CREATE_TASKS_TABLE_SQL =
+                "CREATE TABLE IF NOT EXISTS tasks (" +
                         "id TEXT PRIMARY KEY," +
                         "name TEXT," +
                         "task_type TEXT," +
@@ -105,15 +129,105 @@ public class TaskDbService {
                         "last_run_result TEXT," +
                         "created_at TEXT," +
                         "retry_count INTEGER" +
-                        ")");
+                        ")";
+
+    /**
+     * Some installs' app.db still has a "tasks" table left over from an
+     * earlier, pre-refactor schema that stored the whole task as a single
+     * NOT NULL "xml" blob column. {@code CREATE TABLE IF NOT EXISTS} above is
+     * a no-op against a table that already exists, so on those installs the
+     * legacy "xml" column has silently stuck around ever since — and every
+     * {@link #save} has been failing with
+     * "NOT NULL constraint failed: tasks.xml", because today's INSERT has no
+     * idea that column exists and so never supplies it a value.
+     *
+     * <p>If that legacy column is found, this rebuilds the table under
+     * today's schema and copies across every column the two schemas have in
+     * common, so existing tasks survive the upgrade instead of being
+     * silently dropped. The old table is kept, renamed, rather than deleted,
+     * as a safety net.
+     */
+    private void migrateLegacyXmlColumnIfPresent(Connection c) throws SQLException {
+        List<String> existingColumns = new ArrayList<>();
+        try (Statement st = c.createStatement();
+             ResultSet rs = st.executeQuery("PRAGMA table_info(tasks)")) {
+            while (rs.next()) {
+                existingColumns.add(rs.getString("name"));
             }
-        } catch (Exception e) {
-            log.log(Level.SEVERE, "Failed to open/initialize tasks table in app.db", e);
         }
-        this.conn = c;
-        if (this.conn != null) {
-            migrateLegacyXmlIfPresent();
+        if (!existingColumns.contains("xml")) return; // current schema already, nothing to do
+
+        log.warning("Legacy NOT NULL 'xml' column found on the tasks table in app.db — every "
+                + "task save has been failing on a constraint error until now. Rebuilding the "
+                + "table under the current schema; existing tasks will be carried over.");
+
+        try (Statement st = c.createStatement()) {
+            st.execute("ALTER TABLE tasks RENAME TO tasks_legacy_xml_backup");
+            st.execute(CREATE_TASKS_TABLE_SQL);
         }
+
+        List<String> currentColumns = new ArrayList<>();
+        try (Statement st = c.createStatement();
+             ResultSet rs = st.executeQuery("PRAGMA table_info(tasks)")) {
+            while (rs.next()) {
+                currentColumns.add(rs.getString("name"));
+            }
+        }
+        currentColumns.retainAll(existingColumns); // only columns both schemas actually have
+
+        if (!currentColumns.isEmpty()) {
+            String colList = String.join(", ", currentColumns);
+            try (Statement st = c.createStatement()) {
+                int moved = st.executeUpdate("INSERT INTO tasks (" + colList + ") SELECT "
+                        + colList + " FROM tasks_legacy_xml_backup");
+                log.info("Migrated " + moved + " existing task(s) off the legacy 'xml' column "
+                        + "schema. The old table is kept as 'tasks_legacy_xml_backup' in app.db "
+                        + "and can be dropped manually once you've confirmed everything looks right.");
+            }
+        }
+    }
+
+    // Set by save() whenever a write on an otherwise-live connection fails
+    // (e.g. SQLITE_BUSY because the Daemon is writing at the same instant, a
+    // constraint violation, disk full) — distinct from connectionError, which
+    // only covers "never connected at all". Conflating the two used to make
+    // every save failure say "the database is not connected" even when the
+    // connection was fine and only this one write failed, contradicting a
+    // status badge that (correctly) showed connected.
+    private volatile String lastSaveError;
+
+    /**
+     * True if app.db's tasks table opened successfully AND the connection is
+     * still alive right now — checked live via {@link Connection#isValid},
+     * not just "was it non-null at startup". A connection object can outlive
+     * its underlying connection (e.g. the file becomes unreachable, the OS
+     * closes the handle); reporting from a snapshot taken once at launch
+     * would keep claiming "connected" forever after that happens.
+     */
+    public boolean isConnected() {
+        if (conn == null) return false;
+        try {
+            return conn.isValid(2);
+        } catch (SQLException e) {
+            return false;
+        }
+    }
+
+    /** Short exception summary from the failed connection attempt, or null if connected fine. */
+    public String getConnectionError() {
+        return connectionError;
+    }
+
+    /**
+     * Short exception summary from the most recent failed {@link #save}, or
+     * null if the last save succeeded (or none has been attempted). Use this
+     * — not {@link #getConnectionError()} — when {@link #isConnected()} is
+     * {@code true} but a save still returned {@code false}: the database is
+     * reachable, this specific write just failed, and the two need different
+     * messages so operators aren't told "not connected" when it is.
+     */
+    public String getLastSaveError() {
+        return lastSaveError;
     }
 
     private static final String UPSERT_SQL = "INSERT INTO tasks (" +
@@ -153,9 +267,16 @@ public class TaskDbService {
             "last_run_at=excluded.last_run_at, last_started_at=excluded.last_started_at, " +
             "last_run_result=excluded.last_run_result, created_at=excluded.created_at, retry_count=excluded.retry_count";
 
-    /** Inserts or replaces (by id) a task. Assigns an id if missing, same as the old XML-backed saveTask did. */
-    public synchronized void save(ScheduledTask t) {
-        if (conn == null) return;
+    /**
+     * Inserts or replaces (by id) a task. Assigns an id if missing, same as the
+     * old XML-backed saveTask did. Returns whether the row was actually
+     * persisted — {@code false} means the database isn't connected (see
+     * {@link #getConnectionError()}) or the upsert itself failed (see the log
+     * for the SQLException); callers that silently ignored this before would
+     * report success to the user even though nothing was saved.
+     */
+    public synchronized boolean save(ScheduledTask t) {
+        if (conn == null) return false;
         if (t.getId() == null || t.getId().isEmpty()) {
             t.setId(UUID.randomUUID().toString());
         }
@@ -207,8 +328,12 @@ public class TaskDbService {
             ps.setString(i++, t.getCreatedAt() != null ? t.getCreatedAt().format(DT_FMT) : null);
             ps.setInt(i++, t.getRetryCount());
             ps.executeUpdate();
+            lastSaveError = null;
+            return true;
         } catch (SQLException e) {
             log.log(Level.WARNING, "Failed to save task " + t.getId(), e);
+            lastSaveError = e.getClass().getSimpleName() + ": " + e.getMessage();
+            return false;
         }
     }
 

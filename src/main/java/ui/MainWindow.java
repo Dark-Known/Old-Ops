@@ -43,6 +43,8 @@ public class MainWindow extends JFrame {
     private final java.nio.file.Path daemonStatusFile;
     private JLabel schedulerBadge;
     private javax.swing.Timer schedulerBadgeTimer;
+    private JLabel dbLabel;
+    private javax.swing.Timer dbStatusTimer;
     // Cross-process: notices when a watcher task's trigger mode falls back
     // from push (native watch / remote SSH push) to plain polling, wherever
     // that task is actually running (Daemon or this GUI) — see its javadoc.
@@ -196,6 +198,10 @@ public class MainWindow extends JFrame {
         if (schedulerBadgeTimer != null) {
             schedulerBadgeTimer.stop();
             schedulerBadgeTimer = null;
+        }
+        if (dbStatusTimer != null) {
+            dbStatusTimer.stop();
+            dbStatusTimer = null;
         }
 
         Color bgBase = UIManager.getColor("Panel.background");
@@ -448,7 +454,93 @@ public class MainWindow extends JFrame {
         dataLabel.setFont(dataLabel.getFont().deriveFont(11.5f));
         dataLabel.setForeground(navIdleFg);
         statusBar.add(dataLabel);
+
+        // Database connection indicator — previously a failed app.db connection
+        // was completely invisible (empty task list, tasks that "save" but never
+        // appear, no error anywhere). It was also only ever checked once, at
+        // startup: since a JDBC Connection object can outlive its underlying
+        // connection (the file becomes unreachable, a lock is held elsewhere,
+        // etc.), a snapshot taken at launch could keep claiming "connected"
+        // indefinitely afterwards — exactly the contradiction of the badge
+        // saying connected while a save fails. isConnected() now checks the
+        // connection live (see TaskDbService#isConnected), and this label is
+        // re-checked on a timer, not just once.
+        dbLabel = new JLabel();
+        dbLabel.setFont(dbLabel.getFont().deriveFont(Font.BOLD, 11.5f));
+        dbLabel.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        dbLabel.addMouseListener(new java.awt.event.MouseAdapter() {
+            @Override public void mouseClicked(java.awt.event.MouseEvent e) {
+                // Re-check live at click time rather than trusting whatever the
+                // label said a moment ago — state can change between ticks.
+                if (storage.isConnected()) return;
+                String err = storage.getConnectionError();
+                JOptionPane.showMessageDialog(MainWindow.this,
+                    "app.db did not open successfully, so nothing you do in this session\n"
+                        + "will actually be saved — tasks and credentials will look like they\n"
+                        + "worked, then disappear on refresh.\n\n"
+                        + "Reason:\n" + (err != null ? err : "unknown")
+                        + "\n\nCommon causes: the resolved data directory below doesn't match\n"
+                        + "where your real app.db lives (check app-config.xml's <dataDir> is\n"
+                        + "actually being found), app.db is locked by another process (the\n"
+                        + "Daemon, a backup tool, antivirus), or the account running this app\n"
+                        + "lacks permission on the data directory.",
+                    "Database disconnected", JOptionPane.ERROR_MESSAGE);
+            }
+        });
+        statusBar.add(new JSeparator(SwingConstants.VERTICAL));
+        statusBar.add(dbLabel);
+        refreshDbStatusLabel();
+        dbStatusTimer = new javax.swing.Timer(10_000, e -> refreshDbStatusLabel());
+        dbStatusTimer.start();
+
         add(statusBar, BorderLayout.SOUTH);
+
+        warnIfDataDirFallback();
+    }
+
+    /**
+     * Re-reads storage.isConnected() live and updates the status-bar badge.
+     * Called once at startup and then every 10s by dbStatusTimer, so a
+     * connection that drops mid-session (or recovers) is reflected within
+     * seconds instead of the badge being frozen at whatever it showed at
+     * launch.
+     */
+    private void refreshDbStatusLabel() {
+        if (dbLabel == null) return;
+        boolean connected = storage.isConnected();
+        if (connected) {
+            dbLabel.setText("● Database connected");
+            dbLabel.setForeground(new Color(0x2E7D32));
+            dbLabel.setToolTipText(null);
+        } else {
+            dbLabel.setText("● Database disconnected — click for details");
+            dbLabel.setForeground(new Color(0xC62828));
+            dbLabel.setToolTipText(storage.getConnectionError());
+        }
+    }
+
+    /**
+     * app-config.xml's <dataDir> is only found if AppConfig can locate the file
+     * (cwd, or next to the running jar) — if it can't, every caller silently
+     * falls back to the same hardcoded C:\OpsTools\Data default, which is
+     * almost never where the operator's real, populated app.db actually lives.
+     * That's the single most common cause of "I have app.db in the data
+     * directory but the UI shows nothing" — the app never read that file
+     * at all. Surface it loudly, once, at startup instead of leaving the
+     * status bar's path as the only (easy to miss) clue.
+     */
+    private void warnIfDataDirFallback() {
+        if (util.AppConfig.locate() != null) return; // config file was found; nothing to warn about
+        JOptionPane.showMessageDialog(this,
+            "app-config.xml could not be found, so this session is using the built-in\n"
+                + "default data directory instead of the one configured for this install:\n\n"
+                + "    " + loadDataDir() + "\n\n"
+                + "If your tasks/credentials live in a different folder, they will not\n"
+                + "appear, and anything you create now will be saved to the wrong place.\n\n"
+                + "app-config.xml is looked for in the current working directory, then next\n"
+                + "to the running jar — check how this app was launched (e.g. a shortcut's\n"
+                + "\"Start in\" folder).",
+            "Configuration file not found", JOptionPane.WARNING_MESSAGE);
     }
 
     /** Wraps a panel in a rounded "card" container with breathing room, instead of it

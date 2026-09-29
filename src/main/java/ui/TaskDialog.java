@@ -52,6 +52,7 @@ import java.util.UUID;
 public class TaskDialog extends JDialog {
 
     private final XmlStorageService storage;
+    private final service.RunHistoryService auditLog; // nullable — see 4-arg constructor
     private ScheduledTask result;
 
     // ── General ───────────────────────────────────────────────────────────────
@@ -150,8 +151,22 @@ public class TaskDialog extends JDialog {
     private String  originalTransferMode      = "ENTIRE_FOLDER";
 
     public TaskDialog(Frame parent, XmlStorageService storage, ScheduledTask existing) {
+        this(parent, storage, existing, null);
+    }
+
+    /**
+     * @param auditLog where Test Connection / credential-save / task-save
+     *                 outcomes are logged as activity-feed events (see
+     *                 {@link service.RunHistoryService#recordActivityEvent}).
+     *                 Nullable — pass null (or use the 3-arg constructor) to
+     *                 skip event logging entirely, e.g. in a context with no
+     *                 event feed to log into.
+     */
+    public TaskDialog(Frame parent, XmlStorageService storage, ScheduledTask existing,
+            service.RunHistoryService auditLog) {
         super(parent, existing == null ? "New Task" : "Edit Task", true);
         this.storage = storage;
+        this.auditLog = auditLog;
         setResizable(true);
         setMinimumSize(new Dimension(700, 560));
         setLayout(new BorderLayout(10, 10));
@@ -546,6 +561,21 @@ public class TaskDialog extends JDialog {
             }
             service.ConnectionTestService.Result result =
                     TestConnectionDialog.show(this, host, user, pass);
+            // Log the test itself regardless of outcome — this is the "if test
+            // connection is successful it should show in event logs" ask, and
+            // a failed test is just as worth a permanent record (with the real
+            // reason) as a successful one, not just a modal the operator closes.
+            if (result != null) {
+                String target = user + "@" + host;
+                if (result.success) {
+                    logActivity(true, "Test connection succeeded",
+                            "Connection to " + target + " verified in " + result.elapsedMs + " ms.");
+                } else {
+                    logActivityFailed(true, "Test connection failed",
+                            "Connection to " + target + " failed"
+                                    + (result.message != null ? ": " + result.message : "."));
+                }
+            }
             if (result != null && result.success) {
                 Credential cred = storage.loadCredentialByUsername(user);
                 if (cred == null) cred = new Credential();
@@ -555,11 +585,42 @@ public class TaskDialog extends JDialog {
                 cred.setUsername(user);
                 cred.setPassword(pass);
                 cred.setOsType((String) cbTargetOs.getSelectedItem());
-                storage.saveCredential(cred);
-                JOptionPane.showMessageDialog(this,
-                        "Connection verified — credential for \"" + user + "\" has been saved and is now "
-                                + "visible on the Credentials page.",
-                        "Credential Saved", JOptionPane.INFORMATION_MESSAGE);
+                boolean credSaved = storage.saveCredential(cred);
+                if (!credSaved) {
+                    if (storage.isConnected()) {
+                        String detail = storage.getLastCredentialSaveError();
+                        logActivityFailed(true, "Credential save failed",
+                                "Could not save credential for " + user + "@" + host
+                                        + " — database connected, but this write failed"
+                                        + (detail != null ? ": " + detail : "."));
+                        JOptionPane.showMessageDialog(this,
+                                "Connection verified, but the credential could NOT be saved — the "
+                                        + "database is connected, but this write failed"
+                                        + (detail != null ? (":\n" + detail) : ".")
+                                        + "\n\nIt will not appear on the Credentials page. This is often "
+                                        + "transient — try again.",
+                                "Credential NOT Saved", JOptionPane.ERROR_MESSAGE);
+                    } else {
+                        String detail = storage.getConnectionError();
+                        logActivityFailed(true, "Credential save failed",
+                                "Could not save credential for " + user + "@" + host
+                                        + " — database not connected"
+                                        + (detail != null ? ": " + detail : "."));
+                        JOptionPane.showMessageDialog(this,
+                                "Connection verified, but the credential could NOT be saved — the database "
+                                        + "is not connected" + (detail != null ? (":\n" + detail) : ".")
+                                        + "\n\nIt will not appear on the Credentials page, and this task cannot "
+                                        + "reference it until app.db is reachable again.",
+                                "Credential NOT Saved", JOptionPane.ERROR_MESSAGE);
+                    }
+                } else {
+                    logActivity(true, "Credential saved",
+                            "Credential for " + user + "@" + host + " saved via Test Connection.");
+                    JOptionPane.showMessageDialog(this,
+                            "Connection verified — credential for \"" + user + "\" has been saved and is now "
+                                    + "visible on the Credentials page.",
+                            "Credential Saved", JOptionPane.INFORMATION_MESSAGE);
+                }
             }
         });
         JPanel testConnectionRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
@@ -1158,7 +1219,34 @@ public class TaskDialog extends JDialog {
             cred.setUsername(targetUser);
             cred.setPassword(targetPass);
             cred.setOsType((String) cbTargetOs.getSelectedItem());
-            storage.saveCredential(cred);
+            if (!storage.saveCredential(cred)) {
+                // Bail out before the task upsert below — saving a task that points at
+                // a target credential which was never actually written would leave it
+                // referencing nothing, and the failure would otherwise surface (if at
+                // all) only much later, as an unrelated-looking connection error at
+                // run time.
+                if (storage.isConnected()) {
+                    String detail = storage.getLastCredentialSaveError();
+                    logActivityFailed(true, "Credential save failed",
+                            "Could not save target credential for task \"" + tfName.getText().trim()
+                                    + "\" — database connected, but this write failed"
+                                    + (detail != null ? ": " + detail : ".") + " Task was not saved.");
+                    msg("Could not save the target credential — the database is connected, but "
+                            + "this write failed" + (detail != null ? (":\n" + detail) : ".")
+                            + "\n\nThe task has NOT been saved. This is often transient — try again.");
+                } else {
+                    String detail = storage.getConnectionError();
+                    logActivityFailed(true, "Credential save failed",
+                            "Could not save target credential for task \"" + tfName.getText().trim()
+                                    + "\" — database not connected"
+                                    + (detail != null ? ": " + detail : ".") + " Task was not saved.");
+                    msg("Could not save the target credential — the database is not connected"
+                            + (detail != null ? (":\n" + detail) : ".")
+                            + "\n\nThe task has NOT been saved. Check the data directory / app.db "
+                            + "and try again.");
+                }
+                return;
+            }
         }
 
         try {
@@ -1270,7 +1358,42 @@ public class TaskDialog extends JDialog {
             return;
         }
 
-        storage.saveTask(t);
+        // Previously this always closed the dialog and reported success even if
+        // app.db wasn't connected (saveTask silently no-oped) — the task would
+        // vanish with no error, looking exactly like a "why can't I create a
+        // task" bug with nothing to explain it. Now the dialog stays open and
+        // tells the operator exactly what's wrong so they don't lose their
+        // half-filled-in form for nothing.
+        boolean saved = storage.saveTask(t);
+        if (!saved) {
+            // Two different failures both make saveTask() return false, and
+            // they need different messages: a dropped connection vs. a
+            // perfectly healthy one where just this write failed (lock
+            // contention with the Daemon, a constraint violation, disk full).
+            // Reporting the wrong one is actively misleading — e.g. telling
+            // someone the database isn't connected while the status bar
+            // correctly shows it is.
+            if (storage.isConnected()) {
+                String detail = storage.getLastTaskSaveError();
+                logActivityFailed(false, "Task save failed",
+                        "Could not save task \"" + t.getName() + "\" — database connected, but this "
+                                + "write failed" + (detail != null ? ": " + detail : "."));
+                msg("Could not save this task — the database is connected, but this "
+                        + "write failed" + (detail != null ? (":\n" + detail) : ".")
+                        + "\n\nYour changes have NOT been saved. This is often transient "
+                        + "(e.g. the Daemon writing to app.db at the same moment) — try again.");
+            } else {
+                String detail = storage.getConnectionError();
+                logActivityFailed(false, "Task save failed",
+                        "Could not save task \"" + t.getName() + "\" — database not connected"
+                                + (detail != null ? ": " + detail : "."));
+                msg("Could not save this task — the database is not connected"
+                        + (detail != null ? (":\n" + detail) : ".")
+                        + "\n\nYour changes have NOT been saved. Check the data directory / app.db "
+                        + "and try again.");
+            }
+            return;
+        }
         result = t;
         dispose();
     }
@@ -1569,6 +1692,41 @@ public class TaskDialog extends JDialog {
     private void styleBtn(JButton b, Color bg) {
         b.setBackground(bg); b.setForeground(Color.WHITE);
         b.setFocusPainted(false); b.setBorderPainted(false);
+    }
+
+    /**
+     * Records an application-activity note into the Event Monitor's feed —
+     * see {@link service.RunHistoryService#recordActivityEvent}. Uses the
+     * fixed pseudo-task-id "CREDENTIALS" for anything about a credential
+     * (matches {@code CredentialManagerPanel}'s own logging so both sources
+     * land in the same bucket), or "TASKS" otherwise. No-op if this dialog
+     * was constructed without an audit log reference (the 3-arg constructor).
+     */
+    private void logActivity(boolean aboutCredential, String title, String detail) {
+        if (auditLog == null) return;
+        java.time.LocalDateTime now = java.time.LocalDateTime.now();
+        try {
+            auditLog.recordActivityEvent(aboutCredential ? "CREDENTIALS" : "TASKS", title, null,
+                    detail, detail, now, now);
+        } catch (Exception ignored) {
+            // Best-effort — a failure to log this shouldn't block the actual dialog action.
+        }
+    }
+
+    /** Same as {@link #logActivity} but marks the event FAILED, so it renders
+     *  as a failure (red, "Failed: ...") in the feed instead of a neutral note —
+     *  see {@link service.RunHistoryService#recordActivityEvent(String, String,
+     *  String, model.TaskRunRecord.Status, String, String, java.time.LocalDateTime,
+     *  java.time.LocalDateTime)}. */
+    private void logActivityFailed(boolean aboutCredential, String title, String detail) {
+        if (auditLog == null) return;
+        java.time.LocalDateTime now = java.time.LocalDateTime.now();
+        try {
+            auditLog.recordActivityEvent(aboutCredential ? "CREDENTIALS" : "TASKS", title, null,
+                    model.TaskRunRecord.Status.FAILED, detail, detail, now, now);
+        } catch (Exception ignored) {
+            // Best-effort — a failure to log this shouldn't block the actual dialog action.
+        }
     }
 
     private void msg(String text) {

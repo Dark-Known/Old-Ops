@@ -238,6 +238,19 @@ public class CredentialManagerPanel extends JPanel {
         }
     }
 
+    /** Same as {@link #logActivity} but marks the event FAILED, so it renders
+     *  as a failure (red, "Failed: ...") in the feed instead of a neutral note. */
+    private void logActivityFailed(String title, String detail) {
+        if (auditLog == null) return;
+        LocalDateTime now = LocalDateTime.now();
+        try {
+            auditLog.recordActivityEvent("CREDENTIALS", title, null,
+                    model.TaskRunRecord.Status.FAILED, detail, detail, now, now);
+        } catch (Exception ignored) {
+            // Best-effort — a failure to log this shouldn't block the actual credential change.
+        }
+    }
+
     private void showDialog(Credential existing) {
         JDialog dlg = new JDialog(
             (Frame) SwingUtilities.getWindowAncestor(this),
@@ -308,7 +321,37 @@ public class CredentialManagerPanel extends JPanel {
             c.setUsername(user);
             c.setPassword(pass);
             c.setOsType((String) cbOs.getSelectedItem());
-            storage.saveCredential(c);
+            // Same silent-failure trap as tasks (see TaskDialog#save): a disconnected
+            // app.db used to make this look like it saved fine, then the credential
+            // was just gone. Check the return value and keep the dialog open on failure.
+            boolean saved = storage.saveCredential(c);
+            if (!saved) {
+                if (storage.isConnected()) {
+                    String detail = storage.getLastCredentialSaveError();
+                    logActivityFailed("Credential save failed",
+                            "Could not save credential for " + user + "@" + host
+                                    + " — database connected, but this write failed"
+                                    + (detail != null ? ": " + detail : "."));
+                    JOptionPane.showMessageDialog(dlg,
+                            "Could not save this credential — the database is connected, but this "
+                                    + "write failed" + (detail != null ? (":\n" + detail) : ".")
+                                    + "\n\nYour changes have NOT been saved. This is often transient — "
+                                    + "try again.",
+                            "Save failed", JOptionPane.ERROR_MESSAGE);
+                } else {
+                    String detail = storage.getConnectionError();
+                    logActivityFailed("Credential save failed",
+                            "Could not save credential for " + user + "@" + host
+                                    + " — database not connected"
+                                    + (detail != null ? ": " + detail : "."));
+                    JOptionPane.showMessageDialog(dlg,
+                            "Could not save this credential — the database is not connected"
+                                    + (detail != null ? (":\n" + detail) : ".")
+                                    + "\n\nYour changes have NOT been saved.",
+                            "Save failed", JOptionPane.ERROR_MESSAGE);
+                }
+                return;
+            }
             logActivity(existing == null ? "Credential added" : "Credential edited",
                     (existing == null ? "Added credential for " : "Edited credential for ")
                             + user + "@" + host + " (" + c.getOsType() + ")");

@@ -1060,7 +1060,8 @@ public class TaskManagerPanel extends JPanel {
     private void newTask() {
         try {
             TaskDialog dlg = new TaskDialog(
-                (Frame) SwingUtilities.getWindowAncestor(this), storage, null);
+                (Frame) SwingUtilities.getWindowAncestor(this), storage, null,
+                scheduler.getRunHistoryService());
             dlg.setVisible(true);
             if (dlg.getResult() != null) {
                 logActivity("Task created", "Created task \"" + dlg.getResult().getName() + "\"");
@@ -1081,7 +1082,8 @@ public class TaskManagerPanel extends JPanel {
             .ifPresentOrElse(t -> {
                 try {
                     TaskDialog dlg = new TaskDialog(
-                        (Frame) SwingUtilities.getWindowAncestor(this), storage, t);
+                        (Frame) SwingUtilities.getWindowAncestor(this), storage, t,
+                        scheduler.getRunHistoryService());
                     dlg.setVisible(true);
                     if (dlg.getResult() != null) {
                         logActivity("Task edited", "Edited task \"" + dlg.getResult().getName() + "\"");

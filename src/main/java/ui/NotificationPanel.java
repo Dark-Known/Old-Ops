@@ -122,7 +122,14 @@ public class NotificationPanel extends JPanel {
 
     private Component buildToolbar() {
         JButton btnRefresh = new JButton("Refresh");
-        btnRefresh.addActionListener(e -> refresh());
+        btnRefresh.addActionListener(e -> {
+            // Logged here, not inside refresh() itself — refresh() also runs on
+            // dialog open, the "show snoozed" toggle, and after snooze/retry
+            // actions, and logging every one of those would flood the feed with
+            // noise nobody asked for. Only an explicit click is "touched" it.
+            logActivity("Health feed refreshed", "Manually refreshed from the Health Feed dialog.");
+            refresh();
+        });
 
         showSnoozedToggle = new JToggleButton("Show snoozed");
         showSnoozedToggle.addActionListener(e -> refresh());
@@ -148,15 +155,34 @@ public class NotificationPanel extends JPanel {
         return localSnoozedUntil.containsKey(groupKey);
     }
 
+    /**
+     * Records an application-activity note into the Event Monitor's feed —
+     * same "SETTINGS"/"CREDENTIALS"/"TASKS" pseudo-task-id pattern used by
+     * TaskManagerPanel/CredentialManagerPanel/TaskDialog, using "HEALTH" for
+     * anything about this health feed itself. No-op if there's no scheduler
+     * (defensive — the real app always provides one) or run history.
+     */
+    private void logActivity(String title, String detail) {
+        if (scheduler == null || scheduler.getRunHistoryService() == null) return;
+        LocalDateTime now = LocalDateTime.now();
+        try {
+            scheduler.getRunHistoryService().recordActivityEvent("HEALTH", title, null, detail, detail, now, now);
+        } catch (Exception ignored) {
+            // Best-effort — a failure to log this shouldn't block the actual action.
+        }
+    }
+
     private void snooze(String groupKey) {
         if (healthBar != null) healthBar.snooze(groupKey);
         else localSnoozedUntil.put(groupKey, java.time.Instant.now().plusSeconds(2 * 3600));
+        logActivity("Failure group snoozed", "Snoozed \"" + groupKey + "\" for 2 hours.");
         refresh();
     }
 
     private void unsnooze(String groupKey) {
         if (healthBar != null) healthBar.unsnooze(groupKey);
         else localSnoozedUntil.remove(groupKey);
+        logActivity("Failure group un-snoozed", "Un-snoozed \"" + groupKey + "\".");
         refresh();
     }
 
