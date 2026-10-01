@@ -542,16 +542,67 @@ public class ActionCenterButton extends JPanel {
 
     private void retryTask(String taskId, String taskName) {
         if (taskId == null) return;
-        storage.loadTasks().stream().filter(t -> t.getId().equals(taskId)).findFirst().ifPresent(t -> {
+        // This quick-action retry had NO event logging or failure check at all —
+        // same silent-failure trap as every other unchecked saveTask() found
+        // across the app. A failed save here previously still queued CANCEL/
+        // REFRESH/RUN_NOW commands for a task whose status was never actually
+        // persisted as PENDING, and said "queued for immediate retry" regardless.
+        boolean[] saved = {false};
+        storage.loadTasks().stream().filter(t -> t.getId().equals(taskId)).findFirst().ifPresentOrElse(t -> {
+            ScheduledTask.TaskStatus oldStatus = t.getStatus();
             t.setStatus(ScheduledTask.TaskStatus.PENDING);
-            storage.saveTask(t);
-        });
+            if (storage.saveTask(t)) {
+                saved[0] = true;
+                logActivity("Task restarted", "Task \"" + taskName + "\" status: " + oldStatus
+                        + " \u2192 " + ScheduledTask.TaskStatus.PENDING + "; retried from the Action Center.");
+            } else {
+                String detail = storage.isConnected()
+                        ? storage.getLastTaskSaveError() : storage.getConnectionError();
+                logActivityFailed("Task restart failed",
+                        "Could not retry task \"" + taskName + "\""
+                                + (storage.isConnected() ? " — database connected, but this write failed"
+                                        : " — database not connected")
+                                + (detail != null ? ": " + detail : "."));
+            }
+        }, () -> logActivityFailed("Task restart failed",
+                "Could not retry task \"" + taskName + "\" — task no longer exists."));
+        if (!saved[0]) {
+            JOptionPane.showMessageDialog(this,
+                    "Could not retry \"" + taskName + "\" — the status change did not persist. See the "
+                            + "Event Monitor for details.",
+                    "Retry Failed", JOptionPane.ERROR_MESSAGE);
+            return;
+        }
         CommandQueueService.enqueue(storage.getDataDir(), taskId, CommandQueueService.Action.CANCEL, "gui");
         CommandQueueService.enqueue(storage.getDataDir(), taskId, CommandQueueService.Action.REFRESH, "gui");
         CommandQueueService.enqueue(storage.getDataDir(), taskId, CommandQueueService.Action.RUN_NOW, "gui");
         if (scheduler != null) scheduler.refresh();
         JOptionPane.showMessageDialog(this, "\"" + taskName + "\" queued for immediate retry.");
         refresh();
+    }
+
+    /** Records an application-activity note into the Event Monitor's feed —
+     *  see {@link service.RunHistoryService#recordActivityEvent}. */
+    private void logActivity(String title, String detail) {
+        if (scheduler == null || scheduler.getRunHistoryService() == null) return;
+        java.time.LocalDateTime now = java.time.LocalDateTime.now();
+        try {
+            scheduler.getRunHistoryService().recordActivityEvent("TASKS", title, null, detail, detail, now, now);
+        } catch (Exception ignored) {
+            // Best-effort — a failure to log this shouldn't block the actual action.
+        }
+    }
+
+    /** Same as {@link #logActivity} but marks the event FAILED. */
+    private void logActivityFailed(String title, String detail) {
+        if (scheduler == null || scheduler.getRunHistoryService() == null) return;
+        java.time.LocalDateTime now = java.time.LocalDateTime.now();
+        try {
+            scheduler.getRunHistoryService().recordActivityEvent("TASKS", title, null,
+                    model.TaskRunRecord.Status.FAILED, detail, detail, now, now);
+        } catch (Exception ignored) {
+            // Best-effort — a failure to log this shouldn't block the actual action.
+        }
     }
 
     private void showRunDetail(TaskRunRecord record) {

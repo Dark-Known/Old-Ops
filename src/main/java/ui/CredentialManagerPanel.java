@@ -100,9 +100,39 @@ public class CredentialManagerPanel extends JPanel {
                 "Confirm Delete", JOptionPane.YES_NO_OPTION,
                 inUse > 0 ? JOptionPane.WARNING_MESSAGE : JOptionPane.QUESTION_MESSAGE);
             if (ok == JOptionPane.YES_OPTION) {
-                storage.deleteCredential(username);
+                boolean deleted = storage.deleteCredential(username);
+                if (!deleted) {
+                    // Same silent-failure trap as save() — without this check, a
+                    // failed delete would still log "Credential deleted" and the
+                    // row would just reappear on next refresh with no explanation.
+                    if (storage.isConnected()) {
+                        String detail = storage.getLastCredentialSaveError();
+                        logActivityFailed("Credential delete failed",
+                                "Could not delete credential for " + username
+                                        + " — database connected, but this write failed"
+                                        + (detail != null ? ": " + detail : "."));
+                        JOptionPane.showMessageDialog(this,
+                                "Could not delete this credential — the database is connected, but this "
+                                        + "write failed" + (detail != null ? (":\n" + detail) : ".")
+                                        + "\n\nThis is often transient — try again.",
+                                "Delete failed", JOptionPane.ERROR_MESSAGE);
+                    } else {
+                        String detail = storage.getConnectionError();
+                        logActivityFailed("Credential delete failed",
+                                "Could not delete credential for " + username
+                                        + " — database not connected"
+                                        + (detail != null ? ": " + detail : "."));
+                        JOptionPane.showMessageDialog(this,
+                                "Could not delete this credential — the database is not connected"
+                                        + (detail != null ? (":\n" + detail) : ".") + ".",
+                                "Delete failed", JOptionPane.ERROR_MESSAGE);
+                    }
+                    return;
+                }
                 logActivity("Credential deleted", "Deleted credential for " + username
-                        + (inUse > 0 ? " (was in use by " + inUse + " task" + (inUse == 1 ? "" : "s") + ")" : ""));
+                        + " (host: " + c.getHost() + ", OS type: " + c.getOsType() + ")"
+                        + (inUse > 0 ? " — was in use by " + inUse + " task" + (inUse == 1 ? "" : "s")
+                                + ", which will fail at their next run" : ""));
                 refresh();
             }
         });
@@ -228,6 +258,38 @@ public class CredentialManagerPanel extends JPanel {
      * scheduled task. No-op if this panel was constructed without an audit
      * log reference.
      */
+    /**
+     * Builds a field-level "what actually changed" description for the event
+     * feed, instead of a generic "Credential edited" with no detail — the
+     * "need max information so it's easy for the end user" ask. Password
+     * VALUES are deliberately never included (even though this app already
+     * stores them as plain text — see the class doc — an audit trail is a
+     * wider-visibility surface than the credential itself, and "changed" is
+     * all an operator needs to know here).
+     */
+    private String buildCredentialChangeDetail(boolean isAdd, String user, String host,
+            String oldHost, String newHost, String oldPassword, String newPassword,
+            String oldOsType, String newOsType) {
+        String target = user + "@" + host;
+        if (isAdd) {
+            return "Added credential for " + target + " (OS type: " + newOsType + ").";
+        }
+        java.util.List<String> changes = new java.util.ArrayList<>();
+        if (oldHost != null && !oldHost.equals(newHost)) {
+            changes.add("host changed from \"" + oldHost + "\" to \"" + newHost + "\"");
+        }
+        if (oldPassword != null && !oldPassword.equals(newPassword)) {
+            changes.add("password changed");
+        }
+        if (oldOsType != null && !oldOsType.equals(newOsType)) {
+            changes.add("OS type changed from " + oldOsType + " to " + newOsType);
+        }
+        if (changes.isEmpty()) {
+            return "Edited credential for " + target + " — no fields actually changed (re-saved as-is).";
+        }
+        return "Edited credential for " + target + " — " + String.join("; ", changes) + ".";
+    }
+
     private void logActivity(String title, String detail) {
         if (auditLog == null) return;
         LocalDateTime now = LocalDateTime.now();
@@ -290,7 +352,21 @@ public class CredentialManagerPanel extends JPanel {
                 JOptionPane.showMessageDialog(dlg, "Enter a Hostname / IP and Username first.");
                 return;
             }
-            TestConnectionDialog.show(dlg, host, user, pass);
+            service.ConnectionTestService.Result result = TestConnectionDialog.show(dlg, host, user, pass);
+            // This is the standalone Credentials page's own Test Connection button
+            // (separate from the one inside the Task Dialog, which already logs) —
+            // it was invisible to the event feed entirely until now.
+            if (result != null) {
+                String target = user + "@" + host;
+                if (result.success) {
+                    logActivity("Test connection succeeded",
+                            "Connection to " + target + " verified in " + result.elapsedMs + " ms.");
+                } else {
+                    logActivityFailed("Test connection failed",
+                            "Connection to " + target + " failed"
+                                    + (result.message != null ? ": " + result.message : "."));
+                }
+            }
         });
         JPanel testRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
         testRow.add(btnTest);
@@ -315,6 +391,12 @@ public class CredentialManagerPanel extends JPanel {
                 JOptionPane.showMessageDialog(dlg, "Password is required."); return;
             }
             Credential c = existing != null ? existing : new Credential();
+            // Existing is the SAME object we're about to mutate below, so the old
+            // values must be captured here, before any setter runs — this is what
+            // makes the "what actually changed" diff in the event detail possible.
+            String oldHost = existing != null ? existing.getHost() : null;
+            String oldPassword = existing != null ? existing.getPassword() : null;
+            String oldOsType = existing != null ? existing.getOsType() : null;
             if (c.getId() == null) c.setId(UUID.randomUUID().toString());
             c.setName(user + "@" + host);
             c.setHost(host);
@@ -353,8 +435,8 @@ public class CredentialManagerPanel extends JPanel {
                 return;
             }
             logActivity(existing == null ? "Credential added" : "Credential edited",
-                    (existing == null ? "Added credential for " : "Edited credential for ")
-                            + user + "@" + host + " (" + c.getOsType() + ")");
+                    buildCredentialChangeDetail(existing == null, user, host, oldHost, host,
+                            oldPassword, pass, oldOsType, c.getOsType()));
             refresh();
             dlg.dispose();
         });

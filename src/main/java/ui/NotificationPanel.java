@@ -172,6 +172,20 @@ public class NotificationPanel extends JPanel {
         }
     }
 
+    /** Same as {@link #logActivity} but marks the event FAILED, logged under
+     *  "TASKS" rather than "HEALTH" since a retry failure is about the task
+     *  being retried, not about the health feed itself. */
+    private void logActivityFailed(String title, String detail) {
+        if (scheduler == null || scheduler.getRunHistoryService() == null) return;
+        LocalDateTime now = LocalDateTime.now();
+        try {
+            scheduler.getRunHistoryService().recordActivityEvent("TASKS", title, null,
+                    model.TaskRunRecord.Status.FAILED, detail, detail, now, now);
+        } catch (Exception ignored) {
+            // Best-effort — a failure to log this shouldn't block the actual action.
+        }
+    }
+
     private void snooze(String groupKey) {
         if (healthBar != null) healthBar.snooze(groupKey);
         else localSnoozedUntil.put(groupKey, java.time.Instant.now().plusSeconds(2 * 3600));
@@ -487,35 +501,70 @@ public class NotificationPanel extends JPanel {
 
     private void retryTask(String taskId, String taskName) {
         if (taskId == null) return;
-        storage.loadTasks().stream().filter(t -> t.getId().equals(taskId)).findFirst().ifPresent(this::restartTask);
+        // restartTask() returns whether the status change actually persisted —
+        // previously unchecked here, so a failed save still claimed the task was
+        // "queued for immediate retry" and still asked the daemon to run it.
+        boolean[] ok = {false};
+        storage.loadTasks().stream().filter(t -> t.getId().equals(taskId)).findFirst()
+                .ifPresentOrElse(t -> ok[0] = restartTask(t),
+                        () -> logActivityFailed("Task restart failed",
+                                "Could not retry task \"" + taskName + "\" — task no longer exists."));
+        if (!ok[0]) {
+            JOptionPane.showMessageDialog(this,
+                    "Could not retry \"" + taskName + "\" — the status change did not persist. See the "
+                            + "Event Monitor for details.",
+                    "Retry Failed", JOptionPane.ERROR_MESSAGE);
+            return;
+        }
         if (scheduler != null) scheduler.refresh();
         JOptionPane.showMessageDialog(this, "\"" + taskName + "\" queued for immediate retry.");
         refresh();
     }
 
-    private void restartTask(ScheduledTask task) {
+    /** Returns whether the status change actually persisted — see retryTask(). */
+    private boolean restartTask(ScheduledTask task) {
+        ScheduledTask.TaskStatus oldStatus = task.getStatus();
         task.setStatus(ScheduledTask.TaskStatus.PENDING);
         task.setLastStartedAt(null);
-        storage.saveTask(task);
+        if (!storage.saveTask(task)) {
+            String detail = storage.isConnected()
+                    ? storage.getLastTaskSaveError() : storage.getConnectionError();
+            logActivityFailed("Task restart failed",
+                    "Could not retry task \"" + task.getName() + "\""
+                            + (storage.isConnected() ? " — database connected, but this write failed"
+                                    : " — database not connected")
+                            + (detail != null ? ": " + detail : "."));
+            return false;
+        }
+        logActivity("Task restarted", "Task \"" + task.getName() + "\" status: " + oldStatus + " \u2192 "
+                + ScheduledTask.TaskStatus.PENDING + "; retried from the Health Feed.");
         // Ask the daemon/service to actually do this — this window never
         // runs its own scheduler/worker pool (see MainWindow's thin-client
         // migration and service.CommandQueueService).
         CommandQueueService.enqueue(storage.getDataDir(), task.getId(), CommandQueueService.Action.CANCEL, "gui");
         CommandQueueService.enqueue(storage.getDataDir(), task.getId(), CommandQueueService.Action.RUN_NOW, "gui");
         refresh();
+        return true;
     }
 
     private void restartAllFailed() {
-        int count = 0;
+        // restartTask() now reports success/failure per task (see its own
+        // comment) — this bulk version previously counted every attempt as a
+        // success regardless of whether the save actually persisted, so a
+        // partial failure here would still claim "N restarted" with nothing
+        // to indicate some of those N never actually happened.
+        int succeeded = 0, failed = 0;
         for (ScheduledTask task : storage.loadTasks()) {
             if (task.getStatus() == ScheduledTask.TaskStatus.FAILED
                     || task.getStatus() == ScheduledTask.TaskStatus.RETRYING
                     || task.getStatus() == ScheduledTask.TaskStatus.RUNNING) {
-                restartTask(task);
-                count++;
+                if (restartTask(task)) succeeded++; else failed++;
             }
         }
-        JOptionPane.showMessageDialog(this, count + " failed task(s) restarted.", "Restarted", JOptionPane.INFORMATION_MESSAGE);
+        String msg = succeeded + " failed task(s) restarted" + (failed > 0 ? ", " + failed + " could not be"
+                + " restarted (see Event Monitor for details)" : "") + ".";
+        JOptionPane.showMessageDialog(this, msg, failed > 0 ? "Partially Restarted" : "Restarted",
+                failed > 0 ? JOptionPane.WARNING_MESSAGE : JOptionPane.INFORMATION_MESSAGE);
         refresh();
     }
 }

@@ -65,6 +65,7 @@ public class TaskDbService {
         try {
             Class.forName("org.sqlite.JDBC");
             c = DriverManager.getConnection("jdbc:sqlite:" + dbFile.getAbsolutePath());
+            applyPragmas(c);
             try (Statement st = c.createStatement()) {
                 st.execute(CREATE_TASKS_TABLE_SQL);
             }
@@ -77,6 +78,48 @@ public class TaskDbService {
         this.connectionError = initError;
         if (this.conn != null) {
             migrateLegacyXmlIfPresent();
+        }
+    }
+
+    /**
+     * Tunes this connection for a desktop app with three independent writers
+     * sharing one file (this class, CredentialDbService, and AppSettings all
+     * open their own separate connection to the same app.db — see each
+     * class's own javadoc). None of these PRAGMAs were ever set before,
+     * which left every one of these three connections on SQLite's defaults:
+     * <ul>
+     *   <li>Default journal mode (rollback journal) fsyncs on every single
+     *       COMMIT, and a writer blocks every reader for the duration. On a
+     *       network/mapped drive — a config this app explicitly supports,
+     *       see app-config.xml's {@code <dataDir>} — that fsync can take
+     *       tens to hundreds of milliseconds. Since every save()/delete() in
+     *       this app runs synchronously on the Swing event thread (no
+     *       SwingWorker backing these calls), that latency is a direct,
+     *       literal UI freeze on every click that saves, deletes, enables,
+     *       restarts, or resets anything.</li>
+     *   <li>WAL mode moves that cost mostly off the write path (readers never
+     *       block a writer and vice versa, and commits are a cheap append
+     *       rather than an in-place rewrite + fsync), which is the standard
+     *       fix for exactly this symptom.</li>
+     *   <li>With no busy_timeout, two of these three connections touching the
+     *       same file at the same moment (e.g. a task save landing the same
+     *       instant as a settings save) previously meant the loser failed
+     *       immediately with SQLITE_BUSY (silently, into the old swallowed-
+     *       exception pattern, or now into the visible getLastSaveError()
+     *       path) instead of just waiting the handful of milliseconds a real
+     *       conflict actually takes to clear.</li>
+     * </ul>
+     * synchronous=NORMAL is the pairing SQLite's own documentation
+     * recommends with WAL — still durable against this application
+     * crashing, only trading away safety against the OS/power failing at
+     * the exact instant of a commit, which is an acceptable trade for an
+     * internal ops tool.
+     */
+    private static void applyPragmas(Connection c) throws SQLException {
+        try (Statement st = c.createStatement()) {
+            st.execute("PRAGMA journal_mode=WAL");
+            st.execute("PRAGMA synchronous=NORMAL");
+            st.execute("PRAGMA busy_timeout=5000");
         }
     }
 
@@ -337,14 +380,20 @@ public class TaskDbService {
         }
     }
 
-    /** Deletes the task with the given id, if any. */
-    public synchronized void delete(String id) {
-        if (conn == null || id == null || id.isEmpty()) return;
+    /** Deletes the task with the given id, if any. Returns whether a row was
+     *  actually removed — see {@link #save}'s javadoc for why callers should
+     *  check this instead of assuming a delete silently succeeded. */
+    public synchronized boolean delete(String id) {
+        if (conn == null || id == null || id.isEmpty()) return false;
         try (PreparedStatement ps = conn.prepareStatement("DELETE FROM tasks WHERE id = ?")) {
             ps.setString(1, id);
             ps.executeUpdate();
+            lastSaveError = null;
+            return true;
         } catch (SQLException e) {
             log.log(Level.WARNING, "Failed to delete task " + id, e);
+            lastSaveError = e.getClass().getSimpleName() + ": " + e.getMessage();
+            return false;
         }
     }
 

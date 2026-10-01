@@ -241,6 +241,14 @@ if ($existingService) {
 # exactly the same either way; only its Task Manager identity differs.
 $iconCandidate = if ($IconPath -and (Test-Path $IconPath)) { $IconPath } else { Join-Path $InstallDir "Icon.ico" }
 $brandScript = Join-Path $PSScriptRoot "steps\Brand-Executable.ps1"
+# setup.ps1 and rcedit.exe (per its own header's prerequisite list) live one
+# level up from this script (packaging\install-service.ps1 -> the staging
+# root) — NOT in -InstallDir, which is the deployed destination and never
+# has rcedit.exe placed in it. Same staging-root concept as
+# Deploy-Application.ps1's self-detected -ScriptRoot, just one directory
+# level shallower since this script sits directly in packaging\, not
+# packaging\steps\.
+$stagingRoot = Split-Path $PSScriptRoot -Parent
 
 $runtimeScript = Join-Path $PSScriptRoot "steps\New-PrivateRuntime.ps1"
 $javaSource = $null
@@ -271,7 +279,7 @@ if (-not $javaSource -or -not (Test-Path $javaSource)) {
         IconPath    = $iconCandidate
         Description = "$DaemonDisplayName - background daemon"
         ProductName = $DaemonDisplayName
-        SearchDir   = $InstallDir
+        SearchDir   = $stagingRoot
     }
     if ($RceditPath) { $brandArgs.RceditPath = $RceditPath }
     $brandResult = & $brandScript @brandArgs
@@ -301,7 +309,7 @@ if ($BrandWinSwWrapper) {
             IconPath    = $iconCandidate
             Description = "$DaemonDisplayName - background daemon"
             ProductName = $DaemonDisplayName
-            SearchDir   = $InstallDir
+            SearchDir   = $stagingRoot
         }
         if ($RceditPath) { $wrapperBrandArgs.RceditPath = $RceditPath }
         # DestExe intentionally has the SAME name as SourceExe here: this brands

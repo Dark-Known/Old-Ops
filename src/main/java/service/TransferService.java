@@ -696,7 +696,17 @@ public class TransferService {
 
             task.setLastKnownRemoteFileEpoch(newEpoch);
             task.setLastKnownRemoteFileSize(newSize);
-            storage.saveTask(task);
+            if (!storage.saveTask(task)) {
+                // This was previously fire-and-forget. If this write doesn't
+                // persist, the watcher baseline never actually advances, so the
+                // NEXT run will see these same files as still-new and re-transfer
+                // them — a silent duplicate-transfer bug, not just a missing log
+                // line. Reported via the task's own run log (same channel as
+                // every other line here) since that's what's in scope at this
+                // point in the transfer, not a UI dialog.
+                logLine.accept("[WARN] Failed to persist updated watcher baseline (epoch=" + newEpoch
+                        + ") — the next run may re-process these same file(s).");
+            }
             String readableTime = Instant.ofEpochMilli(newEpoch)
                     .atZone(java.time.ZoneId.systemDefault())
                     .format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
@@ -2311,7 +2321,13 @@ public class TransferService {
 
         if (watcherOn && newestEpoch > 0) {
             task.setMailLastKnownEpoch(newestEpoch);
-            storage.saveTask(task);
+            if (!storage.saveTask(task)) {
+                // Same risk as the file-transfer baseline above: if this doesn't
+                // persist, the next run re-sees (and may re-fetch/re-move) the
+                // same already-processed message(s).
+                logLine.accept("[WARN] Failed to persist updated mail watcher baseline (epoch=" + newestEpoch
+                        + ") — the next run may re-process these same message(s).");
+            }
             String readable = Instant.ofEpochMilli(newestEpoch)
                     .atZone(java.time.ZoneId.systemDefault())
                     .format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));

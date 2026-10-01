@@ -111,9 +111,11 @@ public class XmlStorageService {
         return credentialDb.save(cred);
     }
 
-    /** Delete the stored credential for the given username. */
-    public void deleteCredential(String username) {
-        credentialDb.delete(username);
+    /** Delete the stored credential for the given username. Returns whether
+     *  it was actually removed — false means app.db isn't connected or the
+     *  delete failed; see {@link #isConnected()} / {@link #getLastCredentialSaveError()}. */
+    public boolean deleteCredential(String username) {
+        return credentialDb.delete(username);
     }
 
     /** List every credential stored. */
@@ -157,8 +159,10 @@ public class XmlStorageService {
         return taskDb.save(task);
     }
 
-    /** Deletes the task with the given id, if any. */
-    public void deleteTask(String id) {
-        taskDb.delete(id);
+    /** Deletes the task with the given id, if any. Returns whether it was
+     *  actually removed — false means app.db isn't connected or the delete
+     *  failed; see {@link #isConnected()} / {@link #getLastTaskSaveError()}. */
+    public boolean deleteTask(String id) {
+        return taskDb.delete(id);
     }
 }

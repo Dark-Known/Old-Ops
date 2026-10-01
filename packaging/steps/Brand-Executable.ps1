@@ -57,9 +57,11 @@
     (e.g. the install directory, per setup.ps1's own prerequisite list).
 
 .PARAMETER SearchDir
-    Folder to look for rcedit.exe in if -RceditPath isn't given — pass
-    your app's install directory here, matching where setup.ps1 tells
-    people to place rcedit.exe.
+    Folder to look for rcedit.exe in if -RceditPath isn't given — pass the
+    staging folder rcedit.exe is actually expected in (where setup.ps1 and
+    the other install prerequisites live — see setup.ps1's own header
+    comment), not -InstallDir: rcedit.exe is never placed in the deployed
+    destination, only in the folder the installer is run from.
 
 .PARAMETER LogFile
     Optional path to append timestamped log lines to. Safe to omit.

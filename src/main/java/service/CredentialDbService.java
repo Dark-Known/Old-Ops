@@ -41,6 +41,23 @@ public class CredentialDbService {
     // is tracked instead of just logging once and moving on.
     private final String connectionError;
 
+    /**
+     * Tunes this connection for a desktop app with three independent writers
+     * sharing one app.db file — see {@code TaskDbService#applyPragmas}'s
+     * javadoc for the full reasoning (WAL mode, synchronous=NORMAL, and a
+     * busy_timeout). PRAGMA journal_mode persists at the database-file level
+     * once set by any connection, but synchronous and busy_timeout are
+     * per-connection, so each of the three services opening their own
+     * connection to app.db needs to set these itself.
+     */
+    private static void applyPragmas(Connection c) throws SQLException {
+        try (Statement st = c.createStatement()) {
+            st.execute("PRAGMA journal_mode=WAL");
+            st.execute("PRAGMA synchronous=NORMAL");
+            st.execute("PRAGMA busy_timeout=5000");
+        }
+    }
+
     public CredentialDbService(File dataDir) {
         this.dataDir = dataDir;
         File dbFile = new File(dataDir, "app.db");
@@ -49,6 +66,7 @@ public class CredentialDbService {
         try {
             Class.forName("org.sqlite.JDBC");
             c = DriverManager.getConnection("jdbc:sqlite:" + dbFile.getAbsolutePath());
+            applyPragmas(c);
             try (Statement st = c.createStatement()) {
                 st.execute("CREATE TABLE IF NOT EXISTS credentials (" +
                         "id TEXT PRIMARY KEY," +
@@ -142,14 +160,20 @@ public class CredentialDbService {
         }
     }
 
-    /** Deletes the credential for the given username, if any. */
-    public synchronized void delete(String username) {
-        if (conn == null || username == null || username.isEmpty()) return;
+    /** Deletes the credential for the given username, if any. Returns whether
+     *  it was actually removed — see TaskDbService#save's javadoc for why
+     *  this matters. */
+    public synchronized boolean delete(String username) {
+        if (conn == null || username == null || username.isEmpty()) return false;
         try (PreparedStatement ps = conn.prepareStatement("DELETE FROM credentials WHERE username = ?")) {
             ps.setString(1, username);
             ps.executeUpdate();
+            lastSaveError = null;
+            return true;
         } catch (SQLException e) {
             log.log(Level.WARNING, "Failed to delete credential for username " + username, e);
+            lastSaveError = e.getClass().getSimpleName() + ": " + e.getMessage();
+            return false;
         }
     }
 

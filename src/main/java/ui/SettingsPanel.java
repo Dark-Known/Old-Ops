@@ -381,13 +381,75 @@ public class SettingsPanel extends JPanel {
                     "Mail Routing", JOptionPane.WARNING_MESSAGE);
             return;
         }
+        // Captured before mutating the list below — needed for the diff detail,
+        // and this call previously had NO event logging or failure check at all.
+        java.util.List<util.MailRoutingRule> before = new java.util.ArrayList<>(mailRoutingRules);
         // Replace rather than duplicate if this key is already configured.
         mailRoutingRules.removeIf(r -> key.equalsIgnoreCase(r.getKey()));
         mailRoutingRules.add(new util.MailRoutingRule(key, folder));
-        AppSettings.setMailRoutingRules(mailRoutingRules);
+        try {
+            if (!AppSettings.setMailRoutingRules(mailRoutingRules)) {
+                String detail = AppSettings.getConnectionError();
+                logActivityFailed("Settings save failed",
+                        "Could not save mail routing rule \"" + key + "\" \u2192 \"" + folder
+                                + "\" — database not connected" + (detail != null ? ": " + detail : "."));
+                JOptionPane.showMessageDialog(this,
+                        "Could not save this rule — the database is not connected"
+                                + (detail != null ? (":\n" + detail) : ".") + "\n\nYour change has NOT been saved.",
+                        "Save failed", JOptionPane.ERROR_MESSAGE);
+                mailRoutingRules = before; // roll back the in-memory list to match what's actually persisted
+                return;
+            }
+        } catch (Exception ex) {
+            // Connected, but the write itself failed — see the full editor's
+            // Save handler for why this needs its own catch.
+            logActivityFailed("Settings save failed", "Could not save mail routing rule \"" + key
+                    + "\" \u2192 \"" + folder + "\": " + ex.getMessage());
+            JOptionPane.showMessageDialog(this,
+                    "Could not save this rule: " + ex.getMessage()
+                            + "\n\nYour change has NOT been saved. This is often transient — try again.",
+                    "Save failed", JOptionPane.ERROR_MESSAGE);
+            mailRoutingRules = before;
+            return;
+        }
+        logActivity("Settings saved", "Mail routing rules updated — "
+                + buildMailRoutingDiff(before, mailRoutingRules));
         tfNewRuleKey.setText("");
         tfNewRuleFolder.setText("");
         refreshMailRoutingPreview();
+    }
+
+    /**
+     * Builds a "what actually changed" description for a mail-routing-rules
+     * save — same principle as the settings/credential/task diffs: list every
+     * field name whose folder was added, removed, or changed, instead of a
+     * bare rule count that tells an operator nothing about WHICH mapping
+     * changed. Matching is case-insensitive on the field-name key, mirroring
+     * the existing de-duplication logic in addMailRoutingRuleFromFields().
+     */
+    private String buildMailRoutingDiff(java.util.List<util.MailRoutingRule> before,
+            java.util.List<util.MailRoutingRule> after) {
+        Map<String, String> oldByKey = new LinkedHashMap<>();
+        for (util.MailRoutingRule r : before) oldByKey.put(r.getKey().toLowerCase(), r.getFolder());
+        Map<String, String> newByKey = new LinkedHashMap<>();
+        for (util.MailRoutingRule r : after) newByKey.put(r.getKey().toLowerCase(), r.getFolder());
+
+        java.util.List<String> changes = new java.util.ArrayList<>();
+        for (util.MailRoutingRule r : after) {
+            String key = r.getKey().toLowerCase();
+            if (!oldByKey.containsKey(key)) {
+                changes.add("added \"" + r.getKey() + "\" \u2192 \"" + r.getFolder() + "\"");
+            } else if (!oldByKey.get(key).equals(r.getFolder())) {
+                changes.add("\"" + r.getKey() + "\": \"" + oldByKey.get(key) + "\" \u2192 \"" + r.getFolder() + "\"");
+            }
+        }
+        for (util.MailRoutingRule r : before) {
+            String key = r.getKey().toLowerCase();
+            if (!newByKey.containsKey(key)) {
+                changes.add("removed \"" + r.getKey() + "\" (was \u2192 \"" + r.getFolder() + "\")");
+            }
+        }
+        return changes.isEmpty() ? "no changes (re-saved as-is)" : String.join("; ", changes);
     }
 
     private void refreshMailRoutingPreview() {
@@ -470,8 +532,34 @@ public class SettingsPanel extends JPanel {
             if (!hasOthers) {
                 updated.add(new util.MailRoutingRule(util.MailRoutingRule.OTHERS_KEY, "Others"));
             }
-            AppSettings.setMailRoutingRules(updated);
-            logActivity("Settings saved", "Mail routing rules updated (" + updated.size() + " rule(s))");
+            try {
+                if (!AppSettings.setMailRoutingRules(updated)) {
+                    // false means "never connected at all" — see AppSettings#set.
+                    String detail = AppSettings.getConnectionError();
+                    logActivityFailed("Settings save failed",
+                            "Could not save mail routing rules — database not connected"
+                                    + (detail != null ? ": " + detail : "."));
+                    JOptionPane.showMessageDialog(dlg,
+                            "Could not save mail routing rules — the database is not connected"
+                                    + (detail != null ? (":\n" + detail) : ".")
+                                    + "\n\nYour changes have NOT been saved.",
+                            "Save failed", JOptionPane.ERROR_MESSAGE);
+                    return;
+                }
+            } catch (Exception ex) {
+                // Connected, but the write itself failed (AppSettings#set throws
+                // rather than returning false for this case) — previously
+                // uncaught here, so it would vanish into Swing's default handler
+                // with no dialog and no event logged at all.
+                logActivityFailed("Settings save failed", "Could not save mail routing rules: " + ex.getMessage());
+                JOptionPane.showMessageDialog(dlg,
+                        "Could not save mail routing rules: " + ex.getMessage()
+                                + "\n\nYour changes have NOT been saved. This is often transient — try again.",
+                        "Save failed", JOptionPane.ERROR_MESSAGE);
+                return;
+            }
+            logActivity("Settings saved", "Mail routing rules updated — "
+                    + buildMailRoutingDiff(mailRoutingRules, updated));
             refreshMailRoutingPreview();
             dlg.dispose();
         });
@@ -891,11 +979,70 @@ public class SettingsPanel extends JPanel {
      * panel was constructed without a scheduler reference (see the
      * single-arg constructor's javadoc).
      */
+    // Human-readable labels for the settings-diff event detail below, keyed by
+    // the same constants used in live.put(...) — kept in one place so the
+    // event feed reads naturally ("Log level") instead of raw key constants.
+    private static final Map<String, String> SETTING_LABELS = Map.ofEntries(
+            Map.entry(AppSettings.KEY_DEFAULT_STATION_ADDR, "Default station address"),
+            Map.entry(AppSettings.KEY_ATTACHMENT_DOWNLOAD_DIR, "Attachment download directory"),
+            Map.entry(AppSettings.KEY_LOG_LEVEL, "Log level"),
+            Map.entry(AppSettings.KEY_JVM_MIN_HEAP, "JVM min heap"),
+            Map.entry(AppSettings.KEY_JVM_MAX_HEAP, "JVM max heap"),
+            Map.entry(AppSettings.KEY_TRANSFER_BATCH_TARGET_SECONDS, "Batch target duration (s)"),
+            Map.entry(AppSettings.KEY_TRANSFER_ASSUMED_THROUGHPUT_MBPS, "Assumed throughput (Mbps)"),
+            Map.entry(AppSettings.KEY_TRANSFER_BATCH_INTERVAL_SECONDS, "Batch interval (s)"),
+            Map.entry(AppSettings.KEY_TRANSFER_BATCH_MAX_BYTES, "Batch max bytes override"),
+            Map.entry(AppSettings.KEY_TRANSFER_BATCH_CONCURRENCY, "Batch concurrency"),
+            Map.entry(AppSettings.KEY_WATCHER_FILES_PER_WORKER_THREAD, "Watcher files per worker thread"),
+            Map.entry(AppSettings.KEY_STALE_RUNNING_THRESHOLD_MINUTES, "Stale running threshold (min)"),
+            Map.entry(AppSettings.KEY_MAX_CONCURRENT_TASK_THREADS, "Max concurrent task threads"),
+            Map.entry(AppSettings.KEY_POLL_INTERVAL_SECONDS, "Poll interval (s)"));
+
+    /**
+     * Builds a field-level "what actually changed" description for the event
+     * feed — the "need max information so it's easy for the end user" ask.
+     * A generic "Application settings updated" told an operator nothing
+     * about WHAT changed; this lists every key whose value actually differs,
+     * as "Label: old → new", so the incident is legible from the feed alone
+     * without having to go compare configs by hand.
+     */
+    private String buildSettingsChangeDetail(Map<String, String> oldValues, Map<String, String> newValues) {
+        java.util.List<String> changes = new java.util.ArrayList<>();
+        for (String key : newValues.keySet()) {
+            String oldVal = oldValues.get(key);
+            String newVal = newValues.get(key);
+            boolean oldBlank = oldVal == null || oldVal.isEmpty();
+            boolean newBlank = newVal == null || newVal.isEmpty();
+            if (oldBlank && newBlank) continue;
+            if (!oldBlank && !newBlank && oldVal.equals(newVal)) continue;
+            String label = SETTING_LABELS.getOrDefault(key, key);
+            changes.add(label + ": " + (oldBlank ? "(not set)" : oldVal) + " \u2192 "
+                    + (newBlank ? "(not set)" : newVal));
+        }
+        if (changes.isEmpty()) {
+            return "Application settings re-saved with no changes.";
+        }
+        return "Application settings updated — " + String.join("; ", changes) + ".";
+    }
+
     private void logActivity(String title, String detail) {
         if (scheduler == null) return;
         try {
             java.time.LocalDateTime now = java.time.LocalDateTime.now();
             scheduler.getRunHistoryService().recordActivityEvent("SETTINGS", title, null, detail, detail, now, now);
+        } catch (Exception ignored) {
+            // Best-effort — a failure to log this shouldn't block the actual settings save.
+        }
+    }
+
+    /** Same as {@link #logActivity} but marks the event FAILED, so it renders
+     *  as a failure (red, "Failed: ...") in the feed instead of a neutral note. */
+    private void logActivityFailed(String title, String detail) {
+        if (scheduler == null) return;
+        try {
+            java.time.LocalDateTime now = java.time.LocalDateTime.now();
+            scheduler.getRunHistoryService().recordActivityEvent("SETTINGS", title, null,
+                    model.TaskRunRecord.Status.FAILED, detail, detail, now, now);
         } catch (Exception ignored) {
             // Best-effort — a failure to log this shouldn't block the actual settings save.
         }
@@ -943,17 +1090,56 @@ public class SettingsPanel extends JPanel {
             // shared via app.db so the Daemon/service picks it up too.
             live.put(AppSettings.KEY_POLL_INTERVAL_SECONDS,
                     String.valueOf((Integer) spinnerPollInterval.getValue()));
-            AppSettings.setAll(live);
-            logActivity("Settings saved", "Application settings updated (log level: "
-                    + live.get(AppSettings.KEY_LOG_LEVEL) + ")");
+            // Captured before setAll() overwrites anything — this is what makes
+            // the per-field "what actually changed" diff below possible.
+            Map<String, String> oldValues = new LinkedHashMap<>();
+            for (String key : live.keySet()) oldValues.put(key, AppSettings.get(key));
+            if (!AppSettings.setAll(live)) {
+                // connection() returned null — the settings table in app.db never
+                // opened, so this write never happened at all (previously this
+                // silently updated the in-memory cache anyway and reported
+                // success, meaning the change looked like it took effect in this
+                // process but vanished on restart and was invisible to the
+                // Daemon's separate connection).
+                String detail = AppSettings.getConnectionError();
+                logActivityFailed("Settings save failed",
+                        "Could not save application settings — database not connected"
+                                + (detail != null ? ": " + detail : "."));
+                lblStatus.setText("Could not save settings — the database is not connected"
+                        + (detail != null ? (": " + detail) : ".") + " Your changes were NOT saved.");
+                lblStatus.setForeground(Color.RED);
+                return;
+            }
+            logActivity("Settings saved", buildSettingsChangeDetail(oldValues, live));
         } catch (Exception ex) {
+            logActivityFailed("Settings save failed", "Could not save live settings: " + ex.getMessage());
             lblStatus.setText("Could not save live settings: " + ex.getMessage());
             lblStatus.setForeground(Color.RED);
             return;
         }
 
         if (!path.isEmpty()) {
-            AppSettings.set(AppSettings.KEY_WINSCP_PATH, path);
+            // Captured before set() overwrites it — the WinSCP path is saved via
+            // its own set() call, separate from the live map's setAll() above, so
+            // it needs its own before/after snapshot for the same "what changed"
+            // detail (previously this success path logged nothing about the WinSCP
+            // path at all, even when it was the only thing actually changed).
+            String oldWinScpPath = AppSettings.get(AppSettings.KEY_WINSCP_PATH);
+            if (!AppSettings.set(AppSettings.KEY_WINSCP_PATH, path)) {
+                String detail = AppSettings.getConnectionError();
+                logActivityFailed("Settings save failed",
+                        "Could not save WinSCP path — database not connected"
+                                + (detail != null ? ": " + detail : "."));
+                lblStatus.setText("Could not save the WinSCP path — the database is not connected"
+                        + (detail != null ? (": " + detail) : "."));
+                lblStatus.setForeground(Color.RED);
+                return;
+            }
+            if (!path.equals(oldWinScpPath)) {
+                logActivity("Settings saved", "WinSCP path: "
+                        + (oldWinScpPath == null || oldWinScpPath.isEmpty() ? "(not set)" : oldWinScpPath)
+                        + " \u2192 " + path);
+            }
             transferService.setWinScpPath(path);
             lblStatus.setText("✓  Settings saved.");
             lblStatus.setForeground(AppTheme.EARTH_MOSS);

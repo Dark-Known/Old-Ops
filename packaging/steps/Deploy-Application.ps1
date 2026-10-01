@@ -265,7 +265,7 @@ if (-not $javawExe) {
             DestExe     = $GuiExeName
             IconPath    = $installedIcon
             Description = $ShortcutName
-            SearchDir   = $InstallDir
+            SearchDir   = $ScriptRoot
         }
         if ($RceditPath) { $brandArgs.RceditPath = $RceditPath }
         if ($LogFile)     { $brandArgs.LogFile     = $LogFile }

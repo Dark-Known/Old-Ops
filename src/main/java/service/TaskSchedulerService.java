@@ -304,6 +304,36 @@ public class TaskSchedulerService {
         return remotePushWatcher.isPushActive(task.getId());
     }
 
+    /**
+     * Logs (application log + Event Monitor activity feed) when one of this
+     * scheduler's internal {@code storage.saveTask(...)} calls silently
+     * fails. Purely additive — every call site below keeps running exactly
+     * the same control flow it always did; this only makes a previously
+     * invisible failure visible, since every one of these writes was
+     * fire-and-forget (see {@code TaskDbService#save}'s javadoc for why
+     * that's dangerous in general). Left uncaught, a failure here can mean a
+     * task silently sticks in the wrong status (e.g. still shows RUNNING
+     * forever after a crash-recovery reset was supposed to clear it), or a
+     * schedule/retry transition never actually took effect even though the
+     * scheduler proceeded as if it had.
+     */
+    private void logBackendSaveFailure(ScheduledTask t, String context) {
+        boolean connected = storage.isConnected();
+        String detail = connected ? storage.getLastTaskSaveError() : storage.getConnectionError();
+        String msg = "Could not persist " + context + " for task \"" + t.getName() + "\""
+                + (connected ? " — database connected, but this write failed" : " — database not connected")
+                + (detail != null ? ": " + detail : ".");
+        log.warning(msg);
+        try {
+            LocalDateTime now = LocalDateTime.now();
+            runHistoryService.recordActivityEvent(t.getId(), t.getName(),
+                    t.getTaskType() != null ? t.getTaskType().name() : null,
+                    TaskRunRecord.Status.FAILED, "Internal state save failed: " + context, msg, now, now);
+        } catch (Exception ignored) {
+            // Best-effort — a failure to log this must never affect scheduling itself.
+        }
+    }
+
     public void setLogCallback(BiConsumer<String, String> cb) {
         this.logCallback = cb;
     }
@@ -578,7 +608,7 @@ public class TaskSchedulerService {
             eventQueue.cancel(t.getId());
             t.setStatus(TaskStatus.RUNNING);
             t.setLastStartedAt(LocalDateTime.now());
-            storage.saveTask(t);
+            if (!storage.saveTask(t)) logBackendSaveFailure(t, "RUNNING status at run start");
             refreshMetrics(t.getId(), true);
             Future<?> f = executor.submit(() -> executeTask(t));
             runningTaskFutures.put(t.getId(), f);
@@ -665,7 +695,7 @@ public class TaskSchedulerService {
                         task.setLastStartedAt(null);
                         task.setLastRunResult("FAILED (stale)");
                         task.setStatus(TaskStatus.PENDING);
-                        storage.saveTask(task);
+                        if (!storage.saveTask(task)) logBackendSaveFailure(task, "PENDING status after stale-RUNNING recovery");
                         lastActivityMillis.remove(task.getId());
                         // falls through to get (re)published below
                     } else {
@@ -990,7 +1020,7 @@ public class TaskSchedulerService {
             }
             task.setStatus(TaskStatus.RUNNING);
             task.setLastStartedAt(now);
-            storage.saveTask(task);
+            if (!storage.saveTask(task)) logBackendSaveFailure(task, "RUNNING status at event-triggered run start");
             refreshMetrics(task.getId(), true);
             recordStartedEvent(task, now);
             executeTask(task, event.getChangedFileNames());
@@ -1058,7 +1088,7 @@ public class TaskSchedulerService {
         List<ScheduledTask> tasks = storage.loadTasks();
         tasks.stream().filter(t -> t.getId().equals(taskId)).findFirst().ifPresent(t -> {
             t.setStatus(TaskStatus.PENDING);
-            storage.saveTask(t);
+            if (!storage.saveTask(t)) logBackendSaveFailure(t, "PENDING status on restart");
         });
         refreshMetrics(taskId, false);
         runNow(taskId);
@@ -1222,7 +1252,7 @@ public class TaskSchedulerService {
             pendingOutcomeNote.set(retryReason + " (will retry)");
             task.setStatus(TaskStatus.RETRYING);
             task.setLastStartedAt(null);
-            storage.saveTask(task);
+            if (!storage.saveTask(task)) logBackendSaveFailure(task, "RETRYING status before scheduled retry");
             lastActivityMillis.remove(task.getId());
             scheduler.schedule(() -> retryTask(task), 5, TimeUnit.SECONDS);
             return;
@@ -1248,7 +1278,7 @@ public class TaskSchedulerService {
             } else {
                 t.setStatus(finalSuccess ? TaskStatus.SUCCESS : TaskStatus.FAILED);
             }
-            storage.saveTask(t);
+            if (!storage.saveTask(t)) logBackendSaveFailure(t, "run result/status after completion");
             // Publish the task's next occurrence immediately — this is what
             // eliminates the old "wait for the next shared poll tick" delay.
             // Works uniformly for every schedule type: computeNextFireDelayMs
@@ -1347,11 +1377,11 @@ public class TaskSchedulerService {
             if (t.getRetryCount() > 0) {
                 t.setRetryCount(t.getRetryCount() - 1);
                 t.setStatus(TaskStatus.PENDING);
-                storage.saveTask(t);
+                if (!storage.saveTask(t)) logBackendSaveFailure(t, "retry count/PENDING status before re-run");
                 runNow(t.getId());
             } else {
                 t.setStatus(TaskStatus.FAILED);
-                storage.saveTask(t);
+                if (!storage.saveTask(t)) logBackendSaveFailure(t, "FAILED status after retries exhausted");
             }
         });
     }

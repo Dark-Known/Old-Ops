@@ -472,12 +472,18 @@ public class MainWindow extends JFrame {
             @Override public void mouseClicked(java.awt.event.MouseEvent e) {
                 // Re-check live at click time rather than trusting whatever the
                 // label said a moment ago — state can change between ticks.
-                if (storage.isConnected()) return;
+                boolean tasksOk = storage.isConnected();
+                boolean settingsOk = util.AppSettings.isConnected();
+                if (tasksOk && settingsOk) return;
                 String err = storage.getConnectionError();
+                if (err == null) err = util.AppSettings.getConnectionError();
+                String scope = !tasksOk && !settingsOk ? "Tasks, credentials, and settings"
+                        : !tasksOk ? "Tasks and credentials"
+                        : "Settings";
                 JOptionPane.showMessageDialog(MainWindow.this,
                     "app.db did not open successfully, so nothing you do in this session\n"
-                        + "will actually be saved — tasks and credentials will look like they\n"
-                        + "worked, then disappear on refresh.\n\n"
+                        + "will actually be saved — " + scope + " will look like they\n"
+                        + "worked, then disappear (or silently revert) on refresh.\n\n"
                         + "Reason:\n" + (err != null ? err : "unknown")
                         + "\n\nCommon causes: the resolved data directory below doesn't match\n"
                         + "where your real app.db lives (check app-config.xml's <dataDir> is\n"
@@ -507,7 +513,13 @@ public class MainWindow extends JFrame {
      */
     private void refreshDbStatusLabel() {
         if (dbLabel == null) return;
-        boolean connected = storage.isConnected();
+        // storage.isConnected() only covers TaskDbService/CredentialDbService.
+        // util.AppSettings keeps its own, entirely separate JDBC connection to
+        // the same app.db file, so it can fail independently of the other two
+        // (e.g. it opens the file a moment before/after them, or hits its own
+        // transient lock) — check it too, or the badge could say "connected"
+        // while every Settings save was silently failing.
+        boolean connected = storage.isConnected() && util.AppSettings.isConnected();
         if (connected) {
             dbLabel.setText("● Database connected");
             dbLabel.setForeground(new Color(0x2E7D32));
@@ -515,7 +527,9 @@ public class MainWindow extends JFrame {
         } else {
             dbLabel.setText("● Database disconnected — click for details");
             dbLabel.setForeground(new Color(0xC62828));
-            dbLabel.setToolTipText(storage.getConnectionError());
+            String err = storage.getConnectionError();
+            if (err == null) err = util.AppSettings.getConnectionError();
+            dbLabel.setToolTipText(err);
         }
     }
 

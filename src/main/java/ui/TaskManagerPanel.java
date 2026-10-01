@@ -19,6 +19,7 @@ import java.time.DayOfWeek;
 import java.time.temporal.TemporalAdjusters;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -666,9 +667,33 @@ public class TaskManagerPanel extends JPanel {
                     JOptionPane.WARNING_MESSAGE);
                 if (ok != JOptionPane.YES_OPTION) return;
 
+                long oldEpoch = task.getLastKnownRemoteFileEpoch();
+                long oldSize = task.getLastKnownRemoteFileSize();
                 task.setLastKnownRemoteFileEpoch(0L);
                 task.setLastKnownRemoteFileSize(-1L);
-                storage.saveTask(task);
+                if (!storage.saveTask(task)) {
+                    // This button had NO event logging at all before — not even on
+                    // success — so a failure here was completely invisible: the
+                    // dialog would still say "Baseline cleared" even though nothing
+                    // was written, and the next watcher run would behave as if
+                    // nothing had changed.
+                    String detail = storage.isConnected()
+                            ? storage.getLastTaskSaveError() : storage.getConnectionError();
+                    logActivityFailed("Watcher baseline reset failed",
+                            "Could not reset watcher baseline for \"" + task.getName() + "\""
+                                    + (storage.isConnected() ? " — database connected, but this write failed"
+                                            : " — database not connected")
+                                    + (detail != null ? ": " + detail : "."));
+                    JOptionPane.showMessageDialog(this,
+                            "Could not reset the baseline — the write did not persist"
+                                    + (detail != null ? (":\n" + detail) : ".") + "\n\nTry again.",
+                            "Baseline Reset Failed", JOptionPane.ERROR_MESSAGE);
+                    return;
+                }
+                logActivity("Watcher baseline reset", "Reset watcher baseline for \"" + task.getName()
+                        + "\" — last known remote file epoch: " + oldEpoch + " \u2192 0; last known "
+                        + "remote file size: " + oldSize + " \u2192 -1 (next watcher run treats all "
+                        + "files as new).");
                 updateWatcherFingerprintBar();
                 JOptionPane.showMessageDialog(this,
                     "Baseline cleared. The next watcher run will start fresh.",
@@ -1057,6 +1082,18 @@ public class TaskManagerPanel extends JPanel {
         }
     }
 
+    /** Same as {@link #logActivity} but marks the event FAILED, so it renders
+     *  as a failure (red, "Failed: ...") in the feed instead of a neutral note. */
+    private void logActivityFailed(String title, String detail) {
+        try {
+            java.time.LocalDateTime now = java.time.LocalDateTime.now();
+            scheduler.getRunHistoryService().recordActivityEvent("TASKS", title, null,
+                    model.TaskRunRecord.Status.FAILED, detail, detail, now, now);
+        } catch (Exception ignored) {
+            // Best-effort — a failure to log this shouldn't block the actual task change.
+        }
+    }
+
     private void newTask() {
         try {
             TaskDialog dlg = new TaskDialog(
@@ -1064,7 +1101,9 @@ public class TaskManagerPanel extends JPanel {
                 scheduler.getRunHistoryService());
             dlg.setVisible(true);
             if (dlg.getResult() != null) {
-                logActivity("Task created", "Created task \"" + dlg.getResult().getName() + "\"");
+                ScheduledTask created = dlg.getResult();
+                logActivity("Task created", "Created task \"" + created.getName() + "\" — "
+                        + describeNonBlankFields(snapshotTaskFields(created, buildCredentialNameLookup())) + ".");
                 refresh();
             }
         } catch (Throwable ex) {
@@ -1081,12 +1120,25 @@ public class TaskManagerPanel extends JPanel {
         storage.loadTasks().stream().filter(t -> t.getId().equals(id)).findFirst()
             .ifPresentOrElse(t -> {
                 try {
+                    // TaskDialog.save() mutates this SAME object in place (existing != null
+                    // -> "t" is reused directly, not copied — see TaskDialog#save), so the
+                    // "before" state must be captured here, before the dialog even opens.
+                    // Without this, dlg.getResult() afterward is that same, already-mutated
+                    // object and there is no way to know what changed — which is exactly why
+                    // "Task edited" previously carried zero information beyond the name.
+                    Map<String, String> credLookup = buildCredentialNameLookup();
+                    Map<String, String> before = snapshotTaskFields(t, credLookup);
                     TaskDialog dlg = new TaskDialog(
                         (Frame) SwingUtilities.getWindowAncestor(this), storage, t,
                         scheduler.getRunHistoryService());
                     dlg.setVisible(true);
                     if (dlg.getResult() != null) {
-                        logActivity("Task edited", "Edited task \"" + dlg.getResult().getName() + "\"");
+                        // Reuses the same lookup from just above — a credential
+                        // can't have been added/renamed/deleted by anything else
+                        // in the few seconds this modal dialog was open.
+                        Map<String, String> after = snapshotTaskFields(dlg.getResult(), credLookup);
+                        logActivity("Task edited", "Edited task \"" + dlg.getResult().getName()
+                                + "\" — " + diffTaskFields(before, after));
                         refresh();
                     }
                 } catch (Throwable ex) {
@@ -1099,6 +1151,159 @@ public class TaskManagerPanel extends JPanel {
                 "Selected task could not be found.", "Error", JOptionPane.ERROR_MESSAGE));
     }
 
+    // Human-readable labels for the fields captured by snapshotTaskFields(),
+    // in the order they should read in a created/edited-task event detail.
+    private static final Map<String, String> TASK_FIELD_LABELS = new LinkedHashMap<>();
+    static {
+        TASK_FIELD_LABELS.put("taskType", "Type");
+        TASK_FIELD_LABELS.put("transferDirection", "Direction");
+        TASK_FIELD_LABELS.put("transferMode", "Transfer mode");
+        TASK_FIELD_LABELS.put("sourceCredential", "Source credential");
+        TASK_FIELD_LABELS.put("targetCredential", "Target credential");
+        TASK_FIELD_LABELS.put("targetUsername", "Target username");
+        TASK_FIELD_LABELS.put("sourcePath", "Source path");
+        TASK_FIELD_LABELS.put("targetPath", "Target path");
+        TASK_FIELD_LABELS.put("additionalTargetPaths", "Additional target paths");
+        TASK_FIELD_LABELS.put("backupSourcePath", "Backup source path");
+        TASK_FIELD_LABELS.put("backupDestinationPath", "Backup destination path");
+        TASK_FIELD_LABELS.put("backupRetentionDays", "Backup retention (days)");
+        TASK_FIELD_LABELS.put("backupSourceUsername", "Backup source credential");
+        TASK_FIELD_LABELS.put("backupDestinationUsername", "Backup destination credential");
+        TASK_FIELD_LABELS.put("imapFolder", "IMAP folder");
+        TASK_FIELD_LABELS.put("mailSearchCriteria", "Mail search criteria");
+        TASK_FIELD_LABELS.put("mailFetchMode", "Mail fetch mode");
+        TASK_FIELD_LABELS.put("mailMailboxAddress", "Mailbox address");
+        TASK_FIELD_LABELS.put("mailTenantId", "Mail tenant ID");
+        TASK_FIELD_LABELS.put("mailClientId", "Mail client ID");
+        TASK_FIELD_LABELS.put("mailFetchScope", "Mail fetch scope");
+        TASK_FIELD_LABELS.put("mailMaxResults", "Mail max results");
+        TASK_FIELD_LABELS.put("mailMarkAsRead", "Mark mail as read");
+        TASK_FIELD_LABELS.put("mailMoveToFolderEnabled", "Move mail to folder");
+        TASK_FIELD_LABELS.put("mailMoveToFolderName", "Move-to folder name");
+        TASK_FIELD_LABELS.put("mailOutputFolder", "Mail output folder");
+        TASK_FIELD_LABELS.put("scheduleType", "Schedule type");
+        TASK_FIELD_LABELS.put("scheduledAt", "Scheduled at");
+        TASK_FIELD_LABELS.put("intervalMinutes", "Interval (minutes)");
+        TASK_FIELD_LABELS.put("intervalSeconds", "Interval (seconds)");
+        TASK_FIELD_LABELS.put("cronExpression", "Cron expression");
+        TASK_FIELD_LABELS.put("watcherEnabled", "Watcher enabled");
+        TASK_FIELD_LABELS.put("inboundWatcherPollIntervalMinutes", "Watcher fallback poll interval (min)");
+        TASK_FIELD_LABELS.put("inboundWatcherMaxAgeMinutes", "Watcher max file age (min)");
+        TASK_FIELD_LABELS.put("retryCount", "Retry count");
+    }
+
+    /**
+     * Captures every user-configurable field on a task as label-ready strings,
+     * keyed by the internal names used in {@link #TASK_FIELD_LABELS}. Runtime
+     * bookkeeping fields (last run time/result, created-at, last-known-remote-
+     * file epoch/size) are deliberately excluded — they're not something the
+     * operator edited, and diffing them would just add noise from whatever the
+     * task happened to do at its last run. Credential ids are resolved to
+     * "user@host" via a lookup map the caller supplies — a raw UUID means
+     * nothing to an operator reading the event feed, which is the whole
+     * point of this method existing. The caller builds that map once (see
+     * {@link #buildCredentialNameLookup()}) rather than this method loading
+     * every credential itself: editTask() needs two snapshots (before and
+     * after) for one edit, and reloading the full credentials table via
+     * SQLite from the Swing event thread a second time for the same single
+     * action was pure wasted latency on every click.
+     */
+    /** One full credentials-table read, shared across both snapshots of a
+     *  single edit (or the one snapshot a create/delete needs) — see
+     *  {@link #snapshotTaskFields} for why this is a separate call. */
+    private Map<String, String> buildCredentialNameLookup() {
+        Map<String, String> credNameById = new HashMap<>();
+        for (model.Credential c : storage.loadAllCredentials()) {
+            credNameById.put(c.getId(), c.getUsername() + "@" + c.getHost());
+        }
+        return credNameById;
+    }
+
+    private Map<String, String> snapshotTaskFields(ScheduledTask t, Map<String, String> credNameById) {
+        Map<String, String> f = new LinkedHashMap<>();
+        f.put("taskType", str(t.getTaskType()));
+        f.put("transferDirection", str(t.getTransferDirection()));
+        f.put("transferMode", str(t.getTransferMode()));
+        f.put("sourceCredential", credNameById.getOrDefault(t.getSourceCredentialId(), t.getSourceCredentialId()));
+        f.put("targetCredential", credNameById.getOrDefault(t.getTargetCredentialId(), t.getTargetCredentialId()));
+        f.put("targetUsername", t.getTargetUsername());
+        f.put("sourcePath", t.getSourcePath());
+        f.put("targetPath", t.getTargetPath());
+        f.put("additionalTargetPaths", t.getAdditionalTargetPaths());
+        f.put("backupSourcePath", t.getBackupSourcePath());
+        f.put("backupDestinationPath", t.getBackupDestinationPath());
+        f.put("backupRetentionDays", String.valueOf(t.getBackupRetentionDays()));
+        f.put("backupSourceUsername", t.getBackupSourceUsername());
+        f.put("backupDestinationUsername", t.getBackupDestinationUsername());
+        f.put("imapFolder", t.getImapFolder());
+        f.put("mailSearchCriteria", t.getMailSearchCriteria());
+        f.put("mailFetchMode", str(t.getMailFetchMode()));
+        f.put("mailMailboxAddress", t.getMailMailboxAddress());
+        f.put("mailTenantId", t.getMailTenantId());
+        f.put("mailClientId", t.getMailClientId());
+        f.put("mailFetchScope", str(t.getMailFetchScope()));
+        f.put("mailMaxResults", String.valueOf(t.getMailMaxResults()));
+        f.put("mailMarkAsRead", yesNo(t.isMailMarkAsRead()));
+        f.put("mailMoveToFolderEnabled", yesNo(t.isMailMoveToFolderEnabled()));
+        f.put("mailMoveToFolderName", t.getMailMoveToFolderName());
+        f.put("mailOutputFolder", t.getMailOutputFolder());
+        f.put("scheduleType", str(t.getScheduleType()));
+        f.put("scheduledAt", str(t.getScheduledAt()));
+        f.put("intervalMinutes", String.valueOf(t.getIntervalMinutes()));
+        f.put("intervalSeconds", String.valueOf(t.getIntervalSeconds()));
+        f.put("cronExpression", t.getCronExpression());
+        f.put("watcherEnabled", yesNo(t.isWatcherEnabled()));
+        f.put("inboundWatcherPollIntervalMinutes", String.valueOf(t.getInboundWatcherPollIntervalMinutes()));
+        f.put("inboundWatcherMaxAgeMinutes", String.valueOf(t.getInboundWatcherMaxAgeMinutes()));
+        f.put("retryCount", String.valueOf(t.getRetryCount()));
+        return f;
+    }
+
+    private static String str(Object o) { return o == null ? null : o.toString(); }
+    private static String yesNo(boolean b) { return b ? "Yes" : "No"; }
+
+    private static boolean isBlank(String s) {
+        return s == null || s.isEmpty() || "0".equals(s) || "null".equals(s);
+    }
+
+    /** Lists every non-blank field from a fresh task's snapshot — used for the
+     *  "Task created" event, since there's no "before" state to diff against. */
+    private String describeNonBlankFields(Map<String, String> fields) {
+        List<String> parts = new ArrayList<>();
+        for (Map.Entry<String, String> e : fields.entrySet()) {
+            if (isBlank(e.getValue())) continue;
+            parts.add(TASK_FIELD_LABELS.getOrDefault(e.getKey(), e.getKey()) + ": " + e.getValue());
+        }
+        return parts.isEmpty() ? "no fields set" : String.join("; ", parts);
+    }
+
+    /**
+     * Builds the "what actually changed" description for a "Task edited"
+     * event — same approach as the settings/credential diffs: only fields
+     * whose value genuinely differs are listed, as "Label: old → new", so an
+     * operator can tell exactly what happened without comparing configs by
+     * hand. A field blank on both sides is skipped entirely (e.g. editing a
+     * FILE_TRANSFER task leaves every mail_* field blank before and after —
+     * listing "Mail search criteria: (not set) \u2192 (not set)" for every
+     * inapplicable field would bury the real changes in noise).
+     */
+    private String diffTaskFields(Map<String, String> before, Map<String, String> after) {
+        List<String> changes = new ArrayList<>();
+        for (String key : after.keySet()) {
+            String oldVal = before.get(key);
+            String newVal = after.get(key);
+            boolean oldBlank = isBlank(oldVal);
+            boolean newBlank = isBlank(newVal);
+            if (oldBlank && newBlank) continue;
+            if (!oldBlank && !newBlank && oldVal.equals(newVal)) continue;
+            String label = TASK_FIELD_LABELS.getOrDefault(key, key);
+            changes.add(label + ": " + (oldBlank ? "(not set)" : oldVal) + " \u2192 "
+                    + (newBlank ? "(not set)" : newVal));
+        }
+        return changes.isEmpty() ? "no fields actually changed (re-saved as-is)"
+                : String.join("; ", changes);
+    }
+
     private void deleteTask() {
         ScheduledTask selected = getSelectedTask();
         if (selected == null) { JOptionPane.showMessageDialog(this, "Select a task to delete."); return; }
@@ -1109,8 +1314,40 @@ public class TaskManagerPanel extends JPanel {
             "Delete task \"" + name + "\"?",
             "Confirm Delete", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
         if (ok == JOptionPane.YES_OPTION) {
-            storage.deleteTask(id);
-            logActivity("Task deleted", "Deleted task \"" + name + "\"");
+            boolean deleted = storage.deleteTask(id);
+            if (!deleted) {
+                // Same silent-failure trap fixed for saves — without this check, a
+                // failed delete would still log "Task deleted" and the task would
+                // just reappear on next refresh with no explanation, plus the
+                // scheduler would still get CANCEL/REFRESH commands for a task
+                // that was never actually removed.
+                if (storage.isConnected()) {
+                    String detail = storage.getLastTaskSaveError();
+                    logActivityFailed("Task delete failed",
+                            "Could not delete task \"" + name + "\" — database connected, but this "
+                                    + "write failed" + (detail != null ? ": " + detail : "."));
+                    JOptionPane.showMessageDialog(this,
+                            "Could not delete this task — the database is connected, but this write "
+                                    + "failed" + (detail != null ? (":\n" + detail) : ".")
+                                    + "\n\nThis is often transient — try again.",
+                            "Delete failed", JOptionPane.ERROR_MESSAGE);
+                } else {
+                    String detail = storage.getConnectionError();
+                    logActivityFailed("Task delete failed",
+                            "Could not delete task \"" + name + "\" — database not connected"
+                                    + (detail != null ? ": " + detail : "."));
+                    JOptionPane.showMessageDialog(this,
+                            "Could not delete this task — the database is not connected"
+                                    + (detail != null ? (":\n" + detail) : ".") + ".",
+                            "Delete failed", JOptionPane.ERROR_MESSAGE);
+                }
+                return;
+            }
+            // Includes the task's final configuration, not just its name — once
+            // deleted there's no other way to see what it was actually set up to
+            // do, which matters for an audit trail ("max information" ask).
+            logActivity("Task deleted", "Deleted task \"" + name + "\" — final configuration: "
+                    + describeNonBlankFields(snapshotTaskFields(selected, buildCredentialNameLookup())) + ".");
             service.CommandQueueService.enqueue(storage.getDataDir(), id,
                     service.CommandQueueService.Action.CANCEL, "gui");
             service.CommandQueueService.enqueue(storage.getDataDir(), id,
@@ -1132,6 +1369,7 @@ public class TaskManagerPanel extends JPanel {
         if (ok == JOptionPane.YES_OPTION) {
             service.CommandQueueService.enqueue(storage.getDataDir(), id,
                     service.CommandQueueService.Action.RUN_NOW, "gui");
+            logActivity("Task run requested", "Manually queued \"" + name + "\" for immediate execution.");
             JOptionPane.showMessageDialog(this,
                 "Task \"" + name + "\" queued for immediate execution.");
             refresh();
@@ -1143,9 +1381,29 @@ public class TaskManagerPanel extends JPanel {
         if (id == null) { JOptionPane.showMessageDialog(this, "Select a task."); return; }
 
         storage.loadTasks().stream().filter(t -> t.getId().equals(id)).findFirst().ifPresent(t -> {
-            t.setStatus(t.getStatus() == TaskStatus.DISABLED
-                ? TaskStatus.PENDING : TaskStatus.DISABLED);
-            storage.saveTask(t);
+            // This button previously had NO event logging at all, success or
+            // failure — enabling/disabling a task is exactly the kind of "touched"
+            // state change the event feed exists to capture.
+            TaskStatus oldStatus = t.getStatus();
+            TaskStatus newStatus = oldStatus == TaskStatus.DISABLED ? TaskStatus.PENDING : TaskStatus.DISABLED;
+            t.setStatus(newStatus);
+            if (!storage.saveTask(t)) {
+                String detail = storage.isConnected()
+                        ? storage.getLastTaskSaveError() : storage.getConnectionError();
+                logActivityFailed("Task " + (newStatus == TaskStatus.DISABLED ? "disable" : "enable") + " failed",
+                        "Could not " + (newStatus == TaskStatus.DISABLED ? "disable" : "enable")
+                                + " task \"" + t.getName() + "\""
+                                + (storage.isConnected() ? " — database connected, but this write failed"
+                                        : " — database not connected")
+                                + (detail != null ? ": " + detail : "."));
+                JOptionPane.showMessageDialog(this,
+                        "Could not change this task's status — the write did not persist"
+                                + (detail != null ? (":\n" + detail) : ".") + "\n\nTry again.",
+                        "Status Change Failed", JOptionPane.ERROR_MESSAGE);
+                return;
+            }
+            logActivity(newStatus == TaskStatus.DISABLED ? "Task disabled" : "Task enabled",
+                    "Task \"" + t.getName() + "\" status: " + oldStatus + " \u2192 " + newStatus + ".");
             if (t.getStatus() == TaskStatus.DISABLED) {
                 service.CommandQueueService.enqueue(storage.getDataDir(), t.getId(),
                         service.CommandQueueService.Action.CANCEL, "gui");
@@ -1171,8 +1429,25 @@ public class TaskManagerPanel extends JPanel {
             "Confirm Restart", JOptionPane.YES_NO_OPTION, JOptionPane.QUESTION_MESSAGE);
         if (ok != JOptionPane.YES_OPTION) return;
 
+        // Same gap as toggleEnable() — previously no event logging at all here either.
+        TaskStatus oldStatus = task.getStatus();
         task.setStatus(TaskStatus.PENDING);
-        storage.saveTask(task);
+        if (!storage.saveTask(task)) {
+            String detail = storage.isConnected()
+                    ? storage.getLastTaskSaveError() : storage.getConnectionError();
+            logActivityFailed("Task restart failed",
+                    "Could not restart task \"" + name + "\""
+                            + (storage.isConnected() ? " — database connected, but this write failed"
+                                    : " — database not connected")
+                            + (detail != null ? ": " + detail : "."));
+            JOptionPane.showMessageDialog(this,
+                    "Could not restart this task — the write did not persist"
+                            + (detail != null ? (":\n" + detail) : ".") + "\n\nTry again.",
+                    "Restart Failed", JOptionPane.ERROR_MESSAGE);
+            return;
+        }
+        logActivity("Task restarted", "Task \"" + name + "\" status: " + oldStatus
+                + " \u2192 " + TaskStatus.PENDING + "; cancelled current run and re-queued immediately.");
         service.CommandQueueService.enqueue(storage.getDataDir(), task.getId(),
                 service.CommandQueueService.Action.CANCEL, "gui");
         service.CommandQueueService.enqueue(storage.getDataDir(), task.getId(),

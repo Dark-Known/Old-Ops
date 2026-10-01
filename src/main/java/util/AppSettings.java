@@ -210,6 +210,10 @@ public final class AppSettings {
     private static volatile long cacheLoadedAtMillis = -1;
     private static volatile File resolvedDataDir;
     private static volatile Connection conn;
+    // Set once, in connection()'s catch block, if the connection attempt
+    // fails. Mirrors TaskDbService/CredentialDbService's connectionError —
+    // see their javadoc for why this is surfaced rather than only logged.
+    private static volatile String lastConnectionError;
 
     private AppSettings() {}
 
@@ -236,6 +240,22 @@ public final class AppSettings {
         }
     }
 
+    /**
+     * Tunes this connection for a desktop app with three independent writers
+     * sharing one app.db file — see {@code service.TaskDbService}'s
+     * {@code applyPragmas} javadoc for the full reasoning (WAL mode,
+     * synchronous=NORMAL, and a busy_timeout). This is the third and last of
+     * the three connections onto the same file that previously ran with none
+     * of these set at all.
+     */
+    private static void applyPragmas(Connection c) throws SQLException {
+        try (Statement st = c.createStatement()) {
+            st.execute("PRAGMA journal_mode=WAL");
+            st.execute("PRAGMA synchronous=NORMAL");
+            st.execute("PRAGMA busy_timeout=5000");
+        }
+    }
+
     private static Connection connection() {
         if (conn != null) return conn;
         synchronized (LOCK) {
@@ -246,6 +266,7 @@ public final class AppSettings {
             try {
                 Class.forName("org.sqlite.JDBC");
                 Connection c = DriverManager.getConnection("jdbc:sqlite:" + dbFile.getAbsolutePath());
+                applyPragmas(c);
                 try (Statement st = c.createStatement()) {
                     st.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)");
                 }
@@ -254,6 +275,7 @@ public final class AppSettings {
                 migrateLegacyJsonIfPresent(dir, c);
             } catch (Exception e) {
                 log.log(Level.SEVERE, "Failed to open/initialize app-settings database", e);
+                lastConnectionError = e.getClass().getSimpleName() + ": " + e.getMessage();
             }
             return conn;
         }
@@ -461,8 +483,10 @@ public final class AppSettings {
         return rules;
     }
 
-    /** Persists the full mail-routing rule list. Takes effect on the very next message processed — no restart needed. */
-    public static void setMailRoutingRules(List<MailRoutingRule> rules) {
+    /** Persists the full mail-routing rule list. Takes effect on the very next
+     *  message processed — no restart needed. Returns whether it was actually
+     *  persisted — see {@link #set}. */
+    public static boolean setMailRoutingRules(List<MailRoutingRule> rules) {
         List<Map<String, String>> rows = new ArrayList<>();
         for (MailRoutingRule r : rules) {
             if (r.getKey() == null || r.getKey().trim().isEmpty()) continue;
@@ -471,7 +495,7 @@ public final class AppSettings {
             row.put("folder", r.getFolder() == null ? "" : r.getFolder().trim());
             rows.add(row);
         }
-        set(KEY_MAIL_ROUTING_RULES, MiniJson.writeArrayOfObjects(rows));
+        return set(KEY_MAIL_ROUTING_RULES, MiniJson.writeArrayOfObjects(rows));
     }
 
     /**
@@ -615,20 +639,35 @@ public final class AppSettings {
 
     // ─── Public write API ────────────────────────────────────────────────────
 
-    /** Sets and immediately persists a single value. Visible to the next read from any process/thread. */
-    public static void set(String key, String value) {
+    /**
+     * Sets and immediately persists a single value. Visible to the next read
+     * from any process/thread. Returns whether it was actually written to
+     * app.db — {@code false} means {@link #connection()} couldn't open at
+     * all (see {@link #getConnectionError()}); in that case the in-memory
+     * cache is deliberately NOT updated either, so reads keep returning the
+     * last known-good value instead of a change that only exists in this
+     * process's memory and vanishes on restart (or is invisible to the
+     * Daemon's separate connection). A connected-but-failed write (a
+     * genuine SQLException mid-write) still throws {@link RuntimeException}
+     * from {@link #writeThroughLocked}, unchanged from before.
+     */
+    public static boolean set(String key, String value) {
         synchronized (LOCK) {
             Map<String, String> base = new LinkedHashMap<>(current());
             if (value == null || value.isEmpty()) base.remove(key); else base.put(key, value);
             Connection c = connection();
-            if (c != null) writeThroughLocked(c, base);
+            if (c == null) return false;
+            writeThroughLocked(c, base);
             cache = base;
             cacheLoadedAtMillis = System.currentTimeMillis();
+            return true;
         }
     }
 
-    /** Sets and immediately persists several values in one transaction (preferred for a Settings-panel "Save"). */
-    public static void setAll(Map<String, String> values) {
+    /** Sets and immediately persists several values in one transaction
+     *  (preferred for a Settings-panel "Save"). See {@link #set} for exactly
+     *  what the return value means and why the cache isn't touched on failure. */
+    public static boolean setAll(Map<String, String> values) {
         synchronized (LOCK) {
             Map<String, String> base = new LinkedHashMap<>(current());
             for (Map.Entry<String, String> e : values.entrySet()) {
@@ -636,10 +675,39 @@ public final class AppSettings {
                 else base.put(e.getKey(), e.getValue());
             }
             Connection c = connection();
-            if (c != null) writeThroughLocked(c, base);
+            if (c == null) return false;
+            writeThroughLocked(c, base);
             cache = base;
             cacheLoadedAtMillis = System.currentTimeMillis();
+            return true;
         }
+    }
+
+    /**
+     * True if the settings table's connection opened successfully AND is
+     * still alive right now — checked live via {@link Connection#isValid},
+     * not just "did it open at some point" (see TaskDbService#isConnected
+     * for why a snapshot isn't good enough). This is a SEPARATE JDBC
+     * connection from {@code TaskDbService}/{@code CredentialDbService},
+     * even though all three point at the same app.db file, so it's possible
+     * for this to be disconnected while the task/credential badge in
+     * MainWindow says connected, or vice versa — check this independently
+     * rather than assuming they move together.
+     */
+    public static boolean isConnected() {
+        Connection c = connection();
+        if (c == null) return false;
+        try {
+            return c.isValid(2);
+        } catch (SQLException e) {
+            return false;
+        }
+    }
+
+    /** Short exception summary from the failed connection attempt, or null if connected fine. */
+    public static String getConnectionError() {
+        if (isConnected()) return null;
+        return lastConnectionError != null ? lastConnectionError : "unknown error";
     }
 
     /** Caller must hold LOCK. Replaces the entire settings table contents with {@code values}. */

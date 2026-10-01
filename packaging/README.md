@@ -157,8 +157,10 @@ either launcher works identically either way; only the Task Manager
 identity differs. `rcedit.exe` itself is a completely standalone tool
 with no relationship to the JDK — `Brand-Executable.ps1` looks for it via
 an explicit `-RceditPath`, a `-SearchDir` the caller points at the
-install directory, or PATH; it deliberately does NOT search next to the
-exe being branded, since there's no reason it would need to live there.
+staging folder (next to `setup.ps1` — see its own prerequisite list), or
+PATH; it deliberately does NOT search next to the exe being branded or
+in the deployed install directory, since there's no reason it would need
+to live in either.
 
 **Important constraint `Brand-Executable.ps1` enforces, not just
 documents:** the renamed copy has to live in the *same directory* as its
