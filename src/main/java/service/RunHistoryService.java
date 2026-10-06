@@ -1,5 +1,6 @@
 package service;
 
+import model.EventKind;
 import model.TaskRunRecord;
 
 import java.io.File;
@@ -113,6 +114,14 @@ public class RunHistoryService {
         addColumnIfMissing(st, table, "failure_category", "TEXT");
         addColumnIfMissing(st, table, "retryable", "INTEGER");
         addColumnIfMissing(st, table, "suggested_action", "TEXT");
+        // Added with the Event Monitor redesign: what kind of event a row is,
+        // which execution it belongs to, and what caused it. All nullable so
+        // rows written by older builds stay valid (the monitor classifies them
+        // from their text instead).
+        addColumnIfMissing(st, table, "event_kind", "TEXT");
+        addColumnIfMissing(st, table, "run_key", "TEXT");
+        addColumnIfMissing(st, table, "trigger_src", "TEXT");
+        st.execute("CREATE INDEX IF NOT EXISTS idx_" + table + "_run_key ON " + table + "(run_key)");
     }
 
     /**
@@ -157,12 +166,54 @@ public class RunHistoryService {
 
         log.info("Migrating legacy task_runs table to run_history / event_monitor_history");
         st.execute("ALTER TABLE task_runs RENAME TO " + RUN_TABLE);
+        // Bring the renamed legacy table up to the current column set first,
+        // then copy with an explicit column list — never SELECT * across two
+        // tables whose layouts could differ.
+        createTable(st, RUN_TABLE);
         createTable(st, ACTIVITY_TABLE);
-        st.execute("INSERT INTO " + ACTIVITY_TABLE +
-                " SELECT * FROM " + RUN_TABLE +
+        final String cols = "task_id, task_name, task_type, status, reason, details, started_at, ended_at, "
+                + "duration_ms, failure_category, retryable, suggested_action";
+        st.execute("INSERT INTO " + ACTIVITY_TABLE + " (" + cols + ") SELECT " + cols + " FROM " + RUN_TABLE +
                 " WHERE reason LIKE 'Started \u2014%' OR reason LIKE 'Detected %'");
         st.execute("DELETE FROM " + RUN_TABLE +
                 " WHERE reason LIKE 'Started \u2014%' OR reason LIKE 'Detected %'");
+    }
+
+    // ── Run correlation context ──────────────────────────────────────────
+    // A task execution happens start-to-finish on one worker thread, and
+    // everything it records (Started, Detected, retry notes, the final
+    // outcome) should carry the same run key and trigger so the Event Monitor
+    // can fold them into one expandable run. Threading these through every
+    // recordRun/recordActivityEvent call site would mean changing signatures
+    // across the scheduler; a thread-local set once at the start of a run and
+    // cleared at the end gets the same result with no call-site changes.
+    private static final ThreadLocal<String[]> RUN_CONTEXT = new ThreadLocal<>();
+
+    /** Short, unique-enough id for one task execution. */
+    public static String newRunKey() {
+        return java.util.UUID.randomUUID().toString().substring(0, 8);
+    }
+
+    /** Marks the current thread as executing the run {@code runKey}, caused by {@code trigger} (SCHEDULE/WATCHER/MANUAL/RETRY). */
+    public static void beginRunContext(String runKey, String trigger) {
+        RUN_CONTEXT.set(new String[]{runKey, trigger});
+    }
+
+    /** Clears the current thread's run context. Always call from a finally block. */
+    public static void endRunContext() {
+        RUN_CONTEXT.remove();
+    }
+
+    /** Run key of the run executing on this thread, or null if none. */
+    public static String currentRunKey() {
+        String[] c = RUN_CONTEXT.get();
+        return c != null ? c[0] : null;
+    }
+
+    /** Trigger of the run executing on this thread, or null if none. */
+    public static String currentTrigger() {
+        String[] c = RUN_CONTEXT.get();
+        return c != null ? c[1] : null;
     }
 
     /** Registers a listener invoked after every recorded real outcome (success, failure, or skip). Not called on the EDT — marshal accordingly. */
@@ -230,8 +281,12 @@ public class RunHistoryService {
             suggestedAction = classified.getSuggestedAction();
         }
 
+        EventKind kind = status == TaskRunRecord.Status.SUCCESS ? EventKind.RUN_SUCCEEDED
+                : status == TaskRunRecord.Status.FAILED ? EventKind.RUN_FAILED : EventKind.RUN_SKIPPED;
+        String runKey = currentRunKey();
+        String trigger = currentTrigger();
         long durationMs = insertInto(RUN_TABLE, taskId, taskName, taskType, status, reason, details,
-                startedAt, endedAt, category, retryable, suggestedAction);
+                startedAt, endedAt, category, retryable, suggestedAction, kind, runKey, trigger);
         if (durationMs < 0) return; // insert failed; already logged
 
         if (!runListeners.isEmpty()) {
@@ -248,6 +303,9 @@ public class RunHistoryService {
             rec.setFailureCategory(category);
             rec.setRetryable(retryable);
             rec.setSuggestedAction(suggestedAction);
+            rec.setEventKind(kind.name());
+            rec.setRunKey(runKey);
+            rec.setTrigger(trigger);
             for (java.util.function.Consumer<TaskRunRecord> listener : runListeners) {
                 try { listener.accept(rec); } catch (Exception ignored) {}
             }
@@ -282,7 +340,7 @@ public class RunHistoryService {
     /**
      * Full form of {@link #recordActivityEvent} that lets an application
      * activity note report as a genuine failure (status FAILED) rather than
-     * always SUCCESS — the feed (see {@code QueueMonitorView.toActivityRow},
+     * always SUCCESS — the feed (see {@code ui.monitor.EventClassifier},
      * which reads {@code r.getStatus() == FAILED} to decide the row's color
      * and "Failed: ..." prefix) renders it exactly like a failed task run.
      * Use this for anything that can meaningfully fail on its own — a test
@@ -293,8 +351,28 @@ public class RunHistoryService {
     public synchronized void recordActivityEvent(String taskId, String taskName, String taskType,
             TaskRunRecord.Status status, String message, String details,
             LocalDateTime startedAt, LocalDateTime endedAt) {
+        recordEvent(null, taskId, taskName, taskType, status, message, details, startedAt, endedAt,
+                currentRunKey(), currentTrigger());
+    }
+
+    /**
+     * Records one event of an explicit {@link EventKind} into the activity
+     * table — the structured way to log anything the Event Monitor should
+     * show: a watcher arming or degrading, a retry being scheduled, a
+     * cancellation, a deferred fire. Prefer this over the free-text
+     * {@link #recordActivityEvent} overloads for anything new.
+     *
+     * @param kind   what happened; null lets the monitor infer it from the row
+     * @param runKey the run this belongs to, or null for events not tied to one
+     *               (use {@link #currentRunKey()} when recording from a worker thread)
+     * @param trigger what caused the run (SCHEDULE/WATCHER/MANUAL/RETRY), or null
+     */
+    public synchronized void recordEvent(EventKind kind, String taskId, String taskName, String taskType,
+            TaskRunRecord.Status status, String message, String details,
+            LocalDateTime startedAt, LocalDateTime endedAt, String runKey, String trigger) {
         long durationMs = insertInto(ACTIVITY_TABLE, taskId, taskName, taskType, status,
-                message, details != null ? details : message, startedAt, endedAt, null, false, null);
+                message, details != null ? details : message, startedAt, endedAt, null, false, null,
+                kind, runKey, trigger);
         if (durationMs < 0 || activityListeners.isEmpty()) return;
 
         TaskRunRecord rec = new TaskRunRecord();
@@ -307,6 +385,9 @@ public class RunHistoryService {
         rec.setStartedAt(startedAt);
         rec.setEndedAt(endedAt);
         rec.setDurationMs(durationMs);
+        rec.setEventKind(kind != null ? kind.name() : null);
+        rec.setRunKey(runKey);
+        rec.setTrigger(trigger);
         for (java.util.function.Consumer<TaskRunRecord> listener : activityListeners) {
             try { listener.accept(rec); } catch (Exception ignored) {}
         }
@@ -316,12 +397,13 @@ public class RunHistoryService {
     private long insertInto(String table, String taskId, String taskName, String taskType,
             TaskRunRecord.Status status, String reason, String details,
             LocalDateTime startedAt, LocalDateTime endedAt,
-            TaskRunRecord.FailureCategory category, boolean retryable, String suggestedAction) {
+            TaskRunRecord.FailureCategory category, boolean retryable, String suggestedAction,
+            EventKind kind, String runKey, String trigger) {
         if (conn == null) return -1;
         String sql = "INSERT INTO " + table +
-                " (task_id, task_name, task_type, status, reason, details, started_at, ended_at, duration_ms," +
-                "  failure_category, retryable, suggested_action) " +
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)";
+                " (task_id, task_name, task_type, status, reason, details, started_at, ended_at, duration_ms,"
+                + "  failure_category, retryable, suggested_action, event_kind, run_key, trigger_src) "
+                + "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
         long durationMs = java.time.Duration.between(startedAt, endedAt).toMillis();
         try (PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setString(1, taskId);
@@ -336,6 +418,9 @@ public class RunHistoryService {
             ps.setString(10, category != null ? category.name() : null);
             ps.setInt(11, retryable ? 1 : 0);
             ps.setString(12, suggestedAction);
+            ps.setString(13, kind != null ? kind.name() : null);
+            ps.setString(14, runKey);
+            ps.setString(15, trigger);
             ps.executeUpdate();
             return durationMs;
         } catch (SQLException e) {
@@ -359,7 +444,7 @@ public class RunHistoryService {
      * {@code null} if not found; see {@link #getActivityEventById} for the
      * {@code event_monitor_history} counterpart (row ids are independent
      * per-table autoincrement sequences, so the caller must know which
-     * table a given {@code QueueMonitorView.ActivityRow} came from — see
+     * table a given {@code ui.monitor.MonitorEvent} came from — see
      * its {@code source()} field).
      */
     public synchronized TaskRunRecord getRunById(long id) {
@@ -452,6 +537,64 @@ public class RunHistoryService {
     }
 
     /**
+     * Cheap "did anything get written?" probe for pollers: the highest row id
+     * in each table. Both tables are append-only and ids only grow, so an
+     * unchanged token means no new rows — from <em>any</em> process sharing
+     * this database, which is what lets the Event Monitor skip its query
+     * entirely on the (common) idle tick instead of re-reading the feed every
+     * second.
+     */
+    public synchronized String getChangeToken() {
+        if (conn == null) return "";
+        StringBuilder sb = new StringBuilder();
+        for (String table : new String[]{RUN_TABLE, ACTIVITY_TABLE}) {
+            try (Statement st = conn.createStatement();
+                 ResultSet rs = st.executeQuery("SELECT COALESCE(MAX(id),0) FROM " + table)) {
+                sb.append(rs.next() ? rs.getLong(1) : 0L).append(':');
+            } catch (SQLException e) {
+                sb.append("?:");
+            }
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Like {@link #queryRuns} but <b>without the {@code details} column</b>
+     * (the full captured run log — easily tens of KB per row). The live feed
+     * only needs the one-line {@code reason}; the full log is fetched on
+     * demand for the single selected row via {@link #getRunById}.
+     */
+    public synchronized List<TaskRunRecord> queryRunSummaries(LocalDateTime from, int limit) {
+        return querySummaries(RUN_TABLE, from, limit);
+    }
+
+    /** Activity-table counterpart of {@link #queryRunSummaries}. */
+    public synchronized List<TaskRunRecord> queryActivitySummaries(LocalDateTime from, int limit) {
+        return querySummaries(ACTIVITY_TABLE, from, limit);
+    }
+
+    private List<TaskRunRecord> querySummaries(String table, LocalDateTime from, int limit) {
+        List<TaskRunRecord> results = new ArrayList<>();
+        if (conn == null) return results;
+        StringBuilder sql = new StringBuilder("SELECT id, task_id, task_name, task_type, status, reason, started_at, "
+                + "ended_at, duration_ms, failure_category, retryable, suggested_action, event_kind, run_key, trigger_src "
+                + "FROM " + table + " WHERE 1=1");
+        if (from != null) sql.append(" AND started_at >= ?");
+        sql.append(" ORDER BY started_at DESC, id DESC LIMIT ?");
+        try (PreparedStatement ps = conn.prepareStatement(sql.toString())) {
+            int i = 1;
+            if (from != null) ps.setString(i++, from.format(TS_FMT));
+            ps.setInt(i, limit);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) results.add(mapRow(rs, false));
+            }
+        } catch (SQLException e) {
+            log.log(Level.WARNING, "Failed to query summaries from " + table, e);
+        }
+        return results;
+    }
+
+    /**
      * Deletes rows older than {@code keepDays} days from both tables. Call
      * periodically (e.g. once at app startup) to keep the database from
      * growing unbounded — event_monitor_history in particular accumulates
@@ -475,6 +618,10 @@ public class RunHistoryService {
     }
 
     private TaskRunRecord mapRow(ResultSet rs) throws SQLException {
+        return mapRow(rs, true);
+    }
+
+    private TaskRunRecord mapRow(ResultSet rs, boolean withDetails) throws SQLException {
         TaskRunRecord r = new TaskRunRecord();
         r.setId(rs.getLong("id"));
         r.setTaskId(rs.getString("task_id"));
@@ -482,7 +629,7 @@ public class RunHistoryService {
         r.setTaskType(rs.getString("task_type"));
         r.setStatus(TaskRunRecord.Status.valueOf(rs.getString("status")));
         r.setReason(rs.getString("reason"));
-        r.setDetails(rs.getString("details"));
+        if (withDetails) r.setDetails(rs.getString("details"));
         r.setStartedAt(LocalDateTime.parse(rs.getString("started_at"), TS_FMT));
         r.setEndedAt(LocalDateTime.parse(rs.getString("ended_at"), TS_FMT));
         r.setDurationMs(rs.getLong("duration_ms"));
@@ -493,6 +640,9 @@ public class RunHistoryService {
         }
         r.setRetryable(rs.getInt("retryable") != 0);
         r.setSuggestedAction(rs.getString("suggested_action"));
+        r.setEventKind(rs.getString("event_kind"));
+        r.setRunKey(rs.getString("run_key"));
+        r.setTrigger(rs.getString("trigger_src"));
         return r;
     }
 

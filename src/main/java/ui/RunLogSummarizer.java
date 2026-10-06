@@ -13,7 +13,7 @@ import java.util.regex.Pattern;
  * Parses the free-text run log captured in {@link model.TaskRunRecord#getDetails()}
  * — the exact lines {@code service.TransferService} emitted for one run — into
  * structured fields for the Event Monitor's per-event detail popup
- * ({@link ActivityEventPopup}).
+ * ({@link ui.monitor.DetailPane}).
  *
  * <p>Deliberately reads the log text rather than requiring new database columns
  * or a new stats-plumbing path through the scheduler: every field surfaced here
@@ -24,19 +24,19 @@ import java.util.regex.Pattern;
  * transfer path (watcher-triggered or not) now emits. If that shape ever
  * changes, only this one class needs updating.
  */
-final class RunLogSummarizer {
+public final class RunLogSummarizer {
 
     private RunLogSummarizer() {}
 
     /** One file this run touched — the name it was detected/queued under, and
      *  its size formatted the same way the rest of the app formats sizes
      *  (e.g. "4.2 MB"), or {@code null} if a size was never captured for it. */
-    record FileEntry(String name, String sizeFormatted) {}
+    public record FileEntry(String name, String sizeFormatted) {}
 
     /** Structured view of one FILE_TRANSFER run, or {@code null} if the log
      *  text doesn't look like a file-transfer run at all (e.g. captured before
      *  the transfer even started, or from a non-transfer task type). */
-    record FileTransferSummary(
+    public record FileTransferSummary(
             String direction,           // "OUTBOUND" / "INBOUND", or null if not found
             String sourcePath,
             String destPath,
@@ -64,7 +64,7 @@ final class RunLogSummarizer {
             "^\\[INFO\\] Transfer summary: (\\d+) file\\(s\\), (.+?) total, (\\d+) batch\\(es\\), "
                     + "(\\d+) session\\(s\\), (\\d+) worker thread\\(s\\)\\.$");
 
-    static FileTransferSummary parse(String detailsText) {
+    public static FileTransferSummary parse(String detailsText) {
         if (detailsText == null || detailsText.isBlank()) return null;
 
         String direction = null, sourcePath = null, destPath = null, totalBytesFormatted = null;
@@ -133,7 +133,7 @@ final class RunLogSummarizer {
 
     /** Matches the app's own byte-formatting convention closely enough for
      *  display purposes (binary/1024-based units, one decimal place). */
-    static String formatBytes(long bytes) {
+    public static String formatBytes(long bytes) {
         if (bytes < 1024) return bytes + " B";
         String[] units = {"KB", "MB", "GB", "TB"};
         double value = bytes;

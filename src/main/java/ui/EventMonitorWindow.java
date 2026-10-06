@@ -19,9 +19,10 @@ import java.awt.event.WindowEvent;
  * close to real time instead of switching tabs to check.
  *
  * Styled to match the main application shell: the same gradient header
- * ({@link GradientPanel} + {@link AppTheme} accent colors) and status-chip
- * pattern used in {@link MainWindow}'s header, so this reads as part of the
- * same app rather than a bolted-on debug tool.
+ * ({@link GradientPanel} + {@link AppTheme} accent colors) used in
+ * {@link MainWindow}, so this reads as part of the same app rather than a
+ * bolted-on debug tool. All live status (scheduler, workers, queue) lives in
+ * the panel's own summary bar rather than a header chip.
  *
  * Non-modal and reusable: {@link #open} keeps at most one instance alive
  * per app and just brings it to front on repeat calls, so triggering it
@@ -31,17 +32,13 @@ public class EventMonitorWindow extends JFrame {
 
     private static EventMonitorWindow openInstance;
 
-    private final TaskSchedulerService scheduler;
     private final EventMonitorPanel panel;
-    private JLabel workerChip;
-    private Timer chipTimer;
 
     private EventMonitorWindow(TaskSchedulerService scheduler) {
-        super("Event Monitor — Task Scheduler");
-        this.scheduler = scheduler;
+        super("Event Monitor \u2014 Task Scheduler");
         setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE);
-        setSize(900, 620);
-        setMinimumSize(new Dimension(620, 420));
+        setSize(1240, 740);
+        setMinimumSize(new Dimension(760, 460));
         setLocationByPlatform(true);
 
         JPanel root = new JPanel(new BorderLayout());
@@ -51,15 +48,10 @@ public class EventMonitorWindow extends JFrame {
         root.add(panel, BorderLayout.CENTER);
         setContentPane(root);
 
-        chipTimer = new Timer(1000, e -> refreshChip());
-        refreshChip();
-        chipTimer.start();
-
         addWindowListener(new WindowAdapter() {
             @Override
             public void windowClosed(WindowEvent e) {
                 panel.stopRefreshing();
-                chipTimer.stop();
                 if (openInstance == EventMonitorWindow.this) {
                     openInstance = null;
                 }
@@ -69,14 +61,14 @@ public class EventMonitorWindow extends JFrame {
 
     private JComponent buildHeader() {
         GradientPanel header = new GradientPanel(new BorderLayout(), AppTheme.ACCENT_DARK, AppTheme.ACCENT_SECONDARY);
-        header.setBorder(new EmptyBorder(14, 20, 14, 20));
+        header.setBorder(new EmptyBorder(12, 20, 12, 20));
 
         JLabel title = new JLabel("Event Monitor", VectorIcons.pulse(Color.WHITE, 20), SwingConstants.LEFT);
         title.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 19));
         title.setForeground(Color.WHITE);
         title.setIconTextGap(10);
 
-        JLabel subTitle = new JLabel("Live view of the scheduler's event queue and worker pool");
+        JLabel subTitle = new JLabel("Every run, watcher change and setting change \u2014 live, grouped, and searchable");
         subTitle.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 12));
         subTitle.setForeground(new Color(0xE3E1FB));
 
@@ -89,69 +81,13 @@ public class EventMonitorWindow extends JFrame {
         titleStack.add(Box.createVerticalStrut(3));
         titleStack.add(subTitle);
 
-        workerChip = statusChip("Workers: —", new Color(0x9CB380));
-        JPanel badges = new JPanel(new FlowLayout(FlowLayout.RIGHT, 10, 0));
-        badges.setOpaque(false);
-        badges.add(workerChip);
+        JLabel keys = new JLabel("Ctrl+F search   \u00b7   Ctrl+P pause   \u00b7   \u2190 \u2192 collapse / expand");
+        keys.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 11));
+        keys.setForeground(new Color(0xE3E1FB));
 
         header.add(titleStack, BorderLayout.WEST);
-        header.add(badges, BorderLayout.EAST);
+        header.add(keys, BorderLayout.EAST);
         return header;
-    }
-
-    private void refreshChip() {
-        if (scheduler == null || workerChip == null) return;
-
-        // Only one scheduler is ever actually active at a time (Daemon
-        // primary, GUI on standby — see ui.MainWindow), so this chip should
-        // reflect whichever one that is rather than always showing the
-        // local GUI worker pool, which sits at 0/0 while on standby.
-        if (scheduler.isStarted()) {
-            int size = scheduler.getWorkerPoolSize();
-            int active = scheduler.getActiveWorkerCount();
-            Color dot = active == 0 ? new Color(0x9CB380) : new Color(0xE0A458);
-            restyleChip(workerChip, "Workers (GUI): " + active + " / " + size + " busy", dot);
-            return;
-        }
-
-        java.nio.file.Path daemonStatusFile = scheduler.getStorage().getDataDir().toPath()
-                .resolve("scheduler-status-daemon.dat");
-        service.queue.SchedulerStatusSnapshot snap = service.queue.SchedulerStatusSnapshot.isAlive(
-                daemonStatusFile, service.queue.SchedulerStatusSnapshot.DEFAULT_STALE_MS)
-                ? service.queue.SchedulerStatusSnapshot.read(daemonStatusFile) : null;
-        if (snap != null) {
-            Color dot = snap.getActiveWorkers() == 0 ? new Color(0x9CB380) : new Color(0xE0A458);
-            restyleChip(workerChip, "Workers (Daemon): " + snap.getActiveWorkers() + " / " + snap.getPoolSize() + " busy", dot);
-        } else {
-            restyleChip(workerChip, "No scheduler active", new Color(0xD9785C));
-        }
-    }
-
-    // ── Chip helpers — mirrors MainWindow's header status-pill pattern so
-    // this window's chrome matches the rest of the app. ─────────────────
-
-    private JLabel statusChip(String text, Color dotColor) {
-        JLabel chip = new JLabel(text) {
-            @Override protected void paintComponent(Graphics g) {
-                Graphics2D g2 = (Graphics2D) g.create();
-                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
-                g2.setColor(new Color(255, 255, 255, 30));
-                g2.fillRoundRect(0, 0, getWidth(), getHeight(), getHeight(), getHeight());
-                g2.dispose();
-                super.paintComponent(g);
-            }
-        };
-        chip.setOpaque(false);
-        chip.setForeground(Color.WHITE);
-        chip.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 12));
-        chip.setBorder(new EmptyBorder(5, 12, 5, 12));
-        restyleChip(chip, text, dotColor);
-        return chip;
-    }
-
-    private void restyleChip(JLabel chip, String text, Color dotColor) {
-        String hex = String.format("#%02X%02X%02X", dotColor.getRed(), dotColor.getGreen(), dotColor.getBlue());
-        chip.setText("<html><span style='color:" + hex + "'>\u25CF</span>&nbsp;&nbsp;" + text + "</html>");
     }
 
     /**

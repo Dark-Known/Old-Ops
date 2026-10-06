@@ -1,6 +1,7 @@
 package service;
 
 import model.ScheduledTask.*;
+import model.EventKind;
 import model.ScheduledTask;
 import model.ScheduledTask.TaskStatus;
 import model.ScheduledTask.ScheduleType;
@@ -164,6 +165,87 @@ public class TaskSchedulerService {
         this.remotePushWatcher = new RemotePushWatcher(storage, this::onWatchWakeup);
     }
 
+    // ── Event Monitor bookkeeping ────────────────────────────────────────
+    // Run key of the execution currently in flight for each task, so notes
+    // recorded from OTHER threads (a cancel from the UI, a stale-run reset
+    // from the reconcile sweep) can be attached to the run they're about.
+    private final ConcurrentMap<String, String> activeRunKeys = new ConcurrentHashMap<>();
+    // Run key minted by the first watcher wake-up of a burst, consumed by the
+    // run that eventually handles it — so "Change detected" (watch thread) and
+    // "Started"/outcome (worker thread) land in the same run group.
+    private final ConcurrentMap<String, String> pendingWakeKeys = new ConcurrentHashMap<>();
+    // Tasks whose next runNow() is an automatic retry rather than a manual run.
+    private final java.util.Set<String> retryTriggered = ConcurrentHashMap.newKeySet();
+    // Per-task watcher state, for emitting arm/degrade/restore events on change only.
+    private final Map<String, WatchMode> lastEventWatchMode = new ConcurrentHashMap<>();
+    private final java.util.Set<String> everPushed = ConcurrentHashMap.newKeySet();
+
+    private ScheduledTask lookupTask(String taskId) {
+        for (ScheduledTask t : lastLoadedTasks) if (t.getId().equals(taskId)) return t;
+        return null;
+    }
+
+    /**
+     * Best-effort write of one structured event to the Event Monitor feed.
+     * Never throws and never affects scheduling — a failure to log must not
+     * change what the scheduler does. The run key comes from the calling
+     * thread's run context if it has one, else from the task's in-flight run.
+     */
+    private void recordSchedulerEvent(EventKind kind, String taskId, String taskName, String taskType,
+                                      TaskRunRecord.Status status, String message, String details) {
+        try {
+            LocalDateTime now = LocalDateTime.now();
+            String runKey = RunHistoryService.currentRunKey();
+            if (runKey == null && taskId != null) runKey = activeRunKeys.get(taskId);
+            runHistoryService.recordEvent(kind, taskId, taskName, taskType, status, message, details,
+                    now, now, runKey, RunHistoryService.currentTrigger());
+        } catch (Exception ignored) {
+            // Best-effort.
+        }
+    }
+
+    private void recordSchedulerEvent(EventKind kind, ScheduledTask t, TaskRunRecord.Status status,
+                                      String message, String details) {
+        recordSchedulerEvent(kind, t.getId(), t.getName(),
+                t.getTaskType() != null ? t.getTaskType().name() : null, status, message, details);
+    }
+
+    /**
+     * Emits an event when a watcher-enabled task's trigger mode changes —
+     * armed, degraded to polling, confirmed unsupported, or restored. Only
+     * transitions are recorded (never steady state), and the very first
+     * observation of a transient "not yet attempted" polling state is
+     * ignored, since that resolves itself within one reconcile pass.
+     */
+    private void trackWatchTransition(ScheduledTask t) {
+        WatchStatus status = getWatchStatus(t);
+        WatchMode cur = status.mode();
+        if (cur == WatchMode.NOT_APPLICABLE) {
+            lastEventWatchMode.remove(t.getId());
+            return;
+        }
+        WatchMode prev = lastEventWatchMode.put(t.getId(), cur);
+        if (prev == cur) return;
+
+        boolean curPush = cur == WatchMode.NATIVE_WATCH || cur == WatchMode.REMOTE_PUSH;
+        boolean prevPush = prev == WatchMode.NATIVE_WATCH || prev == WatchMode.REMOTE_PUSH;
+        String via = cur == WatchMode.NATIVE_WATCH ? "native OS directory watch" : "remote push listener";
+        if (curPush) {
+            EventKind kind = everPushed.contains(t.getId()) ? EventKind.WATCH_RESTORED : EventKind.WATCH_ARMED;
+            everPushed.add(t.getId());
+            recordSchedulerEvent(kind, t, TaskRunRecord.Status.SUCCESS,
+                    (kind == EventKind.WATCH_RESTORED ? "Instant triggering restored via " : "Instant triggering armed via ") + via,
+                    status.detail());
+        } else if (cur == WatchMode.POLLING_ONLY_UNSUPPORTED) {
+            recordSchedulerEvent(EventKind.WATCH_UNSUPPORTED, t, TaskRunRecord.Status.SUCCESS,
+                    "Instant triggering is not supported here — using scheduled polling only", status.detail());
+        } else if (cur == WatchMode.POLLING_ONLY && prevPush) {
+            recordSchedulerEvent(EventKind.WATCH_DEGRADED, t, TaskRunRecord.Status.SUCCESS,
+                    "Instant triggering lost — falling back to scheduled polling", status.detail());
+        }
+        // POLLING_ONLY with no prior push is the transient "not yet attempted" state — not an event.
+    }
+
     /**
      * Called by {@link LocalWatchManager} or {@link RemotePushWatcher} the
      * moment they observe a change for a watcher-enabled task. Publishes a
@@ -174,6 +256,29 @@ public class TaskSchedulerService {
      * while the task happens to already be running (onTaskDue no-ops then).
      */
     private void onWatchWakeup(String taskId, java.util.Set<String> changedFileNames) {
+        // Mint (or reuse, for a burst) the run key the eventual run will adopt, so this
+        // "change detected" row groups with that run's Started/outcome rows.
+        String runKey = pendingWakeKeys.computeIfAbsent(taskId, k -> RunHistoryService.newRunKey());
+        try {
+            ScheduledTask t = lookupTask(taskId);
+            int n = changedFileNames != null ? changedFileNames.size() : 0;
+            String msg = n > 0 ? "Watcher saw " + n + " changed file(s)" : "Watcher saw a change (file names not reported)";
+            StringBuilder details = new StringBuilder(msg).append('\n');
+            if (n > 0) {
+                int shown = 0;
+                for (String f : new java.util.TreeSet<>(changedFileNames)) {
+                    if (shown++ >= 50) { details.append("  ... and ").append(n - 50).append(" more\n"); break; }
+                    details.append("  ").append(f).append('\n');
+                }
+            }
+            LocalDateTime now = LocalDateTime.now();
+            runHistoryService.recordEvent(EventKind.WATCH_TRIGGERED, taskId,
+                    t != null ? t.getName() : "(task " + taskId + ")",
+                    t != null && t.getTaskType() != null ? t.getTaskType().name() : null,
+                    TaskRunRecord.Status.SUCCESS, msg, details.toString(), now, now, runKey, "WATCHER");
+        } catch (Exception ignored) {
+            // Best-effort — recording must never stop the wake-up from being delivered.
+        }
         eventQueue.publish(new TaskDueEvent(taskId, LocalDateTime.now(), 0, true, changedFileNames));
     }
 
@@ -681,6 +786,16 @@ public class TaskSchedulerService {
 
             LocalDateTime now = LocalDateTime.now();
 
+            // Record watcher arm/degrade/restore transitions for the Event Monitor,
+            // and forget state for tasks that no longer exist.
+            java.util.Set<String> liveIds = new java.util.HashSet<>();
+            for (ScheduledTask t : tasks) {
+                liveIds.add(t.getId());
+                try { trackWatchTransition(t); } catch (Exception ignored) {}
+            }
+            lastEventWatchMode.keySet().retainAll(liveIds);
+            everPushed.retainAll(liveIds);
+
             for (ScheduledTask task : tasks) {
                 if (task.getStatus() == TaskStatus.DISABLED || task.getStatus() == TaskStatus.RETRYING) {
                     eventQueue.cancel(task.getId());
@@ -689,6 +804,11 @@ public class TaskSchedulerService {
                 if (task.getStatus() == TaskStatus.RUNNING) {
                     if (isStaleRunning(task, now)) {
                         emit(task, "[WARN] Detected stale RUNNING task; cancelling and resetting.");
+                        recordSchedulerEvent(EventKind.STALE_RECOVERED, task, TaskRunRecord.Status.FAILED,
+                                "Run appeared stuck — cancelled and reset to PENDING",
+                                "No log activity from this run for longer than the configured stale threshold "
+                                        + "(Settings → stale running threshold). The run was cancelled and the task "
+                                        + "reset so it can be scheduled again.");
                         try {
                             cancelTask(task.getId());
                         } catch (Exception ignored) {}
@@ -913,10 +1033,19 @@ public class TaskSchedulerService {
      */
     private void recordStartedEvent(ScheduledTask task, LocalDateTime startedAt) {
         try {
-            String reason = "Started \u2014 picked up by a worker thread ("
-                    + workerPool.getActiveWorkerCount() + "/" + workerPool.getWorkerCount() + " busy).";
-            runHistoryService.recordActivityEvent(task.getId(), task.getName(), task.getTaskType().name(),
-                    reason, reason, startedAt, startedAt);
+            String trigger = RunHistoryService.currentTrigger();
+            String reason;
+            if ("MANUAL".equals(trigger)) {
+                reason = "Started \u2014 manual run (Run Now).";
+            } else if ("RETRY".equals(trigger)) {
+                reason = "Started \u2014 automatic retry after a failed attempt.";
+            } else {
+                reason = "Started \u2014 picked up by a worker thread ("
+                        + workerPool.getActiveWorkerCount() + "/" + workerPool.getWorkerCount() + " busy).";
+            }
+            runHistoryService.recordEvent(EventKind.RUN_STARTED, task.getId(), task.getName(),
+                    task.getTaskType().name(), TaskRunRecord.Status.SUCCESS, reason, reason, startedAt, startedAt,
+                    RunHistoryService.currentRunKey(), trigger);
         } catch (Exception ignored) {
             // Best-effort — a failure to log the start event shouldn't affect the run itself.
         }
@@ -950,8 +1079,9 @@ public class TaskSchedulerService {
                     .append(" | size=").append(f.size()).append('\n');
         }
         try {
-            runHistoryService.recordActivityEvent(task.getId(), task.getName(), task.getTaskType().name(),
-                    reason, details.toString(), scanStartedAt, now);
+            runHistoryService.recordEvent(EventKind.FILES_DETECTED, task.getId(), task.getName(),
+                    task.getTaskType().name(), TaskRunRecord.Status.SUCCESS, reason, details.toString(),
+                    scanStartedAt, now, RunHistoryService.currentRunKey(), RunHistoryService.currentTrigger());
         } catch (Exception ignored) {
             // Best-effort — a failure to log the detection step shouldn't affect the transfer itself.
         }
@@ -964,8 +1094,12 @@ public class TaskSchedulerService {
             if (task.getStatus() == TaskStatus.DISABLED || task.getStatus() == TaskStatus.RETRYING
                     || task.getStatus() == TaskStatus.RUNNING) {
                 pendingSuppressActivity.set(true);
+                String why = event.isImmediate() ? "watcher wake-up" : "scheduled fire";
                 if (task.getStatus() == TaskStatus.RUNNING && event.isImmediate()
                         && !event.getChangedFileNames().isEmpty()) {
+                    recordSchedulerEvent(EventKind.FIRE_DEFERRED, task, TaskRunRecord.Status.SUCCESS,
+                            "Change arrived while the previous run is still in progress \u2014 re-queued to run in ~3s",
+                            event.getChangedFileNames().size() + " changed file(s) will be picked up by the next run.");
                     // A watcher fire named real files but arrived while this
                     // task's previous run is still in flight — re-arm a fresh
                     // immediate event a few seconds out instead of silently
@@ -976,6 +1110,12 @@ public class TaskSchedulerService {
                     // transfer doesn't turn into a flood of retries.
                     eventQueue.publish(new TaskDueEvent(task.getId(),
                             now.plusSeconds(3), 0, true, event.getChangedFileNames()));
+                } else {
+                    recordSchedulerEvent(EventKind.FIRE_DROPPED, task, TaskRunRecord.Status.SUCCESS,
+                            "Ignored " + why + " \u2014 task is " + task.getStatus(),
+                            "The task was " + task.getStatus() + " when this " + why + " was delivered, so nothing was started. "
+                                    + "The reconcile sweep re-queues it once it is eligible again.");
+                    if (task.getStatus() == TaskStatus.DISABLED) pendingWakeKeys.remove(task.getId());
                 }
                 return; // reconcile sweep will also pick it back up if it becomes eligible again
             }
@@ -994,6 +1134,9 @@ public class TaskSchedulerService {
                 if (!task.isWatcherEnabled() || task.getTaskType() != ScheduledTask.TaskType.FILE_TRANSFER) {
                     pendingSuppressActivity.set(true);
                     eventQueue.cancel(task.getId());
+                    pendingWakeKeys.remove(task.getId());
+                    recordSchedulerEvent(EventKind.FIRE_DROPPED, task, TaskRunRecord.Status.SUCCESS,
+                            "Discarded watcher wake-up \u2014 watcher is no longer enabled for this task", null);
                     return;
                 }
             } else {
@@ -1010,21 +1153,41 @@ public class TaskSchedulerService {
                 if (freshDelayMs == null) {
                     pendingSuppressActivity.set(true);
                     eventQueue.cancel(task.getId());
+                    recordSchedulerEvent(EventKind.FIRE_DROPPED, task, TaskRunRecord.Status.SUCCESS,
+                            "Dropped scheduled fire \u2014 task no longer has a future occurrence",
+                            "The task's schedule changed or finished between queueing and delivery.");
                     return;
                 }
                 if (freshDelayMs > DUE_TOLERANCE_MS) {
                     pendingSuppressActivity.set(true);
                     publishNextOccurrence(task, now);
+                    recordSchedulerEvent(EventKind.FIRE_DEFERRED, task, TaskRunRecord.Status.SUCCESS,
+                            "Re-armed scheduled fire \u2014 schedule changed since it was queued",
+                            "Next occurrence is now ~" + (freshDelayMs / 1000) + "s away.");
                     return;
                 }
             }
-            task.setStatus(TaskStatus.RUNNING);
-            task.setLastStartedAt(now);
-            if (!storage.saveTask(task)) logBackendSaveFailure(task, "RUNNING status at event-triggered run start");
-            refreshMetrics(task.getId(), true);
-            recordStartedEvent(task, now);
-            executeTask(task, event.getChangedFileNames());
-        }, () -> pendingSuppressActivity.set(true) /* task deleted since the event was published — nothing to do */);
+            // Everything this run records (Started, Detected, retry notes, outcome) shares one
+            // run key + trigger. An immediate event adopts the key its watcher wake-up minted.
+            String runKey = event.isImmediate() ? pendingWakeKeys.remove(task.getId()) : null;
+            if (runKey == null) runKey = RunHistoryService.newRunKey();
+            RunHistoryService.beginRunContext(runKey, event.isImmediate() ? "WATCHER" : "SCHEDULE");
+            try {
+                task.setStatus(TaskStatus.RUNNING);
+                task.setLastStartedAt(now);
+                if (!storage.saveTask(task)) logBackendSaveFailure(task, "RUNNING status at event-triggered run start");
+                refreshMetrics(task.getId(), true);
+                recordStartedEvent(task, now);
+                executeTask(task, event.getChangedFileNames());
+            } finally {
+                RunHistoryService.endRunContext();
+            }
+        }, () -> {
+            pendingSuppressActivity.set(true); // task deleted since the event was published — nothing to do
+            pendingWakeKeys.remove(event.getTaskId());
+            recordSchedulerEvent(EventKind.FIRE_DROPPED, event.getTaskId(), "(deleted task " + event.getTaskId() + ")",
+                    null, TaskRunRecord.Status.SUCCESS, "Dropped fire for a task that no longer exists", null);
+        });
     }
 
     /** Public: publish/refresh due-events for all tasks immediately — called
@@ -1036,15 +1199,28 @@ public class TaskSchedulerService {
 
     /** Attempt to cancel a task: removes its pending queue event and cancels running future if present. */
     public boolean cancelTask(String taskId) {
-        boolean cancelledAny = eventQueue.cancel(taskId);
+        boolean pendingRemoved = eventQueue.cancel(taskId);
+        boolean cancelledAny = pendingRemoved;
         Future<?> f = runningTaskFutures.remove(taskId);
+        boolean interrupted = false;
         if (f != null) {
-            cancelledAny = f.cancel(true) || cancelledAny;
+            interrupted = f.cancel(true);
+            cancelledAny = interrupted || cancelledAny;
         }
         // Also attempt to terminate any external process associated with the task
         try {
             if (transferService != null) transferService.cancelRunningTask(taskId);
         } catch (Exception ignored) {}
+        if (cancelledAny) {
+            ScheduledTask t = lookupTask(taskId);
+            recordSchedulerEvent(EventKind.RUN_CANCELLED, taskId,
+                    t != null ? t.getName() : "(task " + taskId + ")",
+                    t != null && t.getTaskType() != null ? t.getTaskType().name() : null,
+                    TaskRunRecord.Status.SUCCESS,
+                    interrupted ? "Running task was cancelled" : "Pending run was removed from the queue",
+                    interrupted ? "The in-flight run was interrupted and any external transfer process was asked to stop."
+                            : "No run was in progress; the queued occurrence was removed.");
+        }
         return cancelledAny;
     }
 
@@ -1106,6 +1282,26 @@ public class TaskSchedulerService {
      *     java.util.function.Consumer, java.util.Set)} — see that method for how it's used.
      */
     private void executeTask(ScheduledTask task, java.util.Set<String> changedFileNames) {
+        // onTaskDue already opened a run context (and recorded "Started") for scheduled and
+        // watcher runs. Manual runs and retries come straight through runNow() with none,
+        // so open one here — otherwise those runs would have no Started row, no run key
+        // and no trigger, and could not be grouped or attributed in the Event Monitor.
+        if (RunHistoryService.currentRunKey() == null) {
+            String trigger = retryTriggered.remove(task.getId()) ? "RETRY" : "MANUAL";
+            RunHistoryService.beginRunContext(RunHistoryService.newRunKey(), trigger);
+            recordStartedEvent(task, LocalDateTime.now());
+        }
+        final String runKey = RunHistoryService.currentRunKey();
+        activeRunKeys.put(task.getId(), runKey);
+        try {
+            executeTaskBody(task, changedFileNames);
+        } finally {
+            activeRunKeys.remove(task.getId(), runKey);
+            RunHistoryService.endRunContext();
+        }
+    }
+
+    private void executeTaskBody(ScheduledTask task, java.util.Set<String> changedFileNames) {
         final long startNanos = System.nanoTime();
         final long startCpuNanos = THREAD_BEAN.isCurrentThreadCpuTimeSupported() ? THREAD_BEAN.getCurrentThreadCpuTime() : 0L;
         final LocalDateTime runStartedAt = LocalDateTime.now();
@@ -1248,6 +1444,9 @@ public class TaskSchedulerService {
             emitCap.accept("[INFO] Task failed and will be retried " + task.getRetryCount() + " time(s).\n");
             runHistoryService.recordRun(task.getId(), task.getName(), task.getTaskType().name(),
                     TaskRunRecord.Status.FAILED, retryReason, runLog.toString(), runStartedAt, LocalDateTime.now());
+            recordSchedulerEvent(EventKind.RETRY_SCHEDULED, task, TaskRunRecord.Status.SUCCESS,
+                    "Run failed \u2014 retrying in 5s (" + task.getRetryCount() + " retry attempt(s) left)",
+                    "Failure: " + retryReason);
             pendingErrored.set(true);
             pendingOutcomeNote.set(retryReason + " (will retry)");
             task.setStatus(TaskStatus.RETRYING);
@@ -1302,6 +1501,14 @@ public class TaskSchedulerService {
         }
         runHistoryService.recordRun(task.getId(), task.getName(), task.getTaskType().name(),
                 historyStatus, historyReason, runLog.toString(), runStartedAt, runEndedAt);
+        // The last automatic retry just failed too (it ran with no retries left, so it took this
+        // normal failure path rather than scheduling another) — say so explicitly, since otherwise
+        // the feed only shows one more ordinary failure and the end of the retry chain is invisible.
+        if (historyStatus == TaskRunRecord.Status.FAILED && "RETRY".equals(RunHistoryService.currentTrigger())) {
+            recordSchedulerEvent(EventKind.RETRIES_EXHAUSTED, task, TaskRunRecord.Status.FAILED,
+                    "All retry attempts used \u2014 task marked FAILED",
+                    "The task failed and every configured automatic retry also failed. It stays FAILED until it is re-run or edited.");
+        }
         if (finalSkipped || !finalSuccess) {
             pendingErrored.set(!finalSkipped && !finalSuccess);
             pendingOutcomeNote.set(historyReason);
@@ -1378,10 +1585,14 @@ public class TaskSchedulerService {
                 t.setRetryCount(t.getRetryCount() - 1);
                 t.setStatus(TaskStatus.PENDING);
                 if (!storage.saveTask(t)) logBackendSaveFailure(t, "retry count/PENDING status before re-run");
+                retryTriggered.add(t.getId()); // so the run it starts is labelled RETRY, not MANUAL
                 runNow(t.getId());
             } else {
                 t.setStatus(TaskStatus.FAILED);
                 if (!storage.saveTask(t)) logBackendSaveFailure(t, "FAILED status after retries exhausted");
+                recordSchedulerEvent(EventKind.RETRIES_EXHAUSTED, t, TaskRunRecord.Status.FAILED,
+                        "All retry attempts used \u2014 task marked FAILED",
+                        "The task failed and every configured automatic retry also failed. It stays FAILED until it is re-run or edited.");
             }
         });
     }

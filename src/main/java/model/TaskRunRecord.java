@@ -44,6 +44,9 @@ public class TaskRunRecord {
     private FailureCategory failureCategory;
     private boolean retryable;
     private String suggestedAction;
+    private String eventKind;
+    private String runKey;
+    private String trigger;
 
     public TaskRunRecord() {}
 
@@ -88,4 +91,22 @@ public class TaskRunRecord {
     /** One short, human-actionable next step ("Check the credential's password"), or null if none was classified. */
     public String getSuggestedAction()                    { return suggestedAction; }
     public void setSuggestedAction(String suggestedAction) { this.suggestedAction = suggestedAction; }
+
+    /** {@link EventKind} name, or null for rows written before event kinds were stored. */
+    public String getEventKind()                          { return eventKind; }
+    public void setEventKind(String eventKind)            { this.eventKind = eventKind; }
+
+    /**
+     * Correlation id shared by every row produced by one execution of a task
+     * (its Started row, its Detected row, retry/cancel notes, and its final
+     * outcome), so the monitor can fold them into a single expandable run.
+     * Null for rows not tied to a run (config changes, watcher state) and for
+     * rows written before this field existed.
+     */
+    public String getRunKey()                             { return runKey; }
+    public void setRunKey(String runKey)                  { this.runKey = runKey; }
+
+    /** What caused the run: SCHEDULE, WATCHER, MANUAL or RETRY. Null when unknown / not applicable. */
+    public String getTrigger()                            { return trigger; }
+    public void setTrigger(String trigger)                { this.trigger = trigger; }
 }

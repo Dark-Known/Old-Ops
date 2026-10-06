@@ -5,6 +5,7 @@ D:\OPS\OpsTransferTool-source\src\main\java\export\HtmlReportWriter.java
 D:\OPS\OpsTransferTool-source\src\main\java\export\PdfTableWriter.java
 D:\OPS\OpsTransferTool-source\src\main\java\export\XlsxWriter.java
 D:\OPS\OpsTransferTool-source\src\main\java\model\Credential.java
+D:\OPS\OpsTransferTool-source\src\main\java\model\EventKind.java
 D:\OPS\OpsTransferTool-source\src\main\java\model\RemoteFileException.java
 D:\OPS\OpsTransferTool-source\src\main\java\model\RemoteFileMetadata.java
 D:\OPS\OpsTransferTool-source\src\main\java\model\ScheduledTask.java
@@ -52,6 +53,19 @@ D:\OPS\OpsTransferTool-source\src\main\java\ui\HealthBanner.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\IconTile.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\IssueGrouping.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\MainWindow.java
+D:\OPS\OpsTransferTool-source\src\main\java\ui\monitor\DetailPane.java
+D:\OPS\OpsTransferTool-source\src\main\java\ui\monitor\EventClassifier.java
+D:\OPS\OpsTransferTool-source\src\main\java\ui\monitor\EventCsv.java
+D:\OPS\OpsTransferTool-source\src\main\java\ui\monitor\EventFeedPanel.java
+D:\OPS\OpsTransferTool-source\src\main\java\ui\monitor\EventFilter.java
+D:\OPS\OpsTransferTool-source\src\main\java\ui\monitor\FeedBuilder.java
+D:\OPS\OpsTransferTool-source\src\main\java\ui\monitor\FeedRow.java
+D:\OPS\OpsTransferTool-source\src\main\java\ui\monitor\MonitorEvent.java
+D:\OPS\OpsTransferTool-source\src\main\java\ui\monitor\MonitorPrefs.java
+D:\OPS\OpsTransferTool-source\src\main\java\ui\monitor\MonitorStyle.java
+D:\OPS\OpsTransferTool-source\src\main\java\ui\monitor\QueuePanel.java
+D:\OPS\OpsTransferTool-source\src\main\java\ui\monitor\SummaryBar.java
+D:\OPS\OpsTransferTool-source\src\main\java\ui\monitor\WidthTrackingPanel.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\NotificationBell.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\NotificationPanel.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\OAuthAuthorizeDialog.java
