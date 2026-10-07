@@ -50,6 +50,14 @@ public class EventFeedPanel extends JPanel {
     private static final int COL_TIME = 0, COL_STATUS = 1, COL_TASK = 2, COL_EVENT = 3, COL_SUMMARY = 4,
             COL_FILES = 5, COL_TRIGGER = 6, COL_DURATION = 7;
     private static final String[] COLUMNS = {"Time", "Status", "Task", "Event", "Summary", "Files", "Trigger", "Took"};
+    private static final int[] COL_WIDTH = {116, 98, 154, 128, 300, 76, 80, 64};
+    private static final int[] COL_MIN   = {100, 90, 90,  84,  140, 56, 64, 48};
+    /**
+     * Narrow feed: columns are dropped from the right, least important first, rather than being squeezed
+     * until the last ones fall off the edge with no scrollbar. Everything dropped here (files, trigger,
+     * duration) is repeated in the detail pane, so nothing becomes unreachable. Index = column.
+     */
+    private static final int[] HIDE_BELOW = {0, 0, 0, 0, 0, 760, 690, 610};
     private static final int FLASH_MS = 1600;
     private static final int INDENT = 14;
 
@@ -62,9 +70,10 @@ public class EventFeedPanel extends JPanel {
     private final JComboBox<TaskItem> taskCombo = new JComboBox<>();
     private final JComboBox<String> rangeCombo = new JComboBox<>();
     private final JComboBox<String> levelCombo = new JComboBox<>();
-    private final Map<EventKind.Category, JToggleButton> chips = new EnumMap<>(EventKind.Category.class);
+    private final Map<EventKind.Category, FilterChip> chips = new EnumMap<>(EventKind.Category.class);
+    private FilterChip allChip;
     private final JToggleButton pauseBtn = new JToggleButton("Pause");
-    private final JButton resetBtn = new JButton("Reset filters");
+    private final JButton resetBtn = new JButton("\u2715  Reset filters");
     private final JLabel banner = new JLabel();
     private final JPanel bannerHost = new JPanel(new BorderLayout());
     private final JLabel statusLeft = new JLabel(" ");
@@ -125,15 +134,19 @@ public class EventFeedPanel extends JPanel {
         for (MonitorPrefs.Range r : MonitorPrefs.RANGES) rangeCombo.addItem(r.label());
         rangeCombo.setSelectedIndex(prefs.rangeIndex());
         rangeCombo.setToolTipText("How far back to show events");
+        labelled(rangeCombo, "Range: ", "Last 24 hours");
         rangeCombo.addActionListener(e -> { if (!adjusting) prefs.setRangeIndex(rangeCombo.getSelectedIndex()); });
 
         for (MonitorPrefs.Level l : MonitorPrefs.LEVELS) levelCombo.addItem(l.label());
         levelCombo.setSelectedIndex(prefs.levelIndex());
-        levelCombo.setToolTipText("Normal hides low-level queue bookkeeping; choose Everything to see it");
+        levelCombo.setToolTipText("<html>How much detail to show.<br><b>Normal</b> hides low-level queue bookkeeping; "
+                + "<b>All incl. debug</b> shows everything that was recorded.</html>");
+        labelled(levelCombo, "Level: ", "All incl. debug");
         levelCombo.addActionListener(e -> { if (!adjusting) prefs.setLevelIndex(levelCombo.getSelectedIndex()); });
 
         taskCombo.addItem(new TaskItem(null, "All tasks"));
         taskCombo.setToolTipText("Show only one task");
+        labelled(taskCombo, "Task: ", new TaskItem(null, "Some task name"));
         taskCombo.addActionListener(e -> {
             if (adjusting) return;
             TaskItem it = (TaskItem) taskCombo.getSelectedItem();
@@ -151,50 +164,46 @@ public class EventFeedPanel extends JPanel {
         export.setToolTipText("Save the events matching the current filters");
         export.addActionListener(e -> exportCsv());
 
-        // Row 1: what to look for (search + the three dropdowns). Search takes whatever width is spare.
-        JPanel row1 = new JPanel(new GridBagLayout());
-        row1.setOpaque(false);
-        GridBagConstraints g = new GridBagConstraints();
-        g.gridy = 0; g.fill = GridBagConstraints.HORIZONTAL; g.insets = new Insets(0, 0, 0, 6);
-        g.gridx = 0; g.weightx = 1; search.setMinimumSize(new Dimension(120, 10)); row1.add(search, g);
-        g.weightx = 0;
-        g.gridx = 1; row1.add(taskCombo, g);
-        g.gridx = 2; row1.add(rangeCombo, g);
-        g.gridx = 3; g.insets = new Insets(0, 0, 0, 0); row1.add(levelCombo, g);
+        // One wrapping toolbar rather than fixed rows: at a comfortable width it reads as
+        //   [search][task][range][level]   [All Runs Watchers Queue System][Reset]   [Pause][Options][Export]
+        // and in a narrower pane the groups flow onto extra lines instead of being clipped away.
+        search.setColumns(12);
+        search.setMinimumSize(new Dimension(120, 10));
 
-        // Row 2: category chips on the left, view actions on the right.
-        JPanel chipRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
-        chipRow.setOpaque(false);
-        JLabel show = new JLabel("Show:");
-        show.setForeground(MonitorStyle.muted());
-        chipRow.add(show);
+        // Clicking a chip SHOWS that category (the intuitive reading of a filter); Ctrl/Shift-click
+        // combines several; clicking the chosen one again, or "All", goes back to everything.
+        JPanel chipGroup = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
+        chipGroup.setOpaque(false);
+        allChip = new FilterChip("All", "Show every kind of event", (chip, multi) -> chooseCategory(null, false));
+        chipGroup.add(allChip);
         for (EventKind.Category c : EventKind.Category.values()) {
-            JToggleButton chip = new JToggleButton(c.label());
-            chip.setSelected(true);
-            chip.putClientProperty("JButton.buttonType", "roundRect");
-            chip.setFocusable(false);
-            chip.addActionListener(e -> {
-                if (chip.isSelected()) activeCategories.add(c); else activeCategories.remove(c);
-                filterChanged();
-            });
+            FilterChip chip = new FilterChip(c.label(),
+                    "<html>Show only <b>" + c.label() + "</b><br><span style='color:gray'>Ctrl+click to add or remove others</span></html>",
+                    (ch, multi) -> chooseCategory(c, multi));
             chips.put(c, chip);
-            chipRow.add(chip);
+            chipGroup.add(chip);
         }
-        resetBtn.putClientProperty("JButton.buttonType", "borderless");
+        syncChips();
+
+        resetBtn.setToolTipText("Clear the search, task, category, range and level filters");
         resetBtn.addActionListener(e -> resetFilters());
         resetBtn.setVisible(false);
-        chipRow.add(resetBtn);
 
-        JPanel actionRow = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 0));
-        actionRow.setOpaque(false);
-        actionRow.add(pauseBtn);
-        actionRow.add(options);
-        actionRow.add(export);
+        JPanel actionGroup = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
+        actionGroup.setOpaque(false);
+        actionGroup.add(pauseBtn);
+        actionGroup.add(options);
+        actionGroup.add(export);
 
-        JPanel row2 = new JPanel(new BorderLayout());
-        row2.setOpaque(false);
-        row2.add(chipRow, BorderLayout.CENTER);
-        row2.add(actionRow, BorderLayout.EAST);
+        JPanel bar = new JPanel(new WrapLayout(FlowLayout.LEFT, 6, 5));
+        bar.setOpaque(false);
+        bar.add(search);
+        bar.add(taskCombo);
+        bar.add(rangeCombo);
+        bar.add(levelCombo);
+        bar.add(chipGroup);
+        bar.add(resetBtn);
+        bar.add(actionGroup);
 
         banner.setOpaque(true);
         banner.setBorder(new EmptyBorder(6, 10, 6, 10));
@@ -203,15 +212,10 @@ public class EventFeedPanel extends JPanel {
         bannerHost.add(banner, BorderLayout.CENTER);
         bannerHost.setVisible(false);
 
-        JPanel box = new JPanel();
-        box.setLayout(new BoxLayout(box, BoxLayout.Y_AXIS));
-        box.setBorder(new EmptyBorder(0, 0, 6, 0));
-        JComponent[] parts = {bannerHost, row1, row2};
-        for (int i = 0; i < parts.length; i++) {
-            parts[i].setAlignmentX(Component.LEFT_ALIGNMENT);
-            box.add(parts[i]);
-            if (i == 1) box.add(Box.createVerticalStrut(6));
-        }
+        JPanel box = new JPanel(new BorderLayout());
+        box.setBorder(new EmptyBorder(0, 0, 4, 0));
+        box.add(bannerHost, BorderLayout.NORTH);
+        box.add(bar, BorderLayout.CENTER);
         return box;
     }
 
@@ -225,12 +229,10 @@ public class EventFeedPanel extends JPanel {
         table.setFont(table.getFont().deriveFont(12f));
         table.setDefaultRenderer(Object.class, new RowRenderer());
 
-        int[] widths = {116, 98, 154, 128, 300, 76, 80, 64};
-        int[] mins   = {100, 90, 90,  84,  140, 56, 64, 48};
         for (int i = 0; i < COLUMNS.length; i++) {
             TableColumn tc = table.getColumnModel().getColumn(i);
-            tc.setPreferredWidth(widths[i]);
-            tc.setMinWidth(mins[i]);
+            tc.setPreferredWidth(COL_WIDTH[i]);
+            tc.setMinWidth(COL_MIN[i]);
         }
 
         table.getSelectionModel().addListSelectionListener(e -> {
@@ -262,6 +264,9 @@ public class EventFeedPanel extends JPanel {
         });
 
         JScrollPane scroll = new JScrollPane(table);
+        scroll.getViewport().addComponentListener(new java.awt.event.ComponentAdapter() {
+            @Override public void componentResized(java.awt.event.ComponentEvent e) { applyColumnVisibility(scroll.getViewport().getWidth()); }
+        });
         scroll.setBorder(BorderFactory.createLineBorder(UIManager.getColor("Component.borderColor") != null
                 ? UIManager.getColor("Component.borderColor") : Color.LIGHT_GRAY));
         scroll.getVerticalScrollBar().setUnitIncrement(27);
@@ -283,6 +288,31 @@ public class EventFeedPanel extends JPanel {
         cardHost.add(scroll, "table");
         cardHost.add(empty, "empty");
         return cardHost;
+    }
+
+    private int lastColumnMask = -1;
+
+    /** Shows or hides the optional columns to fit {@code viewportWidth}; no-op unless the set actually changes. */
+    private void applyColumnVisibility(int viewportWidth) {
+        if (viewportWidth <= 0) return;
+        int mask = 0;
+        for (int i = 0; i < COLUMNS.length; i++) if (viewportWidth >= HIDE_BELOW[i]) mask |= 1 << i;
+        if (mask == lastColumnMask) return;
+        lastColumnMask = mask;
+        for (int i = 0; i < COLUMNS.length; i++) {
+            TableColumn tc = table.getColumnModel().getColumn(i);
+            if ((mask & (1 << i)) != 0) {
+                tc.setMinWidth(COL_MIN[i]);
+                tc.setMaxWidth(Integer.MAX_VALUE);
+                tc.setPreferredWidth(COL_WIDTH[i]);
+            } else {
+                tc.setMinWidth(0);
+                tc.setPreferredWidth(0);
+                tc.setMaxWidth(0);
+            }
+        }
+        table.revalidate();
+        table.repaint();
     }
 
     private JComponent buildStatusBar() {
@@ -338,6 +368,8 @@ public class EventFeedPanel extends JPanel {
     public void setTaskFilterListener(Consumer<String> l)  { this.taskFilterListener = l != null ? l : id -> {}; }
     public FeedRow getSelectedRow()                        { return selectedRow; }
     public List<MonitorEvent> getMatchedEvents()           { return result.matchedEvents(); }
+    /** Task the feed is currently restricted to, or null for all tasks. */
+    public String getTaskFilterId()                        { return taskFilterId; }
     public boolean isPaused()                              { return pauseBtn.isSelected(); }
     /**
      * Errors / warnings anywhere in the selected time range — deliberately NOT narrowed by the search
@@ -478,21 +510,77 @@ public class EventFeedPanel extends JPanel {
     }
 
     private void resetFilters() {
-        search.setText("");
-        activeCategories.addAll(EnumSet.allOf(EventKind.Category.class));
-        for (JToggleButton c : chips.values()) c.setSelected(true);
-        showOnlyTask(null);
-    }
-
-    private void onPrefsChanged() {
         adjusting = true;
         try {
-            rangeCombo.setSelectedIndex(prefs.rangeIndex());
-            levelCombo.setSelectedIndex(prefs.levelIndex());
+            search.setText("");
         } finally {
             adjusting = false;
         }
-        rebuild();
+        activeCategories.addAll(EnumSet.allOf(EventKind.Category.class));
+        syncChips();
+        prefs.setLevelIndex(MonitorPrefs.DEFAULT_LEVEL);   // each notifies listeners; combos follow via onPrefsChanged
+        prefs.setRangeIndex(MonitorPrefs.DEFAULT_RANGE);
+        showOnlyTask(null);
+    }
+
+    /** Applies a click on a category chip ({@code null} = the "All" chip). */
+    private void chooseCategory(EventKind.Category c, boolean multi) {
+        EnumSet<EventKind.Category> all = EnumSet.allOf(EventKind.Category.class);
+        if (c == null) {
+            activeCategories.clear();
+            activeCategories.addAll(all);
+        } else if (multi) {
+            if (activeCategories.size() == all.size()) {          // from "everything": start a custom set with c
+                activeCategories.clear();
+                activeCategories.add(c);
+            } else if (!activeCategories.remove(c)) {
+                activeCategories.add(c);
+            }
+            if (activeCategories.isEmpty()) activeCategories.addAll(all);   // never leave the feed with nothing selectable
+        } else if (activeCategories.size() == 1 && activeCategories.contains(c)) {
+            activeCategories.addAll(all);                          // click the only chosen one again: back to all
+        } else {
+            activeCategories.clear();
+            activeCategories.add(c);
+        }
+        syncChips();
+        filterChanged();
+    }
+
+    /** Makes the chip row reflect {@link #activeCategories}: "All" lit when nothing is narrowed, else the chosen ones. */
+    private void syncChips() {
+        boolean everything = activeCategories.size() == EventKind.Category.values().length;
+        if (allChip != null) allChip.setSelected(everything);
+        for (Map.Entry<EventKind.Category, FilterChip> en : chips.entrySet()) {
+            en.getValue().setSelected(!everything && activeCategories.contains(en.getKey()));
+        }
+    }
+
+    /** Shows "Prefix: value" in the closed combo, so bare values like "Normal" say what they are. */
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private static void labelled(JComboBox combo, String prefix, Object prototype) {
+        final ListCellRenderer base = combo.getRenderer();
+        combo.setRenderer((list, value, index, isSelected, hasFocus) -> {
+            Component c = base.getListCellRendererComponent(list, value, index, isSelected, hasFocus);
+            if (index < 0 && c instanceof JLabel l) l.setText(prefix + value);
+            return c;
+        });
+        combo.setPrototypeDisplayValue(prototype);
+    }
+
+    /** Reacts to a preference change — narrowly: only what actually changed is redone. */
+    private void onPrefsChanged(String what) {
+        adjusting = true;
+        try {
+            if (rangeCombo.getSelectedIndex() != prefs.rangeIndex()) rangeCombo.setSelectedIndex(prefs.rangeIndex());
+            if (levelCombo.getSelectedIndex() != prefs.levelIndex()) levelCombo.setSelectedIndex(prefs.levelIndex());
+        } finally {
+            adjusting = false;
+        }
+        switch (what) {
+            case "range", "level", "groupRuns", "collapseRepeats", "highlightNew" -> rebuild();
+            default -> { /* layout / toast options don't change what the feed shows */ }
+        }
     }
 
     private void startFlash(Set<String> keys) {
@@ -554,7 +642,7 @@ public class EventFeedPanel extends JPanel {
 
         updateChips();
         updateStatus();
-        boolean anyFilter = !filter.isDefault();
+        boolean anyFilter = !filter.isDefault() || prefs.viewFiltersChanged();
         resetBtn.setVisible(anyFilter);
         cards.show(cardHost, result.rows().isEmpty() ? "empty" : "table");
         if (result.rows().isEmpty()) {
@@ -576,11 +664,13 @@ public class EventFeedPanel extends JPanel {
     }
 
     private void updateChips() {
+        int total = 0;
         for (EventKind.Category c : EventKind.Category.values()) {
-            JToggleButton chip = chips.get(c);
             int n = result.categoryCounts().getOrDefault(c, 0);
-            chip.setText(c.label() + (n > 0 ? "  " + n : ""));
+            total += n;
+            chips.get(c).setCount(n);
         }
+        allChip.setCount(total);
     }
 
     private void updateStatus() {

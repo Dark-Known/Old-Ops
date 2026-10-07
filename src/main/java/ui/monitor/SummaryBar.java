@@ -21,8 +21,8 @@ public class SummaryBar extends JPanel {
     private final Map<String, Chip> chips = new LinkedHashMap<>();
 
     public SummaryBar() {
-        setLayout(new FlowLayout(FlowLayout.LEFT, 8, 0));
-        setBorder(new EmptyBorder(0, 0, 8, 0));
+        setLayout(new WrapLayout(FlowLayout.LEFT, 8, 4));
+        setBorder(new EmptyBorder(0, 0, 4, 0));
         setOpaque(false);
     }
 

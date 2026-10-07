@@ -52,6 +52,7 @@ ui\DirectoryBrowserDialog.class
 ui\ActionCenterButton$3.class
 ui\MainWindow$1.class
 ui\monitor\DetailPane$3.class
+ui\monitor\EventFeedPanel$5.class
 service\watch\RemotePushWatcher$ListenerHandle.class
 ui\TestConnectionDialog$1.class
 ui\monitor\EventFeedPanel.class
@@ -160,7 +161,9 @@ ui\DirectoryBrowserDialog$9.class
 service\queue\SchedulerStatusSnapshot$WatchEntry.class
 service\TransferService$RemoteFileStat.class
 ui\monitor\EventFeedPanel$3.class
+ui\monitor\WrapLayout.class
 ui\monitor\EventFeedPanel$FeedModel.class
+ui\monitor\FilterChip$1.class
 service\queue\SchedulerStatusSnapshot$PendingEntry.class
 ui\DirectoryBrowserDialog$UpArrowIcon.class
 ui\monitor\QueuePanel$CellTip.class
@@ -238,6 +241,7 @@ Daemon$2.class
 service\RemoteFileMetadataService.class
 ui\ActionCenterButton$RoundedLineBorder.class
 service\TransferService$BackupCandidate.class
+ui\monitor\FilterChip.class
 ui\WatcherInfoPopup.class
 ui\monitor\FeedBuilder.class
 ui\TaskDialog$1.class
@@ -269,6 +273,7 @@ service\queue\TaskWorkerPool$HandlerOutcome.class
 ui\DirectoryBrowserDialog$FolderIcon.class
 service\TaskSchedulerService$1.class
 ui\CredentialManagerPanel.class
+ui\monitor\FilterChip$Listener.class
 model\ScheduledTask$TaskStatus.class
 ui\components\PillBadge.class
 ui\monitor\WidthTrackingPanel.class

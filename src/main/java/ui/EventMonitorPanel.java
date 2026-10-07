@@ -112,14 +112,17 @@ public class EventMonitorPanel extends JPanel {
         feed = new EventFeedPanel(prefs);
         detail = new DetailPane(scheduler.getRunHistoryService(), feed::showOnlyTask);
         feed.setSelectionListener(detail::setRow);
+        feed.setTaskFilterListener(detail::setActiveTaskFilter);
 
         summary.set("scheduler", "Scheduler", "\u2026", null, null);
         summary.set("workers", "Workers", "\u2014", null, "Worker threads busy / total");
         summary.set("running", "Running", "0", null, "Tasks executing right now");
         summary.set("queued", "Queued", "0", null, "Runs waiting for their scheduled time");
         summary.set("watchers", "Watchers", "\u2014", null, "How watcher-enabled tasks are being triggered");
-        summary.set("attention", "Attention", "\u2026", null, "Click to show only warnings and errors");
-        summary.onClick("attention", () -> prefs.setLevelIndex(1));
+        summary.set("attention", "Attention", "\u2026", null, "Click to show only warnings and errors \u2014 click again to go back");
+        // Toggle: first click narrows the feed to problems, second click goes back to normal.
+        summary.onClick("attention", () -> prefs.setLevelIndex(
+                prefs.levelIndex() == 1 ? MonitorPrefs.DEFAULT_LEVEL : 1));
 
         JPanel eventsTab = new JPanel(new BorderLayout());
         eventsTab.setBorder(BorderFactory.createEmptyBorder(8, 4, 4, 4));
@@ -138,7 +141,16 @@ public class EventMonitorPanel extends JPanel {
         tabs.addChangeListener(e -> { if (tabs.getSelectedIndex() == 1) refreshStats(true); });
 
         layoutSide();
-        prefs.addListener(() -> { layoutSide(); requestLoad(true); });
+        // React narrowly: rebuilding the split panes on every preference change would reset the
+        // dividers the operator dragged each time they touched a filter, and re-querying the
+        // database is only needed when the time range (which bounds the query) changes.
+        prefs.addListener(what -> {
+            switch (what) {
+                case "showDetail", "showQueue" -> layoutSide();
+                case "range" -> requestLoad(true);
+                default -> { }
+            }
+        });
 
         // Same-process writes arrive instantly through these listeners; the 1s timer plus the
         // change token below cover the headless Daemon, which is a separate JVM and can never
@@ -201,7 +213,7 @@ public class EventMonitorPanel extends JPanel {
             h.setBorder(null);
             h.setContinuousLayout(true);
             h.setDividerSize(8);
-            feed.setMinimumSize(new Dimension(420, 120));
+            feed.setMinimumSize(new Dimension(460, 120));
             centerHolder.add(h, BorderLayout.CENTER);
             SwingUtilities.invokeLater(() -> h.setDividerLocation(0.72));
         }
@@ -353,7 +365,7 @@ public class EventMonitorPanel extends JPanel {
         } else {
             summary.set("attention", "Attention", (errs > 0 ? errs + (errs == 1 ? " error" : " errors") : "")
                     + (errs > 0 && warns > 0 ? " \u00b7 " : "") + (warns > 0 ? warns + (warns == 1 ? " warning" : " warnings") : ""),
-                    errs > 0 ? AppTheme.FAILED_FG : AppTheme.SKIPPED_FG, "Click to show only warnings and errors");
+                    errs > 0 ? AppTheme.FAILED_FG : AppTheme.SKIPPED_FG, "Click to show only warnings and errors \u2014 click again to go back");
         }
 
         if (tabs.getSelectedIndex() == 1) refreshStats(false);

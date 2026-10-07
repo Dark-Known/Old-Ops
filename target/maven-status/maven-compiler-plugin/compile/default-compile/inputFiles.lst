@@ -60,12 +60,14 @@ D:\OPS\OpsTransferTool-source\src\main\java\ui\monitor\EventFeedPanel.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\monitor\EventFilter.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\monitor\FeedBuilder.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\monitor\FeedRow.java
+D:\OPS\OpsTransferTool-source\src\main\java\ui\monitor\FilterChip.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\monitor\MonitorEvent.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\monitor\MonitorPrefs.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\monitor\MonitorStyle.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\monitor\QueuePanel.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\monitor\SummaryBar.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\monitor\WidthTrackingPanel.java
+D:\OPS\OpsTransferTool-source\src\main\java\ui\monitor\WrapLayout.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\NotificationBell.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\NotificationPanel.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\OAuthAuthorizeDialog.java

@@ -46,6 +46,7 @@ public class DetailPane extends JPanel {
     private final JButton copyBtn = new JButton("Copy");
     private final JButton onlyBtn = new JButton("Only this task");
 
+    private String activeTaskFilter;
     private FeedRow current;
     private String currentText = "";
     private String currentLog = "";
@@ -112,7 +113,12 @@ public class DetailPane extends JPanel {
         });
         copyBtn.addActionListener(e -> Toolkit.getDefaultToolkit().getSystemClipboard()
                 .setContents(new StringSelection(currentText + (currentLog.isEmpty() ? "" : "\n\n--- Raw log ---\n" + currentLog)), null));
-        onlyBtn.addActionListener(e -> { if (current != null && current.taskId != null) onlyTask.accept(current.taskId); });
+        // Doubles as the way back: once the feed is already restricted to this task, the same button
+        // lifts the restriction instead of silently doing nothing.
+        onlyBtn.addActionListener(e -> {
+            if (current == null || current.taskId == null) return;
+            onlyTask.accept(current.taskId.equals(activeTaskFilter) ? null : current.taskId);
+        });
 
         JPanel actions = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
         actions.setOpaque(false);
@@ -128,6 +134,18 @@ public class DetailPane extends JPanel {
         return p;
     }
 
+    /** Tells the pane which task the feed is currently restricted to (null = none), so its button can read "Show all tasks". */
+    public void setActiveTaskFilter(String taskId) {
+        this.activeTaskFilter = taskId;
+        refreshOnlyButton();
+    }
+
+    private void refreshOnlyButton() {
+        boolean on = current != null && current.taskId != null && current.taskId.equals(activeTaskFilter);
+        onlyBtn.setText(on ? "Show all tasks" : "Only this task");
+        onlyBtn.setToolTipText(on ? "Remove the task filter" : "Show only events of this task in the feed");
+    }
+
     /** Shows {@code row}, or the empty hint for null. Safe to call with the same row repeatedly. */
     public void setRow(FeedRow row) {
         current = row;
@@ -140,6 +158,7 @@ public class DetailPane extends JPanel {
         subtitle.setText("<html><span style='color:" + MonitorStyle.hex(MonitorStyle.onSurface(c[0])) + "'><b>" + row.outcome.label()
                 + "</b></span>  \u00b7  " + MonitorStyle.htmlEscape(headline(row)) + "</html>");
         onlyBtn.setVisible(row.taskId != null && row.head.kind().category() != EventKind.Category.SYSTEM);
+        refreshOnlyButton();
 
         // Render immediately from what the feed already knows, then enrich once the log arrives.
         render(row, Map.of());
