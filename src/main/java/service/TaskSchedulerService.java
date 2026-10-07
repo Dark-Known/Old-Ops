@@ -158,9 +158,16 @@ public class TaskSchedulerService {
         this.logService = new TaskLogService(storage.getDataDir().getAbsolutePath());
         this.runHistoryService = new RunHistoryService(storage.getDataDir().getAbsolutePath());
         // Keep the run-history database from growing unbounded — every run
-        // (success, failure, or skip) adds a row. 90 days is a generous
-        // default; adjust here if a different retention window is needed.
-        this.runHistoryService.pruneOlderThan(90);
+        // (success, failure, or skip) adds a row. This is only the cheap
+        // startup trim using the configured windows (Settings -> Data
+        // retention, default 90 days); the full purge (clearing old run
+        // logs, size cap, VACUUM, task log cleanup) is service.MaintenanceService,
+        // run daily by the daemon.
+        if (util.AppSettings.isPurgeEnabled()) {
+            this.runHistoryService.pruneOlderThan(
+                    util.AppSettings.getPurgeRunHistoryDays(),
+                    util.AppSettings.getPurgeEventHistoryDays());
+        }
         this.pollIntervalSeconds = Math.max(1, pollIntervalSeconds);
         this.remotePushWatcher = new RemotePushWatcher(storage, this::onWatchWakeup);
     }

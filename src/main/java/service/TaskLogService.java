@@ -246,6 +246,114 @@ public class TaskLogService {
         }
     }
     
+    // ── Retention / purge ────────────────────────────────────────────────
+
+    /** What one {@link #purgeLogs} call did (or, for a dry run, would do). */
+    public static final class PurgeStats {
+        public int archivesDeleted;
+        public int orphanFoldersDeleted;
+        public int failures;       // files/folders that could not be deleted (e.g. still open on Windows)
+        public long bytesFreed;
+    }
+
+    /**
+     * Keeps the per-task log folders under {@code <dataDir>/logs} from
+     * growing forever. Size-based rotation already caps each live task, but
+     * nothing ever removed (a) rotated archives once they were no longer
+     * interesting or (b) the folder of a task that was deleted or renamed
+     * (a rename starts a new folder, see {@link #folderNameFor}).
+     *
+     * <ul>
+     *   <li><b>archives:</b> {@code task-*.log} files older than
+     *       {@code archiveDays} are deleted in every folder. The live
+     *       {@code task.log} is never touched. 0 = off.</li>
+     *   <li><b>orphans:</b> a folder that matches no current task, and in
+     *       which nothing has been written for {@code orphanDays}, is
+     *       deleted whole. The {@code system} folder is always kept. If
+     *       {@code tasks} is empty (storage may simply have failed to load)
+     *       no folder is considered an orphan. 0 = off.</li>
+     * </ul>
+     *
+     * Only direct children of the logs directory are ever touched.
+     */
+    public synchronized PurgeStats purgeLogs(Collection<model.ScheduledTask> tasks,
+                                             int archiveDays, int orphanDays, boolean dryRun) {
+        PurgeStats stats = new PurgeStats();
+        File[] folders = logsDir.listFiles(File::isDirectory);
+        if (folders == null) return stats;
+
+        Set<String> activeFolders = new HashSet<>();
+        activeFolders.add("system");
+        boolean taskListTrusted = tasks != null && !tasks.isEmpty();
+        if (tasks != null) {
+            for (model.ScheduledTask t : tasks) activeFolders.add(folderNameFor(t.getId(), t.getName()));
+        }
+
+        long now = System.currentTimeMillis();
+        long archiveCutoff = archiveDays > 0 ? now - archiveDays * 86_400_000L : Long.MIN_VALUE;
+        long orphanCutoff  = orphanDays  > 0 ? now - orphanDays  * 86_400_000L : Long.MIN_VALUE;
+        boolean closedWriters = false;
+
+        for (File folder : folders) {
+            if (Files.isSymbolicLink(folder.toPath())) continue;
+            File[] files = folder.listFiles();
+            if (files == null) continue;
+
+            boolean isOrphan = taskListTrusted && orphanDays > 0 && !activeFolders.contains(folder.getName());
+            if (isOrphan) {
+                // Judge idleness by the files inside, not the folder's own
+                // timestamp: deleting an archive (below) bumps the folder's
+                // mtime, which would make a dead folder look freshly active.
+                // An empty folder falls back to its own mtime so a task that
+                // has just created its folder is never caught mid-write.
+                long newest = 0;
+                boolean hasSubdir = false;
+                for (File f : files) {
+                    if (f.isDirectory()) hasSubdir = true;
+                    newest = Math.max(newest, f.lastModified());
+                }
+                if (files.length == 0) newest = folder.lastModified();
+                if (!hasSubdir && newest < orphanCutoff) {
+                    long size = 0;
+                    for (File f : files) size += f.length();
+                    if (dryRun) {
+                        stats.orphanFoldersDeleted++;
+                        stats.bytesFreed += size;
+                    } else {
+                        if (!closedWriters) { closeAll(); closedWriters = true; } // release handles; they reopen lazily
+                        boolean allGone = true;
+                        for (File f : files) {
+                            long len = f.length();
+                            if (f.delete()) stats.bytesFreed += len; else { allGone = false; stats.failures++; }
+                        }
+                        if (allGone && folder.delete()) stats.orphanFoldersDeleted++;
+                        else if (allGone) stats.failures++;
+                    }
+                    continue;   // whole folder handled
+                }
+            }
+
+            if (archiveDays > 0) {
+                for (File f : files) {
+                    String n = f.getName();
+                    boolean isArchive = f.isFile() && n.startsWith("task-") && n.endsWith(".log") && !n.equals("task.log");
+                    if (!isArchive || f.lastModified() >= archiveCutoff) continue;
+                    long len = f.length();
+                    if (dryRun) {
+                        stats.archivesDeleted++;
+                        stats.bytesFreed += len;
+                    } else if (f.delete()) {
+                        stats.archivesDeleted++;
+                        stats.bytesFreed += len;
+                    } else {
+                        stats.failures++;
+                    }
+                }
+            }
+        }
+        return stats;
+    }
+
     /**
      * Close all open writers (call on shutdown).
      */

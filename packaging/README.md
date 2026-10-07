@@ -191,3 +191,39 @@ so the GUI can read/write there as a normal user. If it still can't (a
 network share with unusual ACLs, say), the GUI relaunches itself
 elevated once automatically via a UAC prompt — see `App.java`'s startup
 check — rather than silently starting with an inaccessible database.
+
+## Redeploy and rollback
+
+Both scripts reuse the pieces above (`Deploy-Application.ps1`, and
+`install-service.ps1` on request) and share helpers in `Ops-Common.ps1`.
+Run from an elevated PowerShell prompt.
+
+```powershell
+# Redeploy a rebuilt jar (auto-finds .\Monitoring-Tool.jar or the newest .\target\*.jar)
+.\packaging\redeploy.ps1
+.\packaging\redeploy.ps1 -SourceJar .\target\Monitoring-Tool.jar -AutoRollback
+
+# See backups, then roll back
+.\packaging\rollback.ps1 -List
+.\packaging\rollback.ps1                      # restores the version live before the last redeploy
+.\packaging\rollback.ps1 -Backup redeploy_20260107_101500 -Yes
+```
+
+`redeploy.ps1` flow: validate jar -> refuse if the GUI has it open (or
+`-ForceCloseGui`) -> stop `OpsTransferToolDaemon` -> back up the installed
+jar/config/icon **and the entire data folder** to `<InstallDir>\backups\` ->
+`Deploy-Application.ps1` -> verify hash -> restart service -> health check.
+A failed deploy step restores the old version automatically; a failed
+health check does so with `-AutoRollback`. Exit codes: 0 ok, 1 error,
+2 deployed but service unhealthy.
+
+`rollback.ps1` restores the jar/config/icon and the full data folder from the
+backup (overwrite only, nothing deleted; `-SkipDataRestore` to leave data
+alone). It snapshots the current state first (`pre-rollback_*`), so a
+rollback can itself be undone by naming that backup.
+
+Notes: `Deploy-Application.ps1` also overwrites the installed
+`app-config.xml` with the one in the staging folder, which is why config is
+part of every backup. The last 5 backups of each kind are kept
+(`-KeepBackups`); each one contains a full data copy, so watch disk usage
+if the data folder is large.

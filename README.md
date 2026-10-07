@@ -287,3 +287,41 @@ when the task is reopened.
   a JSON library dependency)
 - Mail watcher baseline fields live on `ScheduledTask` (`mailLastKnownEpoch` etc.) and
   are persisted the same way as file-transfer watcher baselines, via `XmlStorageService`
+## Data retention (purging run history and logs)
+
+`run_history.db` gets a row for every run and every activity-feed event, and
+each run row stores the full captured run log, so left alone it only grows.
+SQLite also never shrinks its file on DELETE. The daemon now runs a purge once
+a day (`service.MaintenanceService`); everything is configured in
+**Settings → Data Retention** and takes effect without a restart. `0` turns an
+individual rule off.
+
+| Setting | Default | What it does |
+|---|---|---|
+| Purge automatically | on | Daily run after the chosen hour (default 03:00). If the machine was off then, it runs on the next check. |
+| Delete run history older than | 90 days | Removes old `run_history` rows (what Logs/Statistics show). |
+| Delete activity/event feed older than | 90 days | Removes old `event_monitor_history` rows (grows fastest; 14–30 is usually plenty). |
+| Clear full run log text older than | off | Keeps the summary row but drops its captured log text, which is the bulk of the file. Good middle ground: e.g. clear after 14 days, delete after 90. |
+| Max run history size | off | Hard cap: after the rules above, deletes the oldest rows (events first) until it fits. |
+| Delete rotated task log files older than | 30 days | Removes `task-*.log` archives under `<dataDir>\logs\<Task>_<id>\`. The live `task.log` is never deleted. |
+| Delete logs of deleted/renamed tasks idle for | 30 days | Removes whole log folders that no longer belong to any task and have had nothing written for that long. Skipped entirely if the task list can't be loaded. |
+
+After deleting, the database is VACUUMed (when at least 1 MB / 10% of it is
+free) so the file really gets smaller. VACUUM holds the database for as long
+as it takes to rewrite it, which is why the purge runs overnight.
+
+**Purge now** in Settings queues a `PURGE_NOW` command for the daemon, so it
+uses the *saved* values. Every purge writes a "Data retention" entry to the
+Event Monitor and a "Last purge" line to Settings.
+
+Run it by hand, or from Windows Task Scheduler if you prefer that to the
+built-in schedule (add `--dry-run` to only report what would be removed):
+
+```
+java -cp Monitoring-Tool.jar service.MaintenanceService "D:\OpsTools\Data" --dry-run
+java -cp Monitoring-Tool.jar service.MaintenanceService "D:\OpsTools\Data"
+```
+
+Not covered: `daemon.log` and its rotated files are already limited by
+`logRotateMaxBytes` / `logRotateKeepFiles` in `app-config.xml`, and `app.db`
+(tasks, credentials, settings) is small and is not purged.

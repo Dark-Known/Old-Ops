@@ -522,7 +522,7 @@ public class RunHistoryPanel extends JPanel {
                 + (r.getReason() != null && !r.getReason().isEmpty() ? "  ·  " + r.getReason() : ""));
 
         String body = r.getDetails() != null && !r.getDetails().isEmpty()
-                ? r.getDetails() : "(no detail lines captured)";
+                ? r.getDetails() : "(no detail lines captured — the full run log may have been cleared by Data Retention in Settings; the summary above is kept)";
         detailArea.setText(body);
         detailArea.setCaretPosition(0);
 

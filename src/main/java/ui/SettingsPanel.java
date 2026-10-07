@@ -53,6 +53,12 @@ public class SettingsPanel extends JPanel {
     private javax.swing.JSpinner spinnerWatcherFilesPerThread;
     private javax.swing.JSpinner spinnerStaleThresholdMinutes;
     private javax.swing.JSpinner spinnerMaxConcurrentTaskThreads;
+
+    // Data retention (see service.MaintenanceService)
+    private JCheckBox chkPurgeEnabled;
+    private javax.swing.JSpinner spinnerPurgeHour, spinnerPurgeRunDays, spinnerPurgeEventDays,
+            spinnerPurgeDetailsDays, spinnerPurgeMaxDbMb, spinnerPurgeTaskLogDays, spinnerPurgeOrphanLogDays;
+    private JLabel lblPurgeStatus, lblRunHistorySize;
     public SettingsPanel(TransferService transferService) {
         this(transferService, null);
     }
@@ -178,6 +184,9 @@ public class SettingsPanel extends JPanel {
         daemonPanel.add(btnRow2, g);
 
         outer.add(card("Daemon", daemonPanel));
+        outer.add(Box.createVerticalStrut(12));
+
+        outer.add(card("Data Retention (keeps run history and logs from growing forever)", buildRetentionPanel()));
         outer.add(Box.createVerticalStrut(12));
 
         // App Info section
@@ -597,6 +606,116 @@ public class SettingsPanel extends JPanel {
         return card;
     }
 
+    /**
+     * \"Data Retention\" card. All values are live settings (see
+     * {@link AppSettings}); the daemon runs the purge once a day after the
+     * chosen hour. 0 turns an individual rule off.
+     */
+    private JPanel buildRetentionPanel() {
+        JPanel panel = new JPanel(new GridBagLayout());
+        panel.setBorder(new EmptyBorder(4, 4, 4, 4));
+        GridBagConstraints lc = new GridBagConstraints();
+        lc.anchor = GridBagConstraints.WEST; lc.insets = new Insets(4, 4, 4, 8);
+        GridBagConstraints fc = new GridBagConstraints();
+        fc.fill = GridBagConstraints.NONE; fc.weightx = 0; fc.anchor = GridBagConstraints.WEST;
+        fc.insets = new Insets(4, 0, 4, 4);
+
+        chkPurgeEnabled = new JCheckBox("Purge automatically once a day");
+        spinnerPurgeHour        = new javax.swing.JSpinner(new javax.swing.SpinnerNumberModel(3, 0, 23, 1));
+        spinnerPurgeRunDays     = new javax.swing.JSpinner(new javax.swing.SpinnerNumberModel(90, 0, 3650, 1));
+        spinnerPurgeEventDays   = new javax.swing.JSpinner(new javax.swing.SpinnerNumberModel(90, 0, 3650, 1));
+        spinnerPurgeDetailsDays = new javax.swing.JSpinner(new javax.swing.SpinnerNumberModel(0, 0, 3650, 1));
+        spinnerPurgeMaxDbMb     = new javax.swing.JSpinner(new javax.swing.SpinnerNumberModel(0, 0, 1_000_000, 50));
+        spinnerPurgeTaskLogDays = new javax.swing.JSpinner(new javax.swing.SpinnerNumberModel(30, 0, 3650, 1));
+        spinnerPurgeOrphanLogDays = new javax.swing.JSpinner(new javax.swing.SpinnerNumberModel(30, 0, 3650, 1));
+
+        int row = 0;
+        row = addFieldRow(panel, lc, fc, "", chkPurgeEnabled, row);
+        row = addFieldRow(panel, lc, fc, "Run time (hour of day, 0-23):", spinnerPurgeHour, row);
+        row = addFieldRow(panel, lc, fc, "Delete run history older than (days, 0=never):", spinnerPurgeRunDays, row);
+        row = addFieldRow(panel, lc, fc, "Delete activity/event feed older than (days, 0=never):", spinnerPurgeEventDays, row);
+        row = addFieldRow(panel, lc, fc, "Clear full run log text older than (days, 0=never):", spinnerPurgeDetailsDays, row);
+        row = addFieldRow(panel, lc, fc, "Max run history size (MB, 0=no limit):", spinnerPurgeMaxDbMb, row);
+        row = addFieldRow(panel, lc, fc, "Delete rotated task log files older than (days, 0=never):", spinnerPurgeTaskLogDays, row);
+        row = addFieldRow(panel, lc, fc, "Delete logs of deleted/renamed tasks idle for (days, 0=never):", spinnerPurgeOrphanLogDays, row);
+
+        JButton btnPurgeNow = new JButton("Purge now");
+        styleBtn(btnPurgeNow, AppTheme.EARTH_RUST);
+        btnPurgeNow.addActionListener(e -> purgeNow());
+        lblPurgeStatus = new JLabel(" ");
+        lblRunHistorySize = new JLabel(" ");
+        JPanel btnRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
+        btnRow.add(btnPurgeNow);
+        btnRow.add(lblRunHistorySize);
+        GridBagConstraints bc = new GridBagConstraints();
+        bc.gridx = 0; bc.gridy = row++; bc.gridwidth = 3; bc.anchor = GridBagConstraints.WEST;
+        bc.insets = new Insets(8, 4, 2, 4);
+        panel.add(btnRow, bc);
+        GridBagConstraints sc = new GridBagConstraints();
+        sc.gridx = 0; sc.gridy = row++; sc.gridwidth = 3; sc.anchor = GridBagConstraints.WEST;
+        sc.insets = new Insets(2, 4, 4, 4);
+        panel.add(lblPurgeStatus, sc);
+        return panel;
+    }
+
+    private File retentionDataDir() {
+        return scheduler != null ? scheduler.getStorage().getDataDir() : new File(resolveActualDataDir());
+    }
+
+    /** Refreshes the "last purge" line and the run_history.db size label from live state. */
+    private void refreshPurgeStatus() {
+        long last = AppSettings.getPurgeLastRunEpochMs();
+        if (last <= 0) {
+            lblPurgeStatus.setText("Last purge: never run yet.");
+        } else {
+            String when = java.time.LocalDateTime.ofInstant(java.time.Instant.ofEpochMilli(last),
+                    java.time.ZoneId.systemDefault()).format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm"));
+            lblPurgeStatus.setText("<html>Last purge: " + when + " &mdash; "
+                    + AppSettings.getPurgeLastResult().replace("<", "&lt;") + "</html>");
+        }
+        File db = new File(retentionDataDir(), "run_history.db");
+        lblRunHistorySize.setText("run_history.db is currently "
+                + (db.exists() ? String.format("%.1f MB", db.length() / 1048576.0) : "not created yet"));
+    }
+
+    /**
+     * Asks the daemon (the only process that owns the databases' writers)
+     * to run a purge right now, using the SAVED settings, then watches for
+     * its result to appear in the status line.
+     */
+    private void purgeNow() {
+        int ok = JOptionPane.showConfirmDialog(this,
+                "Permanently delete old run history and log files now,\n"
+                + "using the retention values currently SAVED in Settings?\n\n"
+                + "(Click Save Settings first if you changed any value above.)",
+                "Purge now", JOptionPane.OK_CANCEL_OPTION, JOptionPane.WARNING_MESSAGE);
+        if (ok != JOptionPane.OK_OPTION) return;
+
+        final long lastBefore = AppSettings.getPurgeLastRunEpochMs();
+        if (!service.CommandQueueService.enqueue(retentionDataDir(), "SYSTEM",
+                service.CommandQueueService.Action.PURGE_NOW, "gui")) {
+            lblPurgeStatus.setText("Could not queue the purge request (database unavailable).");
+            lblPurgeStatus.setForeground(Color.RED);
+            return;
+        }
+        lblPurgeStatus.setForeground(UIManager.getColor("Label.foreground"));
+        lblPurgeStatus.setText("Purge requested — waiting for the daemon...");
+        final long deadline = System.currentTimeMillis() + 60_000;
+        javax.swing.Timer poll = new javax.swing.Timer(2000, null);
+        poll.addActionListener(ev -> {
+            if (AppSettings.getPurgeLastRunEpochMs() > lastBefore) {
+                poll.stop();
+                refreshPurgeStatus();
+            } else if (System.currentTimeMillis() > deadline) {
+                poll.stop();
+                lblPurgeStatus.setText("The daemon did not respond within 60 s. Is the Ops Transfer Tool service running?"
+                        + " (If it is busy compacting a large database, check Last purge again in a minute.)");
+                lblPurgeStatus.setForeground(Color.RED);
+            }
+        });
+        poll.start();
+    }
+
     private int addFieldRow(JPanel panel, GridBagConstraints lc, GridBagConstraints fc, String label, JComponent field, int row) {
         lc.gridx = 0; lc.gridy = row;
         fc.gridx = 1; fc.gridy = row; fc.gridwidth = 2;
@@ -970,6 +1089,15 @@ public class SettingsPanel extends JPanel {
         spinnerWatcherFilesPerThread.setValue(AppSettings.getWatcherFilesPerWorkerThread());
         spinnerStaleThresholdMinutes.setValue(AppSettings.getStaleRunningThresholdMinutes());
         spinnerMaxConcurrentTaskThreads.setValue(AppSettings.getMaxConcurrentTaskThreads());
+        chkPurgeEnabled.setSelected(AppSettings.isPurgeEnabled());
+        spinnerPurgeHour.setValue(AppSettings.getPurgeHour());
+        spinnerPurgeRunDays.setValue(AppSettings.getPurgeRunHistoryDays());
+        spinnerPurgeEventDays.setValue(AppSettings.getPurgeEventHistoryDays());
+        spinnerPurgeDetailsDays.setValue(AppSettings.getPurgeRunDetailsDays());
+        spinnerPurgeMaxDbMb.setValue(AppSettings.getPurgeMaxDbMb());
+        spinnerPurgeTaskLogDays.setValue(AppSettings.getPurgeTaskLogDays());
+        spinnerPurgeOrphanLogDays.setValue(AppSettings.getPurgeOrphanLogDays());
+        refreshPurgeStatus();
     }
 
     /**
@@ -1086,6 +1214,14 @@ public class SettingsPanel extends JPanel {
                     String.valueOf((Integer) spinnerStaleThresholdMinutes.getValue()));
             live.put(AppSettings.KEY_MAX_CONCURRENT_TASK_THREADS,
                     String.valueOf((Integer) spinnerMaxConcurrentTaskThreads.getValue()));
+            live.put(AppSettings.KEY_PURGE_ENABLED, String.valueOf(chkPurgeEnabled.isSelected()));
+            live.put(AppSettings.KEY_PURGE_HOUR, String.valueOf((Integer) spinnerPurgeHour.getValue()));
+            live.put(AppSettings.KEY_PURGE_RUN_HISTORY_DAYS, String.valueOf((Integer) spinnerPurgeRunDays.getValue()));
+            live.put(AppSettings.KEY_PURGE_EVENT_HISTORY_DAYS, String.valueOf((Integer) spinnerPurgeEventDays.getValue()));
+            live.put(AppSettings.KEY_PURGE_RUN_DETAILS_DAYS, String.valueOf((Integer) spinnerPurgeDetailsDays.getValue()));
+            live.put(AppSettings.KEY_PURGE_MAX_DB_MB, String.valueOf((Integer) spinnerPurgeMaxDbMb.getValue()));
+            live.put(AppSettings.KEY_PURGE_TASK_LOG_DAYS, String.valueOf((Integer) spinnerPurgeTaskLogDays.getValue()));
+            live.put(AppSettings.KEY_PURGE_ORPHAN_LOG_DAYS, String.valueOf((Integer) spinnerPurgeOrphanLogDays.getValue()));
             // Poll interval always saved here regardless of WinSCP path below —
             // shared via app.db so the Daemon/service picks it up too.
             live.put(AppSettings.KEY_POLL_INTERVAL_SECONDS,

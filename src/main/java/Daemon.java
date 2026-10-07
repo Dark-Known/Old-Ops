@@ -1,5 +1,6 @@
 
 
+import service.MaintenanceService;
 import service.TaskSchedulerService;
 import service.TransferService;
 import service.XmlStorageService;
@@ -41,6 +42,7 @@ public class Daemon {
     private static String daemonLogPath;
     private static long maxLogBytes;
     private static int keepArchiveCount;
+    private static MaintenanceService maintenance;
 
     public static void main(String[] args) throws Exception {
 
@@ -96,6 +98,7 @@ public class Daemon {
         // ── Shutdown hook — flush logs on SIGTERM ────────────────────────────
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             log("Daemon shutting down — flushing logs");
+            if (maintenance != null) maintenance.stop();
             scheduler.stop();
             if (daemonLog != null) daemonLog.flush();
         }));
@@ -104,6 +107,14 @@ public class Daemon {
         scheduler.enableStatusExport(dataDir, "daemon");
         scheduler.start();
         log("Scheduler started — polling every " + pollInterval + " seconds");
+
+        // ── Data retention (daily purge of run history + task logs) ──────────
+        // Shares the scheduler's own RunHistoryService/TaskLogService so there is
+        // no second connection to run_history.db. Schedule and rules are live
+        // settings (Settings panel -> Data retention).
+        maintenance = new MaintenanceService(storage, scheduler.getRunHistoryService(),
+                scheduler.getLogService(), Daemon::log);
+        maintenance.start();
 
         // ── Start the GUI command poller ─────────────────────────────────────
         // Separate from the scheduling tick above (and deliberately much
@@ -161,6 +172,9 @@ public class Daemon {
                 case RESTART -> scheduler.restartTask(cmd.taskId());
                 case RECONNECT_WATCH -> scheduler.reconnectWatch(cmd.taskId());
                 case REFRESH -> scheduler.refresh();
+                case PURGE_NOW -> {
+                    if (maintenance != null) maintenance.runNowAsync("MANUAL");
+                }
             }
             log("Executed GUI command " + cmd.action() + " for task " + cmd.taskId()
                     + " (requested by " + cmd.requestedBy() + ")");
