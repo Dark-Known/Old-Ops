@@ -44,7 +44,6 @@ public final class CommandQueueService {
     private static final Logger log = Logger.getLogger(CommandQueueService.class.getName());
     private static final DateTimeFormatter TS = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS");
 
-    /** PURGE_NOW is not about a task: pass any non-empty id (e.g. "SYSTEM") for it. */
     public enum Action { RUN_NOW, CANCEL, RESTART, RECONNECT_WATCH, REFRESH, PURGE_NOW }
     public enum Status { PENDING, DONE, FAILED }
 

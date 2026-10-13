@@ -165,11 +165,15 @@ public class NotificationPanel extends JPanel {
     private void logActivity(String title, String detail) {
         if (scheduler == null || scheduler.getRunHistoryService() == null) return;
         LocalDateTime now = LocalDateTime.now();
-        try {
-            scheduler.getRunHistoryService().recordActivityEvent("HEALTH", title, null, detail, detail, now, now);
-        } catch (Exception ignored) {
-            // Best-effort — a failure to log this shouldn't block the actual action.
-        }
+        // Audit writes go through a single background thread (in order) so a busy
+        // SQLite connection can never freeze the UI on save.
+        Async.inOrder(() -> {
+            try {
+                scheduler.getRunHistoryService().recordActivityEvent("HEALTH", title, null, detail, detail, now, now);
+            } catch (Exception ignored) {
+                // Best-effort — a failure to log this shouldn't block the actual action.
+            }
+        });
     }
 
     /** Same as {@link #logActivity} but marks the event FAILED, logged under
@@ -178,12 +182,16 @@ public class NotificationPanel extends JPanel {
     private void logActivityFailed(String title, String detail) {
         if (scheduler == null || scheduler.getRunHistoryService() == null) return;
         LocalDateTime now = LocalDateTime.now();
-        try {
-            scheduler.getRunHistoryService().recordActivityEvent("TASKS", title, null,
-                    model.TaskRunRecord.Status.FAILED, detail, detail, now, now);
-        } catch (Exception ignored) {
-            // Best-effort — a failure to log this shouldn't block the actual action.
-        }
+        // Audit writes go through a single background thread (in order) so a busy
+        // SQLite connection can never freeze the UI on save.
+        Async.inOrder(() -> {
+            try {
+                scheduler.getRunHistoryService().recordActivityEvent("TASKS", title, null,
+                        model.TaskRunRecord.Status.FAILED, detail, detail, now, now);
+            } catch (Exception ignored) {
+                // Best-effort — a failure to log this shouldn't block the actual action.
+            }
+        });
     }
 
     private void snooze(String groupKey) {
@@ -212,19 +220,36 @@ public class NotificationPanel extends JPanel {
     /** One row in the merged feed — just enough to sort everything by time and render it. */
     private record FeedItem(LocalDateTime timestamp, boolean snoozed, JPanel card) {}
 
+    private record Loaded(List<TaskRunRecord> failures, List<ScheduledTask> tasks) {}
+
     private void refresh() {
+        // SQLite + task-store reads happen off the EDT (summary rows only: the
+        // full run log is fetched on demand when "view log" is clicked).
+        Async.latest(this, () -> {
+            List<TaskRunRecord> failures = List.of();
+            if (scheduler != null && scheduler.getRunHistoryService() != null) {
+                try {
+                    LocalDateTime since = LocalDateTime.now().minusHours(LOOKBACK_HOURS);
+                    failures = scheduler.getRunHistoryService()
+                            .queryRunSummaries(TaskRunRecord.Status.FAILED, since, QUERY_LIMIT);
+                } catch (Exception ignored) {
+                    // DB briefly locked by a write — next refresh will catch up
+                }
+            }
+            return new Loaded(failures, storage.loadTasks());
+        }, this::applyLoaded, e -> System.err.println("Health feed refresh failed: " + e));
+    }
+
+    private void applyLoaded(Loaded loaded) {
         feedList.removeAll();
 
         List<FeedItem> items = new ArrayList<>();
         int activeIssueCount = 0;
         int watcherCount = 0;
 
-        if (scheduler != null && scheduler.getRunHistoryService() != null) {
+        {
             try {
-                var history = scheduler.getRunHistoryService();
-                LocalDateTime now = LocalDateTime.now();
-                LocalDateTime since = now.minusHours(LOOKBACK_HOURS);
-                List<TaskRunRecord> failures = history.queryRuns(null, TaskRunRecord.Status.FAILED, since, null, QUERY_LIMIT);
+                List<TaskRunRecord> failures = loaded.failures();
                 Map<String, List<TaskRunRecord>> groups = IssueGrouping.groupByLikelyCause(failures);
                 for (var e : groups.entrySet()) {
                     boolean snoozed = isSnoozed(e.getKey());
@@ -238,7 +263,7 @@ public class NotificationPanel extends JPanel {
             }
         }
 
-        for (ScheduledTask task : storage.loadTasks()) {
+        for (ScheduledTask task : loaded.tasks()) {
             if ("SKIPPED".equals(task.getLastRunResult())) {
                 LocalDateTime ts = task.getLastStartedAt() != null ? task.getLastStartedAt() : task.getLastRunAt();
                 items.add(new FeedItem(ts != null ? ts : LocalDateTime.MIN, false, buildSkippedCard(task)));
@@ -489,7 +514,17 @@ public class NotificationPanel extends JPanel {
     // ------------------------------------------------------------------
 
     private void showRunDetail(TaskRunRecord record) {
-        JTextArea area = new JTextArea(record.getDetails() != null ? record.getDetails() : record.getReason());
+        var history = scheduler != null ? scheduler.getRunHistoryService() : null;
+        if (history == null) { showRunDetailDialog(record, record.getDetails()); return; }
+        // The list rows carry no run log; fetch the full one for just this run, off the EDT.
+        Async.call(() -> {
+            TaskRunRecord full = history.getRunById(record.getId());
+            return full != null && full.getDetails() != null ? full.getDetails() : record.getDetails();
+        }, details -> showRunDetailDialog(record, details), e -> showRunDetailDialog(record, record.getDetails()));
+    }
+
+    private void showRunDetailDialog(TaskRunRecord record, String details) {
+        JTextArea area = new JTextArea(details != null ? details : record.getReason());
         area.setEditable(false);
         area.setLineWrap(true);
         area.setWrapStyleWord(true);

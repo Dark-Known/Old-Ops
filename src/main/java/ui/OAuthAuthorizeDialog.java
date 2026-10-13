@@ -149,7 +149,7 @@ public class OAuthAuthorizeDialog extends JDialog {
                 }
             }
         };
-        worker.execute();
+        Async.execute("Authorize mailbox (device code)", true, true, worker);
     }
 
     /** Pulls the short alphanumeric sign-in code out of Microsoft's device-code prompt text. */

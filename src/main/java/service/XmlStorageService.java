@@ -133,9 +133,15 @@ public class XmlStorageService {
      * a credential something still depends on.
      */
     public int countTasksUsingCredential(String username) {
+        return countTasksUsingCredential(loadTasks(), username);
+    }
+
+    /** Same count over an already-loaded task list — lets callers that count many
+     *  credentials load the task table once instead of once per credential. */
+    public static int countTasksUsingCredential(List<ScheduledTask> tasks, String username) {
         if (username == null || username.isEmpty()) return 0;
         int count = 0;
-        for (ScheduledTask t : loadTasks()) {
+        for (ScheduledTask t : tasks) {
             if (username.equals(t.getTargetUsername())
                     || username.equals(t.getBackupSourceUsername())
                     || username.equals(t.getBackupDestinationUsername())) {

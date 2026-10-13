@@ -38,7 +38,7 @@ public record MonitorEvent(
         String suggestedAction) {
 
     /** Which history table a row lives in — their id sequences are independent. */
-    public enum Table { RUN, ACTIVITY }
+    public enum Table { RUN, ACTIVITY, BACKGROUND }
 
     /** Globally unique key for this event (table + row id). */
     public String key() {
@@ -65,6 +65,6 @@ public record MonitorEvent(
 
     /** Task id values used for application-level notes that are not about any one task. */
     public boolean isSystemNote() {
-        return kind.category() == EventKind.Category.SYSTEM;
+        return kind.category().taskless();
     }
 }

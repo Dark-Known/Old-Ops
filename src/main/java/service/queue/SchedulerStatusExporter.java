@@ -48,6 +48,18 @@ public final class SchedulerStatusExporter {
                         List<SchedulerStatusSnapshot.FireEntry> fireEntries,
                         List<String> runningTaskIds,
                         List<SchedulerStatusSnapshot.SessionEntry> sessionEntries) {
+        export(poolSize, activeWorkers, pending, activity, watchEntries, fireEntries, runningTaskIds, sessionEntries,
+                java.util.Collections.emptyList(), java.util.Collections.emptyList());
+    }
+
+    /** As above, plus what each worker is running and the process's lane/job lines for the GUI tooltip. */
+    public void export(int poolSize, int activeWorkers, List<TaskDueEvent> pending,
+                        List<TaskWorkerPool.ActivityEntry> activity,
+                        List<SchedulerStatusSnapshot.WatchEntry> watchEntries,
+                        List<SchedulerStatusSnapshot.FireEntry> fireEntries,
+                        List<String> runningTaskIds,
+                        List<SchedulerStatusSnapshot.SessionEntry> sessionEntries,
+                        List<TaskWorkerPool.InFlightTask> inFlight, List<String> liveLines) {
         try {
             StringBuilder sb = new StringBuilder(512);
             sb.append("PROC|").append(SchedulerStatusSnapshot.escape(processLabel)).append('|')
@@ -89,6 +101,14 @@ public final class SchedulerStatusExporter {
                             .append(s.count()).append('\n');
                 }
             }
+
+            for (TaskWorkerPool.InFlightTask t : inFlight) {
+                sb.append("T|").append(SchedulerStatusSnapshot.escape(t.taskId())).append('|')
+                        .append(SchedulerStatusSnapshot.escape(t.thread())).append('|')
+                        .append(toEpochMillis(t.startedAt())).append('\n');
+            }
+            sb.append("B|").append(service.Workers.busyBackground()).append('\n');
+            for (String l : liveLines) sb.append("L|").append(SchedulerStatusSnapshot.escape(l)).append('\n');
 
             Path dir = targetFile.toAbsolutePath().getParent();
             if (dir != null) Files.createDirectories(dir);

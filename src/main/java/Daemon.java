@@ -1,6 +1,5 @@
 
 
-import service.MaintenanceService;
 import service.TaskSchedulerService;
 import service.TransferService;
 import service.XmlStorageService;
@@ -42,7 +41,6 @@ public class Daemon {
     private static String daemonLogPath;
     private static long maxLogBytes;
     private static int keepArchiveCount;
-    private static MaintenanceService maintenance;
 
     public static void main(String[] args) throws Exception {
 
@@ -52,6 +50,7 @@ public class Daemon {
                 : loadDataDirFromConfig();
 
         new File(dataDir).mkdirs();
+        service.BackgroundLogService.setProcessLabel("Daemon"); // background-log rows say which process wrote them
 
         // ── Set up file logging ──────────────────────────────────────────────
         String logPath = dataDir + File.separator + daemonLogFileName();
@@ -98,7 +97,6 @@ public class Daemon {
         // ── Shutdown hook — flush logs on SIGTERM ────────────────────────────
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             log("Daemon shutting down — flushing logs");
-            if (maintenance != null) maintenance.stop();
             scheduler.stop();
             if (daemonLog != null) daemonLog.flush();
         }));
@@ -108,22 +106,12 @@ public class Daemon {
         scheduler.start();
         log("Scheduler started — polling every " + pollInterval + " seconds");
 
-        // ── Data retention (daily purge of run history + task logs) ──────────
-        // Shares the scheduler's own RunHistoryService/TaskLogService so there is
-        // no second connection to run_history.db. Schedule and rules are live
-        // settings (Settings panel -> Data retention).
-        maintenance = new MaintenanceService(storage, scheduler.getRunHistoryService(),
-                scheduler.getLogService(), Daemon::log);
-        maintenance.start();
-
         // ── Start the GUI command poller ─────────────────────────────────────
         // Separate from the scheduling tick above (and deliberately much
         // faster — 3s vs. the scheduler's own 60s-ish poll interval) so a
         // "Run now" click from a thin GUI that owns no scheduler of its own
         // feels responsive, without coupling the two poll loops together.
-        Thread commandPoller = new Thread(() -> runCommandPollerLoop(dataDir, scheduler), "gui-command-poller");
-        commandPoller.setDaemon(true);
-        commandPoller.start();
+        service.Workers.service("gui-command-poller", () -> runCommandPollerLoop(dataDir, scheduler));
         log("Command poller started — checking for GUI-requested actions every 3 seconds");
 
         // ── Keep alive ───────────────────────────────────────────────────────
@@ -172,9 +160,8 @@ public class Daemon {
                 case RESTART -> scheduler.restartTask(cmd.taskId());
                 case RECONNECT_WATCH -> scheduler.reconnectWatch(cmd.taskId());
                 case REFRESH -> scheduler.refresh();
-                case PURGE_NOW -> {
-                    if (maintenance != null) maintenance.runNowAsync("MANUAL");
-                }
+                // Queued as a system job: a task worker (not this poller thread) does the actual purge.
+                case PURGE_NOW -> scheduler.requestPurge("manual (from GUI)");
             }
             log("Executed GUI command " + cmd.action() + " for task " + cmd.taskId()
                     + " (requested by " + cmd.requestedBy() + ")");
@@ -255,27 +242,9 @@ public class Daemon {
      * via {@link TaskSchedulerService#setLogCallback}, which only ever went
      * to the non-rotating file.
      */
-    private static long readConfiguredMaxBytes() {
-        String raw = util.AppConfig.readValue("logRotateMaxBytes");
-        if (raw != null) {
-            try {
-                long v = Long.parseLong(raw.trim());
-                if (v > 0) return v;
-            } catch (NumberFormatException ignored) { /* fall through to default */ }
-        }
-        return 10 * 1024; // 10 KB default, matching app-config.xml's shipped value
-    }
+    private static long readConfiguredMaxBytes() { return service.TaskLogService.configuredMaxBytes(); }
 
-    private static int readConfiguredKeepCount() {
-        String raw = util.AppConfig.readValue("logRotateKeepFiles");
-        if (raw != null) {
-            try {
-                int v = Integer.parseInt(raw.trim());
-                if (v > 0) return v;
-            } catch (NumberFormatException ignored) { /* fall through to default */ }
-        }
-        return 5;
-    }
+    private static int readConfiguredKeepCount() { return service.TaskLogService.configuredKeepCount(); }
 
     /**
      * Maps the app's DEBUG/INFO/WARN/ERROR log level (as configured in the

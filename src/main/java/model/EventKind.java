@@ -41,13 +41,23 @@ public enum EventKind {
     // ── System / audit ───────────────────────────────────────────────
     CONFIG_CHANGE    ("Config change",    Category.SYSTEM, Severity.INFO),
     HEALTH           ("Health",           Category.SYSTEM, Severity.WARN),
-    SYSTEM_ERROR     ("System error",     Category.SYSTEM, Severity.ERROR);
+    SYSTEM_ERROR     ("System error",     Category.SYSTEM, Severity.ERROR),
+
+    // ── Background work (the app's own worker threads) ───────────────
+    BACKGROUND_STARTED  ("Background job started",  Category.BACKGROUND, Severity.INFO),
+    BACKGROUND_COMPLETED("Background job finished", Category.BACKGROUND, Severity.INFO),
+    BACKGROUND_FAILED   ("Background job failed",   Category.BACKGROUND, Severity.ERROR),
+    BACKGROUND_SLOW     ("Slow background job",     Category.BACKGROUND, Severity.WARN),
+    FEED_STARTED        ("Live feed started",       Category.BACKGROUND, Severity.INFO),
+    UI_STALL            ("UI stall",                Category.BACKGROUND, Severity.WARN);
 
     public enum Category {
-        RUN("Runs"), WATCH("Watchers"), QUEUE("Queue"), SYSTEM("System");
+        RUN("Runs"), WATCH("Watchers"), QUEUE("Queue"), SYSTEM("System"), BACKGROUND("Background");
         private final String label;
         Category(String label) { this.label = label; }
         public String label() { return label; }
+        /** True for categories whose events are not about any one scheduled task. */
+        public boolean taskless() { return this == SYSTEM || this == BACKGROUND; }
     }
 
     /** Ordered least → most severe so {@code compareTo} can be used for "at least this level". */

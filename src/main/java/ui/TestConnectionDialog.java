@@ -78,7 +78,7 @@ public final class TestConnectionDialog {
 
         final ConnectionTestService.Result[] holder = new ConnectionTestService.Result[1];
 
-        new SwingWorker<ConnectionTestService.Result, Void>() {
+        Async.execute("Test SFTP connection", true, false, new SwingWorker<ConnectionTestService.Result, Void>() {
             @Override protected ConnectionTestService.Result doInBackground() {
                 return ConnectionTestService.testSftp(host, username, password);
             }
@@ -109,7 +109,7 @@ public final class TestConnectionDialog {
                 btnClose.setEnabled(true);
                 dlg.getRootPane().setDefaultButton(btnClose);
             }
-        }.execute();
+        });
 
         dlg.setVisible(true); // blocks (modal) until Close is clicked
         return holder[0];

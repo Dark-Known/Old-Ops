@@ -77,16 +77,12 @@ public class RunHistoryService {
             new java.util.concurrent.CopyOnWriteArrayList<>();
 
     public RunHistoryService(String dataDir) {
-        File dbFile = new File(dataDir, "run_history.db");
-        this.dbFile = dbFile;
+        this.dbFile = new File(dataDir, "run_history.db");
         Connection c = null;
         try {
             Class.forName("org.sqlite.JDBC");
             c = DriverManager.getConnection("jdbc:sqlite:" + dbFile.getAbsolutePath());
             try (Statement st = c.createStatement()) {
-                // The GUI and the daemon each hold a connection to this file; wait
-                // briefly for a lock (e.g. during a purge/VACUUM) instead of failing.
-                st.execute("PRAGMA busy_timeout=5000");
                 migrateLegacyTaskRunsTable(c, st);
                 createTable(st, RUN_TABLE);
                 createTable(st, ACTIVITY_TABLE);
@@ -127,6 +123,12 @@ public class RunHistoryService {
         addColumnIfMissing(st, table, "run_key", "TEXT");
         addColumnIfMissing(st, table, "trigger_src", "TEXT");
         st.execute("CREATE INDEX IF NOT EXISTS idx_" + table + "_run_key ON " + table + "(run_key)");
+        // Covering index for querySummaries(): every selected column lives in the index,
+        // so SQLite never has to read the table's overflow pages (the multi-KB `details`
+        // run log) just to list recent rows. Built once, then maintained incrementally.
+        st.execute("CREATE INDEX IF NOT EXISTS idx_" + table + "_summary ON " + table
+                + "(started_at, id, task_id, task_name, task_type, status, reason, ended_at, duration_ms,"
+                + " failure_category, retryable, suggested_action, event_kind, run_key, trigger_src)");
     }
 
     /**
@@ -573,21 +575,32 @@ public class RunHistoryService {
         return querySummaries(RUN_TABLE, from, limit);
     }
 
+    /** Like {@link #queryRunSummaries(LocalDateTime, int)} but restricted to one status (e.g. FAILED). */
+    public synchronized List<TaskRunRecord> queryRunSummaries(TaskRunRecord.Status status, LocalDateTime from, int limit) {
+        return querySummaries(RUN_TABLE, status, from, limit);
+    }
+
     /** Activity-table counterpart of {@link #queryRunSummaries}. */
     public synchronized List<TaskRunRecord> queryActivitySummaries(LocalDateTime from, int limit) {
         return querySummaries(ACTIVITY_TABLE, from, limit);
     }
 
     private List<TaskRunRecord> querySummaries(String table, LocalDateTime from, int limit) {
+        return querySummaries(table, null, from, limit);
+    }
+
+    private List<TaskRunRecord> querySummaries(String table, TaskRunRecord.Status status, LocalDateTime from, int limit) {
         List<TaskRunRecord> results = new ArrayList<>();
         if (conn == null) return results;
         StringBuilder sql = new StringBuilder("SELECT id, task_id, task_name, task_type, status, reason, started_at, "
                 + "ended_at, duration_ms, failure_category, retryable, suggested_action, event_kind, run_key, trigger_src "
                 + "FROM " + table + " WHERE 1=1");
+        if (status != null) sql.append(" AND status = ?");
         if (from != null) sql.append(" AND started_at >= ?");
         sql.append(" ORDER BY started_at DESC, id DESC LIMIT ?");
         try (PreparedStatement ps = conn.prepareStatement(sql.toString())) {
             int i = 1;
+            if (status != null) ps.setString(i++, status.name());
             if (from != null) ps.setString(i++, from.format(TS_FMT));
             ps.setInt(i, limit);
             try (ResultSet rs = ps.executeQuery()) {
@@ -600,238 +613,69 @@ public class RunHistoryService {
     }
 
     /**
-     * Deletes rows older than {@code keepDays} days from both tables. Kept
-     * for existing callers (no VACUUM, so it is cheap enough for startup);
-     * {@link #purge} is the full retention routine (separate windows per
-     * table, log clearing, size cap, VACUUM).
+     * Deletes rows older than {@code keepDays} days from both tables. Call
+     * periodically (e.g. once at app startup) to keep the database from
+     * growing unbounded — event_monitor_history in particular accumulates
+     * much faster than run_history now that every task start and every
+     * watcher detection scan is its own row there.
      */
-    public void pruneOlderThan(int keepDays) {
-        pruneOlderThan(keepDays, keepDays);
-    }
-
-    /** Same, with a separate window per table; 0 leaves that table alone. */
-    public void pruneOlderThan(int runDays, int eventDays) {
+    public synchronized void pruneOlderThan(int keepDays) {
         if (conn == null) return;
-        try {
-            long runs = runDays > 0 ? deleteOlder(RUN_TABLE, cutoff(runDays), false) : 0;
-            long events = eventDays > 0 ? deleteOlder(ACTIVITY_TABLE, cutoff(eventDays), false) : 0;
-            if (runs + events > 0) {
-                log.info("Pruned " + runs + " run row(s) and " + events + " event row(s)");
+        String cutoff = LocalDateTime.now().minusDays(keepDays).format(TS_FMT);
+        for (String table : new String[]{RUN_TABLE, ACTIVITY_TABLE}) {
+            try (PreparedStatement ps = conn.prepareStatement("DELETE FROM " + table + " WHERE started_at < ?")) {
+                ps.setString(1, cutoff);
+                int deleted = ps.executeUpdate();
+                if (deleted > 0) {
+                    log.info("Pruned " + deleted + " rows older than " + keepDays + " days from " + table);
+                }
+            } catch (SQLException e) {
+                log.log(Level.WARNING, "Failed to prune old rows from " + table, e);
             }
-        } catch (SQLException e) {
-            log.log(Level.WARNING, "Failed to prune old rows", e);
-        }
-    }
-
-    // ── Retention / purge ────────────────────────────────────────────────
-
-    /** What one {@link #purge} call did (or, for a dry run, would do). */
-    public static final class PurgeReport {
-        public long runRowsDeleted;
-        public long eventRowsDeleted;
-        public long detailsCleared;
-        public long sizeCapRowsDeleted;
-        public long fileBytesBefore;
-        public long fileBytesAfter;
-        public boolean vacuumed;
-        public String note = "";   // e.g. why VACUUM was skipped
-        public boolean dryRun;
-
-        public long totalRowsDeleted() { return runRowsDeleted + eventRowsDeleted + sizeCapRowsDeleted; }
-    }
-
-    private static final int PURGE_BATCH_ROWS = 5000;
-
-    /**
-     * Applies the retention rules to {@code run_history.db}. A rule with a
-     * value of 0 is skipped.
-     *
-     * <ol>
-     *   <li>delete {@code run_history} rows older than {@code runDays},</li>
-     *   <li>delete {@code event_monitor_history} rows older than {@code eventDays},</li>
-     *   <li>clear the full captured run log ({@code details}, the bulk of the
-     *       file) on {@code run_history} rows older than {@code detailsDays},
-     *       keeping the summary row,</li>
-     *   <li>if the live data is still above {@code maxDbMb}, delete the oldest
-     *       rows (events first) until it fits,</li>
-     *   <li>VACUUM, because SQLite never shrinks the file on DELETE alone.</li>
-     * </ol>
-     *
-     * Work is done in small batches, each taking this service's lock
-     * separately, so a running task is never blocked from recording its
-     * outcome for more than one batch (VACUUM is the one exception: it holds
-     * the lock for as long as it takes to rewrite the file).
-     *
-     * @param dryRun count what would be removed; change nothing
-     */
-    public PurgeReport purge(int runDays, int eventDays, int detailsDays, int maxDbMb, boolean dryRun) {
-        PurgeReport r = new PurgeReport();
-        r.dryRun = dryRun;
-        if (conn == null) { r.note = "database not available"; return r; }
-        r.fileBytesBefore = dbFile.length();
-        try {
-            if (runDays > 0) r.runRowsDeleted = deleteOlder(RUN_TABLE, cutoff(runDays), dryRun);
-            if (eventDays > 0) r.eventRowsDeleted = deleteOlder(ACTIVITY_TABLE, cutoff(eventDays), dryRun);
-            if (detailsDays > 0) r.detailsCleared = clearDetailsOlder(cutoff(detailsDays), dryRun);
-
-            if (maxDbMb > 0 && !dryRun) {
-                r.sizeCapRowsDeleted = enforceSizeCap(maxDbMb * 1024L * 1024L);
-            } else if (maxDbMb > 0) {
-                r.note = "size cap not simulated in dry run";
-            }
-
-            if (!dryRun) {
-                r.vacuumed = vacuumIfWorthIt(r);
-            }
-        } catch (SQLException e) {
-            log.log(Level.WARNING, "Purge of run history failed part-way", e);
-            r.note = "failed: " + e.getMessage();
-        }
-        r.fileBytesAfter = dbFile.length();
-        if (r.totalRowsDeleted() > 0 || r.detailsCleared > 0) {
-            log.info((dryRun ? "[dry run] would purge " : "Purged ") + r.runRowsDeleted + " run row(s), "
-                    + r.eventRowsDeleted + " event row(s), cleared " + r.detailsCleared + " run log(s), "
-                    + r.sizeCapRowsDeleted + " row(s) for size cap");
-        }
-        return r;
-    }
-
-    private static String cutoff(int days) {
-        return LocalDateTime.now().minusDays(days).format(TS_FMT);
-    }
-
-    private long deleteOlder(String table, String cutoff, boolean dryRun) throws SQLException {
-        if (dryRun) return countWhere(table, "started_at < ?", cutoff);
-        long total = 0;
-        int n;
-        do {
-            n = deleteBatchOlder(table, cutoff);
-            total += n;
-        } while (n >= PURGE_BATCH_ROWS);
-        return total;
-    }
-
-    private synchronized int deleteBatchOlder(String table, String cutoff) throws SQLException {
-        try (PreparedStatement ps = conn.prepareStatement("DELETE FROM " + table
-                + " WHERE id IN (SELECT id FROM " + table + " WHERE started_at < ? LIMIT ?)")) {
-            ps.setString(1, cutoff);
-            ps.setInt(2, PURGE_BATCH_ROWS);
-            return ps.executeUpdate();
-        }
-    }
-
-    private long clearDetailsOlder(String cutoff, boolean dryRun) throws SQLException {
-        final String cond = "started_at < ? AND details IS NOT NULL";
-        if (dryRun) return countWhere(RUN_TABLE, cond, cutoff);
-        long total = 0;
-        int n;
-        do {
-            n = clearDetailsBatch(cutoff);
-            total += n;
-        } while (n >= PURGE_BATCH_ROWS);
-        return total;
-    }
-
-    private synchronized int clearDetailsBatch(String cutoff) throws SQLException {
-        try (PreparedStatement ps = conn.prepareStatement("UPDATE " + RUN_TABLE + " SET details = NULL"
-                + " WHERE id IN (SELECT id FROM " + RUN_TABLE
-                + " WHERE started_at < ? AND details IS NOT NULL LIMIT ?)")) {
-            ps.setString(1, cutoff);
-            ps.setInt(2, PURGE_BATCH_ROWS);
-            return ps.executeUpdate();
-        }
-    }
-
-    private synchronized long countWhere(String table, String where, String param) throws SQLException {
-        try (PreparedStatement ps = conn.prepareStatement("SELECT COUNT(*) FROM " + table + " WHERE " + where)) {
-            ps.setString(1, param);
-            try (ResultSet rs = ps.executeQuery()) { return rs.next() ? rs.getLong(1) : 0; }
-        }
-    }
-
-    /** Bytes of actual data (file size minus pages already freed by DELETE but not yet VACUUMed). */
-    private synchronized long liveBytes() throws SQLException {
-        long pages = pragmaLong("page_count"), free = pragmaLong("freelist_count"), size = pragmaLong("page_size");
-        return Math.max(0, pages - free) * size;
-    }
-
-    private long pragmaLong(String name) throws SQLException {
-        try (Statement st = conn.createStatement(); ResultSet rs = st.executeQuery("PRAGMA " + name)) {
-            return rs.next() ? rs.getLong(1) : 0;
         }
     }
 
     /**
-     * Deletes the oldest rows (event table first, then runs) until live data
-     * fits {@code capBytes}. Each step deletes just enough of the oldest rows
-     * to cover the remaining excess, judged by their stored text size, and
-     * re-measures, so it neither overshoots by much nor wastes passes on rows
-     * that are already tiny (e.g. ones whose run log was cleared).
+     * Purges both tables to the given retention policy (age and/or size), oldest rows first.
+     * Runs in short chunks that release this service's lock between them, so recording and
+     * querying carry on during a large purge. Meant to be called from a worker thread.
      */
-    private long enforceSizeCap(long capBytes) throws SQLException {
-        long deleted = 0;
-        for (int i = 0; i < 100; i++) {
-            long excess = liveBytes() - capBytes;
-            if (excess <= 0) return deleted;
-            long n = deleteOldestBytes(ACTIVITY_TABLE, excess);
-            if (n == 0) n = deleteOldestBytes(RUN_TABLE, excess);
-            if (n == 0) break;   // nothing left to delete
-            deleted += n;
-        }
-        if (liveBytes() > capBytes) {
-            log.warning("run_history.db still above the " + (capBytes / 1024 / 1024)
-                    + " MB cap after deleting everything deletable");
-        }
-        return deleted;
+    public PurgeResult purge(PurgePolicy policy, java.util.function.BooleanSupplier cancelled) {
+        return SqlitePurge.run("Run history", this, conn, dbFile, List.of(RUN_TABLE, ACTIVITY_TABLE), policy, cancelled);
     }
 
-    /** Deletes oldest rows of {@code table} until their estimated size reaches {@code needBytes} (at most 20,000 rows per call). */
-    private synchronized long deleteOldestBytes(String table, long needBytes) throws SQLException {
-        List<Long> ids = new ArrayList<>();
-        long acc = 0;
-        try (Statement st = conn.createStatement();
-             ResultSet rs = st.executeQuery("SELECT id, 150 + COALESCE(length(CAST(details AS BLOB)),0)"
-                     + " + COALESCE(length(CAST(reason AS BLOB)),0) + COALESCE(length(CAST(task_name AS BLOB)),0)"
-                     + " FROM " + table + " ORDER BY started_at ASC, id ASC LIMIT 20000")) {
-            while (acc < needBytes && rs.next()) {
-                ids.add(rs.getLong(1));
-                acc += rs.getLong(2);
-            }
-        }
-        if (ids.isEmpty()) return 0;
-        boolean prior = conn.getAutoCommit();
-        conn.setAutoCommit(false);
-        try (PreparedStatement ps = conn.prepareStatement("DELETE FROM " + table + " WHERE id = ?")) {
-            for (long id : ids) { ps.setLong(1, id); ps.addBatch(); }
-            ps.executeBatch();
-            conn.commit();
+    /** On-disk size of the run-history database (file plus write-ahead log). */
+    public long sizeBytes() { return SqlitePurge.fileBytes(dbFile); }
+
+    /**
+     * Background-thread events used to be stored in this database. They now live in their own
+     * (see {@link BackgroundLogService}); this returns any that are still here so they can be moved.
+     */
+    public synchronized List<TaskRunRecord> listLegacyBackgroundRows() {
+        List<TaskRunRecord> out = new ArrayList<>();
+        if (conn == null) return out;
+        try (PreparedStatement ps = conn.prepareStatement("SELECT * FROM " + ACTIVITY_TABLE
+                + " WHERE task_id = ? ORDER BY id")) {
+            ps.setString(1, BackgroundLogService.TASK_ID);
+            try (ResultSet rs = ps.executeQuery()) { while (rs.next()) out.add(mapRow(rs)); }
         } catch (SQLException e) {
-            conn.rollback();
-            throw e;
-        } finally {
-            conn.setAutoCommit(prior);
+            log.log(Level.WARNING, "Failed to list legacy background rows", e);
         }
-        return ids.size();
+        return out;
     }
 
-    /** VACUUM when at least 1 MB (and 10%) of the file is free pages. Never throws: a busy database just skips it until next run. */
-    private synchronized boolean vacuumIfWorthIt(PurgeReport r) {
-        try {
-            long freeBytes = pragmaLong("freelist_count") * pragmaLong("page_size");
-            long fileBytes = dbFile.length();
-            if (freeBytes < 1024 * 1024 || freeBytes * 10 < fileBytes) return false;
-            try (Statement st = conn.createStatement()) { st.execute("VACUUM"); }
-            return true;
+    /** Deletes the legacy background rows with id up to and including {@code maxId}. */
+    public synchronized int deleteLegacyBackgroundRows(long maxId) {
+        if (conn == null) return 0;
+        try (PreparedStatement ps = conn.prepareStatement("DELETE FROM " + ACTIVITY_TABLE
+                + " WHERE task_id = ? AND id <= ?")) {
+            ps.setString(1, BackgroundLogService.TASK_ID);
+            ps.setLong(2, maxId);
+            return ps.executeUpdate();
         } catch (SQLException e) {
-            r.note = (r.note.isEmpty() ? "" : r.note + "; ") + "VACUUM skipped: " + e.getMessage();
-            log.log(Level.WARNING, "VACUUM of run_history.db skipped", e);
-            return false;
+            log.log(Level.WARNING, "Failed to delete legacy background rows", e);
+            return 0;
         }
-    }
-
-    /** Current size of run_history.db on disk, in bytes (0 if missing). */
-    public long fileSizeBytes() {
-        return dbFile.length();
     }
 
     private TaskRunRecord mapRow(ResultSet rs) throws SQLException {

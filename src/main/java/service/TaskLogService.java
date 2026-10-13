@@ -3,6 +3,7 @@ package service;
 import util.AppSettings;
 
 import java.io.*;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
@@ -47,28 +48,34 @@ public class TaskLogService {
     public TaskLogService(String dataDir) {
         this.logsDir = new File(dataDir, "logs");
         this.logsDir.mkdirs();
-        this.maxLogSizeBytes = readConfiguredMaxBytes();
-        this.keepArchiveCount = readConfiguredKeepCount();
+        this.maxLogSizeBytes = configuredMaxBytes();
+        this.keepArchiveCount = configuredKeepCount();
     }
 
-    private static long readConfiguredMaxBytes() {
-        String raw = util.AppConfig.readValue("logRotateMaxBytes");
-        if (raw != null) {
-            try {
-                long v = Long.parseLong(raw.trim());
-                if (v > 0) return v;
-            } catch (NumberFormatException ignored) { /* fall through to default */ }
+    /**
+     * Rotation size in bytes. Precedence: {@code <logRotateMaxBytes>} (exact bytes, handy for tests),
+     * then {@code <maxLogSizeMB>} (the key the shipped app-config.xml actually defines), then 10 MB.
+     * This used to read only logRotateMaxBytes — which the shipped config never defines — so every
+     * task log silently rotated at a 10 KB fallback and the Logs view showed only a tiny tail.
+     */
+    public static long configuredMaxBytes() {
+        String bytes = util.AppConfig.readValue("logRotateMaxBytes");
+        if (bytes != null) {
+            try { long v = Long.parseLong(bytes.trim()); if (v > 0) return v; } catch (NumberFormatException ignored) { }
         }
-        return 10 * 1024; // 10 KB default, matching app-config.xml's shipped value
+        String mb = util.AppConfig.readValue("maxLogSizeMB");
+        if (mb != null) {
+            try { double v = Double.parseDouble(mb.trim()); if (v > 0) return (long) (v * 1024 * 1024); } catch (NumberFormatException ignored) { }
+        }
+        return 10L * 1024 * 1024;
     }
 
-    private static int readConfiguredKeepCount() {
-        String raw = util.AppConfig.readValue("logRotateKeepFiles");
-        if (raw != null) {
-            try {
-                int v = Integer.parseInt(raw.trim());
-                if (v > 0) return v;
-            } catch (NumberFormatException ignored) { /* fall through to default */ }
+    /** Rotated files kept per task: {@code <logRotateKeepFiles>}, then {@code <maxLogFiles>}, then 5. */
+    public static int configuredKeepCount() {
+        for (String key : new String[] { "logRotateKeepFiles", "maxLogFiles" }) {
+            String raw = util.AppConfig.readValue(key);
+            if (raw == null) continue;
+            try { int v = Integer.parseInt(raw.trim()); if (v > 0) return v; } catch (NumberFormatException ignored) { }
         }
         return 5;
     }
@@ -126,11 +133,15 @@ public class TaskLogService {
             // for this task BEFORE renaming, so the next write below opens a
             // fresh writer against a new, empty task.log.
             if (logFile.exists() && logFile.length() > maxLogSizeBytes) {
-                PrintWriter existing = openWriters.remove(taskId);
+                PrintWriter existing = openWriters.remove(logFile.getAbsolutePath());
                 if (existing != null) existing.close();
 
-                String rotatedName = "task-" + LocalDateTime.now().format(FILE_FMT) + ".log";
-                File rotatedFile = new File(taskDir, rotatedName);
+                // Millisecond resolution plus a collision counter: with whole-second names, several
+                // rotations inside one second overwrote each other and that part of the log was lost.
+                String base = "task-" + LocalDateTime.now().format(FILE_FMT) + "-"
+                        + String.format("%03d", System.currentTimeMillis() % 1000);
+                File rotatedFile = new File(taskDir, base + ".log");
+                for (int n = 1; rotatedFile.exists() && n < 1000; n++) rotatedFile = new File(taskDir, base + "-" + n + ".log");
                 if (logFile.renameTo(rotatedFile)) {
                     cleanupOldLogs(taskId, taskName, keepArchiveCount);
                 } else {
@@ -143,9 +154,12 @@ public class TaskLogService {
             String line = "[" + LocalDateTime.now().format(DT_FMT) + "] " + message;
 
 
-            PrintWriter pw = openWriters.computeIfAbsent(taskId, k -> {
+            // Keyed by the file path (not the task id): renaming a task moves its folder, and a
+            // writer cached by id would keep appending to the old folder where nothing reads it.
+            PrintWriter pw = openWriters.computeIfAbsent(logFile.getAbsolutePath(), k -> {
                 try {
-                    return new PrintWriter(new FileWriter(logFile, true));
+                    return new PrintWriter(new java.io.OutputStreamWriter(
+                            new java.io.FileOutputStream(logFile, true), StandardCharsets.UTF_8));
                 } catch (IOException e) {
                     System.err.println("Failed to open log for task " + taskId + ": " + e.getMessage());
                     return null;
@@ -183,34 +197,97 @@ public class TaskLogService {
     }
     
     /**
-     * Retrieve all log lines for a task from the current log file.
+     * Retrieve all log lines for a task from the current log file. Decoded leniently: one stray
+     * byte (a log written by an older build in the platform charset) no longer makes the whole
+     * file unreadable.
      */
     public List<String> getTaskLogs(String taskId, String taskName) {
-        List<String> lines = new ArrayList<>();
+        File logFile = new File(new File(logsDir, folderNameFor(taskId, taskName)), "task.log");
         try {
-            File taskDir = new File(logsDir, folderNameFor(taskId, taskName));
-            File logFile = new File(taskDir, "task.log");
-            
-            if (logFile.exists()) {
-                lines = Files.readAllLines(logFile.toPath());
+            return logFile.exists() ? tailLines(logFile, Integer.MAX_VALUE) : new ArrayList<>();
+        } catch (Exception e) {
+            List<String> lines = new ArrayList<>();
+            lines.add("[ERROR] Failed to read logs: " + e.getMessage());
+            return lines;
+        }
+    }
+
+    /** The last N lines of the current log file only. */
+    public List<String> getTaskLogsLastN(String taskId, String taskName, int maxLines) {
+        return getTaskLogsRecent(taskId, taskName, maxLines);
+    }
+
+    /**
+     * The last {@code maxLines} lines of the task's log <b>across rotations</b>: the current file
+     * first, then the newest archives until enough lines are found, returned oldest-first. A run
+     * that straddles a rotation is shown whole instead of being cut where the file rolled over.
+     * Only the tail of each file is read, so this stays cheap on a multi-megabyte log.
+     */
+    public List<String> getTaskLogsRecent(String taskId, String taskName, int maxLines) {
+        List<String> out = new ArrayList<>();
+        try {
+            File dir = new File(logsDir, folderNameFor(taskId, taskName));
+            List<File> newestFirst = new ArrayList<>();
+            File current = new File(dir, "task.log");
+            if (current.exists()) newestFirst.add(current);
+            newestFirst.addAll(getTaskLogArchives(taskId, taskName));
+            for (File f : newestFirst) {
+                int need = maxLines == Integer.MAX_VALUE ? Integer.MAX_VALUE : maxLines - out.size();
+                if (need <= 0) break;
+                List<String> part = tailLines(f, need);
+                out.addAll(0, part);
             }
         } catch (Exception e) {
-            lines.add("[ERROR] Failed to read logs: " + e.getMessage());
+            out.add("[ERROR] Failed to read logs: " + e.getMessage());
         }
-        return lines;
+        return out;
     }
-    
+
     /**
-     * Retrieve the last N log lines for a task (most recent first from bottom of file).
+     * Cheap change detector for the log view: differs whenever the current file grows, rotates or
+     * an archive appears. Lets a poller skip re-reading and re-rendering an unchanged log.
      */
-    public List<String> getTaskLogsLastN(String taskId, String taskName, int maxLines) {
-        List<String> allLines = getTaskLogs(taskId, taskName);
-        if (allLines.size() <= maxLines) {
-            return allLines;
-        }
-        return allLines.subList(allLines.size() - maxLines, allLines.size());
+    public String getLogStamp(String taskId, String taskName) {
+        File dir = new File(logsDir, folderNameFor(taskId, taskName));
+        File cur = new File(dir, "task.log");
+        File[] all = dir.listFiles((d, n) -> n.endsWith(".log"));
+        return cur.length() + ":" + cur.lastModified() + ":" + (all == null ? 0 : all.length);
     }
-    
+
+    /** Reads the last {@code max} lines of a file by scanning backwards from the end. */
+    static List<String> tailLines(File f, int max) throws IOException {
+        if (max <= 0) return new ArrayList<>();
+        try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(f, "r")) {
+            long pos = raf.length();
+            java.util.ArrayDeque<byte[]> chunks = new java.util.ArrayDeque<>();
+            long newlines = 0;
+            final int CHUNK = 64 * 1024;
+            while (pos > 0 && newlines <= max) {
+                int n = (int) Math.min(CHUNK, pos);
+                pos -= n;
+                byte[] buf = new byte[n];
+                raf.seek(pos);
+                raf.readFully(buf);
+                for (byte b : buf) if (b == '\n') newlines++;
+                chunks.addFirst(buf);
+            }
+            int total = 0;
+            for (byte[] c : chunks) total += c.length;
+            byte[] all = new byte[total];
+            int off = 0;
+            for (byte[] c : chunks) { System.arraycopy(c, 0, all, off, c.length); off += c.length; }
+            String text = new String(all, StandardCharsets.UTF_8); // malformed bytes become U+FFFD, never throw
+            List<String> lines = new ArrayList<>(java.util.Arrays.asList(text.split("\n", -1)));
+            if (!lines.isEmpty() && lines.get(lines.size() - 1).isEmpty()) lines.remove(lines.size() - 1);
+            if (pos > 0 && !lines.isEmpty()) lines.remove(0); // first line is a partial one
+            for (int i = 0; i < lines.size(); i++) {
+                String l = lines.get(i);
+                if (l.endsWith("\r")) lines.set(i, l.substring(0, l.length() - 1));
+            }
+            return lines.size() > max ? new ArrayList<>(lines.subList(lines.size() - max, lines.size())) : lines;
+        }
+    }
+
     /**
      * Retrieve all rotated log files for a task (for archive/history).
      */
@@ -222,7 +299,9 @@ public class TaskLogService {
                 File[] files = taskDir.listFiles((dir, name) -> 
                     name.startsWith("task-") && name.endsWith(".log") && !name.equals("task.log"));
                 if (files != null) {
-                    Arrays.sort(files, (a, b) -> Long.compare(b.lastModified(), a.lastModified()));
+                    // Newest first. By name: the timestamp is in it, and unlike lastModified it survives
+                    // several rotations in the same instant or a restored/copied file.
+                    Arrays.sort(files, (a, b) -> b.getName().compareTo(a.getName()));
                     archives.addAll(Arrays.asList(files));
                 }
             }
@@ -246,114 +325,6 @@ public class TaskLogService {
         }
     }
     
-    // ── Retention / purge ────────────────────────────────────────────────
-
-    /** What one {@link #purgeLogs} call did (or, for a dry run, would do). */
-    public static final class PurgeStats {
-        public int archivesDeleted;
-        public int orphanFoldersDeleted;
-        public int failures;       // files/folders that could not be deleted (e.g. still open on Windows)
-        public long bytesFreed;
-    }
-
-    /**
-     * Keeps the per-task log folders under {@code <dataDir>/logs} from
-     * growing forever. Size-based rotation already caps each live task, but
-     * nothing ever removed (a) rotated archives once they were no longer
-     * interesting or (b) the folder of a task that was deleted or renamed
-     * (a rename starts a new folder, see {@link #folderNameFor}).
-     *
-     * <ul>
-     *   <li><b>archives:</b> {@code task-*.log} files older than
-     *       {@code archiveDays} are deleted in every folder. The live
-     *       {@code task.log} is never touched. 0 = off.</li>
-     *   <li><b>orphans:</b> a folder that matches no current task, and in
-     *       which nothing has been written for {@code orphanDays}, is
-     *       deleted whole. The {@code system} folder is always kept. If
-     *       {@code tasks} is empty (storage may simply have failed to load)
-     *       no folder is considered an orphan. 0 = off.</li>
-     * </ul>
-     *
-     * Only direct children of the logs directory are ever touched.
-     */
-    public synchronized PurgeStats purgeLogs(Collection<model.ScheduledTask> tasks,
-                                             int archiveDays, int orphanDays, boolean dryRun) {
-        PurgeStats stats = new PurgeStats();
-        File[] folders = logsDir.listFiles(File::isDirectory);
-        if (folders == null) return stats;
-
-        Set<String> activeFolders = new HashSet<>();
-        activeFolders.add("system");
-        boolean taskListTrusted = tasks != null && !tasks.isEmpty();
-        if (tasks != null) {
-            for (model.ScheduledTask t : tasks) activeFolders.add(folderNameFor(t.getId(), t.getName()));
-        }
-
-        long now = System.currentTimeMillis();
-        long archiveCutoff = archiveDays > 0 ? now - archiveDays * 86_400_000L : Long.MIN_VALUE;
-        long orphanCutoff  = orphanDays  > 0 ? now - orphanDays  * 86_400_000L : Long.MIN_VALUE;
-        boolean closedWriters = false;
-
-        for (File folder : folders) {
-            if (Files.isSymbolicLink(folder.toPath())) continue;
-            File[] files = folder.listFiles();
-            if (files == null) continue;
-
-            boolean isOrphan = taskListTrusted && orphanDays > 0 && !activeFolders.contains(folder.getName());
-            if (isOrphan) {
-                // Judge idleness by the files inside, not the folder's own
-                // timestamp: deleting an archive (below) bumps the folder's
-                // mtime, which would make a dead folder look freshly active.
-                // An empty folder falls back to its own mtime so a task that
-                // has just created its folder is never caught mid-write.
-                long newest = 0;
-                boolean hasSubdir = false;
-                for (File f : files) {
-                    if (f.isDirectory()) hasSubdir = true;
-                    newest = Math.max(newest, f.lastModified());
-                }
-                if (files.length == 0) newest = folder.lastModified();
-                if (!hasSubdir && newest < orphanCutoff) {
-                    long size = 0;
-                    for (File f : files) size += f.length();
-                    if (dryRun) {
-                        stats.orphanFoldersDeleted++;
-                        stats.bytesFreed += size;
-                    } else {
-                        if (!closedWriters) { closeAll(); closedWriters = true; } // release handles; they reopen lazily
-                        boolean allGone = true;
-                        for (File f : files) {
-                            long len = f.length();
-                            if (f.delete()) stats.bytesFreed += len; else { allGone = false; stats.failures++; }
-                        }
-                        if (allGone && folder.delete()) stats.orphanFoldersDeleted++;
-                        else if (allGone) stats.failures++;
-                    }
-                    continue;   // whole folder handled
-                }
-            }
-
-            if (archiveDays > 0) {
-                for (File f : files) {
-                    String n = f.getName();
-                    boolean isArchive = f.isFile() && n.startsWith("task-") && n.endsWith(".log") && !n.equals("task.log");
-                    if (!isArchive || f.lastModified() >= archiveCutoff) continue;
-                    long len = f.length();
-                    if (dryRun) {
-                        stats.archivesDeleted++;
-                        stats.bytesFreed += len;
-                    } else if (f.delete()) {
-                        stats.archivesDeleted++;
-                        stats.bytesFreed += len;
-                    } else {
-                        stats.failures++;
-                    }
-                }
-            }
-        }
-        return stats;
-    }
-
     /**
      * Close all open writers (call on shutdown).
      */

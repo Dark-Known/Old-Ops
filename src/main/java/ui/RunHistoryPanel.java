@@ -408,59 +408,67 @@ public class RunHistoryPanel extends JPanel {
      * doesn't recursively re-trigger this same method via its own listener.
      */
     public void refresh() {
+        // Snapshot every filter on the EDT, do the storage / SQLite work in the
+        // background, then apply the rows back on the EDT (latest request wins).
+        final String previouslySelectedTask = (String) cbTaskFilter.getSelectedItem();
+        final String statusFilterStr = (String) cbStatusFilter.getSelectedItem();
+        final int limit = (Integer) spLimit.getValue();
+        final String searchText = txtSearch != null ? txtSearch.getText().trim().toLowerCase() : "";
+        LocalDateTime fromDt = null, toDt = null;
+        if (cbUseDateFilter.isSelected()) {
+            fromDt = dateSpinnerToLocalDateTime(spFromDate, false);
+            toDt = dateSpinnerToLocalDateTime(spToDate, true);
+        }
+        final LocalDateTime from = fromDt, to = toDt;
+        final TaskRunRecord.Status status = (statusFilterStr != null && !"All".equals(statusFilterStr))
+                ? TaskRunRecord.Status.valueOf(statusFilterStr) : null;
+
+        Async.latest(this, () -> {
+            List<ScheduledTask> tasks = storage.loadTasks();
+            String taskId = null;
+            if (previouslySelectedTask != null && !"All tasks".equals(previouslySelectedTask)) {
+                taskId = tasks.stream()
+                        .filter(t -> t.getName().equals(previouslySelectedTask))
+                        .map(ScheduledTask::getId)
+                        .findFirst().orElse(null);
+            }
+            List<TaskRunRecord> dbRows = runHistoryService.queryRuns(taskId, status, from, to, limit);
+            // Free-text search isn't a DB-level filter (queryRuns has no text
+            // param) — applied on top of the task/status/date results, over
+            // task name and reason.
+            List<TaskRunRecord> rows;
+            if (searchText.isEmpty()) {
+                rows = dbRows;
+            } else {
+                rows = new ArrayList<>();
+                for (TaskRunRecord r : dbRows) {
+                    String haystack = (r.getTaskName() + " " + (r.getReason() != null ? r.getReason() : ""))
+                            .toLowerCase();
+                    if (haystack.contains(searchText)) rows.add(r);
+                }
+            }
+            List<String> names = new ArrayList<>();
+            for (ScheduledTask t : tasks) names.add(t.getName());
+            return new Loaded(names, rows);
+        }, loaded -> applyLoaded(loaded, previouslySelectedTask),
+           e -> System.err.println("Run history refresh failed: " + e));
+    }
+
+    private record Loaded(List<String> taskNames, List<TaskRunRecord> rows) {}
+
+    private void applyLoaded(Loaded loaded, String previouslySelectedTask) {
+        // Repopulating the task combo is guarded so it doesn't re-trigger refresh().
         suppressFilterEvents = true;
         try {
-            String previouslySelectedTask = (String) cbTaskFilter.getSelectedItem();
             cbTaskFilter.removeAllItems();
             cbTaskFilter.addItem("All tasks");
-            for (ScheduledTask t : storage.loadTasks()) {
-                cbTaskFilter.addItem(t.getName());
-            }
-            if (previouslySelectedTask != null) {
-                cbTaskFilter.setSelectedItem(previouslySelectedTask);
-            }
+            for (String n : loaded.taskNames()) cbTaskFilter.addItem(n);
+            if (previouslySelectedTask != null) cbTaskFilter.setSelectedItem(previouslySelectedTask);
         } finally {
             suppressFilterEvents = false;
         }
 
-        String taskFilterName = (String) cbTaskFilter.getSelectedItem();
-        String statusFilterStr = (String) cbStatusFilter.getSelectedItem();
-        int limit = (Integer) spLimit.getValue();
-
-        String taskId = null;
-        if (taskFilterName != null && !"All tasks".equals(taskFilterName)) {
-            taskId = storage.loadTasks().stream()
-                    .filter(t -> t.getName().equals(taskFilterName))
-                    .map(ScheduledTask::getId)
-                    .findFirst().orElse(null);
-        }
-        TaskRunRecord.Status status = (statusFilterStr != null && !"All".equals(statusFilterStr))
-                ? TaskRunRecord.Status.valueOf(statusFilterStr) : null;
-
-        LocalDateTime from = null;
-        LocalDateTime to = null;
-        if (cbUseDateFilter.isSelected()) {
-            from = dateSpinnerToLocalDateTime(spFromDate, false);
-            to = dateSpinnerToLocalDateTime(spToDate, true);
-        }
-
-        List<TaskRunRecord> dbRows = runHistoryService.queryRuns(taskId, status, from, to, limit);
-
-        // Free-text search isn't a DB-level filter (queryRuns has no text
-        // param) — applied here on top of the task/status/date results
-        // already pulled, over task name and reason.
-        String searchText = txtSearch != null ? txtSearch.getText().trim().toLowerCase() : "";
-        if (searchText.isEmpty()) {
-            currentRows = dbRows;
-        } else {
-            currentRows = new ArrayList<>();
-            for (TaskRunRecord r : dbRows) {
-                String haystack = (r.getTaskName() + " " + (r.getReason() != null ? r.getReason() : ""))
-                        .toLowerCase();
-                if (haystack.contains(searchText)) currentRows.add(r);
-            }
-        }
-
+        currentRows = loaded.rows();
         tableModel.setRowCount(0);
         for (TaskRunRecord r : currentRows) {
             tableModel.addRow(new Object[]{
@@ -522,7 +530,7 @@ public class RunHistoryPanel extends JPanel {
                 + (r.getReason() != null && !r.getReason().isEmpty() ? "  ·  " + r.getReason() : ""));
 
         String body = r.getDetails() != null && !r.getDetails().isEmpty()
-                ? r.getDetails() : "(no detail lines captured — the full run log may have been cleared by Data Retention in Settings; the summary above is kept)";
+                ? r.getDetails() : "(no detail lines captured)";
         detailArea.setText(body);
         detailArea.setCaretPosition(0);
 
@@ -604,7 +612,7 @@ public class RunHistoryPanel extends JPanel {
         List<String[]> rows = buildExportRows();
         List<String> fills = buildExportFills();
 
-        new SwingWorker<Void, Void>() {
+        Async.execute("Export run history", true, false, new SwingWorker<Void, Void>() {
             Exception failure;
             @Override protected Void doInBackground() {
                 try {
@@ -633,7 +641,7 @@ public class RunHistoryPanel extends JPanel {
                     }
                 }
             }
-        }.execute();
+        });
     }
 
     private void exportExcel() {

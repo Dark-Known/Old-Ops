@@ -1,5 +1,6 @@
 package ui.monitor;
 
+import service.BackgroundJobs;
 import model.EventKind;
 import ui.AppTheme;
 import ui.components.PillBadge;
@@ -394,7 +395,7 @@ public class EventFeedPanel extends JPanel {
         Map<String, String> byName = new LinkedHashMap<>();
         for (Map.Entry<String, String> e : liveTasks.entrySet()) byName.put(e.getKey(), e.getValue());
         for (MonitorEvent ev : latestEvents) {
-            if (ev.kind().category() == EventKind.Category.SYSTEM || ev.taskId() == null) continue;
+            if (ev.kind().category().taskless() || ev.taskId() == null) continue;
             byName.putIfAbsent(ev.taskId(), ev.taskName());
         }
         List<Map.Entry<String, String>> sorted = new ArrayList<>(byName.entrySet());
@@ -590,21 +591,71 @@ public class EventFeedPanel extends JPanel {
         t.start();
     }
 
-    private void rebuild() {
-        lastRebuildMs = System.currentTimeMillis();
-        EventFilter filter = currentFilter();
-        if (activeCategories.isEmpty()) filter = filter.withCategories(EnumSet.noneOf(EventKind.Category.class));
+    /** Above this many events the feed is rebuilt on a worker thread instead of inline on the EDT. */
+    private static final int SYNC_BUILD_LIMIT = 800;
+    private static final java.util.concurrent.ExecutorService BUILDER =
+            service.Workers.newPool(service.Workers.Lane.FEED, 1);
+    private boolean building;       // EDT-only: a background build is in flight
+    private boolean buildAgain;     // EDT-only: another rebuild() arrived meanwhile -> run once more
 
-        result = FeedBuilder.build(shownEvents, filter, prefs.groupRuns(), prefs.collapseRepeats(),
-                runningIds, expanded, LocalDateTime.now());
+    private record Built(FeedBuilder.Result result, int errors, int warnings) {}
+
+    private static Built compute(List<MonitorEvent> events, EventFilter filter, boolean group, boolean collapse,
+                                 Set<String> running, Set<String> expandedKeys) {
+        FeedBuilder.Result res = FeedBuilder.build(events, filter, group, collapse, running, expandedKeys, LocalDateTime.now());
         int errs = 0, warns = 0;
-        for (MonitorEvent e : shownEvents) {
+        for (MonitorEvent e : events) {
             if (filter.since() != null && e.time().isBefore(filter.since())) continue;
             if (e.severity() == EventKind.Severity.ERROR) errs++;
             else if (e.severity() == EventKind.Severity.WARN) warns++;
         }
-        attentionErrors = errs;
-        attentionWarnings = warns;
+        return new Built(res, errs, warns);
+    }
+
+    private void rebuild() {
+        lastRebuildMs = System.currentTimeMillis();
+        EventFilter filter = currentFilter();
+        if (activeCategories.isEmpty()) filter = filter.withCategories(EnumSet.noneOf(EventKind.Category.class));
+        final EventFilter f = filter;
+        final List<MonitorEvent> events = shownEvents;
+        final boolean group = prefs.groupRuns(), collapse = prefs.collapseRepeats();
+        final Set<String> running = runningIds;
+
+        if (events.size() <= SYNC_BUILD_LIMIT) {
+            applyBuild(compute(events, f, group, collapse, running, expanded), f);
+            return;
+        }
+        // Big feed: build off the EDT. One build at a time; requests that arrive while one is
+        // running collapse into a single follow-up build with the newest inputs.
+        if (building) { buildAgain = true; return; }
+        building = true;
+        final Set<String> expandedCopy = new HashSet<>(expanded);
+        BUILDER.execute(() -> {
+            Built built;
+            try (BackgroundJobs.Job job = BackgroundJobs.begin("Event feed build", false)) {
+                try {
+                    built = compute(events, f, group, collapse, running, expandedCopy);
+                } catch (Throwable t) {
+                    job.fail(t);
+                    throw t;
+                }
+            } catch (Throwable t) {
+                SwingUtilities.invokeLater(() -> { building = false; });
+                System.err.println("Feed build failed: " + t);
+                return;
+            }
+            SwingUtilities.invokeLater(() -> {
+                building = false;
+                if (buildAgain) { buildAgain = false; rebuild(); return; } // newer inputs exist; skip stale apply
+                applyBuild(built, f);
+            });
+        });
+    }
+
+    private void applyBuild(Built built, EventFilter filter) {
+        result = built.result();
+        attentionErrors = built.errors();
+        attentionWarnings = built.warnings();
 
         // Anchor the view: remember which row sits at the top of the viewport (and how far into it),
         // so new rows arriving above don't shove what the operator is reading off-screen.
@@ -726,7 +777,7 @@ public class EventFeedPanel extends JPanel {
             JMenuItem copy = new JMenuItem("Copy as text");
             copy.addActionListener(e -> copy(rowText(row)));
             m.add(copy);
-            if (row.taskId != null && row.head.kind().category() != EventKind.Category.SYSTEM) {
+            if (row.taskId != null && !row.head.kind().category().taskless()) {
                 JMenuItem only = new JMenuItem("Show only \u201C" + row.taskName + "\u201D");
                 only.addActionListener(e -> showOnlyTask(row.taskId));
                 m.add(only);
@@ -807,11 +858,36 @@ public class EventFeedPanel extends JPanel {
         private Map<String, Integer> index = Map.of();
 
         void setRows(List<FeedRow> r) {
+            List<FeedRow> old = rows;
+            boolean sameShape = old.size() == r.size();
+            for (int i = 0; sameShape && i < r.size(); i++) sameShape = old.get(i).key.equals(r.get(i).key);
             rows = r;
+            if (sameShape) {
+                // Same rows in the same order (the common once-a-second refresh): only repaint
+                // the rows whose visible content changed, so selection, scroll position and
+                // layout are left alone instead of the whole table being reset.
+                int n = r.size(), i = 0;
+                while (i < n) {
+                    if (displayEqual(old.get(i), r.get(i))) { i++; continue; }
+                    int start = i;
+                    while (i < n && !displayEqual(old.get(i), r.get(i))) i++;
+                    fireTableRowsUpdated(start, i - 1);
+                }
+                return;
+            }
             Map<String, Integer> idx = new HashMap<>(r.size() * 2);
             for (int i = 0; i < r.size(); i++) idx.putIfAbsent(r.get(i).key, i);
             index = idx;
             fireTableDataChanged();
+        }
+
+        /** True when two rows with the same key would paint identically. */
+        private static boolean displayEqual(FeedRow a, FeedRow b) {
+            return a.type == b.type && a.depth == b.depth && a.count == b.count && a.outcome == b.outcome
+                    && a.durationMs == b.durationMs && a.expanded == b.expanded && a.events.size() == b.events.size()
+                    && Objects.equals(a.time, b.time) && Objects.equals(a.summary, b.summary)
+                    && Objects.equals(a.label, b.label) && Objects.equals(a.trigger, b.trigger)
+                    && Objects.equals(a.files, b.files) && Objects.equals(a.taskName, b.taskName);
         }
         FeedRow rowAt(int i)              { return rows.get(i); }
         int indexOfKey(String key)        { return index.getOrDefault(key, -1); }
@@ -885,7 +961,7 @@ public class EventFeedPanel extends JPanel {
                     return pillHost;
                 }
                 case COL_TASK -> {
-                    setText(r.head.kind().category() == EventKind.Category.SYSTEM
+                    setText(r.head.kind().category().taskless()
                             ? "\u2699 " + r.taskName : MonitorStyle.directionGlyph(r.direction) + r.taskName);
                     setToolTipText(r.taskName + (r.taskType != null ? "  \u00b7  " + r.taskType : ""));
                 }

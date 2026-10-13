@@ -95,15 +95,9 @@ public class LocalWatchManager {
                     + e.getMessage() + "); OUTBOUND watcher tasks will fall back to scheduled polling only.");
             return;
         }
-        debounceExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "local-watch-debounce");
-            t.setDaemon(true);
-            return t;
-        });
+        debounceExecutor = service.Workers.newScheduled(service.Workers.Lane.WATCH, 1);
         running = true;
-        watchThread = new Thread(this::watchLoop, "local-watch-service");
-        watchThread.setDaemon(true);
-        watchThread.start();
+        watchThread = service.Workers.service("local-watch", this::watchLoop);
         log.info("LocalWatchManager started (OS-level directory notifications for OUTBOUND watcher tasks).");
     }
 

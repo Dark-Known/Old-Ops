@@ -152,16 +152,30 @@ public class CredentialManagerPanel extends JPanel {
     }
 
     public void refresh() {
+        // Both stores are read off the EDT, and the task table is loaded once
+        // (not once per credential); the list is rebuilt on the EDT.
+        Async.latest(this, () -> {
+            List<Credential> creds = storage.loadAllCredentials();
+            List<model.ScheduledTask> tasks = storage.loadTasks();
+            Map<String, Integer> usage = new HashMap<>();
+            for (Credential c : creds) {
+                usage.put(c.getUsername(),
+                        service.XmlStorageService.countTasksUsingCredential(tasks, c.getUsername()));
+            }
+            return new Loaded(creds, usage);
+        }, this::applyLoaded, e -> System.err.println("Credential refresh failed: " + e));
+    }
+
+    private record Loaded(List<Credential> creds, Map<String, Integer> usage) {}
+
+    private void applyLoaded(Loaded loaded) {
         Credential selected = credList.getSelectedValue();
         String selectedUsername = selected != null ? selected.getUsername() : null;
 
         listModel.clear();
         usageByUsername.clear();
-        List<Credential> creds = storage.loadAllCredentials();
-        for (Credential c : creds) {
-            usageByUsername.put(c.getUsername(), storage.countTasksUsingCredential(c.getUsername()));
-            listModel.addElement(c);
-        }
+        usageByUsername.putAll(loaded.usage());
+        for (Credential c : loaded.creds()) listModel.addElement(c);
 
         if (selectedUsername != null) {
             for (int i = 0; i < listModel.size(); i++) {
@@ -293,11 +307,15 @@ public class CredentialManagerPanel extends JPanel {
     private void logActivity(String title, String detail) {
         if (auditLog == null) return;
         LocalDateTime now = LocalDateTime.now();
-        try {
-            auditLog.recordActivityEvent("CREDENTIALS", title, null, detail, detail, now, now);
-        } catch (Exception ignored) {
-            // Best-effort — a failure to log this shouldn't block the actual credential change.
-        }
+        // Audit writes go through a single background thread (in order) so a busy
+        // SQLite connection can never freeze the UI on save.
+        Async.inOrder(() -> {
+            try {
+                auditLog.recordActivityEvent("CREDENTIALS", title, null, detail, detail, now, now);
+            } catch (Exception ignored) {
+                // Best-effort — a failure to log this shouldn't block the actual credential change.
+            }
+        });
     }
 
     /** Same as {@link #logActivity} but marks the event FAILED, so it renders
@@ -305,12 +323,16 @@ public class CredentialManagerPanel extends JPanel {
     private void logActivityFailed(String title, String detail) {
         if (auditLog == null) return;
         LocalDateTime now = LocalDateTime.now();
-        try {
-            auditLog.recordActivityEvent("CREDENTIALS", title, null,
-                    model.TaskRunRecord.Status.FAILED, detail, detail, now, now);
-        } catch (Exception ignored) {
-            // Best-effort — a failure to log this shouldn't block the actual credential change.
-        }
+        // Audit writes go through a single background thread (in order) so a busy
+        // SQLite connection can never freeze the UI on save.
+        Async.inOrder(() -> {
+            try {
+                auditLog.recordActivityEvent("CREDENTIALS", title, null,
+                        model.TaskRunRecord.Status.FAILED, detail, detail, now, now);
+            } catch (Exception ignored) {
+                // Best-effort — a failure to log this shouldn't block the actual credential change.
+            }
+        });
     }
 
     private void showDialog(Credential existing) {

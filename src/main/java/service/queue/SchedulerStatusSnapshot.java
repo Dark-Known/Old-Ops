@@ -96,6 +96,9 @@ public final class SchedulerStatusSnapshot {
      */
     public record SessionEntry(String taskId, int count) {}
 
+    /** A task a worker is executing right now: which task, on which worker thread, since when. */
+    public record InFlightEntry(String taskId, String thread, LocalDateTime startedAt) {}
+
     private final String processLabel;
     private final long pid;
     private final LocalDateTime writtenAt;
@@ -107,11 +110,15 @@ public final class SchedulerStatusSnapshot {
     private final List<FireEntry> fireEntries;
     private final List<String> runningTaskIds;
     private final List<SessionEntry> sessionEntries;
+    private final List<InFlightEntry> inFlight;
+    private final List<String> liveLines;
+    private final int backgroundBusy;
 
     private SchedulerStatusSnapshot(String processLabel, long pid, LocalDateTime writtenAt, int poolSize,
                                      int activeWorkers, List<PendingEntry> pending, List<ActivityEntry> activity,
                                      List<WatchEntry> watchEntries, List<FireEntry> fireEntries,
-                                     List<String> runningTaskIds, List<SessionEntry> sessionEntries) {
+                                     List<String> runningTaskIds, List<SessionEntry> sessionEntries,
+                                     List<InFlightEntry> inFlight, List<String> liveLines, int backgroundBusy) {
         this.processLabel = processLabel;
         this.pid = pid;
         this.writtenAt = writtenAt;
@@ -123,7 +130,19 @@ public final class SchedulerStatusSnapshot {
         this.fireEntries = fireEntries;
         this.runningTaskIds = runningTaskIds;
         this.sessionEntries = sessionEntries;
+        this.inFlight = inFlight;
+        this.liveLines = liveLines;
+        this.backgroundBusy = backgroundBusy;
     }
+
+    /** Worker threads busy outside the task pool (UI actions, feeds, transfers…) in that process; 0 from older versions. */
+    public int getBackgroundBusy() { return backgroundBusy; }
+
+    /** Tasks the process's workers are executing right now (empty for status files from older versions). */
+    public List<InFlightEntry> getInFlight() { return inFlight; }
+
+    /** Lane summary and running background jobs of that process, one line each (empty from older versions). */
+    public List<String> getLiveLines() { return liveLines; }
 
     public String getProcessLabel() { return processLabel; }
     public long getPid() { return pid; }
@@ -175,6 +194,9 @@ public final class SchedulerStatusSnapshot {
             List<FireEntry> fireEntries = new ArrayList<>();
             List<String> runningTaskIds = new ArrayList<>();
             List<SessionEntry> sessionEntries = new ArrayList<>();
+            List<InFlightEntry> inFlight = new ArrayList<>();
+            List<String> liveLines = new ArrayList<>();
+            int backgroundBusy = 0;
 
             for (String line : lines) {
                 if (line.isBlank()) continue;
@@ -216,6 +238,19 @@ public final class SchedulerStatusSnapshot {
                         if (parts.length < 3) continue;
                         sessionEntries.add(new SessionEntry(unescape(parts[1]), Integer.parseInt(parts[2])));
                     }
+                    case "T" -> {
+                        if (parts.length < 4) continue;
+                        inFlight.add(new InFlightEntry(unescape(parts[1]), unescape(parts[2]),
+                                epochMillisToLocalDateTime(Long.parseLong(parts[3]))));
+                    }
+                    case "B" -> {
+                        if (parts.length < 2) continue;
+                        backgroundBusy = Integer.parseInt(parts[1]);
+                    }
+                    case "L" -> {
+                        if (parts.length < 2) continue;
+                        liveLines.add(unescape(parts[1]));
+                    }
                     default -> { /* forward-compatible: ignore unknown record types */ }
                 }
             }
@@ -223,7 +258,8 @@ public final class SchedulerStatusSnapshot {
             return new SchedulerStatusSnapshot(label, pid, writtenAt, poolSize, active,
                     Collections.unmodifiableList(pending), Collections.unmodifiableList(activity),
                     Collections.unmodifiableList(watchEntries), Collections.unmodifiableList(fireEntries),
-                    Collections.unmodifiableList(runningTaskIds), Collections.unmodifiableList(sessionEntries));
+                    Collections.unmodifiableList(runningTaskIds), Collections.unmodifiableList(sessionEntries),
+                    Collections.unmodifiableList(inFlight), Collections.unmodifiableList(liveLines), backgroundBusy);
         } catch (IOException | NumberFormatException | ArrayIndexOutOfBoundsException e) {
             // Most commonly: caught mid-write by the exporter on the other
             // process. The exporter writes atomically (temp file + move) to

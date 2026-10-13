@@ -90,7 +90,25 @@ public class WatchStatusMonitor {
         recentEvents.clear();
     }
 
+    private final java.util.concurrent.atomic.AtomicBoolean polling = new java.util.concurrent.atomic.AtomicBoolean();
+
+    /** Runs the (file + storage) poll off the EDT, then reports notable transitions on the EDT. */
     private void poll() {
+        if (!polling.compareAndSet(false, true)) return; // previous poll still running
+        Async.run(() -> {
+            try {
+                List<Event> notable = pollBlocking();
+                if (onNotableTransition != null && !notable.isEmpty()) {
+                    javax.swing.SwingUtilities.invokeLater(() -> notable.forEach(onNotableTransition));
+                }
+            } finally {
+                polling.set(false);
+            }
+        });
+    }
+
+    private List<Event> pollBlocking() {
+        List<Event> notable = new ArrayList<>();
         boolean daemonFresh = SchedulerStatusSnapshot.isAlive(daemonStatusFile, DAEMON_STALE_MS);
         SchedulerStatusSnapshot snap = daemonFresh ? SchedulerStatusSnapshot.read(daemonStatusFile) : null;
         Map<String, SchedulerStatusSnapshot.WatchEntry> daemonEntries = new HashMap<>();
@@ -126,9 +144,10 @@ public class WatchStatusMonitor {
                     recentEvents.addFirst(ev);
                     while (recentEvents.size() > MAX_EVENTS) recentEvents.removeLast();
                 }
-                if (onNotableTransition != null) onNotableTransition.accept(ev);
+                notable.add(ev);
             }
         }
+        return notable;
     }
 
     /** True for "was actively pushing, now polling" and for "just confirmed

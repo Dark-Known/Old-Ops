@@ -1469,7 +1469,7 @@ public class TaskDialog extends JDialog {
                 wait.dispose();
             }
         };
-        connector.execute();
+        Async.execute("Connect to SFTP server", true, false, connector);
         wait.setVisible(true); // blocks (modal) until connector's done() disposes it
 
         if (failure[0] != null) {
@@ -1705,12 +1705,16 @@ public class TaskDialog extends JDialog {
     private void logActivity(boolean aboutCredential, String title, String detail) {
         if (auditLog == null) return;
         java.time.LocalDateTime now = java.time.LocalDateTime.now();
-        try {
-            auditLog.recordActivityEvent(aboutCredential ? "CREDENTIALS" : "TASKS", title, null,
-                    detail, detail, now, now);
-        } catch (Exception ignored) {
-            // Best-effort — a failure to log this shouldn't block the actual dialog action.
-        }
+        // Audit writes go through a single background thread (in order) so a busy
+        // SQLite connection can never freeze the UI on save.
+        Async.inOrder(() -> {
+            try {
+                auditLog.recordActivityEvent(aboutCredential ? "CREDENTIALS" : "TASKS", title, null,
+                        detail, detail, now, now);
+            } catch (Exception ignored) {
+                // Best-effort — a failure to log this shouldn't block the actual dialog action.
+            }
+        });
     }
 
     /** Same as {@link #logActivity} but marks the event FAILED, so it renders
@@ -1721,12 +1725,16 @@ public class TaskDialog extends JDialog {
     private void logActivityFailed(boolean aboutCredential, String title, String detail) {
         if (auditLog == null) return;
         java.time.LocalDateTime now = java.time.LocalDateTime.now();
-        try {
-            auditLog.recordActivityEvent(aboutCredential ? "CREDENTIALS" : "TASKS", title, null,
-                    model.TaskRunRecord.Status.FAILED, detail, detail, now, now);
-        } catch (Exception ignored) {
-            // Best-effort — a failure to log this shouldn't block the actual dialog action.
-        }
+        // Audit writes go through a single background thread (in order) so a busy
+        // SQLite connection can never freeze the UI on save.
+        Async.inOrder(() -> {
+            try {
+                auditLog.recordActivityEvent(aboutCredential ? "CREDENTIALS" : "TASKS", title, null,
+                        model.TaskRunRecord.Status.FAILED, detail, detail, now, now);
+            } catch (Exception ignored) {
+                // Best-effort — a failure to log this shouldn't block the actual dialog action.
+            }
+        });
     }
 
     private void msg(String text) {

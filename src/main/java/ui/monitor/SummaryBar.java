@@ -33,6 +33,16 @@ public class SummaryBar extends JPanel {
         c.update(label, value, accent, tooltip);
     }
 
+    /**
+     * Gives a chip a tooltip that is built each time it is shown (and re-read every second while it stays open),
+     * instead of a fixed string — {@link #set} keeps replacing the fixed text on every refresh, so a live
+     * tooltip has to live outside it.
+     */
+    public void setLiveTooltip(String id, java.util.function.Supplier<String> supplier) {
+        Chip c = chips.get(id);
+        if (c != null) c.setLiveTooltip(supplier);
+    }
+
     /** Makes a chip clickable (hand cursor + callback). */
     public void onClick(String id, Runnable r) {
         Chip c = chips.get(id);
@@ -59,11 +69,36 @@ public class SummaryBar extends JPanel {
             });
         }
 
+        private java.util.function.Supplier<String> live;
+        private javax.swing.Timer hover;
+
+        void setLiveTooltip(java.util.function.Supplier<String> supplier) {
+            live = supplier;
+            if (hover != null) return;
+            setToolTipText("live"); // registers the component with the tooltip manager; the text comes from getToolTipText(event)
+            hover = new javax.swing.Timer(1000, ev -> {
+                Point pt = getMousePosition();
+                if (pt != null) ToolTipManager.sharedInstance().mouseMoved(
+                        new MouseEvent(this, MouseEvent.MOUSE_MOVED, System.currentTimeMillis(), 0, pt.x, pt.y, 0, false));
+            });
+            addMouseListener(new MouseAdapter() {
+                @Override public void mouseEntered(MouseEvent e) { hover.start(); }
+                @Override public void mouseExited(MouseEvent e) { hover.stop(); }
+            });
+        }
+
+        @Override public String getToolTipText(MouseEvent e) {
+            if (live != null) {
+                try { return live.get(); } catch (RuntimeException ex) { /* fall back to the fixed text */ }
+            }
+            return super.getToolTipText(e);
+        }
+
         void update(String l, String v, Color a, String tip) {
             label.setText(l);
             value.setText(v);
             accent = a;
-            setToolTipText(tip);
+            if (live == null) setToolTipText(tip);
             // Leave room for the dot only when there is one.
             setBorder(new EmptyBorder(4, a != null ? 22 : 12, 4, 12));
             repaint();

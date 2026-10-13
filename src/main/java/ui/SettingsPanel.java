@@ -1,5 +1,7 @@
 package ui;
 
+import service.BackgroundJobs;
+
 import service.TransferService;
 import util.AppSettings;
 
@@ -28,6 +30,8 @@ public class SettingsPanel extends JPanel {
 
     private final TransferService transferService;
     private final service.TaskSchedulerService scheduler; // may be null if not wired by caller
+    private RetentionPanel retentionPanel;
+    private VisibilityPanel visibilityPanel;
     private final Preferences prefs = Preferences.userNodeForPackage(SettingsPanel.class);
     private JTextField tfWinScp;
     private JLabel     lblStatus;
@@ -53,12 +57,6 @@ public class SettingsPanel extends JPanel {
     private javax.swing.JSpinner spinnerWatcherFilesPerThread;
     private javax.swing.JSpinner spinnerStaleThresholdMinutes;
     private javax.swing.JSpinner spinnerMaxConcurrentTaskThreads;
-
-    // Data retention (see service.MaintenanceService)
-    private JCheckBox chkPurgeEnabled;
-    private javax.swing.JSpinner spinnerPurgeHour, spinnerPurgeRunDays, spinnerPurgeEventDays,
-            spinnerPurgeDetailsDays, spinnerPurgeMaxDbMb, spinnerPurgeTaskLogDays, spinnerPurgeOrphanLogDays;
-    private JLabel lblPurgeStatus, lblRunHistorySize;
     public SettingsPanel(TransferService transferService) {
         this(transferService, null);
     }
@@ -186,19 +184,24 @@ public class SettingsPanel extends JPanel {
         outer.add(card("Daemon", daemonPanel));
         outer.add(Box.createVerticalStrut(12));
 
-        outer.add(card("Data Retention (keeps run history and logs from growing forever)", buildRetentionPanel()));
+        // Retention: how long / how large the log databases may grow (purged by a task worker)
+        retentionPanel = new RetentionPanel(scheduler);
+        outer.add(card("Data retention & purge", retentionPanel));
+        visibilityPanel = new VisibilityPanel();
+        outer.add(card("Event Monitor visibility", visibilityPanel));
         outer.add(Box.createVerticalStrut(12));
 
         // App Info section
         JPanel infoPanel = new JPanel(new GridBagLayout());
         infoPanel.setBorder(new EmptyBorder(4, 4, 4, 4));
-        infoPanel.setMaximumSize(new Dimension(Integer.MAX_VALUE, 155));
+        infoPanel.setMaximumSize(new Dimension(Integer.MAX_VALUE, 185));
 
         String dataDir = resolveActualDataDir();
         addInfoRow(infoPanel, "Data directory:", dataDir, 0);
         addInfoRow(infoPanel, "Tasks, credentials & settings (database):", dataDir + File.separator + "app.db", 1);
         addInfoRow(infoPanel, "Daemon log:",     dataDir + File.separator + resolveDaemonLogFileName(), 2);
         addInfoRow(infoPanel, "Run history (database):", dataDir + File.separator + "run_history.db", 3);
+        addInfoRow(infoPanel, "Background log (database):", dataDir + File.separator + "background_log.db", 4);
         outer.add(card("Application Info", infoPanel));
         outer.add(Box.createVerticalStrut(12));
 
@@ -606,116 +609,6 @@ public class SettingsPanel extends JPanel {
         return card;
     }
 
-    /**
-     * \"Data Retention\" card. All values are live settings (see
-     * {@link AppSettings}); the daemon runs the purge once a day after the
-     * chosen hour. 0 turns an individual rule off.
-     */
-    private JPanel buildRetentionPanel() {
-        JPanel panel = new JPanel(new GridBagLayout());
-        panel.setBorder(new EmptyBorder(4, 4, 4, 4));
-        GridBagConstraints lc = new GridBagConstraints();
-        lc.anchor = GridBagConstraints.WEST; lc.insets = new Insets(4, 4, 4, 8);
-        GridBagConstraints fc = new GridBagConstraints();
-        fc.fill = GridBagConstraints.NONE; fc.weightx = 0; fc.anchor = GridBagConstraints.WEST;
-        fc.insets = new Insets(4, 0, 4, 4);
-
-        chkPurgeEnabled = new JCheckBox("Purge automatically once a day");
-        spinnerPurgeHour        = new javax.swing.JSpinner(new javax.swing.SpinnerNumberModel(3, 0, 23, 1));
-        spinnerPurgeRunDays     = new javax.swing.JSpinner(new javax.swing.SpinnerNumberModel(90, 0, 3650, 1));
-        spinnerPurgeEventDays   = new javax.swing.JSpinner(new javax.swing.SpinnerNumberModel(90, 0, 3650, 1));
-        spinnerPurgeDetailsDays = new javax.swing.JSpinner(new javax.swing.SpinnerNumberModel(0, 0, 3650, 1));
-        spinnerPurgeMaxDbMb     = new javax.swing.JSpinner(new javax.swing.SpinnerNumberModel(0, 0, 1_000_000, 50));
-        spinnerPurgeTaskLogDays = new javax.swing.JSpinner(new javax.swing.SpinnerNumberModel(30, 0, 3650, 1));
-        spinnerPurgeOrphanLogDays = new javax.swing.JSpinner(new javax.swing.SpinnerNumberModel(30, 0, 3650, 1));
-
-        int row = 0;
-        row = addFieldRow(panel, lc, fc, "", chkPurgeEnabled, row);
-        row = addFieldRow(panel, lc, fc, "Run time (hour of day, 0-23):", spinnerPurgeHour, row);
-        row = addFieldRow(panel, lc, fc, "Delete run history older than (days, 0=never):", spinnerPurgeRunDays, row);
-        row = addFieldRow(panel, lc, fc, "Delete activity/event feed older than (days, 0=never):", spinnerPurgeEventDays, row);
-        row = addFieldRow(panel, lc, fc, "Clear full run log text older than (days, 0=never):", spinnerPurgeDetailsDays, row);
-        row = addFieldRow(panel, lc, fc, "Max run history size (MB, 0=no limit):", spinnerPurgeMaxDbMb, row);
-        row = addFieldRow(panel, lc, fc, "Delete rotated task log files older than (days, 0=never):", spinnerPurgeTaskLogDays, row);
-        row = addFieldRow(panel, lc, fc, "Delete logs of deleted/renamed tasks idle for (days, 0=never):", spinnerPurgeOrphanLogDays, row);
-
-        JButton btnPurgeNow = new JButton("Purge now");
-        styleBtn(btnPurgeNow, AppTheme.EARTH_RUST);
-        btnPurgeNow.addActionListener(e -> purgeNow());
-        lblPurgeStatus = new JLabel(" ");
-        lblRunHistorySize = new JLabel(" ");
-        JPanel btnRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
-        btnRow.add(btnPurgeNow);
-        btnRow.add(lblRunHistorySize);
-        GridBagConstraints bc = new GridBagConstraints();
-        bc.gridx = 0; bc.gridy = row++; bc.gridwidth = 3; bc.anchor = GridBagConstraints.WEST;
-        bc.insets = new Insets(8, 4, 2, 4);
-        panel.add(btnRow, bc);
-        GridBagConstraints sc = new GridBagConstraints();
-        sc.gridx = 0; sc.gridy = row++; sc.gridwidth = 3; sc.anchor = GridBagConstraints.WEST;
-        sc.insets = new Insets(2, 4, 4, 4);
-        panel.add(lblPurgeStatus, sc);
-        return panel;
-    }
-
-    private File retentionDataDir() {
-        return scheduler != null ? scheduler.getStorage().getDataDir() : new File(resolveActualDataDir());
-    }
-
-    /** Refreshes the "last purge" line and the run_history.db size label from live state. */
-    private void refreshPurgeStatus() {
-        long last = AppSettings.getPurgeLastRunEpochMs();
-        if (last <= 0) {
-            lblPurgeStatus.setText("Last purge: never run yet.");
-        } else {
-            String when = java.time.LocalDateTime.ofInstant(java.time.Instant.ofEpochMilli(last),
-                    java.time.ZoneId.systemDefault()).format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm"));
-            lblPurgeStatus.setText("<html>Last purge: " + when + " &mdash; "
-                    + AppSettings.getPurgeLastResult().replace("<", "&lt;") + "</html>");
-        }
-        File db = new File(retentionDataDir(), "run_history.db");
-        lblRunHistorySize.setText("run_history.db is currently "
-                + (db.exists() ? String.format("%.1f MB", db.length() / 1048576.0) : "not created yet"));
-    }
-
-    /**
-     * Asks the daemon (the only process that owns the databases' writers)
-     * to run a purge right now, using the SAVED settings, then watches for
-     * its result to appear in the status line.
-     */
-    private void purgeNow() {
-        int ok = JOptionPane.showConfirmDialog(this,
-                "Permanently delete old run history and log files now,\n"
-                + "using the retention values currently SAVED in Settings?\n\n"
-                + "(Click Save Settings first if you changed any value above.)",
-                "Purge now", JOptionPane.OK_CANCEL_OPTION, JOptionPane.WARNING_MESSAGE);
-        if (ok != JOptionPane.OK_OPTION) return;
-
-        final long lastBefore = AppSettings.getPurgeLastRunEpochMs();
-        if (!service.CommandQueueService.enqueue(retentionDataDir(), "SYSTEM",
-                service.CommandQueueService.Action.PURGE_NOW, "gui")) {
-            lblPurgeStatus.setText("Could not queue the purge request (database unavailable).");
-            lblPurgeStatus.setForeground(Color.RED);
-            return;
-        }
-        lblPurgeStatus.setForeground(UIManager.getColor("Label.foreground"));
-        lblPurgeStatus.setText("Purge requested — waiting for the daemon...");
-        final long deadline = System.currentTimeMillis() + 60_000;
-        javax.swing.Timer poll = new javax.swing.Timer(2000, null);
-        poll.addActionListener(ev -> {
-            if (AppSettings.getPurgeLastRunEpochMs() > lastBefore) {
-                poll.stop();
-                refreshPurgeStatus();
-            } else if (System.currentTimeMillis() > deadline) {
-                poll.stop();
-                lblPurgeStatus.setText("The daemon did not respond within 60 s. Is the Ops Transfer Tool service running?"
-                        + " (If it is busy compacting a large database, check Last purge again in a minute.)");
-                lblPurgeStatus.setForeground(Color.RED);
-            }
-        });
-        poll.start();
-    }
-
     private int addFieldRow(JPanel panel, GridBagConstraints lc, GridBagConstraints fc, String label, JComponent field, int row) {
         lc.gridx = 0; lc.gridy = row;
         fc.gridx = 1; fc.gridy = row; fc.gridwidth = 2;
@@ -796,21 +689,39 @@ public class SettingsPanel extends JPanel {
             + "-WinSwPath \"" + winswExe.getAbsolutePath() + "\" "
             + "-JarPath \"" + jarPath + "\"";
 
-        int rc = runElevatedPowerShell(script, "Install daemon service");
-        try { Thread.sleep(1500); } catch (InterruptedException ignored) {}
+        // UAC prompt + install script can take a long time: never on the EDT.
+        runDaemonAction("Install daemon service", job -> {
+            int rc = runElevatedPowerShell(script, "Install daemon service");
+            try { Thread.sleep(1500); } catch (InterruptedException ignored) {}
+            boolean exists = serviceExists();
+            if (!exists) job.fail("service not found after install (elevated exit code " + rc + ")");
+            SwingUtilities.invokeLater(() -> {
+                if (exists) {
+                    showInfo("Daemon service installed and started.\n\n"
+                        + "Service name: " + SERVICE_NAME + "\n\n"
+                        + "It now runs continuously in the background, independent of this window,\n"
+                        + "and restarts automatically if it crashes (see the service's Recovery tab\n"
+                        + "in services.msc).");
+                } else {
+                    showError("Service installation may have failed (elevated process exit code " + rc + ").\n"
+                        + "Check services.msc for '" + SERVICE_NAME + "', or re-run install-service.ps1 manually.\n"
+                        + "Make sure you clicked Yes on the UAC prompt.");
+                }
+                refreshDaemonStatus();
+            });
+        });
+    }
 
-        if (serviceExists()) {
-            showInfo("Daemon service installed and started.\n\n"
-                + "Service name: " + SERVICE_NAME + "\n\n"
-                + "It now runs continuously in the background, independent of this window,\n"
-                + "and restarts automatically if it crashes (see the service's Recovery tab\n"
-                + "in services.msc).");
-        } else {
-            showError("Service installation may have failed (elevated process exit code " + rc + ").\n"
-                + "Check services.msc for '" + SERVICE_NAME + "', or re-run install-service.ps1 manually.\n"
-                + "Make sure you clicked Yes on the UAC prompt.");
-        }
-        refreshDaemonStatus();
+    private final java.util.concurrent.atomic.AtomicBoolean daemonActionRunning =
+            new java.util.concurrent.atomic.AtomicBoolean();
+
+    /** Runs a slow service action on a background thread; ignores clicks while one is already running. */
+    private void runDaemonAction(String name, java.util.function.Consumer<BackgroundJobs.Job> work) {
+        if (!daemonActionRunning.compareAndSet(false, true)) return;
+        // Audited: the Event Monitor records when this started, how long it took and whether it failed.
+        Async.runJob(name, true, job -> {
+            try { work.accept(job); } finally { daemonActionRunning.set(false); }
+        });
     }
 
     private void removeDaemon() {
@@ -832,14 +743,20 @@ public class SettingsPanel extends JPanel {
 
         String script = "& \"" + winswExe.getAbsolutePath() + "\" stop; "
             + "& \"" + winswExe.getAbsolutePath() + "\" uninstall";
-        int rc = runElevatedPowerShell(script, "Uninstall daemon service");
-        if (rc == 0 && !serviceExists())
-            showInfo("Daemon service uninstalled.\nScheduled tasks will only run while this window is open.");
-        else
-            showError("Uninstall may have failed (exit code " + rc + ").\n"
-                + "You can also remove it manually:\n"
-                + "  services.msc \u2192 " + SERVICE_NAME + ", or: sc.exe delete " + SERVICE_NAME);
-        refreshDaemonStatus();
+        runDaemonAction("Uninstall daemon service", job -> {
+            int rc = runElevatedPowerShell(script, "Uninstall daemon service");
+            boolean removed = rc == 0 && !serviceExists();
+            if (!removed) job.fail("service still present or elevated exit code " + rc);
+            SwingUtilities.invokeLater(() -> {
+                if (removed)
+                    showInfo("Daemon service uninstalled.\nScheduled tasks will only run while this window is open.");
+                else
+                    showError("Uninstall may have failed (exit code " + rc + ").\n"
+                        + "You can also remove it manually:\n"
+                        + "  services.msc \u2192 " + SERVICE_NAME + ", or: sc.exe delete " + SERVICE_NAME);
+                refreshDaemonStatus();
+            });
+        });
     }
 
     private void runDaemonNow() {
@@ -847,19 +764,25 @@ public class SettingsPanel extends JPanel {
         // ("schtasks /Run"). A Windows Service isn't triggered periodically
         // — it just runs continuously once installed — so the equivalent
         // action here is simply making sure it's started if it was stopped.
-        try {
-            int rc = runElevatedPowerShell("Start-Service -Name '" + SERVICE_NAME + "'", "Start daemon service");
-            if (rc == 0) {
-                showInfo("Daemon service started.\nCheck the daemon log for details.");
-            } else {
-                showError("Failed to start the service (exit code " + rc + ").\n"
-                    + "Make sure it's installed first (Install Service button above).");
+        runDaemonAction("Start daemon service", job -> {
+            try {
+                int rc = runElevatedPowerShell("Start-Service -Name '" + SERVICE_NAME + "'", "Start daemon service");
+                if (rc != 0) job.fail("elevated exit code " + rc);
+                Thread.sleep(500);
+                SwingUtilities.invokeLater(() -> {
+                    if (rc == 0) {
+                        showInfo("Daemon service started.\nCheck the daemon log for details.");
+                    } else {
+                        showError("Failed to start the service (exit code " + rc + ").\n"
+                            + "Make sure it's installed first (Install Service button above).");
+                    }
+                    refreshDaemonStatus();
+                });
+            } catch (Exception e) {
+                job.fail(String.valueOf(e.getMessage()));
+                SwingUtilities.invokeLater(() -> showError("Error starting daemon service: " + e.getMessage()));
             }
-            Thread.sleep(500);
-            refreshDaemonStatus();
-        } catch (Exception e) {
-            showError("Error starting daemon service: " + e.getMessage());
-        }
+        });
     }
 
     /**
@@ -886,7 +809,7 @@ public class SettingsPanel extends JPanel {
             }
             return p.waitFor();
         } catch (Exception e) {
-            showError(description + " failed: " + e.getMessage());
+            SwingUtilities.invokeLater(() -> showError(description + " failed: " + e.getMessage()));
             return -1;
         }
     }
@@ -942,7 +865,7 @@ public class SettingsPanel extends JPanel {
                 }
             }
         };
-        worker.execute();
+        Async.execute("Check service status", false, false, worker);
     }
 
     private void openDaemonLog() {
@@ -1089,15 +1012,8 @@ public class SettingsPanel extends JPanel {
         spinnerWatcherFilesPerThread.setValue(AppSettings.getWatcherFilesPerWorkerThread());
         spinnerStaleThresholdMinutes.setValue(AppSettings.getStaleRunningThresholdMinutes());
         spinnerMaxConcurrentTaskThreads.setValue(AppSettings.getMaxConcurrentTaskThreads());
-        chkPurgeEnabled.setSelected(AppSettings.isPurgeEnabled());
-        spinnerPurgeHour.setValue(AppSettings.getPurgeHour());
-        spinnerPurgeRunDays.setValue(AppSettings.getPurgeRunHistoryDays());
-        spinnerPurgeEventDays.setValue(AppSettings.getPurgeEventHistoryDays());
-        spinnerPurgeDetailsDays.setValue(AppSettings.getPurgeRunDetailsDays());
-        spinnerPurgeMaxDbMb.setValue(AppSettings.getPurgeMaxDbMb());
-        spinnerPurgeTaskLogDays.setValue(AppSettings.getPurgeTaskLogDays());
-        spinnerPurgeOrphanLogDays.setValue(AppSettings.getPurgeOrphanLogDays());
-        refreshPurgeStatus();
+        if (retentionPanel != null) retentionPanel.load();
+        if (visibilityPanel != null) visibilityPanel.load();
     }
 
     /**
@@ -1111,6 +1027,8 @@ public class SettingsPanel extends JPanel {
     // the same constants used in live.put(...) — kept in one place so the
     // event feed reads naturally ("Log level") instead of raw key constants.
     private static final Map<String, String> SETTING_LABELS = Map.ofEntries(
+            Map.entry(service.ActivityVisibility.KEY_SLOW_JOB_MS, "Show background work slower than (ms)"),
+            Map.entry(service.ActivityVisibility.KEY_UI_STALL_MS, "Report UI stall longer than (ms)"),
             Map.entry(AppSettings.KEY_DEFAULT_STATION_ADDR, "Default station address"),
             Map.entry(AppSettings.KEY_ATTACHMENT_DOWNLOAD_DIR, "Attachment download directory"),
             Map.entry(AppSettings.KEY_LOG_LEVEL, "Log level"),
@@ -1124,7 +1042,13 @@ public class SettingsPanel extends JPanel {
             Map.entry(AppSettings.KEY_WATCHER_FILES_PER_WORKER_THREAD, "Watcher files per worker thread"),
             Map.entry(AppSettings.KEY_STALE_RUNNING_THRESHOLD_MINUTES, "Stale running threshold (min)"),
             Map.entry(AppSettings.KEY_MAX_CONCURRENT_TASK_THREADS, "Max concurrent task threads"),
-            Map.entry(AppSettings.KEY_POLL_INTERVAL_SECONDS, "Poll interval (s)"));
+            Map.entry(AppSettings.KEY_POLL_INTERVAL_SECONDS, "Poll interval (s)"),
+            Map.entry(service.PurgePolicy.KEY_BG_DAYS, "Background log: keep days"),
+            Map.entry(service.PurgePolicy.KEY_BG_MB, "Background log: max MB"),
+            Map.entry(service.PurgePolicy.KEY_RUN_DAYS, "Run history: keep days"),
+            Map.entry(service.PurgePolicy.KEY_RUN_MB, "Run history: max MB"),
+            Map.entry(service.PurgePolicy.KEY_SCHEDULED, "Automatic purge"),
+            Map.entry(service.PurgePolicy.KEY_INTERVAL_H, "Purge every (hours)"));
 
     /**
      * Builds a field-level "what actually changed" description for the event
@@ -1155,25 +1079,33 @@ public class SettingsPanel extends JPanel {
 
     private void logActivity(String title, String detail) {
         if (scheduler == null) return;
-        try {
-            java.time.LocalDateTime now = java.time.LocalDateTime.now();
-            scheduler.getRunHistoryService().recordActivityEvent("SETTINGS", title, null, detail, detail, now, now);
-        } catch (Exception ignored) {
-            // Best-effort — a failure to log this shouldn't block the actual settings save.
-        }
+        // Audit writes go through a single background thread (in order) so a busy
+        // SQLite connection can never freeze the UI on save.
+        Async.inOrder(() -> {
+            try {
+                java.time.LocalDateTime now = java.time.LocalDateTime.now();
+                scheduler.getRunHistoryService().recordActivityEvent("SETTINGS", title, null, detail, detail, now, now);
+            } catch (Exception ignored) {
+                // Best-effort — a failure to log this shouldn't block the actual settings save.
+            }
+        });
     }
 
     /** Same as {@link #logActivity} but marks the event FAILED, so it renders
      *  as a failure (red, "Failed: ...") in the feed instead of a neutral note. */
     private void logActivityFailed(String title, String detail) {
         if (scheduler == null) return;
-        try {
-            java.time.LocalDateTime now = java.time.LocalDateTime.now();
-            scheduler.getRunHistoryService().recordActivityEvent("SETTINGS", title, null,
-                    model.TaskRunRecord.Status.FAILED, detail, detail, now, now);
-        } catch (Exception ignored) {
-            // Best-effort — a failure to log this shouldn't block the actual settings save.
-        }
+        // Audit writes go through a single background thread (in order) so a busy
+        // SQLite connection can never freeze the UI on save.
+        Async.inOrder(() -> {
+            try {
+                java.time.LocalDateTime now = java.time.LocalDateTime.now();
+                scheduler.getRunHistoryService().recordActivityEvent("SETTINGS", title, null,
+                        model.TaskRunRecord.Status.FAILED, detail, detail, now, now);
+            } catch (Exception ignored) {
+                // Best-effort — a failure to log this shouldn't block the actual settings save.
+            }
+        });
     }
 
     private void savePrefs() {
@@ -1214,18 +1146,12 @@ public class SettingsPanel extends JPanel {
                     String.valueOf((Integer) spinnerStaleThresholdMinutes.getValue()));
             live.put(AppSettings.KEY_MAX_CONCURRENT_TASK_THREADS,
                     String.valueOf((Integer) spinnerMaxConcurrentTaskThreads.getValue()));
-            live.put(AppSettings.KEY_PURGE_ENABLED, String.valueOf(chkPurgeEnabled.isSelected()));
-            live.put(AppSettings.KEY_PURGE_HOUR, String.valueOf((Integer) spinnerPurgeHour.getValue()));
-            live.put(AppSettings.KEY_PURGE_RUN_HISTORY_DAYS, String.valueOf((Integer) spinnerPurgeRunDays.getValue()));
-            live.put(AppSettings.KEY_PURGE_EVENT_HISTORY_DAYS, String.valueOf((Integer) spinnerPurgeEventDays.getValue()));
-            live.put(AppSettings.KEY_PURGE_RUN_DETAILS_DAYS, String.valueOf((Integer) spinnerPurgeDetailsDays.getValue()));
-            live.put(AppSettings.KEY_PURGE_MAX_DB_MB, String.valueOf((Integer) spinnerPurgeMaxDbMb.getValue()));
-            live.put(AppSettings.KEY_PURGE_TASK_LOG_DAYS, String.valueOf((Integer) spinnerPurgeTaskLogDays.getValue()));
-            live.put(AppSettings.KEY_PURGE_ORPHAN_LOG_DAYS, String.valueOf((Integer) spinnerPurgeOrphanLogDays.getValue()));
             // Poll interval always saved here regardless of WinSCP path below —
             // shared via app.db so the Daemon/service picks it up too.
             live.put(AppSettings.KEY_POLL_INTERVAL_SECONDS,
                     String.valueOf((Integer) spinnerPollInterval.getValue()));
+            if (retentionPanel != null) live.putAll(retentionPanel.values());
+            if (visibilityPanel != null) live.putAll(visibilityPanel.values());
             // Captured before setAll() overwrites anything — this is what makes
             // the per-field "what actually changed" diff below possible.
             Map<String, String> oldValues = new LinkedHashMap<>();

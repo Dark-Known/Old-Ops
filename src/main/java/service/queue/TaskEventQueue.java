@@ -43,6 +43,10 @@ public class TaskEventQueue {
      */
     public void publish(TaskDueEvent event) {
         TaskDueEvent previous = pendingByTaskId.get(event.getTaskId());
+        // An explicit run request that has not been picked up yet wins over a scheduled/watcher
+        // fire for the same task: the task is already marked RUNNING for it, so dropping it would
+        // leave the task stuck in that state.
+        if (previous != null && previous.isManual() && !event.isManual()) return;
         if (previous != null && previous.isImmediate() && event.isImmediate()
                 && !previous.getChangedFileNames().isEmpty()) {
             java.util.Set<String> merged = new java.util.LinkedHashSet<>(previous.getChangedFileNames());

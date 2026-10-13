@@ -109,16 +109,8 @@ public class RemotePushWatcher {
     public synchronized void start() {
         if (running) return;
         running = true;
-        listenerExecutor = Executors.newCachedThreadPool(r -> {
-            Thread t = new Thread(r, "remote-push-listener");
-            t.setDaemon(true);
-            return t;
-        });
-        debounceExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "remote-push-debounce");
-            t.setDaemon(true);
-            return t;
-        });
+        listenerExecutor = service.Workers.newCachedPool(service.Workers.Lane.WATCH);
+        debounceExecutor = service.Workers.newScheduled(service.Workers.Lane.WATCH, 1);
         log.info("RemotePushWatcher started (best-effort remote push — Linux inotify / Windows FileSystemWatcher"
                 + " — for eligible INBOUND watcher tasks).");
     }

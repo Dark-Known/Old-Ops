@@ -1,5 +1,7 @@
 package ui;
 
+import service.BackgroundJobs;
+
 import ui.CredentialManagerPanel;
 import model.ScheduledTask;
 import service.TaskSchedulerService;
@@ -519,7 +521,20 @@ public class MainWindow extends JFrame {
         // (e.g. it opens the file a moment before/after them, or hits its own
         // transient lock) — check it too, or the badge could say "connected"
         // while every Settings save was silently failing.
-        boolean connected = storage.isConnected() && util.AppSettings.isConnected();
+        // Both isConnected() calls ping JDBC, so they run off the EDT.
+        Async.latest("db-status", () -> {
+            boolean ok = storage.isConnected() && util.AppSettings.isConnected();
+            String err = null;
+            if (!ok) {
+                err = storage.getConnectionError();
+                if (err == null) err = util.AppSettings.getConnectionError();
+            }
+            return new Object[] { ok, err };
+        }, r -> applyDbStatus((Boolean) r[0], (String) r[1]), null);
+    }
+
+    private void applyDbStatus(boolean connected, String err) {
+        if (dbLabel == null) return;
         if (connected) {
             dbLabel.setText("● Database connected");
             dbLabel.setForeground(new Color(0x2E7D32));
@@ -527,8 +542,6 @@ public class MainWindow extends JFrame {
         } else {
             dbLabel.setText("● Database disconnected — click for details");
             dbLabel.setForeground(new Color(0xC62828));
-            String err = storage.getConnectionError();
-            if (err == null) err = util.AppSettings.getConnectionError();
             dbLabel.setToolTipText(err);
         }
     }
@@ -615,8 +628,15 @@ public class MainWindow extends JFrame {
     private void refreshSchedulerBadge() {
         if (schedulerBadge == null) return;
 
-        boolean daemonAlive = service.queue.SchedulerStatusSnapshot.isAlive(
-                daemonStatusFile, service.queue.SchedulerStatusSnapshot.DEFAULT_STALE_MS);
+        // File read happens off the EDT; only the restyle runs on it.
+        Async.latest("scheduler-badge",
+                () -> service.queue.SchedulerStatusSnapshot.isAlive(
+                        daemonStatusFile, service.queue.SchedulerStatusSnapshot.DEFAULT_STALE_MS),
+                this::applySchedulerBadge, null);
+    }
+
+    private void applySchedulerBadge(boolean daemonAlive) {
+        if (schedulerBadge == null) return;
         if (daemonAlive) {
             restyleChip(schedulerBadge, "Scheduler: Service Active", new Color(0x7FA7C9));
             schedulerBadge.setToolTipText("The background service is handling scheduling.");

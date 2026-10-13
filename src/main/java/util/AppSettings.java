@@ -146,22 +146,6 @@ public final class AppSettings {
     public static final String KEY_WINSCP_PATH            = "winScpPath";
     public static final String KEY_POLL_INTERVAL_SECONDS  = "pollIntervalSeconds";
 
-    // ── Data retention / purge (see service.MaintenanceService) ───────────
-    // Keeps run_history.db and the per-task log folders from growing without
-    // bound. The daemon runs the purge once a day (after PURGE_HOUR) and on
-    // demand from the Settings panel; every value is read live, no restart.
-    // A value of 0 turns that individual rule off.
-    public static final String KEY_PURGE_ENABLED            = "purgeEnabled";
-    public static final String KEY_PURGE_HOUR               = "purgeHour";              // 0-23, local time
-    public static final String KEY_PURGE_RUN_HISTORY_DAYS   = "purgeRunHistoryDays";    // delete run_history rows older than N days
-    public static final String KEY_PURGE_EVENT_HISTORY_DAYS = "purgeEventHistoryDays";  // delete event_monitor_history rows older than N days
-    public static final String KEY_PURGE_RUN_DETAILS_DAYS   = "purgeRunDetailsDays";    // clear the full captured run log (details) older than N days, keep the summary row
-    public static final String KEY_PURGE_MAX_DB_MB          = "purgeMaxDbMb";           // hard cap on run_history.db size; oldest rows go first
-    public static final String KEY_PURGE_TASK_LOG_DAYS      = "purgeTaskLogDays";       // delete rotated task-*.log archives older than N days
-    public static final String KEY_PURGE_ORPHAN_LOG_DAYS    = "purgeOrphanLogDays";     // delete log folders of deleted/renamed tasks idle for N days
-    public static final String KEY_PURGE_LAST_RUN           = "purgeLastRunEpochMs";    // written by the purge itself
-    public static final String KEY_PURGE_LAST_RESULT        = "purgeLastResult";        // written by the purge itself
-
     // Built-in fallbacks, used only if neither app-settings.json nor
     // app-config.xml has a value (keeps behavior identical to before this
     // file existed, for anyone upgrading in place).
@@ -198,16 +182,6 @@ public final class AppSettings {
         HARD_DEFAULTS.put(KEY_MAX_CONCURRENT_TASK_THREADS, "20");
         HARD_DEFAULTS.put(KEY_WINSCP_PATH, "");
         HARD_DEFAULTS.put(KEY_POLL_INTERVAL_SECONDS, "60");
-        // Retention defaults keep today's behavior (the old hardcoded
-        // pruneOlderThan(90)) and add bounds where there were none.
-        HARD_DEFAULTS.put(KEY_PURGE_ENABLED, "true");
-        HARD_DEFAULTS.put(KEY_PURGE_HOUR, "3");
-        HARD_DEFAULTS.put(KEY_PURGE_RUN_HISTORY_DAYS, "90");
-        HARD_DEFAULTS.put(KEY_PURGE_EVENT_HISTORY_DAYS, "90");
-        HARD_DEFAULTS.put(KEY_PURGE_RUN_DETAILS_DAYS, "0");   // off: clearing logs is opt-in
-        HARD_DEFAULTS.put(KEY_PURGE_MAX_DB_MB, "0");          // off: size cap is opt-in
-        HARD_DEFAULTS.put(KEY_PURGE_TASK_LOG_DAYS, "30");
-        HARD_DEFAULTS.put(KEY_PURGE_ORPHAN_LOG_DAYS, "30");
     }
 
     // app-config.xml tag each key is seeded from on first run.
@@ -550,33 +524,6 @@ public final class AppSettings {
     public static String getLogLevel()               { return get(KEY_LOG_LEVEL); }
     public static String getWinScpPath()             { return get(KEY_WINSCP_PATH); }
     public static int getPollIntervalSeconds()       { return intOrDefault(KEY_POLL_INTERVAL_SECONDS); }
-
-    // ── Retention / purge getters ────────────────────────────────────────────
-    public static boolean isPurgeEnabled()           { return !"false".equalsIgnoreCase(get(KEY_PURGE_ENABLED)); }
-    public static int getPurgeHour()                 { return Math.min(23, nonNegIntOrDefault(KEY_PURGE_HOUR)); }
-    public static int getPurgeRunHistoryDays()       { return nonNegIntOrDefault(KEY_PURGE_RUN_HISTORY_DAYS); }
-    public static int getPurgeEventHistoryDays()     { return nonNegIntOrDefault(KEY_PURGE_EVENT_HISTORY_DAYS); }
-    public static int getPurgeRunDetailsDays()       { return nonNegIntOrDefault(KEY_PURGE_RUN_DETAILS_DAYS); }
-    public static int getPurgeMaxDbMb()              { return nonNegIntOrDefault(KEY_PURGE_MAX_DB_MB); }
-    public static int getPurgeTaskLogDays()          { return nonNegIntOrDefault(KEY_PURGE_TASK_LOG_DAYS); }
-    public static int getPurgeOrphanLogDays()        { return nonNegIntOrDefault(KEY_PURGE_ORPHAN_LOG_DAYS); }
-    public static long getPurgeLastRunEpochMs() {
-        try { return Long.parseLong(get(KEY_PURGE_LAST_RUN)); } catch (Exception e) { return 0L; }
-    }
-    public static String getPurgeLastResult() {
-        String v = get(KEY_PURGE_LAST_RESULT);
-        return v == null ? "" : v;
-    }
-
-    /** Like {@link #intOrDefault} but 0 is a valid value (means "rule off"). */
-    private static int nonNegIntOrDefault(String key) {
-        try {
-            int v = Integer.parseInt(get(key));
-            return v >= 0 ? v : Integer.parseInt(HARD_DEFAULTS.get(key));
-        } catch (Exception e) {
-            return Integer.parseInt(HARD_DEFAULTS.get(key));
-        }
-    }
     /** Applies only on the JVM's NEXT start — see class javadoc. */
     public static String getJvmMinHeap()             { return get(KEY_JVM_MIN_HEAP); }
     /** Applies only on the JVM's NEXT start — see class javadoc. */

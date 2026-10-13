@@ -1,5 +1,6 @@
 package ui.monitor;
 
+import ui.Async;
 import model.EventKind;
 import model.TaskRunRecord;
 import service.RunHistoryService;
@@ -34,6 +35,7 @@ public class DetailPane extends JPanel {
     private static final int MAX_LOG_CHARS = 200_000;
 
     private final RunHistoryService history;
+    private final service.BackgroundLogService backgroundLog;
     private final Consumer<String> onlyTask;
 
     private final CardLayout cards = new CardLayout();
@@ -55,8 +57,9 @@ public class DetailPane extends JPanel {
         @Override protected boolean removeEldestEntry(Map.Entry<String, TaskRunRecord> e) { return size() > 60; }
     };
 
-    public DetailPane(RunHistoryService history, Consumer<String> onlyTask) {
+    public DetailPane(RunHistoryService history, service.BackgroundLogService backgroundLog, Consumer<String> onlyTask) {
         this.history = history;
+        this.backgroundLog = backgroundLog;
         this.onlyTask = onlyTask;
         setLayout(cards);
 
@@ -157,7 +160,7 @@ public class DetailPane extends JPanel {
         Color[] c = MonitorStyle.pill(row.outcome);
         subtitle.setText("<html><span style='color:" + MonitorStyle.hex(MonitorStyle.onSurface(c[0])) + "'><b>" + row.outcome.label()
                 + "</b></span>  \u00b7  " + MonitorStyle.htmlEscape(headline(row)) + "</html>");
-        onlyBtn.setVisible(row.taskId != null && row.head.kind().category() != EventKind.Category.SYSTEM);
+        onlyBtn.setVisible(row.taskId != null && !row.head.kind().category().taskless());
         refreshOnlyButton();
 
         // Render immediately from what the feed already knows, then enrich once the log arrives.
@@ -177,12 +180,15 @@ public class DetailPane extends JPanel {
         }
         if (missing.isEmpty()) { applyLog(row, have); return; }
 
-        new SwingWorker<Map<String, TaskRunRecord>, Void>() {
+        Async.execute("Load event details", false, false, new SwingWorker<Map<String, TaskRunRecord>, Void>() {
             @Override protected Map<String, TaskRunRecord> doInBackground() {
                 Map<String, TaskRunRecord> out = new HashMap<>();
                 for (MonitorEvent e : missing) {
-                    TaskRunRecord r = e.table() == MonitorEvent.Table.RUN ? history.getRunById(e.id())
-                            : history.getActivityEventById(e.id());
+                    TaskRunRecord r = switch (e.table()) {
+                        case RUN -> history.getRunById(e.id());
+                        case ACTIVITY -> history.getActivityEventById(e.id());
+                        case BACKGROUND -> backgroundLog.getById(e.id());
+                    };
                     if (r != null) out.put(e.key(), r);
                 }
                 return out;
@@ -199,7 +205,7 @@ public class DetailPane extends JPanel {
                     applyLog(row, have);
                 }
             }
-        }.execute();
+        });
     }
 
     private void applyLog(FeedRow row, Map<String, TaskRunRecord> records) {

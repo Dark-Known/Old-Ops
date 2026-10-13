@@ -40,6 +40,10 @@ public final class TaskDueEvent implements Delayed {
     // eventFileNames parameter. Empty (never null) for every ordinary
     // scheduled/retry occurrence, which only ever uses the 3-arg constructor.
     private final Set<String> changedFileNames;
+    // True for an explicit "run it now" (Run Now button, Daemon RUN_NOW command, automatic retry).
+    // These used to be executed on a second, private thread pool that no counter or monitor knew
+    // about; now they are queued like every other run and executed by a task worker.
+    private final boolean manual;
     private final long sequence; // tiebreaker for events with identical dueAt, and identity for cancellation
 
     public TaskDueEvent(String taskId, LocalDateTime dueAt, int attempt) {
@@ -52,6 +56,17 @@ public final class TaskDueEvent implements Delayed {
 
     public TaskDueEvent(String taskId, LocalDateTime dueAt, int attempt, boolean immediate,
                          Set<String> changedFileNames) {
+        this(taskId, dueAt, attempt, immediate, changedFileNames, false);
+    }
+
+    /** A run requested explicitly (manual or retry): executed by a worker as soon as one is free. */
+    public static TaskDueEvent manual(String taskId) {
+        return new TaskDueEvent(taskId, LocalDateTime.now(), 0, false, Collections.emptySet(), true);
+    }
+
+    private TaskDueEvent(String taskId, LocalDateTime dueAt, int attempt, boolean immediate,
+                         Set<String> changedFileNames, boolean manual) {
+        this.manual = manual;
         this.taskId = Objects.requireNonNull(taskId, "taskId");
         this.dueAt = Objects.requireNonNull(dueAt, "dueAt");
         this.attempt = attempt;
@@ -64,6 +79,8 @@ public final class TaskDueEvent implements Delayed {
     public LocalDateTime getDueAt() { return dueAt; }
     public int getAttempt() { return attempt; }
     public boolean isImmediate() { return immediate; }
+    /** True for an explicit run request (Run Now / retry) as opposed to a scheduled or watcher fire. */
+    public boolean isManual() { return manual; }
     /** Filenames the push-watch layer named for this fire, or empty for an ordinary scheduled occurrence. */
     public Set<String> getChangedFileNames() { return changedFileNames; }
     long getSequence() { return sequence; }

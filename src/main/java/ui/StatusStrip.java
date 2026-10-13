@@ -61,11 +61,17 @@ public class StatusStrip extends JPanel {
 
     private final JLabel dot = new JLabel("\u25CF");
     private final JLabel summary = new JLabel();
-    private final JLabel workersChip = glanceChip();
+    /** Task-id -> name, refreshed off the EDT; used by the workers tooltip, which is built live on hover. */
+    private volatile Map<String, String> taskNames = Map.of();
+    private final JLabel workersChip = new JLabel() {
+        @Override public String getToolTipText(java.awt.event.MouseEvent e) { return buildWorkersTooltip(); }
+    };
     private final JLabel nextRunChip = glanceChip();
     private final JLabel bellBadge = new JLabel();
 
     private final javax.swing.Timer pollTimer;
+    private final javax.swing.Timer chipTimer;
+    private Runnable daemonUnsub = () -> { };
     private final java.util.function.Consumer<TaskRunRecord> runListener;
 
     public StatusStrip(XmlStorageService storage, TaskSchedulerService scheduler, WatchStatusMonitor watchStatusMonitor) {
@@ -117,6 +123,27 @@ public class StatusStrip extends JPanel {
             c.addMouseListener(openOnClick);
         }
 
+        // The chip must show whichever process is really running tasks. With the Daemon as primary
+        // scheduler this GUI's own scheduler is idle, so reading it always showed "0/N workers".
+        if (storage != null) {
+            daemonUnsub = AppFeeds.daemon(storage.getDataDir().toPath().resolve("scheduler-status-daemon.dat"))
+                    .subscribe(d -> updateWorkersChip());
+        }
+        styleChip(workersChip);
+        workersChip.setToolTipText("Workers"); // registers the tooltip; the text itself is built live on hover (see buildWorkersTooltip)
+        // While the tooltip is open, nudge the tooltip manager once a second so it re-reads the live text.
+        final javax.swing.Timer hover = new javax.swing.Timer(1000, ev -> {
+            java.awt.Point pt = workersChip.getMousePosition();
+            if (pt != null) javax.swing.ToolTipManager.sharedInstance().mouseMoved(new java.awt.event.MouseEvent(
+                    workersChip, java.awt.event.MouseEvent.MOUSE_MOVED, System.currentTimeMillis(), 0, pt.x, pt.y, 0, false));
+        });
+        workersChip.addMouseListener(new java.awt.event.MouseAdapter() {
+            @Override public void mouseEntered(java.awt.event.MouseEvent e) { hover.start(); }
+            @Override public void mouseExited(java.awt.event.MouseEvent e) { hover.stop(); }
+        });
+        // Cheap in-memory read, so the chip can follow short background jobs instead of updating every 15 s.
+        chipTimer = new javax.swing.Timer(1000, e -> updateWorkersChip());
+        chipTimer.start();
         refresh();
         pollTimer = new javax.swing.Timer(15_000, e -> refresh());
         pollTimer.start();
@@ -134,15 +161,21 @@ public class StatusStrip extends JPanel {
 
     private static JLabel glanceChip() {
         JLabel l = new JLabel();
+        styleChip(l);
+        return l;
+    }
+
+    private static void styleChip(JLabel l) {
         l.setFont(l.getFont().deriveFont(Font.PLAIN, 11f));
         l.setForeground(AppTheme.NEUTRAL_FG);
-        return l;
     }
 
     /** Stops the internal poll timer and detaches the run listener — call before discarding
      *  a StatusStrip instance (e.g. on a UI rebuild), so rebuilds don't stack duplicates. */
     public void dispose() {
         pollTimer.stop();
+        chipTimer.stop();
+        daemonUnsub.run();
         if (runListener != null && scheduler != null && scheduler.getRunHistoryService() != null) {
             scheduler.getRunHistoryService().removeRunListener(runListener);
         }
@@ -182,16 +215,29 @@ public class StatusStrip extends JPanel {
     /** Re-reads failures, trend, and worker/schedule glance-stats, then repaints. Cheap — call freely. */
     public void refresh() {
         if (scheduler == null || scheduler.getRunHistoryService() == null) return;
-        LocalDateTime now = LocalDateTime.now();
-        LocalDateTime since = now.minusHours(LOOKBACK_HOURS);
-        List<TaskRunRecord> failures;
-        try {
-            var history = scheduler.getRunHistoryService();
-            failures = history.queryRuns(null, TaskRunRecord.Status.FAILED, since, null, QUERY_LIMIT);
-        } catch (Exception e) {
-            return; // DB briefly locked by a write — next poll tick will catch up
-        }
+        // SQLite + task-store reads run off the EDT; only the repaint happens on it.
+        Async.latest(this, () -> {
+            LocalDateTime since = LocalDateTime.now().minusHours(LOOKBACK_HOURS);
+            List<TaskRunRecord> f;
+            try {
+                f = scheduler.getRunHistoryService()
+                        .queryRunSummaries(TaskRunRecord.Status.FAILED, since, QUERY_LIMIT);
+            } catch (Exception e) {
+                return null; // DB briefly locked by a write — next poll tick will catch up
+            }
+            try {
+                Map<String, String> names = new java.util.HashMap<>();
+                for (ScheduledTask t : storage.loadTasks()) names.put(t.getId(), t.getName());
+                taskNames = names;
+            } catch (Exception ignored) { /* keep the previous names */ }
+            return new Loaded(f, describeNextScheduledCompact());
+        }, loaded -> { if (loaded != null) apply(loaded); }, null);
+    }
 
+    private record Loaded(List<TaskRunRecord> failures, String nextText) {}
+
+    private void apply(Loaded loaded) {
+        List<TaskRunRecord> failures = loaded.failures();
         purgeExpiredSnoozes();
         Map<String, List<TaskRunRecord>> allGroups = IssueGrouping.groupByLikelyCause(failures);
         int activeCount = 0;
@@ -202,10 +248,8 @@ public class StatusStrip extends JPanel {
         bellBadge.setVisible(badgeCount > 0);
         bellBadge.setText(badgeCount > 99 ? "99+" : String.valueOf(badgeCount));
 
-        int active = scheduler.getActiveWorkerCount();
-        int total = scheduler.getWorkerPoolSize();
-        workersChip.setText(active + "/" + total + " workers");
-        nextRunChip.setText("Next " + describeNextScheduledCompact());
+        updateWorkersChip();
+        nextRunChip.setText("Next " + loaded.nextText());
 
         int distinctFailingTasks = (int) failures.stream().map(TaskRunRecord::getTaskId).distinct().count();
         boolean anyBlocking = failures.stream().anyMatch(IssueGrouping::isBlocking);
@@ -220,6 +264,31 @@ public class StatusStrip extends JPanel {
                     + " across " + distinctFailingTasks + " task" + (distinctFailingTasks == 1 ? "" : "s")
                     + (anyBlocking ? " \u2014 action needed" : " \u2014 all retryable"));
         }
+    }
+
+    /** Built each time the tooltip is shown; see {@link WorkersTooltip}. */
+    private String buildWorkersTooltip() {
+        AppFeeds.Daemon d = storage == null ? null
+                : AppFeeds.daemon(storage.getDataDir().toPath().resolve("scheduler-status-daemon.dat")).latest();
+        return WorkersTooltip.build(scheduler, d, id -> taskNames.getOrDefault(id, id));
+    }
+
+    /** Busy/total task workers of the process that is actually scheduling (this GUI, or the Daemon). */
+    private void updateWorkersChip() {
+        int active, total;
+        AppFeeds.Daemon d = storage == null ? null
+                : AppFeeds.daemon(storage.getDataDir().toPath().resolve("scheduler-status-daemon.dat")).latest();
+        if (!scheduler.isStarted() && d != null && d.alive() && d.snapshot() != null) {
+            active = d.snapshot().getActiveWorkers();
+            total = d.snapshot().getPoolSize();
+        } else {
+            active = scheduler.getActiveWorkerCount();
+            total = scheduler.getWorkerPoolSize();
+        }
+        int bg = service.Workers.busyBackground()
+                + (!scheduler.isStarted() && d != null && d.alive() && d.snapshot() != null ? d.snapshot().getBackgroundBusy() : 0);
+        // "0/20 workers" counts task workers only; background work (screen loads, feeds, transfers) runs on other lanes.
+        workersChip.setText(active + "/" + total + " workers" + (bg > 0 ? " \u00b7 +" + bg + " bg" : ""));
     }
 
     /** Best-effort "what's coming up next" — cheapest useful signal to balance a bar that's otherwise all-bad-news. */

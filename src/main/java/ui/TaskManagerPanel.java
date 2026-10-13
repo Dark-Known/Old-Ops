@@ -42,6 +42,8 @@ public class TaskManagerPanel extends JPanel {
     // reality regardless of whether the GUI or the Daemon is actually
     // running the task.
     private final java.nio.file.Path daemonStatusFile;
+    /** Last daemon status read by the background feed; never touches disk on the EDT. */
+    private volatile AppFeeds.Daemon daemonState = AppFeeds.Daemon.OFFLINE;
     private static final long DAEMON_STALE_MS = service.queue.SchedulerStatusSnapshot.DEFAULT_STALE_MS;
     private DefaultListModel<ScheduledTask> listModel;
     private JList<ScheduledTask> taskList;
@@ -85,6 +87,10 @@ public class TaskManagerPanel extends JPanel {
         this.storage   = storage;
         this.scheduler = scheduler;
         this.daemonStatusFile = storage.getDataDir().toPath().resolve("scheduler-status-daemon.dat");
+        DataFeed<AppFeeds.Daemon> daemonFeed = AppFeeds.daemon(daemonStatusFile);
+        if (daemonFeed.latest() != null) daemonState = daemonFeed.latest();
+        daemonFeed.subscribe(d -> daemonState = d);
+        AppFeeds.tasks(storage).subscribe(t -> { });
         setLayout(new BorderLayout(8, 8));
         setBorder(new EmptyBorder(10, 10, 10, 10));
         buildUI();
@@ -144,38 +150,55 @@ public class TaskManagerPanel extends JPanel {
      * position is preserved unless the view was already pinned to the
      * bottom, in which case it stays pinned as new lines arrive.
      */
-    private void refreshSelectedTaskLogIfChanged() {
-        try {
-            ScheduledTask t = getSelectedTask();
-            if (t == null) return;
-            String id = t.getId();
-            String name = t.getName();
+    // ── Log view ─────────────────────────────────────────────────────────────
+    // The on-disk task log (current file plus rotated archives) is the single source of truth for
+    // what the panel shows. It used to be fed from two places in two different formats: live
+    // callback lines ("HH:mm:ss  line", unfiltered) appended as they arrived, and the disk file
+    // ("[date time] line", filtered by log level) swapped in by a 1.5 s poll that never matched
+    // the live text — so the view kept being replaced by just the tail of the current, freshly
+    // rotated file. Now live lines only trigger an (off-EDT, change-gated) reload from disk.
 
-            List<String> logs = showingLatestOnly
-                    ? scheduler.getLogService().getTaskLogsLastN(id, name, 50)
-                    : scheduler.getLogService().getTaskLogs(id, name);
-            String fresh = logs.isEmpty() ? "" : String.join("\n", logs);
-            String current = logArea.getText();
-            // getTaskLogs() returns "" for a placeholder message too — only treat
-            // a genuinely different, non-empty disk read as new content, so an
-            // empty disk read never stomps a "No log entries yet..." placeholder
-            // or an in-memory (taskLogs) fallback that showLogForSelected() may
-            // have shown instead.
-            if (fresh.isEmpty() || fresh.equals(current)) return;
+    private enum LogMode { FULL, LATEST, ARCHIVE }
+    private volatile LogMode logMode = LogMode.FULL;
+    /** Identity of what is on screen (task + mode + file stamp); an unchanged key skips the re-read. */
+    private volatile String shownLogKey;
+    private static final int FULL_VIEW_LINES = 5000;
 
-            JScrollBar vbar = logScrollPane.getVerticalScrollBar();
-            boolean wasAtBottom = vbar == null
-                    || vbar.getValue() + vbar.getVisibleAmount() >= vbar.getMaximum() - 8;
-            logArea.setText(fresh);
-            if (wasAtBottom) {
-                logArea.setCaretPosition(logArea.getDocument().getLength());
+    private record LogView(String taskId, LogMode mode, String key, String text) {}
+
+    private void refreshSelectedTaskLogIfChanged() { loadLogView(false); }
+
+    /** Reloads the selected task's log off the EDT; {@code force} also replaces a placeholder / scrolls to the end. */
+    private void loadLogView(boolean force) {
+        if (logMode == LogMode.ARCHIVE) return; // an archive the user opened is never swapped out underneath them
+        ScheduledTask t = getSelectedTask();
+        if (t == null) return;
+        final String id = t.getId(), name = t.getName();
+        final LogMode mode = logMode;
+        if (force) shownLogKey = null;
+        final String known = shownLogKey;
+        Async.latest("Task log view", () -> {
+            var logs = scheduler.getLogService();
+            String key = id + "|" + mode + "|" + logs.getLogStamp(id, name);
+            if (key.equals(known)) return null; // nothing changed since last paint
+            List<String> lines = logs.getTaskLogsRecent(id, name, mode == LogMode.LATEST ? 50 : FULL_VIEW_LINES);
+            return new LogView(id, mode, key, String.join("\n", lines));
+        }, v -> {
+            if (v == null || logMode != v.mode() || !v.taskId().equals(getSelectedTaskId())) return; // selection moved on
+            shownLogKey = v.key();
+            if (v.text().isEmpty()) {
+                if (force) {
+                    StringBuilder sb = taskLogs.getOrDefault(v.taskId(), new StringBuilder());
+                    logArea.setText(sb.length() > 0 ? sb.toString() : "No log entries yet. Run the task to see output here.");
+                }
+                return;
             }
-        } catch (Exception e) {
-            // Never let a hiccup here (e.g. a log file mid-rotation) silently
-            // and repeatedly no-op this timer tick after tick with nothing
-            // visible to the user — surface it once to stderr instead.
-            System.err.println("Live log poll failed: " + e);
-        }
+            JScrollBar vbar = logScrollPane.getVerticalScrollBar();
+            boolean wasAtBottom = force || vbar == null
+                    || vbar.getValue() + vbar.getVisibleAmount() >= vbar.getMaximum() - 8;
+            logArea.setText(v.text());
+            if (wasAtBottom) logArea.setCaretPosition(logArea.getDocument().getLength());
+        }, e -> System.err.println("Log view load failed: " + e));
     }
 
     /**
@@ -190,9 +213,9 @@ public class TaskManagerPanel extends JPanel {
     private int activeSessionCount(String taskId) {
         int local = scheduler.getActiveSessionCount(taskId);
         if (local > 0 || scheduler.isStarted()) return local;
-        if (!service.queue.SchedulerStatusSnapshot.isAlive(daemonStatusFile, DAEMON_STALE_MS)) return local;
-        service.queue.SchedulerStatusSnapshot snap = service.queue.SchedulerStatusSnapshot.read(daemonStatusFile);
-        return snap != null ? snap.getActiveSessionCount(taskId) : local;
+        AppFeeds.Daemon d = daemonState;
+        if (!d.alive() || d.snapshot() == null) return local;
+        return d.snapshot().getActiveSessionCount(taskId);
     }
 
     private void refreshActiveSessionLabel() {
@@ -241,16 +264,11 @@ public class TaskManagerPanel extends JPanel {
             }
 
             if (selectedHasRow && taskId.equals(selectedTaskId)) {
-                logArea.append(chunk);
-                appendedToVisibleArea = true;
+                appendedToVisibleArea = true; // reloaded from the log file below, in one consistent format
             }
         }
 
-        if (appendedToVisibleArea) {
-            // Document.getLength() is O(1) — unlike getText().length(), which
-            // copies the entire document into a new String on every call.
-            logArea.setCaretPosition(logArea.getDocument().getLength());
-        }
+        if (appendedToVisibleArea) loadLogView(false); // change-gated, off the EDT
 
         // Only refresh table on terminal lines — not every log line.
         // This prevents UI thrash that breaks the Refresh button and next-run calculation.
@@ -532,7 +550,9 @@ public class TaskManagerPanel extends JPanel {
             return;
         }
 
-        ScheduledTask task = storage.loadTasks().stream()
+        List<ScheduledTask> cachedTasks = AppFeeds.tasks(storage).latest();
+        if (cachedTasks == null) return; // first background load not done yet; next tick will paint
+        ScheduledTask task = cachedTasks.stream()
                 .filter(t -> t.getId().equals(taskId))
                 .findFirst().orElse(null);
 
@@ -637,10 +657,9 @@ public class TaskManagerPanel extends JPanel {
      * (e.g. task isn't watcher-enabled, or was created after its last tick).
      */
     private String readDaemonWatchMode(String taskId) {
-        if (!service.queue.SchedulerStatusSnapshot.isAlive(daemonStatusFile, DAEMON_STALE_MS)) return null;
-        service.queue.SchedulerStatusSnapshot snap = service.queue.SchedulerStatusSnapshot.read(daemonStatusFile);
-        if (snap == null) return null;
-        for (service.queue.SchedulerStatusSnapshot.WatchEntry w : snap.getWatchEntries()) {
+        AppFeeds.Daemon d = daemonState;
+        if (!d.alive() || d.snapshot() == null) return null;
+        for (service.queue.SchedulerStatusSnapshot.WatchEntry w : d.snapshot().getWatchEntries()) {
             if (w.taskId().equals(taskId)) return w.mode();
         }
         return null;
@@ -864,8 +883,13 @@ public class TaskManagerPanel extends JPanel {
 
     public void refresh() {
         String selectedId = getSelectedTaskId();
+        // The task store is read off the EDT (it shares one SQLite connection with
+        // the scheduler); the table is rebuilt on the EDT when the rows arrive.
+        Async.latest(this, storage::loadTasks, tasks -> applyRefresh(selectedId, tasks),
+                e -> System.err.println("Task list refresh failed: " + e));
+    }
 
-        List<ScheduledTask> tasks = storage.loadTasks();
+    private void applyRefresh(String selectedId, List<ScheduledTask> tasks) {
         allTasksCache = tasks;
         rowInfoByTaskId.clear();
 
@@ -874,12 +898,10 @@ public class TaskManagerPanel extends JPanel {
         // WatcherInfoPopup already use, just batched here since this loop
         // may touch many watcher-enabled rows at once.
         Map<String, service.queue.SchedulerStatusSnapshot.WatchEntry> daemonWatchEntries = new HashMap<>();
-        if (service.queue.SchedulerStatusSnapshot.isAlive(daemonStatusFile, DAEMON_STALE_MS)) {
-            service.queue.SchedulerStatusSnapshot snap = service.queue.SchedulerStatusSnapshot.read(daemonStatusFile);
-            if (snap != null) {
-                for (service.queue.SchedulerStatusSnapshot.WatchEntry w : snap.getWatchEntries()) {
-                    daemonWatchEntries.put(w.taskId(), w);
-                }
+        AppFeeds.Daemon daemonNow = daemonState;
+        if (daemonNow.alive() && daemonNow.snapshot() != null) {
+            for (service.queue.SchedulerStatusSnapshot.WatchEntry w : daemonNow.snapshot().getWatchEntries()) {
+                daemonWatchEntries.put(w.taskId(), w);
             }
         }
 
@@ -1074,24 +1096,32 @@ public class TaskManagerPanel extends JPanel {
      * itself, not one specific scheduled run.
      */
     private void logActivity(String title, String detail) {
-        try {
-            java.time.LocalDateTime now = java.time.LocalDateTime.now();
-            scheduler.getRunHistoryService().recordActivityEvent("TASKS", title, null, detail, detail, now, now);
-        } catch (Exception ignored) {
-            // Best-effort — a failure to log this shouldn't block the actual task change.
-        }
+        // Audit writes go through a single background thread (in order) so a busy
+        // SQLite connection can never freeze the UI on save.
+        Async.inOrder(() -> {
+            try {
+                java.time.LocalDateTime now = java.time.LocalDateTime.now();
+                scheduler.getRunHistoryService().recordActivityEvent("TASKS", title, null, detail, detail, now, now);
+            } catch (Exception ignored) {
+                // Best-effort — a failure to log this shouldn't block the actual task change.
+            }
+        });
     }
 
     /** Same as {@link #logActivity} but marks the event FAILED, so it renders
      *  as a failure (red, "Failed: ...") in the feed instead of a neutral note. */
     private void logActivityFailed(String title, String detail) {
-        try {
-            java.time.LocalDateTime now = java.time.LocalDateTime.now();
-            scheduler.getRunHistoryService().recordActivityEvent("TASKS", title, null,
-                    model.TaskRunRecord.Status.FAILED, detail, detail, now, now);
-        } catch (Exception ignored) {
-            // Best-effort — a failure to log this shouldn't block the actual task change.
-        }
+        // Audit writes go through a single background thread (in order) so a busy
+        // SQLite connection can never freeze the UI on save.
+        Async.inOrder(() -> {
+            try {
+                java.time.LocalDateTime now = java.time.LocalDateTime.now();
+                scheduler.getRunHistoryService().recordActivityEvent("TASKS", title, null,
+                        model.TaskRunRecord.Status.FAILED, detail, detail, now, now);
+            } catch (Exception ignored) {
+                // Best-effort — a failure to log this shouldn't block the actual task change.
+            }
+        });
     }
 
     private void newTask() {
@@ -1469,6 +1499,7 @@ public class TaskManagerPanel extends JPanel {
 
     private void showLogForSelected() {
         showingLatestOnly = false;
+        logMode = LogMode.FULL;
         ScheduledTask selected = getSelectedTask();
         if (selected == null) {
             lblSelectedTask.setText("Select a task to view its execution log");
@@ -1488,20 +1519,13 @@ public class TaskManagerPanel extends JPanel {
             lblSelectedTask.setForeground(UIManager.getColor("Label.foreground"));
         }
 
-        List<String> logs = scheduler.getLogService().getTaskLogs(id, name);
-        if (logs.isEmpty()) {
-            StringBuilder sb = taskLogs.getOrDefault(id, new StringBuilder());
-            logArea.setText(sb.length() > 0
-                ? sb.toString()
-                : "No log entries yet. Run the task to see output here.");
-        } else {
-            logArea.setText(String.join("\n", logs));
-        }
-        logArea.setCaretPosition(logArea.getDocument().getLength());
+        logMode = LogMode.FULL;
+        loadLogView(true);
     }
 
     private void showLatestLogsForSelected() {
         showingLatestOnly = true;
+        logMode = LogMode.LATEST;
         ScheduledTask selected = getSelectedTask();
         if (selected == null) {
             lblSelectedTask.setText("Select a task to view logs");
@@ -1512,16 +1536,8 @@ public class TaskManagerPanel extends JPanel {
         lblSelectedTask.setText("Latest 50 lines - Execution log: " + name);
         lblSelectedTask.setForeground(UIManager.getColor("Label.foreground"));
 
-        List<String> logs = scheduler.getLogService().getTaskLogsLastN(id, name, 50);
-        if (logs.isEmpty()) {
-            StringBuilder sb = taskLogs.getOrDefault(id, new StringBuilder());
-            logArea.setText(sb.length() > 0 ? sb.toString()
-                : "No log entries yet. Run the task to see output here.");
-        } else {
-            logArea.setText(String.join("\n", logs));
-        }
-        logArea.setCaretPosition(
-            Math.min(logArea.getText().length(), logArea.getDocument().getLength()));
+        logMode = LogMode.LATEST;
+        loadLogView(true);
     }
 
     // ── Export / archives ─────────────────────────────────────────────────────
@@ -1539,17 +1555,20 @@ public class TaskManagerPanel extends JPanel {
         fc.setSelectedFile(new java.io.File(name + "_logs.txt"));
         if (fc.showSaveDialog(this) == JFileChooser.APPROVE_OPTION) {
             java.io.File selected = fc.getSelectedFile();
-            try (java.io.FileWriter fw = new java.io.FileWriter(selected)) {
-                for (String logLine : scheduler.getLogService().getTaskLogs(id, name))
-                    fw.write(logLine + "\n");
-                JOptionPane.showMessageDialog(this,
-                    "Logs exported to:\n" + selected.getAbsolutePath(),
-                    "Export Complete", JOptionPane.INFORMATION_MESSAGE);
-            } catch (Exception e) {
-                JOptionPane.showMessageDialog(this,
-                    "Failed to export logs: " + e.getMessage(),
-                    "Export Error", JOptionPane.ERROR_MESSAGE);
-            }
+            // Whole history (current file + rotated archives), written off the EDT as UTF-8.
+            Async.run("Export task log", true, () -> {
+                try {
+                    List<String> all = scheduler.getLogService().getTaskLogsRecent(id, name, Integer.MAX_VALUE);
+                    java.nio.file.Files.write(selected.toPath(), all, java.nio.charset.StandardCharsets.UTF_8);
+                    SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(this,
+                        "Logs exported to:\n" + selected.getAbsolutePath() + "\n(" + all.size() + " lines, including rotated files)",
+                        "Export Complete", JOptionPane.INFORMATION_MESSAGE));
+                } catch (Exception e) {
+                    SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(this,
+                        "Failed to export logs: " + e.getMessage(),
+                        "Export Error", JOptionPane.ERROR_MESSAGE));
+                }
+            });
         }
     }
 
@@ -1576,18 +1595,22 @@ public class TaskManagerPanel extends JPanel {
             archiveNames.length > 0 ? archiveNames[0] : null);
 
         if (selected != null) {
-            try {
-                List<String> lines = java.nio.file.Files.readAllLines(
-                    archives.stream().filter(f -> f.getName().equals(selected))
-                        .findFirst().orElseThrow().toPath());
-                logArea.setText(String.join("\n", lines));
-                lblSelectedTask.setText("Archive: " + selected + " - " + name);
-                lblSelectedTask.setForeground(UIManager.getColor("Label.foreground"));
-            } catch (Exception e) {
-                JOptionPane.showMessageDialog(this,
-                    "Failed to read archive: " + e.getMessage(),
-                    "Error", JOptionPane.ERROR_MESSAGE);
-            }
+            final java.io.File archiveFile = archives.stream().filter(f -> f.getName().equals(selected))
+                    .findFirst().orElseThrow();
+            logMode = LogMode.ARCHIVE; // stop the live reload replacing what the user chose to look at
+            lblSelectedTask.setText("Archive: " + selected + " - " + name + "   (select the task again to return to the live log)");
+            lblSelectedTask.setForeground(UIManager.getColor("Label.foreground"));
+            Async.call("Read log archive", () -> {
+                try {
+                    return new String(java.nio.file.Files.readAllBytes(archiveFile.toPath()),
+                            java.nio.charset.StandardCharsets.UTF_8);
+                } catch (java.io.IOException e) { throw new java.io.UncheckedIOException(e); }
+            }, text -> {
+                if (logMode != LogMode.ARCHIVE) return;
+                logArea.setText(text);
+                logArea.setCaretPosition(0);
+            }, e -> JOptionPane.showMessageDialog(this,
+                    "Failed to read archive: " + e.getMessage(), "Error", JOptionPane.ERROR_MESSAGE));
         }
     }
 

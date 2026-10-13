@@ -1,5 +1,7 @@
 package ui;
 
+import service.BackgroundJobs;
+
 import model.EventKind;
 import model.ScheduledTask;
 import model.TaskRunRecord;
@@ -78,14 +80,12 @@ public class EventMonitorPanel extends JPanel {
     private final JPanel centerHolder = new JPanel(new BorderLayout());
 
     private final javax.swing.Timer refreshTimer;
+    private volatile AppFeeds.Daemon daemonState = AppFeeds.Daemon.OFFLINE;
+    private Runnable daemonUnsub = () -> { };
     private final java.util.function.Consumer<TaskRunRecord> historyListener;
 
     // Background loading
-    private final ExecutorService loader = Executors.newSingleThreadExecutor(r -> {
-        Thread t = new Thread(r, "event-monitor-loader");
-        t.setDaemon(true);
-        return t;
-    });
+    private final ExecutorService loader = service.Workers.newPool(service.Workers.Lane.FEED, 1);
     private final AtomicBoolean loading = new AtomicBoolean();
     private final AtomicBoolean reloadAgain = new AtomicBoolean();
     private volatile boolean forceNext;
@@ -110,7 +110,7 @@ public class EventMonitorPanel extends JPanel {
         setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
 
         feed = new EventFeedPanel(prefs);
-        detail = new DetailPane(scheduler.getRunHistoryService(), feed::showOnlyTask);
+        detail = new DetailPane(scheduler.getRunHistoryService(), scheduler.getBackgroundLogService(), feed::showOnlyTask);
         feed.setSelectionListener(detail::setRow);
         feed.setTaskFilterListener(detail::setActiveTaskFilter);
 
@@ -119,6 +119,8 @@ public class EventMonitorPanel extends JPanel {
         summary.set("running", "Running", "0", null, "Tasks executing right now");
         summary.set("queued", "Queued", "0", null, "Runs waiting for their scheduled time");
         summary.set("watchers", "Watchers", "\u2014", null, "How watcher-enabled tasks are being triggered");
+        summary.setLiveTooltip("workers", () -> WorkersTooltip.build(scheduler, daemonState,
+                id -> { ScheduledTask t = latestById.get(id); return t != null ? t.getName() : id; }));
         summary.set("attention", "Attention", "\u2026", null, "Click to show only warnings and errors \u2014 click again to go back");
         // Toggle: first click narrows the feed to problems, second click goes back to normal.
         summary.onClick("attention", () -> prefs.setLevelIndex(
@@ -158,9 +160,13 @@ public class EventMonitorPanel extends JPanel {
         historyListener = rec -> requestLoad(false);
         scheduler.getRunHistoryService().addRunListener(historyListener);
         scheduler.getRunHistoryService().addActivityListener(historyListener);
+        scheduler.getBackgroundLogService().addListener(historyListener);
 
         refresh();
         requestLoad(true);
+        DataFeed<AppFeeds.Daemon> daemonFeed = AppFeeds.daemon(daemonStatusFile);
+        if (daemonFeed.latest() != null) daemonState = daemonFeed.latest();
+        daemonUnsub = daemonFeed.subscribe(d -> daemonState = d);
         refreshTimer = new javax.swing.Timer(REFRESH_MS, e -> refresh());
         refreshTimer.start();
     }
@@ -169,11 +175,13 @@ public class EventMonitorPanel extends JPanel {
     public void stopRefreshing() {
         stopped = true;
         if (refreshTimer != null) refreshTimer.stop();
+        daemonUnsub.run();
         loader.shutdownNow();
         // Each open/close of the window builds a fresh panel — without removing these, every reopen
         // would stack another listener onto the shared RunHistoryService, firing forever.
         scheduler.getRunHistoryService().removeRunListener(historyListener);
         scheduler.getRunHistoryService().removeActivityListener(historyListener);
+        scheduler.getBackgroundLogService().removeListener(historyListener);
     }
 
     // ── Layout ──────────────────────────────────────────────────────
@@ -251,7 +259,8 @@ public class EventMonitorPanel extends JPanel {
 
             // Read the token BEFORE querying: a row written mid-query then changes the token and is
             // picked up on the next pass instead of being missed.
-            String token = rhs.getChangeToken();
+            service.BackgroundLogService bgLog = scheduler.getBackgroundLogService();
+            String token = rhs.getChangeToken() + "|" + bgLog.getChangeToken();
             int rangeIdx = prefs.rangeIndex();
             if (!force && token.equals(lastToken) && rangeIdx == lastRangeIndex) return;
 
@@ -259,12 +268,14 @@ public class EventMonitorPanel extends JPanel {
             LocalDateTime from = range.window() != null ? LocalDateTime.now().minus(range.window()) : null;
             List<TaskRunRecord> runs = rhs.queryRunSummaries(from, LOAD_LIMIT);
             List<TaskRunRecord> acts = rhs.queryActivitySummaries(from, LOAD_LIMIT);
+            List<TaskRunRecord> bgs = bgLog.querySummaries(from, LOAD_LIMIT);   // the app's own background threads
 
             Map<String, ScheduledTask> byId = latestById;
-            List<MonitorEvent> events = new ArrayList<>(runs.size() + acts.size());
+            List<MonitorEvent> events = new ArrayList<>(runs.size() + acts.size() + bgs.size());
             for (TaskRunRecord r : runs) events.add(EventClassifier.classify(r, MonitorEvent.Table.RUN, byId));
             for (TaskRunRecord r : acts) events.add(EventClassifier.classify(r, MonitorEvent.Table.ACTIVITY, byId));
-            boolean limited = runs.size() >= LOAD_LIMIT || acts.size() >= LOAD_LIMIT;
+            for (TaskRunRecord r : bgs) events.add(EventClassifier.classify(r, MonitorEvent.Table.BACKGROUND, byId));
+            boolean limited = runs.size() >= LOAD_LIMIT || acts.size() >= LOAD_LIMIT || bgs.size() >= LOAD_LIMIT;
 
             lastToken = token;
             lastRangeIndex = rangeIdx;
@@ -287,8 +298,8 @@ public class EventMonitorPanel extends JPanel {
         if (stopped) return;
         Map<String, ScheduledTask> byId = latestById;
         boolean guiActive = scheduler.isStarted();
-        boolean daemonFresh = !guiActive && SchedulerStatusSnapshot.isAlive(daemonStatusFile, DAEMON_STALE_MS);
-        SchedulerStatusSnapshot snap = daemonFresh ? SchedulerStatusSnapshot.read(daemonStatusFile) : null;
+        AppFeeds.Daemon daemon = daemonState; // background feed: no disk read on the EDT
+        SchedulerStatusSnapshot snap = (!guiActive && daemon.alive()) ? daemon.snapshot() : null;
         boolean anyActive = guiActive || snap != null;
 
         List<QueuePanel.RunningRow> running = new ArrayList<>();
@@ -322,6 +333,15 @@ public class EventMonitorPanel extends JPanel {
                 pending.add(new QueuePanel.PendingRow(name(byId, e.taskId()), glyph(byId, e.taskId()), e.dueAt(), e.attempt(), false));
             }
         }
+        // The app's own background threads, so what the UI is doing behind the scenes is visible too.
+        // Jobs under 400 ms are skipped: they would only flicker in and out of the list.
+        final int runningTaskCount = running.size(); // the "Running" tile counts scheduled tasks only
+        LocalDateTime flickerCutoff = LocalDateTime.now().minusNanos(400_000_000L);
+        for (BackgroundJobs.Running job : BackgroundJobs.running()) {
+            if (job.startedAt().isAfter(flickerCutoff)) continue;
+            running.add(new QueuePanel.RunningRow(job.name(), "\u2699", job.startedAt(),
+                    job.thread() + " \u00b7 " + (job.audited() ? "background action" : "background")));
+        }
         pending.sort(Comparator.comparing(QueuePanel.PendingRow::dueAt));
         running.sort(Comparator.comparing(r -> r.startedAt() != null ? r.startedAt() : LocalDateTime.MAX));
 
@@ -352,11 +372,13 @@ public class EventMonitorPanel extends JPanel {
                 snap != null ? "The Daemon is the active scheduler; per-task start times come from the task list." : null);
 
         // Summary chips
+        // Task workers are only part of the picture: UI loads, feeds and transfers run on their own lanes.
+        int bgBusy = service.Workers.busyBackground() + (snap != null ? snap.getBackgroundBusy() : 0);
         summary.set("scheduler", "Scheduler", source, anyActive ? AppTheme.SUCCESS_FG : AppTheme.FAILED_FG,
                 anyActive ? "The " + source + " is currently scheduling tasks" : "No GUI or Daemon scheduler is running");
-        summary.set("workers", "Workers", anyActive ? busy + " / " + pool + " busy" : "\u2014", busy > 0 ? AppTheme.RUNNING_FG : null, null);
-        summary.set("running", "Running", String.valueOf(running.size()), running.isEmpty() ? null : AppTheme.RUNNING_FG, null);
-        summary.set("queued", "Queued", String.valueOf(pending.size()), null, null);
+        summary.set("workers", "Workers", anyActive ? busy + " / " + pool + " busy" + (bgBusy > 0 ? " \u00b7 +" + bgBusy + " bg" : "") : "\u2014", busy > 0 || bgBusy > 0 ? AppTheme.RUNNING_FG : null, "Worker threads busy / total \u2014 hover for what each one is doing");
+        summary.set("running", "Running", String.valueOf(runningTaskCount), runningTaskCount == 0 ? null : AppTheme.RUNNING_FG, "Tasks executing right now");
+        summary.set("queued", "Queued", String.valueOf(pending.size()), null, "Runs waiting for their scheduled time");
         summary.set("watchers", "Watchers", instant + polling == 0 ? "none" : instant + " instant" + (polling > 0 ? " \u00b7 " + polling + " polling" : ""),
                 polling > 0 ? AppTheme.SKIPPED_FG : null, polling > 0 ? "Some watchers fell back to scheduled polling \u2014 see the list on the right" : null);
         int errs = feed.getErrorCount(), warns = feed.getWarningCount();
@@ -373,6 +395,7 @@ public class EventMonitorPanel extends JPanel {
     }
 
     private static String name(Map<String, ScheduledTask> byId, String id) {
+        if (service.MaintenanceService.isSystemJob(id)) return service.MaintenanceService.displayName(id);
         ScheduledTask t = byId.get(id);
         return t != null ? t.getName() : "(deleted task)";
     }
@@ -442,7 +465,8 @@ public class EventMonitorPanel extends JPanel {
                     ? e.isOutcome()
                     : e.severity().compareTo(EventKind.Severity.WARN) >= 0
                         && e.kind() != EventKind.RETRY_SCHEDULED   // its failed run already toasted
-                        && e.kind().category() != EventKind.Category.QUEUE;
+                        && e.kind().category() != EventKind.Category.QUEUE
+                        && e.kind().category() != EventKind.Category.BACKGROUND; // slow-job / UI-stall notes are for the feed, not popups
             if (wanted) pick.add(e);
         }
         if (pick.isEmpty()) return;

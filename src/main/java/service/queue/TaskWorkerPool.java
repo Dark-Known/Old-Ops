@@ -81,7 +81,7 @@ public class TaskWorkerPool {
     }
 
     /** One worker thread's currently-executing task, for the live activity widget — see {@link #getInFlightSnapshot()}. */
-    public record InFlightTask(String taskId, LocalDateTime startedAt) {}
+    public record InFlightTask(String taskId, LocalDateTime startedAt, String thread) {}
 
     private final java.util.concurrent.ConcurrentHashMap<Long, InFlightTask> inFlightByThread =
             new java.util.concurrent.ConcurrentHashMap<>();
@@ -108,8 +108,9 @@ public class TaskWorkerPool {
         this.handler = handler;
         this.outcomeSupplier = outcomeSupplier != null ? outcomeSupplier : () -> HandlerOutcome.DEFAULT;
         this.workerCount = Math.max(1, workerCount);
+        final java.util.concurrent.atomic.AtomicInteger threadNo = new java.util.concurrent.atomic.AtomicInteger();
         this.workers = Executors.newFixedThreadPool(this.workerCount, r -> {
-            Thread t = new Thread(r, "task-worker");
+            Thread t = new Thread(r, "task-worker-" + threadNo.incrementAndGet());
             t.setDaemon(true);
             return t;
         });
@@ -130,7 +131,7 @@ public class TaskWorkerPool {
                 TaskDueEvent event = queue.take(); // blocks here — zero CPU while idle, no polling
                 activeWorkers.incrementAndGet();
                 LocalDateTime startedAt = LocalDateTime.now();
-                inFlightByThread.put(Thread.currentThread().getId(), new InFlightTask(event.getTaskId(), startedAt));
+                inFlightByThread.put(Thread.currentThread().getId(), new InFlightTask(event.getTaskId(), startedAt, Thread.currentThread().getName()));
                 boolean errored = false;
                 String message = null;
                 boolean suppress = false;
@@ -147,6 +148,9 @@ public class TaskWorkerPool {
                     message = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
                     log.warning("Worker error handling task event " + event + ": " + e.getMessage());
                 } finally {
+                    // cancelTask() interrupts the thread running a task. Clear a leftover flag so it
+                    // cannot make the next take() throw and end this worker for good.
+                    if (running) Thread.interrupted();
                     activeWorkers.decrementAndGet();
                     inFlightByThread.remove(Thread.currentThread().getId());
                     if (!suppress) {
@@ -155,8 +159,8 @@ public class TaskWorkerPool {
                     }
                 }
             } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-                return;
+                if (!running) { Thread.currentThread().interrupt(); return; } // pool shutting down
+                // otherwise a task-cancel interrupt landed while idle: keep serving events
             }
         }
     }

@@ -104,11 +104,7 @@ public class PersistentSftpConnectionManager {
     private final ScheduledExecutorService reaper;
 
     public PersistentSftpConnectionManager() {
-        reaper = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "sftp-persistent-reaper");
-            t.setDaemon(true);
-            return t;
-        });
+        reaper = service.Workers.newScheduled(service.Workers.Lane.WATCH, 1);
         reaper.scheduleAtFixedRate(this::reapIdle, 1, 1, TimeUnit.MINUTES);
     }
 

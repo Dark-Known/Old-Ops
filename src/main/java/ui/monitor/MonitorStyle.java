@@ -50,6 +50,7 @@ public final class MonitorStyle {
             case WATCH -> new Color(0x4A8A6D);
             case QUEUE -> new Color(0x8A8378);
             case SYSTEM -> new Color(0x6E6FA8);
+            case BACKGROUND -> new Color(0x5B8FA3);
         };
     }
 

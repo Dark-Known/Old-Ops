@@ -180,11 +180,7 @@ public class TransferService {
             0, Math.max(1, AppSettings.getTransferBatchConcurrency()),
             BATCH_POOL_IDLE_SECONDS, TimeUnit.SECONDS,
             new SynchronousQueue<>(),
-            r -> {
-                Thread t = new Thread(r, "watcher-sftp-worker");
-                t.setDaemon(true);
-                return t;
-            },
+            Workers.factory(Workers.Lane.WATCH),
             new ThreadPoolExecutor.CallerRunsPolicy());
 
     public TransferService(XmlStorageService storage) {
@@ -395,18 +391,21 @@ public class TransferService {
     private boolean runLocalFileOpsConcurrently(List<Path> batch, Path destDir, LocalFileOp op,
             Consumer<String> logLine, int concurrency, int[] doneOut) {
         java.util.concurrent.ExecutorService pool =
-                java.util.concurrent.Executors.newFixedThreadPool(Math.min(concurrency, batch.size()));
+                Workers.newPool(Workers.Lane.TRANSFER, Math.min(concurrency, batch.size()));
         java.util.concurrent.atomic.AtomicInteger done = new java.util.concurrent.atomic.AtomicInteger(0);
         boolean allOk = true;
         try {
             List<java.util.concurrent.Callable<Boolean>> tasks = new ArrayList<>();
             for (Path src : batch) {
                 tasks.add(() -> {
+                    try (BackgroundJobs.Job j = BackgroundJobs.begin((op == LocalFileOp.MOVE ? "Move " : "Copy ") + src.getFileName(), false)) {
                     boolean ok = op == LocalFileOp.MOVE
                             ? moveSingleFile(src, destDir.resolve(src.getFileName()), logLine)
                             : copySingleFile(src, destDir.resolve(src.getFileName()), logLine);
                     if (ok) done.incrementAndGet();
+                    if (!ok) j.fail("file operation reported failure");
                     return ok;
+                    }
                 });
             }
             List<java.util.concurrent.Future<Boolean>> results;
@@ -432,7 +431,7 @@ public class TransferService {
                 }
             }
         } finally {
-            pool.shutdownNow();
+            Workers.shutdownNow(pool);
         }
         doneOut[0] = done.get();
         return allOk;
@@ -1554,7 +1553,7 @@ public class TransferService {
         boolean allOk = true;
         int total = batches.size();
         java.util.concurrent.ExecutorService pool =
-                java.util.concurrent.Executors.newFixedThreadPool(Math.min(concurrency, total));
+                Workers.newPool(Workers.Lane.TRANSFER, Math.min(concurrency, total));
         try {
             for (int waveStart = 0; waveStart < total; waveStart += concurrency) {
                 if (Thread.currentThread().isInterrupted()) {
@@ -1565,7 +1564,13 @@ public class TransferService {
                 List<java.util.concurrent.Callable<Boolean>> waveTasks = new ArrayList<>();
                 for (int i = waveStart; i < waveEnd; i++) {
                     final int idx = i;
-                    waveTasks.add(() -> runOneBatch(target, password, batches.get(idx), idx, total, logLine, taskId));
+                    waveTasks.add(() -> {
+                        try (BackgroundJobs.Job j = BackgroundJobs.begin("Transfer batch " + (idx + 1) + "/" + total + " (task " + taskId + ")", false)) {
+                            boolean ok = runOneBatch(target, password, batches.get(idx), idx, total, logLine, taskId);
+                            if (!ok) j.fail("batch " + (idx + 1) + " reported failure");
+                            return ok;
+                        }
+                    });
                 }
                 List<java.util.concurrent.Future<Boolean>> results;
                 try {
@@ -1587,7 +1592,7 @@ public class TransferService {
                 }
             }
         } finally {
-            pool.shutdownNow();
+            Workers.shutdownNow(pool);
         }
         return allOk;
     }

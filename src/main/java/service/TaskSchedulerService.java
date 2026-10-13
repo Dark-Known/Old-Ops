@@ -60,21 +60,16 @@ public class TaskSchedulerService {
     private final TransferService transferService;
     private final TaskLogService logService;
     private final RunHistoryService runHistoryService;
-    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(4);
-    // Bounded, NOT Executors.newCachedThreadPool(). A cached pool creates a
-    // brand-new thread for every task submitted while none are idle, with
-    // no ceiling — each thread reserves its own stack (OS-default is
-    // typically several hundred KB–1MB), so any burst of task submissions
-    // (a backlog of due tasks after the GUI was closed a while, retries,
-    // or previously the same-process double-scheduling race fixed above)
-    // could spawn hundreds of threads and visibly balloon the process's
-    // memory footprint without a single object leak anywhere. A fixed pool
-    // sized to a realistic worst-case concurrent-task count keeps that
-    // bounded; excess submissions simply queue instead of spawning more
-    // threads. Configurable since a very large deployment may genuinely
-    // want more parallel transfers.
-    private final ExecutorService executor = Executors.newFixedThreadPool(
-            Math.max(4, util.AppSettings.getMaxConcurrentTaskThreads()));
+    private final BackgroundLogService backgroundLogService;
+    private final MaintenanceService maintenance;
+    /** Tasks whose "change arrived during a run" deferral has already been recorded for the current run. */
+    private final java.util.Set<String> deferNoted = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private final ScheduledExecutorService scheduler = Workers.newScheduled(Workers.Lane.SCHEDULER, 4);
+    // There is deliberately no second "run it now" executor any more. Run Now, the Daemon's RUN_NOW
+    // command and automatic retries used to run on a private fixed pool that the workers badge, the
+    // queue and the Event Monitor knew nothing about (and that doubled the real concurrency limit).
+    // Every task run - scheduled, watcher-fired, manual or retry - is now a TaskDueEvent executed by a
+    // TaskWorkerPool worker, bounded by AppSettings.getMaxConcurrentTaskThreads().
     // The in-process "broker": holds one pending TaskDueEvent per eligible
     // task, releasing each to a worker exactly at its due instant. Replaces
     // the old shared poll tick + separate short-interval-timer map.
@@ -103,7 +98,8 @@ public class TaskSchedulerService {
     private final LocalWatchManager localWatchManager = new LocalWatchManager(this::onWatchWakeup);
     private final RemotePushWatcher remotePushWatcher;
     // Tracks currently running task futures so they can be cancelled on request
-     private final ConcurrentMap<String, Future<?>> runningTaskFutures = new ConcurrentHashMap<>();
+     // Worker thread currently executing each running task (so cancelTask can interrupt it).
+     private final ConcurrentMap<String, Thread> runningThreads = new ConcurrentHashMap<>();
      private final ConcurrentMap<String, TaskMetrics> taskMetrics = new ConcurrentHashMap<>();
      // Last time ANY log line was emitted for a task's current run (wall-clock
      // millis). Used by isStaleRunning() to catch a run whose connection has
@@ -157,17 +153,14 @@ public class TaskSchedulerService {
         this.transferService = transferService;
         this.logService = new TaskLogService(storage.getDataDir().getAbsolutePath());
         this.runHistoryService = new RunHistoryService(storage.getDataDir().getAbsolutePath());
-        // Keep the run-history database from growing unbounded — every run
-        // (success, failure, or skip) adds a row. This is only the cheap
-        // startup trim using the configured windows (Settings -> Data
-        // retention, default 90 days); the full purge (clearing old run
-        // logs, size cap, VACUUM, task log cleanup) is service.MaintenanceService,
-        // run daily by the daemon.
-        if (util.AppSettings.isPurgeEnabled()) {
-            this.runHistoryService.pruneOlderThan(
-                    util.AppSettings.getPurgeRunHistoryDays(),
-                    util.AppSettings.getPurgeEventHistoryDays());
-        }
+        // Background-thread events get their own database, so they can be purged and vacuumed
+        // independently of the run history. Older builds stored them in run history: move them over.
+        this.backgroundLogService = new BackgroundLogService(storage.getDataDir().getAbsolutePath());
+        MaintenanceService.migrateLegacyBackgroundRows(runHistoryService, backgroundLogService);
+        BackgroundJobs.attach(backgroundLogService);
+        this.maintenance = new MaintenanceService(runHistoryService, backgroundLogService);
+        // Retention (age + size) is enforced by a scheduled purge that runs on a task worker —
+        // see maintenanceTick() — rather than blocking start-up with a synchronous delete here.
         this.pollIntervalSeconds = Math.max(1, pollIntervalSeconds);
         this.remotePushWatcher = new RemotePushWatcher(storage, this::onWatchWakeup);
     }
@@ -458,6 +451,55 @@ public class TaskSchedulerService {
         return runHistoryService;
     }
 
+    public BackgroundLogService getBackgroundLogService() {
+        return backgroundLogService;
+    }
+
+    public MaintenanceService getMaintenance() {
+        return maintenance;
+    }
+
+    // ── System jobs (purge) — executed by the same task workers as every other run ──────────────
+
+    private final java.util.concurrent.atomic.AtomicBoolean purgeQueued = new java.util.concurrent.atomic.AtomicBoolean();
+    private volatile String purgeTrigger = "scheduled";
+
+    /**
+     * Queues a purge of the log databases for a task worker to execute. Returns false when this
+     * instance is not the active scheduler (its worker pool isn't running), so the caller can
+     * hand the request to whichever process is. Safe to call repeatedly: while one purge is
+     * queued or running, further requests are folded into it.
+     */
+    public boolean requestPurge(String trigger) {
+        if (!started) return false;
+        if (purgeQueued.compareAndSet(false, true)) {
+            purgeTrigger = trigger;
+            eventQueue.publish(TaskDueEvent.manual(MaintenanceService.JOB_PURGE));
+        }
+        return true;
+    }
+
+    /** Periodic check (on the scheduler clock, not a worker): queues a purge when the schedule says it is due. */
+    private void maintenanceTick() {
+        try {
+            if (started && !purgeQueued.get() && maintenance.purgeDue()) requestPurge("scheduled");
+        } catch (Exception e) {
+            log.warning("Maintenance schedule check failed: " + e);
+        }
+    }
+
+    /** Executes a system job on the calling worker thread. */
+    private void runSystemJob(String jobId) {
+        pendingSuppressActivity.set(true); // not a user task: keep it out of the per-task activity list
+        try {
+            if (MaintenanceService.JOB_PURGE.equals(jobId)) {
+                maintenance.runPurge(purgeTrigger, () -> !started);
+            }
+        } finally {
+            if (MaintenanceService.JOB_PURGE.equals(jobId)) purgeQueued.set(false);
+        }
+    }
+
     public XmlStorageService getStorage() {
         return storage;
     }
@@ -535,6 +577,14 @@ public class TaskSchedulerService {
         }
     }
 
+    /** Lane summary plus every running background job of this process, for the workers tooltip. */
+    private static List<String> workerLines() {
+        List<String> out = new ArrayList<>();
+        out.addAll(Workers.summaryLines());
+        out.addAll(BackgroundJobs.liveLines(10));
+        return out;
+    }
+
     private void exportStatus() {
         if (statusExporter == null) return;
         try {
@@ -553,7 +603,7 @@ public class TaskSchedulerService {
             }
             statusExporter.export(getWorkerPoolSize(), getActiveWorkerCount(), getPendingEvents(),
                     getRecentActivity(30), watchEntries, java.util.Collections.emptyList(), getRunningTaskIds(),
-                    sessionEntries);
+                    sessionEntries, getInFlightTasks(), workerLines());
         } catch (Exception e) {
             log.fine("Status export tick failed: " + e.getMessage());
         }
@@ -688,6 +738,9 @@ public class TaskSchedulerService {
         // seconds to actually transfer, even in the fallback cases where
         // something does have to wait for it.
         scheduler.scheduleAtFixedRate(this::reconcileSchedules, 5, 8, TimeUnit.SECONDS);
+        // Retention purge: first check shortly after start (a Daemon restart purges at once if due),
+        // then once a minute. The tick only decides; the purge itself runs on a task worker.
+        scheduler.scheduleWithFixedDelay(this::maintenanceTick, 20, 60, TimeUnit.SECONDS);
         reconcileSchedules();
         log.info("Task scheduler started (event-driven; " + eventQueue.size() + " task(s) pending).");
     }
@@ -700,9 +753,10 @@ public class TaskSchedulerService {
         transferService.shutdownWatcherConnections();
         if (statusExportFuture != null) statusExportFuture.cancel(false);
         scheduler.shutdownNow();
-        executor.shutdownNow();
         logService.closeAll();
+        BackgroundJobs.attach(null);
         runHistoryService.close();
+        backgroundLogService.close();
         log.info("TaskSchedulerService stopped.");
     }
 
@@ -722,8 +776,8 @@ public class TaskSchedulerService {
             t.setLastStartedAt(LocalDateTime.now());
             if (!storage.saveTask(t)) logBackendSaveFailure(t, "RUNNING status at run start");
             refreshMetrics(t.getId(), true);
-            Future<?> f = executor.submit(() -> executeTask(t));
-            runningTaskFutures.put(t.getId(), f);
+            // Hand the run to the worker pool like any other fire; a free worker picks it up at once.
+            eventQueue.publish(TaskDueEvent.manual(t.getId()));
         });
     }
 
@@ -914,6 +968,7 @@ public class TaskSchedulerService {
                     return null;
                 }
                 LocalDateTime next = now.toLocalDate().atTime(target);
+                if (justDue(next, now, task.getLastRunAt())) return 0L;
                 boolean alreadyRanToday = task.getLastRunAt() != null
                         && !task.getLastRunAt().toLocalDate().isBefore(now.toLocalDate());
                 if (!next.isAfter(now) || alreadyRanToday) {
@@ -935,6 +990,7 @@ public class TaskSchedulerService {
                     return null;
                 }
                 LocalDateTime next = now.toLocalDate().atTime(target);
+                if (next.getDayOfWeek() == targetDay && justDue(next, now, task.getLastRunAt())) return 0L;
                 // Walk forward to the next matching day/time that's actually
                 // still ahead of now; bounded loop (max 7 steps) so a bad/
                 // unmatched day name can never spin forever.
@@ -961,6 +1017,35 @@ public class TaskSchedulerService {
             default:
                 return null;
         }
+    }
+
+    /**
+     * True when {@code occurrence} (today's configured time) has only just passed — within the delivery
+     * jitter tolerance — and this task has not already run for it. An event is delivered at its target
+     * instant or a few ms after, so "the next occurrence after now" is already tomorrow by then; without
+     * this a DAILY/WEEKLY task re-validated at delivery was judged "not due" and re-armed for ~24 h
+     * ("Re-armed scheduled fire — schedule changed since it was queued") and so never ran.
+     */
+    /** For the deferral event: how long the run that is holding the task has been going, and on which thread. */
+    private String describeRunInProgress(ScheduledTask task, LocalDateTime now) {
+        StringBuilder sb = new StringBuilder("Previous run: ");
+        if (task.getLastStartedAt() != null) {
+            long secs = Math.max(0, Duration.between(task.getLastStartedAt(), now).getSeconds());
+            sb.append("started ").append(task.getLastStartedAt().toLocalTime().withNano(0)).append(", running for ")
+                    .append(secs >= 120 ? (secs / 60) + " min" : secs + " s");
+        } else {
+            sb.append("start time unknown");
+        }
+        Thread runner = runningThreads.get(task.getId());
+        if (runner != null) sb.append(" on ").append(runner.getName());
+        else sb.append(" \u2014 but no worker is executing it right now (the status may be stale; the reconcile sweep resets stuck runs)");
+        return sb.toString();
+    }
+
+    private static boolean justDue(LocalDateTime occurrence, LocalDateTime now, LocalDateTime lastRunAt) {
+        if (occurrence.isAfter(now)) return false;
+        if (Duration.between(occurrence, now).toMillis() > DUE_TOLERANCE_MS) return false;
+        return lastRunAt == null || lastRunAt.isBefore(occurrence);
     }
 
     private static long millisUntil(LocalDateTime target, LocalDateTime now) {
@@ -1095,18 +1180,36 @@ public class TaskSchedulerService {
     }
 
     private void onTaskDue(TaskDueEvent event) {
+        if (MaintenanceService.isSystemJob(event.getTaskId())) {
+            runSystemJob(event.getTaskId());
+            return;
+        }
         List<ScheduledTask> tasks = storage.loadTasks();
         tasks.stream().filter(t -> t.getId().equals(event.getTaskId())).findFirst().ifPresentOrElse(task -> {
             LocalDateTime now = LocalDateTime.now();
+            if (event.isManual()) {
+                // Run Now / retry: runNow() already validated the request and marked the task RUNNING,
+                // so there is no schedule or status check to repeat here - just run it on this worker.
+                pendingSuppressActivity.set(true); // executeTask records its own Started/outcome rows
+                executeTask(task);
+                return;
+            }
+            if (task.getStatus() != TaskStatus.RUNNING) deferNoted.remove(task.getId());
             if (task.getStatus() == TaskStatus.DISABLED || task.getStatus() == TaskStatus.RETRYING
                     || task.getStatus() == TaskStatus.RUNNING) {
                 pendingSuppressActivity.set(true);
                 String why = event.isImmediate() ? "watcher wake-up" : "scheduled fire";
                 if (task.getStatus() == TaskStatus.RUNNING && event.isImmediate()
                         && !event.getChangedFileNames().isEmpty()) {
-                    recordSchedulerEvent(EventKind.FIRE_DEFERRED, task, TaskRunRecord.Status.SUCCESS,
-                            "Change arrived while the previous run is still in progress \u2014 re-queued to run in ~3s",
-                            event.getChangedFileNames().size() + " changed file(s) will be picked up by the next run.");
+                    // Recorded once per in-progress run. The re-queued wake-up comes back every ~3 s for as long as
+                    // the run lasts and used to log this line each time (one event per 3 s for a long transfer).
+                    if (deferNoted.add(task.getId())) {
+                        recordSchedulerEvent(EventKind.FIRE_DEFERRED, task, TaskRunRecord.Status.SUCCESS,
+                                "Change arrived while the previous run is still in progress \u2014 re-queued to run in ~3s",
+                                event.getChangedFileNames().size() + " changed file(s) will be picked up by the next run. "
+                                        + "Further changes during this run are queued without another event.\n"
+                                        + describeRunInProgress(task, now));
+                    }
                     // A watcher fire named real files but arrived while this
                     // task's previous run is still in flight — re-arm a fresh
                     // immediate event a few seconds out instead of silently
@@ -1208,11 +1311,12 @@ public class TaskSchedulerService {
     public boolean cancelTask(String taskId) {
         boolean pendingRemoved = eventQueue.cancel(taskId);
         boolean cancelledAny = pendingRemoved;
-        Future<?> f = runningTaskFutures.remove(taskId);
+        Thread runner = runningThreads.get(taskId);
         boolean interrupted = false;
-        if (f != null) {
-            interrupted = f.cancel(true);
-            cancelledAny = interrupted || cancelledAny;
+        if (runner != null) {
+            runner.interrupt(); // the worker clears the flag afterwards and keeps serving the queue
+            interrupted = true;
+            cancelledAny = true;
         }
         // Also attempt to terminate any external process associated with the task
         try {
@@ -1249,13 +1353,13 @@ public class TaskSchedulerService {
 
     /**
      * IDs of tasks that are actively executing right now (i.e. have a live
-     * future in {@link #runningTaskFutures}). Used by the Settings panel to
+     * worker thread in {@link #runningThreads}). Used by the Settings panel to
      * offer restarting in-flight tasks when the log level changes, so their
      * logs come out consistently at the new level for the whole run instead
      * of switching level partway through.
      */
     public List<String> getRunningTaskIds() {
-        return new ArrayList<>(runningTaskFutures.keySet());
+        return new ArrayList<>(runningThreads.keySet());
     }
 
     /**
@@ -1300,9 +1404,12 @@ public class TaskSchedulerService {
         }
         final String runKey = RunHistoryService.currentRunKey();
         activeRunKeys.put(task.getId(), runKey);
+        final Thread self = Thread.currentThread();
+        runningThreads.put(task.getId(), self);
         try {
             executeTaskBody(task, changedFileNames);
         } finally {
+            runningThreads.remove(task.getId(), self);
             activeRunKeys.remove(task.getId(), runKey);
             RunHistoryService.endRunContext();
         }
@@ -1372,7 +1479,7 @@ public class TaskSchedulerService {
                     TaskRunRecord.Status.SKIPPED, reason, reason, runStartedAt, LocalDateTime.now());
             pendingOutcomeNote.set(reason);
             try { lockChannel.close(); } catch (IOException ignored) {}
-            try { runningTaskFutures.remove(task.getId()); } catch (Exception ignored) {}
+            try { runningThreads.remove(task.getId()); } catch (Exception ignored) {}
             lastActivityMillis.remove(task.getId());
             return;
         }
@@ -1527,7 +1634,7 @@ public class TaskSchedulerService {
         long cpuMs = THREAD_BEAN.isCurrentThreadCpuTimeSupported() ? (THREAD_BEAN.getCurrentThreadCpuTime() - startCpuNanos) / 1_000_000 : 0L;
         recordMetricsOnComplete(task.getId(), success, durationMs, cpuMs);
         // Clean up running future mapping
-        try { runningTaskFutures.remove(task.getId()); } catch (Exception ignored) {}
+        try { runningThreads.remove(task.getId()); } catch (Exception ignored) {}
         lastActivityMillis.remove(task.getId());
         } finally {
             // Always release the cross-process lock, however this run ended
