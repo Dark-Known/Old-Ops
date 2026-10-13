@@ -104,9 +104,11 @@ public final class FeedBuilder {
     static int rank(MonitorEvent e) {
         return switch (e.kind()) {
             case WATCH_TRIGGERED -> 0;
-            case RUN_STARTED -> 1;
-            case FILES_DETECTED -> 2;
             case RUN_SUCCEEDED, RUN_FAILED, RUN_SKIPPED -> 9;
+            // Everything else a run records (Started, SSH opened, Files detected, SSH closed, notes...)
+            // lives in the same table, whose ids ARE in true order — so it must be ordered by id, not by
+            // a fixed rank (a rank put "SSH opened" after "Files detected" although the connection is
+            // opened first to list the files).
             default -> 5;
         };
     }

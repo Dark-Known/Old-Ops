@@ -75,6 +75,9 @@ public class RemotePushWatcher {
     // detected-to-started budget.
     private static final long SETTLE_MILLIS = 1200L;
     private static final String UNAVAILABLE_MARKER = "__WATCH_UNAVAILABLE__";
+    /** Keep-alive line the remote script prints every few seconds; ignored here. Its real job is
+     *  to make the remote process fail a write (and exit) once the SSH channel is gone. */
+    private static final String HEARTBEAT = "__HB__";
 
     private final XmlStorageService storage;
     // taskId, changedFileNames -> wake the task up now, naming exactly the file(s)
@@ -240,6 +243,9 @@ public class RemotePushWatcher {
     private void runListener(String taskId, Credential cred, String rawTargetPath, RemoteOs os, ListenerHandle handle) {
         Session session = null;
         ChannelExec channel = null;
+        boolean opened = false;
+        long openedAt = 0;
+        String endReason = null;
         try {
             JSch jsch = new JSch();
             session = jsch.getSession(cred.getUsername(), cred.getHost(), 22);
@@ -250,8 +256,18 @@ public class RemotePushWatcher {
             // Keep the long-lived channel alive through idle periods / NAT timeouts.
             session.setServerAliveInterval(15_000);
             session.setServerAliveCountMax(4);
-            session.connect(15_000);
+            try {
+                session.connect(15_000);
+            } catch (Exception ex) {
+                service.SshSessionEvents.failedDetached(taskId, "remote change listener (" + os + "), stays open while the watcher is armed", cred.getHost(),
+                        cred.getUsername(), ex.getMessage());
+                throw ex;
+            }
+            opened = true;
+            openedAt = System.currentTimeMillis();
+            service.SshSessionEvents.openedDetached(taskId, "remote change listener (" + os + "), stays open while the watcher is armed", cred.getHost(), cred.getUsername());
             handle.session = session;
+            if (handle.closed) return; // stopped/replaced while connecting: never start a remote process
 
             channel = (ChannelExec) session.openChannel("exec");
             handle.channel = channel;
@@ -263,6 +279,7 @@ public class RemotePushWatcher {
 
             InputStream in = channel.getInputStream();
             channel.connect(15_000);
+            if (handle.closed) return; // finally{} tears the channel + session down
             reasonByTaskId.put(taskId, "connected (" + os + "), waiting for first change event");
 
             BufferedReader reader = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8));
@@ -272,6 +289,7 @@ public class RemotePushWatcher {
                 line = line.trim();
                 if (line.isEmpty()) continue;
                 sawAnyLine = true;
+                if (line.equals(HEARTBEAT)) continue;
                 if (line.contains(UNAVAILABLE_MARKER)) {
                     // Windows side now appends ":<real PS error text>" after the
                     // marker (path-not-found message, or $_.Exception.Message
@@ -310,8 +328,10 @@ public class RemotePushWatcher {
                         + " the exec channel (some SFTP-only servers do)";
                 log.info("Watcher task " + taskId + ": " + reason + "; falling back to scheduled polling only.");
                 markUnsupported(taskId, reason);
+                endReason = "remote exec produced no output";
             }
         } catch (Exception e) {
+            endReason = "error: " + e.getMessage();
             if (!handle.closed) {
                 String reason = "connection failed (" + os + "): " + e.getMessage();
                 log.info("Watcher task " + taskId + ": remote push listener unavailable (" + e.getMessage()
@@ -321,6 +341,13 @@ public class RemotePushWatcher {
         } finally {
             if (channel != null && channel.isConnected()) channel.disconnect();
             if (session != null && session.isConnected()) session.disconnect();
+            if (opened) {
+                service.SshSessionEvents.closedDetached(taskId, "remote change listener (" + os + "), stays open while the watcher is armed", cred.getHost(),
+                        cred.getUsername(),
+                        handle.closed ? "watcher stopped or reconfigured"
+                                : endReason != null ? endReason : "remote side ended the stream",
+                        System.currentTimeMillis() - openedAt);
+            }
             activeByTaskId.remove(taskId, handle);
         }
     }
@@ -378,14 +405,28 @@ public class RemotePushWatcher {
                 "  Register-ObjectEvent -InputObject $w -EventName Created -SourceIdentifier PushCreate | Out-Null\n" +
                 "  Register-ObjectEvent -InputObject $w -EventName Changed -SourceIdentifier PushChange | Out-Null\n" +
                 "  Register-ObjectEvent -InputObject $w -EventName Renamed -SourceIdentifier PushRename | Out-Null\n" +
+                // Self-terminate when the SSH channel goes away. Windows OpenSSH does not
+                // reliably kill a child powershell.exe when the channel/session closes, so a
+                // loop that only blocks in Wait-Event is orphaned forever under sshd.exe.
+                // (1) stdin EOF: sshd closes the child's stdin when the channel closes.
+                // (2) heartbeat: a write to the dead stdout pipe throws, which ends the script.
+                "  $in = [Console]::OpenStandardInput()\n" +
+                "  $buf = New-Object byte[] 1\n" +
+                "  $rd = $in.ReadAsync($buf, 0, 1)\n" +
                 "  while ($true) {\n" +
-                "    $e = Wait-Event\n" +
+                "    $e = Wait-Event -Timeout 5\n" +
+                "    if ($rd.IsCompleted) { break }\n" +
+                "    if ($e -eq $null) { [Console]::Out.WriteLine('" + HEARTBEAT + "'); [Console]::Out.Flush(); continue }\n" +
                 "    Write-Output $e.SourceEventArgs.Name\n" +
                 "    Remove-Event -EventIdentifier $e.EventIdentifier\n" +
                 "  }\n" +
                 "} catch {\n" +
                 "  Write-Output ('" + UNAVAILABLE_MARKER + ":' + $_.Exception.Message)\n" +
-                "}\n";
+                "} finally {\n" +
+                "  Get-EventSubscriber -ErrorAction SilentlyContinue | Unregister-Event -ErrorAction SilentlyContinue\n" +
+                "  if ($w) { $w.EnableRaisingEvents = $false; $w.Dispose() }\n" +
+                "}\n" +
+                "exit\n";
 
         String encoded = Base64.getEncoder().encodeToString(script.getBytes(StandardCharsets.UTF_16LE));
         // -NonInteractive + -NoProfile keep this fast and free of profile-script

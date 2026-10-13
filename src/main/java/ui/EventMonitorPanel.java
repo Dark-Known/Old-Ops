@@ -466,6 +466,7 @@ public class EventMonitorPanel extends JPanel {
                     : e.severity().compareTo(EventKind.Severity.WARN) >= 0
                         && e.kind() != EventKind.RETRY_SCHEDULED   // its failed run already toasted
                         && e.kind().category() != EventKind.Category.QUEUE
+                        && e.kind().category() != EventKind.Category.SSH     // connect failures already surface as the run/watcher failure
                         && e.kind().category() != EventKind.Category.BACKGROUND; // slow-job / UI-stall notes are for the feed, not popups
             if (wanted) pick.add(e);
         }

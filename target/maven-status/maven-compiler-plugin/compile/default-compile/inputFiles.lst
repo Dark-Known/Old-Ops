@@ -34,6 +34,7 @@ D:\OPS\OpsTransferTool-source\src\main\java\service\RunHistoryService.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\SftpBrowseService.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\SftpRemoteFileMetadataService.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\SqlitePurge.java
+D:\OPS\OpsTransferTool-source\src\main\java\service\SshSessionEvents.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\TaskDbService.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\TaskLogService.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\TaskSchedulerService.java

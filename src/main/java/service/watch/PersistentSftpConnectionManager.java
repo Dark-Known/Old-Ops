@@ -91,6 +91,8 @@ public class PersistentSftpConnectionManager {
         final String credentialFingerprint;
         volatile long lastUsedMillis;
         int connectCount;
+        final long openedAtMillis = System.currentTimeMillis();
+        String host, user;
 
         Entry(Session session, String fingerprint, int connectCount) {
             this.session = session;
@@ -113,7 +115,7 @@ public class PersistentSftpConnectionManager {
         for (java.util.Map.Entry<String, Entry> e : entries.entrySet()) {
             if (now - e.getValue().lastUsedMillis > IDLE_CLOSE_MILLIS) {
                 if (entries.remove(e.getKey(), e.getValue())) {
-                    closeQuietly(e.getValue());
+                    closeQuietly(e.getKey(), e.getValue(), "idle for " + (IDLE_CLOSE_MILLIS / 60000) + " min");
                     log.info("Persistent SFTP connection for task " + e.getKey()
                             + " closed after " + (IDLE_CLOSE_MILLIS / 60000) + " minute(s) idle.");
                 }
@@ -167,10 +169,11 @@ public class PersistentSftpConnectionManager {
         int priorConnectCount = 0;
         if (existing != null) {
             priorConnectCount = existing.connectCount;
-            closeQuietly(existing);
+            closeQuietly(taskId, existing, !existing.session.isConnected() ? "connection dropped"
+                    : "credential changed");
             entries.remove(taskId);
         }
-        Entry created = connect(credential, priorConnectCount + 1);
+        Entry created = connect(taskId, credential, priorConnectCount + 1);
         ChannelSftp channel = (ChannelSftp) created.session.openChannel("sftp");
         channel.connect(CONNECT_TIMEOUT_MILLIS);
         created.slots.put(slot, channel);
@@ -193,14 +196,20 @@ public class PersistentSftpConnectionManager {
         return e != null ? Math.max(e.connectCount, 1) : 1;
     }
 
-    private Entry connect(Credential credential, int connectCount) throws Exception {
+    private Entry connect(String taskId, Credential credential, int connectCount) throws Exception {
         JSch jsch = new JSch();
         Session session = jsch.getSession(credential.getUsername(), credential.getHost(), 22);
         session.setPassword(credential.getPassword());
         Properties config = new Properties();
         config.put("StrictHostKeyChecking", "no");
         session.setConfig(config);
-        session.connect(CONNECT_TIMEOUT_MILLIS);
+        try {
+            session.connect(CONNECT_TIMEOUT_MILLIS);
+        } catch (Exception ex) {
+            service.SshSessionEvents.failed(taskId, "SFTP transfer", credential.getHost(),
+                    credential.getUsername(), ex.getMessage());
+            throw ex;
+        }
         // Keep the connection alive across long idle gaps between watcher
         // fires — without this, some firewalls/NAT devices silently drop a
         // quiet TCP connection well before our own idle-close window, and the
@@ -209,7 +218,12 @@ public class PersistentSftpConnectionManager {
         // even with the persistent-connection fix in place.
         session.setServerAliveInterval(15_000);
         session.setServerAliveCountMax(4);
-        return new Entry(session, fingerprint(credential), connectCount);
+        Entry entry = new Entry(session, fingerprint(credential), connectCount);
+        entry.host = credential.getHost();
+        entry.user = credential.getUsername();
+        service.SshSessionEvents.opened(taskId, "SFTP transfer"
+                + (connectCount > 1 ? ", reconnect #" + (connectCount - 1) : ""), entry.host, entry.user);
+        return entry;
     }
 
     private static String fingerprint(Credential c) {
@@ -224,11 +238,11 @@ public class PersistentSftpConnectionManager {
      */
     public synchronized void close(String taskId) {
         Entry e = entries.remove(taskId);
-        if (e != null) closeQuietly(e);
+        if (e != null) closeQuietly(taskId, e, "run finished");
     }
 
     public synchronized void closeAll() {
-        for (Entry e : entries.values()) closeQuietly(e);
+        for (java.util.Map.Entry<String, Entry> e : entries.entrySet()) closeQuietly(e.getKey(), e.getValue(), "shutdown");
         entries.clear();
     }
 
@@ -238,10 +252,13 @@ public class PersistentSftpConnectionManager {
         reaper.shutdownNow();
     }
 
-    private static void closeQuietly(Entry e) {
+    private static void closeQuietly(String taskId, Entry e, String reason) {
+        boolean wasOpen = e.session != null;
         for (ChannelSftp c : e.slots.values()) {
             try { if (c.isConnected()) c.disconnect(); } catch (Exception ignored) {}
         }
         try { if (e.session != null && e.session.isConnected()) e.session.disconnect(); } catch (Exception ignored) {}
+        if (wasOpen) service.SshSessionEvents.closed(taskId, "SFTP transfer", e.host, e.user, reason,
+                System.currentTimeMillis() - e.openedAtMillis);
     }
 }

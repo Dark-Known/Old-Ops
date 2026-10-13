@@ -33,6 +33,7 @@ service\watch\PersistentSftpConnectionManager$Entry.class
 service\CredentialDbService.class
 ui\monitor\MonitorStyle$1.class
 ui\VectorIcons$6.class
+service\SshSessionEvents$Event.class
 ui\monitor\EventClassifier$1.class
 service\queue\TaskWorkerPool$InFlightTask.class
 service\watch\RemotePushWatcher.class
@@ -71,6 +72,7 @@ ui\monitor\EventFeedPanel$RowRenderer.class
 ui\SettingsRow.class
 export\XlsxWriter.class
 util\CryptoUtil.class
+service\SshSessionEvents$Phase.class
 ui\StatusStrip.class
 ui\monitor\EventFeedPanel$2.class
 util\AppSettings.class
@@ -118,6 +120,7 @@ ui\QueueMonitorView$EventRowRenderer.class
 service\queue\TaskEventQueue.class
 service\TransferService$PerFileTransfer.class
 ui\DataFeed.class
+service\SshSessionEvents.class
 ui\DirectoryBrowserDialog$FwdArrowIcon.class
 ui\DirectoryBrowserDialog$10.class
 service\TransferService$LocalFileOp.class

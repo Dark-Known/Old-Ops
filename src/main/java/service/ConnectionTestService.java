@@ -54,6 +54,8 @@ public final class ConnectionTestService {
 
         Session session = null;
         ChannelSftp channel = null;
+        boolean opened = false;
+        long openedAt = 0;
         try {
             JSch jsch = new JSch();
             session = jsch.getSession(username.trim(), host.trim(), port);
@@ -63,6 +65,9 @@ public final class ConnectionTestService {
             config.put("StrictHostKeyChecking", "no");
             session.setConfig(config);
             session.connect(CONNECT_TIMEOUT_MS);
+            opened = true;
+            openedAt = System.currentTimeMillis();
+            SshSessionEvents.uiOpened("Test connection", host.trim(), username.trim());
 
             channel = (ChannelSftp) session.openChannel("sftp");
             channel.connect(CHANNEL_TIMEOUT_MS);
@@ -73,11 +78,14 @@ public final class ConnectionTestService {
                     "Authenticated over SFTP. Home directory: " + home, elapsed);
 
         } catch (Exception ex) {
+            if (!opened) SshSessionEvents.uiFailed("Test connection", host.trim(), username.trim(), describeFailure(ex));
             long elapsed = System.currentTimeMillis() - start;
             return new Result(false, describeFailure(ex), elapsed);
         } finally {
             if (channel != null && channel.isConnected()) channel.disconnect();
             if (session != null && session.isConnected()) session.disconnect();
+            if (opened) SshSessionEvents.uiClosed("Test connection", host.trim(), username.trim(),
+                    System.currentTimeMillis() - openedAt);
         }
     }
 

@@ -33,6 +33,10 @@ public final class SftpBrowseService implements AutoCloseable {
     private final Session session;
     private final ChannelSftp channel;
 
+    private String host, user;
+    private long openedAt = System.currentTimeMillis();
+    private boolean reported = false;
+
     private SftpBrowseService(Session session, ChannelSftp channel) {
         this.session = session;
         this.channel = channel;
@@ -45,11 +49,24 @@ public final class SftpBrowseService implements AutoCloseable {
         Properties config = new Properties();
         config.put("StrictHostKeyChecking", "no");
         session.setConfig(config);
-        session.connect(8_000);
-
-        ChannelSftp channel = (ChannelSftp) session.openChannel("sftp");
-        channel.connect(6_000);
-        return new SftpBrowseService(session, channel);
+        try {
+            session.connect(8_000);
+        } catch (Exception ex) {
+            SshSessionEvents.uiFailed("Remote folder browser", host, username, ex.getMessage());
+            throw ex;
+        }
+        try {
+            ChannelSftp channel = (ChannelSftp) session.openChannel("sftp");
+            channel.connect(6_000);
+            SftpBrowseService svc = new SftpBrowseService(session, channel);
+            svc.host = host; svc.user = username; svc.reported = true;
+            SshSessionEvents.uiOpened("Remote folder browser", host, username);
+            return svc;
+        } catch (Exception ex) {
+            session.disconnect();
+            SshSessionEvents.uiFailed("Remote folder browser", host, username, ex.getMessage());
+            throw ex;
+        }
     }
 
     /** The remote user's home / landing directory — used as the initial browse path. */
@@ -77,5 +94,9 @@ public final class SftpBrowseService implements AutoCloseable {
     public void close() {
         if (channel != null && channel.isConnected()) channel.disconnect();
         if (session != null && session.isConnected()) session.disconnect();
+        if (reported) {
+            reported = false;
+            SshSessionEvents.uiClosed("Remote folder browser", host, user, System.currentTimeMillis() - openedAt);
+        }
     }
 }

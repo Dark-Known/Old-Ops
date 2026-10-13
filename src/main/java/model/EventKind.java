@@ -34,6 +34,11 @@ public enum EventKind {
     WATCH_RESTORED   ("Watcher restored", Category.WATCH,  Severity.INFO),
     WATCH_UNSUPPORTED("Push unsupported", Category.WATCH,  Severity.WARN),
 
+    // ── SSH sessions opened/closed on behalf of a task ───────────────
+    SSH_OPENED       ("SSH session opened", Category.SSH,   Severity.INFO),
+    SSH_CLOSED       ("SSH session closed", Category.SSH,   Severity.INFO),
+    SSH_FAILED       ("SSH connect failed", Category.SSH,   Severity.WARN),
+
     // ── Queue bookkeeping (hidden at the default level) ──────────────
     FIRE_DEFERRED    ("Fire deferred",    Category.QUEUE,  Severity.DEBUG),
     FIRE_DROPPED     ("Fire dropped",     Category.QUEUE,  Severity.DEBUG),
@@ -52,7 +57,7 @@ public enum EventKind {
     UI_STALL            ("UI stall",                Category.BACKGROUND, Severity.WARN);
 
     public enum Category {
-        RUN("Runs"), WATCH("Watchers"), QUEUE("Queue"), SYSTEM("System"), BACKGROUND("Background");
+        RUN("Runs"), WATCH("Watchers"), QUEUE("Queue"), SSH("SSH"), SYSTEM("System"), BACKGROUND("Background");
         private final String label;
         Category(String label) { this.label = label; }
         public String label() { return label; }

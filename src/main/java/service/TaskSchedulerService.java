@@ -163,7 +163,65 @@ public class TaskSchedulerService {
         // see maintenanceTick() — rather than blocking start-up with a synchronous delete here.
         this.pollIntervalSeconds = Math.max(1, pollIntervalSeconds);
         this.remotePushWatcher = new RemotePushWatcher(storage, this::onWatchWakeup);
+        SshSessionEvents.setSink(sshSink);
     }
+
+    /** Turns SSH open/close/fail reports from any component into Event Monitor events for the task. */
+    private final java.util.function.Consumer<SshSessionEvents.Event> sshSink = this::onSshEvent;
+
+    private void onSshEvent(SshSessionEvents.Event e0) {
+        SshSessionEvents.Event e = e0;
+        if (e.taskId() == null) {
+            // Reported from a place that doesn't know its task (e.g. a WinSCP listing during a backup
+            // run): the calling thread's run key says which task's run it belongs to.
+            String rk = RunHistoryService.currentRunKey();
+            String tid = null;
+            if (rk != null) for (Map.Entry<String, String> en : activeRunKeys.entrySet())
+                if (rk.equals(en.getValue())) { tid = en.getKey(); break; }
+            if (tid == null) { // genuinely not a task session
+                switch (e.phase()) {
+                    case OPENED -> SshSessionEvents.uiOpened(e.purpose(), e.host(), e.user());
+                    case CLOSED -> SshSessionEvents.uiClosed(e.purpose(), e.host(), e.user(), e.openMs());
+                    default -> SshSessionEvents.uiFailed(e.purpose(), e.host(), e.user(), e.reason());
+                }
+                return;
+            }
+            e = new SshSessionEvents.Event(e.phase(), tid, e.purpose(), e.host(), e.user(), e.reason(), e.openMs(), e.detached());
+        }
+        ScheduledTask t = lookupTask(e.taskId());
+        String who = SshSessionEvents.who(e.host(), e.user());
+        String what = e.purpose() != null ? e.purpose() : "SSH";
+        EventKind kind;
+        TaskRunRecord.Status status = TaskRunRecord.Status.SUCCESS;
+        String msg;
+        switch (e.phase()) {
+            case OPENED -> { kind = EventKind.SSH_OPENED; msg = "SSH session opened to " + who + " (" + what + ")"; }
+            case CLOSED -> {
+                kind = EventKind.SSH_CLOSED;
+                msg = "SSH session closed to " + who + " (" + what + ")"
+                        + (e.openMs() > 0 ? " after " + SshSessionEvents.duration(e.openMs()) : "")
+                        + (e.reason() != null ? " — " + e.reason() : "");
+            }
+            default -> {
+                kind = EventKind.SSH_FAILED; status = TaskRunRecord.Status.FAILED;
+                msg = "SSH connect to " + who + " failed (" + what + ")" + (e.reason() != null ? ": " + e.reason() : "");
+            }
+        }
+        String name = t != null ? t.getName() : "(task " + e.taskId() + ")";
+        String type = t != null && t.getTaskType() != null ? t.getTaskType().name() : null;
+        if (e.detached()) {
+            // Long-lived session (remote watcher): belongs to the task, not to any one run.
+            try {
+                LocalDateTime now = LocalDateTime.now();
+                runHistoryService.recordEvent(kind, e.taskId(), name, type, status, msg, msg, now, now, null, null);
+            } catch (Exception ignored) { }
+        } else {
+            // Opened/closed while a run executes: recordSchedulerEvent attaches the run key (the
+            // calling thread's run context, else the task's in-flight run).
+            recordSchedulerEvent(kind, e.taskId(), name, type, status, msg, msg);
+        }
+    }
+
 
     // ── Event Monitor bookkeeping ────────────────────────────────────────
     // Run key of the execution currently in flight for each task, so notes
@@ -751,6 +809,7 @@ public class TaskSchedulerService {
         localWatchManager.stop();
         remotePushWatcher.stop();
         transferService.shutdownWatcherConnections();
+        SshSessionEvents.clearSink(sshSink);
         if (statusExportFuture != null) statusExportFuture.cancel(false);
         scheduler.shutdownNow();
         logService.closeAll();

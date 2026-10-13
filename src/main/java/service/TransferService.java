@@ -1247,12 +1247,16 @@ public class TransferService {
 
         List<String> rawLines = new ArrayList<>();
         File listLogFile = new File(listScript.getAbsolutePath() + ".log");
+        long lsOpenedAt = 0;
+        int lsExit = 0;
         try {
             ProcessBuilder pb = new ProcessBuilder(
                     winScpPath, "/script=" + listScript.getAbsolutePath(),
                     "/log=" + listLogFile.getAbsolutePath(), "/loglevel=1");
             pb.redirectErrorStream(true);
             Process proc = pb.start();
+            lsOpenedAt = System.currentTimeMillis();
+            SshSessionEvents.opened(null, "WinSCP listing", target.getHost(), target.getUsername());
             try (BufferedReader br =
                          new BufferedReader(new InputStreamReader(proc.getInputStream()))) {
                 String line;
@@ -1265,8 +1269,10 @@ public class TransferService {
                     rawLines.add(line);
                 }
             }
-            proc.waitFor();
+            lsExit = proc.waitFor();
         } finally {
+            if (lsOpenedAt != 0) SshSessionEvents.closed(null, "WinSCP listing", target.getHost(), target.getUsername(),
+                    lsExit == 0 ? "finished" : "WinSCP exit code " + lsExit, System.currentTimeMillis() - lsOpenedAt);
             listScript.delete();
             try { listLogFile.delete(); } catch (Exception ignored) {}
         }
@@ -1377,8 +1383,16 @@ public class TransferService {
                 "/loglevel=1");
         pb.redirectErrorStream(true);
         Process proc = null;
+        // Each WinSCP.com process is its own SSH session: report it to the Event Monitor (pseudo task ids
+        // such as "backup-mkdir" are not tasks, so those resolve through the calling thread's run).
+        String[] who = SshSessionEvents.targetOfWinScpScript(scriptFile);
+        String evTask = taskId != null && !taskId.startsWith("backup-") ? taskId : null;
+        long sshOpenedAt = 0;
+        String sshEnd = "finished";
         try {
             proc = pb.start();
+            sshOpenedAt = System.currentTimeMillis();
+            SshSessionEvents.opened(evTask, "WinSCP transfer", who[1], who[0]);
             if (taskId != null) {
                 activeProcesses.computeIfAbsent(taskId, k -> ConcurrentHashMap.newKeySet()).add(proc);
             }
@@ -1399,15 +1413,23 @@ public class TransferService {
                 logLine.accept("[SUCCESS] Transfer completed successfully.");
                 return true;
             } else {
+                sshEnd = "WinSCP exit code " + exitCode;
                 logLine.accept("[ERROR] WinSCP exited with code: " + exitCode);
                 return false;
             }
         } catch (InterruptedException ie) {
+            sshEnd = "cancelled";
             logLine.accept("[INFO] Transfer interrupted: " + ie.getMessage());
             if (proc != null) try { proc.destroyForcibly(); } catch (Exception ignored) {}
             Thread.currentThread().interrupt();
             return false;
+        } catch (Exception ex) {
+            sshEnd = "error: " + ex.getMessage();
+            if (sshOpenedAt == 0) SshSessionEvents.failed(evTask, "WinSCP transfer", who[1], who[0], ex.getMessage());
+            throw ex;
         } finally {
+            if (sshOpenedAt != 0) SshSessionEvents.closed(evTask, "WinSCP transfer", who[1], who[0], sshEnd,
+                    System.currentTimeMillis() - sshOpenedAt);
             if (taskId != null) {
                 java.util.Set<Process> set = activeProcesses.get(taskId);
                 if (set != null) {
