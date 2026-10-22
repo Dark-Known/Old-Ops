@@ -249,10 +249,11 @@ public class RemotePushWatcher {
         try {
             JSch jsch = new JSch();
             session = jsch.getSession(cred.getUsername(), cred.getHost(), 22);
-            session.setPassword(cred.getPassword());
+            util.SshAuth.apply(jsch, session, cred.getPassword());
             Properties config = new Properties();
             config.put("StrictHostKeyChecking", "no");
             session.setConfig(config);
+            util.SshHostKeys.apply(jsch, session);
             // Keep the long-lived channel alive through idle periods / NAT timeouts.
             session.setServerAliveInterval(15_000);
             session.setServerAliveCountMax(4);

@@ -268,7 +268,12 @@ public class DetailPane extends JPanel {
 
         // --- Message ---
         String message = fullMessage(row, records);
-        if (!message.isBlank() && row.type != FeedRow.Type.BUCKET) {
+        if (!message.isBlank() && row.type == FeedRow.Type.EVENT && TaskChangeView.applies(message)) {
+            // Task created / edited / deleted: readable settings instead of one long line of codes.
+            TaskChangeView.View v = TaskChangeView.render(message, "m");
+            h.append(v.html());
+            t.append('\n').append(v.text());
+        } else if (!message.isBlank() && row.type != FeedRow.Type.BUCKET) {
             boolean bad = row.outcome == FeedRow.Outcome.FAILED || row.outcome == FeedRow.Outcome.ERROR;
             h.append("<h4>").append(bad ? "WHAT WENT WRONG" : "SUMMARY").append("</h4><div class='").append(bad ? "bad" : "")
                     .append("'>").append(MonitorStyle.htmlEscape(message).replace("\n", "<br>")).append("</div>");
@@ -359,7 +364,7 @@ public class DetailPane extends JPanel {
         fact(h, t, "Files", String.valueOf(s.fileCount()));
         if (s.totalBytesFormatted() != null) fact(h, t, "Total size", s.totalBytesFormatted());
         if (s.batchCount() > 0) fact(h, t, "Batches", String.valueOf(s.batchCount()));
-        if (s.sessionCount() > 0) fact(h, t, "SFTP/WinSCP sessions", String.valueOf(s.sessionCount()));
+        if (s.sessionCount() > 0) fact(h, t, "SFTP sessions", String.valueOf(s.sessionCount()));
         if (s.workerThreads() > 0) fact(h, t, "Worker threads", String.valueOf(s.workerThreads()));
         h.append("</table>");
         if (!s.files().isEmpty() && !hasDetectedList(row)) {

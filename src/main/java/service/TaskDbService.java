@@ -70,6 +70,7 @@ public class TaskDbService {
                 st.execute(CREATE_TASKS_TABLE_SQL);
             }
             migrateLegacyXmlColumnIfPresent(c);
+            addMissingColumns(c);
         } catch (Exception e) {
             log.log(Level.SEVERE, "Failed to open/initialize tasks table in app.db", e);
             initError = (e.getClass().getSimpleName() + ": " + e.getMessage());
@@ -173,6 +174,33 @@ public class TaskDbService {
                         "created_at TEXT," +
                         "retry_count INTEGER" +
                         ")";
+
+    /**
+     * Brings an existing {@code tasks} table up to the columns declared in
+     * {@link #CREATE_TASKS_TABLE_SQL}. {@code CREATE TABLE IF NOT EXISTS} does nothing for a table
+     * that already exists, so a column added to that statement in a newer build would otherwise
+     * be missing on every upgraded install (and every save would fail with "no such column").
+     * To add a task field: add the column to the CREATE statement; installs pick it up here on
+     * next start. Only columns are added, never changed or dropped, so it is safe to re-run.
+     */
+    static void addMissingColumns(Connection c) throws SQLException {
+        java.util.Set<String> existing = new java.util.HashSet<>();
+        try (Statement st = c.createStatement(); ResultSet rs = st.executeQuery("PRAGMA table_info(tasks)")) {
+            while (rs.next()) existing.add(rs.getString("name").toLowerCase());
+        }
+        String body = CREATE_TASKS_TABLE_SQL.substring(
+                CREATE_TASKS_TABLE_SQL.indexOf('(') + 1, CREATE_TASKS_TABLE_SQL.lastIndexOf(')'));
+        for (String def : body.split(",")) {
+            String d = def.trim();
+            if (d.isEmpty()) continue;
+            String name = d.split("\\s+")[0];
+            if (name.equalsIgnoreCase("id") || existing.contains(name.toLowerCase())) continue;
+            try (Statement st = c.createStatement()) {
+                st.execute("ALTER TABLE tasks ADD COLUMN " + d);
+            }
+            log.info("Added missing column to tasks table: " + name);
+        }
+    }
 
     /**
      * Some installs' app.db still has a "tasks" table left over from an

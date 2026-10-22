@@ -96,11 +96,12 @@ public class RemoteFileMetadataServiceFactory {
                 credential.getUsername(),
                 credential.getHost(),
                 22);
-        session.setPassword(credential.getPassword());
+        util.SshAuth.apply(jsch, session, credential.getPassword());
 
         Properties config = new Properties();
         config.put("StrictHostKeyChecking", "no");
         session.setConfig(config);
+        util.SshHostKeys.apply(jsch, session);
         session.connect(30_000);
 
         ChannelSftp channel = (ChannelSftp) session.openChannel("sftp");

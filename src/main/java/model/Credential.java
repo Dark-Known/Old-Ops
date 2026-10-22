@@ -9,7 +9,7 @@ public class Credential {
     private String name;       // display label
     private String host;       // hostname / IP
     private String username;   // login username
-    private String password;   // plain-text password (stored in per-user XML)
+    private String password;   // plain-text in memory; encrypted at rest by CredentialDbService
     private String osType;     // WINDOWS or LINUX
 
     public Credential() {}

@@ -59,11 +59,12 @@ public final class ConnectionTestService {
         try {
             JSch jsch = new JSch();
             session = jsch.getSession(username.trim(), host.trim(), port);
-            session.setPassword(password == null ? "" : password);
+            util.SshAuth.apply(jsch, session, password);
 
             Properties config = new Properties();
             config.put("StrictHostKeyChecking", "no");
             session.setConfig(config);
+            util.SshHostKeys.apply(jsch, session);
             session.connect(CONNECT_TIMEOUT_MS);
             opened = true;
             openedAt = System.currentTimeMillis();

@@ -199,10 +199,11 @@ public class PersistentSftpConnectionManager {
     private Entry connect(String taskId, Credential credential, int connectCount) throws Exception {
         JSch jsch = new JSch();
         Session session = jsch.getSession(credential.getUsername(), credential.getHost(), 22);
-        session.setPassword(credential.getPassword());
+        util.SshAuth.apply(jsch, session, credential.getPassword());
         Properties config = new Properties();
         config.put("StrictHostKeyChecking", "no");
         session.setConfig(config);
+        util.SshHostKeys.apply(jsch, session);
         try {
             session.connect(CONNECT_TIMEOUT_MILLIS);
         } catch (Exception ex) {

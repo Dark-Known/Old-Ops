@@ -1,6 +1,8 @@
 package service;
 
 import model.Credential;
+import util.AppConfig;
+import util.CryptoUtil;
 
 import java.io.File;
 import java.sql.*;
@@ -58,8 +60,33 @@ public class CredentialDbService {
         }
     }
 
+    /** Marks a password column value as encrypted; anything else is legacy plaintext. */
+    private static final String ENC_PREFIX = "enc:";
+
+    /**
+     * Encryption is on unless app-config.xml explicitly sets
+     * {@code <credentialEncryption>false</credentialEncryption>}. Reading always
+     * understands both forms, so flipping the setting never makes rows unreadable.
+     */
+    private static boolean encryptionEnabled() {
+        String v = AppConfig.readValue("credentialEncryption");
+        return v == null || !v.trim().equalsIgnoreCase("false");
+    }
+
+    private static String protect(String plain) {
+        if (plain == null || plain.isEmpty() || !encryptionEnabled()) return plain;
+        return ENC_PREFIX + CryptoUtil.encrypt(plain);
+    }
+
+    private static String reveal(String stored) {
+        if (stored == null || !stored.startsWith(ENC_PREFIX)) return stored; // legacy plaintext
+        return CryptoUtil.decrypt(stored.substring(ENC_PREFIX.length()));
+    }
+
     public CredentialDbService(File dataDir) {
         this.dataDir = dataDir;
+        CryptoUtil.configure(dataDir);
+        util.SshHostKeys.configure(dataDir);
         File dbFile = new File(dataDir, "app.db");
         Connection c = null;
         String initError = null;
@@ -86,6 +113,35 @@ public class CredentialDbService {
         if (this.conn != null) {
             migrateLegacyCredentialsDbIfPresent();
             migrateLegacyXmlIfPresent();
+            encryptPlaintextRows();
+        }
+    }
+
+    /** One-time upgrade: re-writes any plaintext password rows in the encrypted form. */
+    private synchronized void encryptPlaintextRows() {
+        if (!encryptionEnabled()) return;
+        try {
+            List<String[]> todo = new ArrayList<>();
+            try (Statement st = conn.createStatement();
+                 ResultSet rs = st.executeQuery("SELECT id, password FROM credentials")) {
+                while (rs.next()) {
+                    String pw = rs.getString(2);
+                    if (pw != null && !pw.isEmpty() && !pw.startsWith(ENC_PREFIX)) {
+                        todo.add(new String[]{rs.getString(1), pw});
+                    }
+                }
+            }
+            if (todo.isEmpty()) return;
+            try (PreparedStatement ps = conn.prepareStatement("UPDATE credentials SET password = ? WHERE id = ?")) {
+                for (String[] row : todo) {
+                    ps.setString(1, protect(row[1]));
+                    ps.setString(2, row[0]);
+                    ps.executeUpdate();
+                }
+            }
+            log.info("Encrypted " + todo.size() + " plaintext credential password(s) in app.db");
+        } catch (Exception e) {
+            log.log(Level.WARNING, "Could not encrypt existing credential passwords", e);
         }
     }
 
@@ -148,7 +204,7 @@ public class CredentialDbService {
             ps.setString(2, cred.getName());
             ps.setString(3, cred.getHost());
             ps.setString(4, cred.getUsername());
-            ps.setString(5, cred.getPassword());
+            ps.setString(5, protect(cred.getPassword()));
             ps.setString(6, cred.getOsType());
             ps.executeUpdate();
             lastSaveError = null;
@@ -196,7 +252,13 @@ public class CredentialDbService {
         c.setName(rs.getString("name"));
         c.setHost(rs.getString("host"));
         c.setUsername(rs.getString("username"));
-        c.setPassword(rs.getString("password"));
+        try {
+            c.setPassword(reveal(rs.getString("password")));
+        } catch (RuntimeException e) {
+            log.log(Level.WARNING, "Could not decrypt password for " + c.getUsername()
+                    + " (key file missing or changed?) - re-enter it in the credentials screen", e);
+            c.setPassword("");
+        }
         c.setOsType(rs.getString("os_type"));
         return c;
     }

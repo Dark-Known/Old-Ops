@@ -44,8 +44,11 @@ import java.util.function.Consumer;
  */
 public class OAuth2TokenService {
 
-    private static final String AUTH_BASE = "https://login.microsoftonline.com/";
-    private final HttpClient http = HttpClient.newHttpClient();
+    private static final String DEFAULT_AUTH_BASE = "https://login.microsoftonline.com/";
+    private String AUTH_BASE = DEFAULT_AUTH_BASE; // overridable for tests only (see setAuthBaseForTesting)
+    private final HttpClient http = HttpClient.newBuilder()
+            .connectTimeout(java.time.Duration.ofSeconds(15)).build();
+    private static final java.time.Duration REQUEST_TIMEOUT = java.time.Duration.ofSeconds(30);
     private final Path tokenDir;
 
     /**
@@ -68,6 +71,9 @@ public class OAuth2TokenService {
 
     public OAuth2TokenService(Path tokenDir) {
         this.tokenDir = tokenDir;
+        if (tokenDir != null && tokenDir.getParent() != null) {
+            CryptoUtil.configure(tokenDir.getParent().toFile()); // key file lives in <dataDir>
+        }
         try { Files.createDirectories(tokenDir); } catch (IOException ignored) {}
     }
 
@@ -100,6 +106,7 @@ public class OAuth2TokenService {
                 .header("Content-Type", "application/x-www-form-urlencoded")
                 .POST(HttpRequest.BodyPublishers.ofString(
                         "client_id=" + urlEnc(clientId) + "&scope=" + urlEnc(scope)))
+                .timeout(REQUEST_TIMEOUT)
                 .build();
 
         HttpResponse<String> deviceResp = http.send(deviceReq, HttpResponse.BodyHandlers.ofString());
@@ -134,6 +141,7 @@ public class OAuth2TokenService {
                             "grant_type=urn:ietf:params:oauth:grant-type:device_code"
                                     + "&client_id=" + urlEnc(clientId)
                                     + "&device_code=" + urlEnc(deviceCode)))
+                    .timeout(REQUEST_TIMEOUT)
                     .build();
 
             HttpResponse<String> pollResp = http.send(pollReq, HttpResponse.BodyHandlers.ofString());
@@ -145,7 +153,11 @@ public class OAuth2TokenService {
             }
 
             String error = MiniJson.getString(body, "error", "");
-            if (error.equals("authorization_pending") || error.equals("slow_down")) {
+            if (error.equals("slow_down")) {
+                interval += 5; // the server asked us to poll less often (RFC 8628 section 3.5)
+                continue;
+            }
+            if (error.equals("authorization_pending")) {
                 continue; // keep polling
             }
             throw new IOException("Device code sign-in failed: "
@@ -231,6 +243,7 @@ public class OAuth2TokenService {
                                     + "&client_id=" + urlEnc(clientId)
                                     + "&refresh_token=" + urlEnc(refreshToken)
                                     + "&scope=" + urlEnc(scope)))
+                    .timeout(REQUEST_TIMEOUT)
                     .build();
 
             HttpResponse<String> resp;
@@ -261,6 +274,97 @@ public class OAuth2TokenService {
             accessTokenCache.put(accountKey, new CachedToken(accessToken, expiresAt));
 
             return accessToken;
+        }
+    }
+
+
+    // ─── App-only login with a client certificate (client-credentials flow) ─────────────────
+    //
+    // No user, no refresh token, nothing that rotates: the app registration proves itself with a
+    // short-lived JWT signed by the certificate's private key (RFC 7523 / Microsoft "client
+    // assertion"), and receives an access token for https://graph.microsoft.com/.default.
+    // The registration needs *application* permissions (e.g. Mail.ReadWrite) with admin consent;
+    // mailboxes are addressed as /users/{mailbox} (see GraphMailService#forMailbox).
+
+    private final Map<String, CachedToken> appOnlyCache = new ConcurrentHashMap<>();
+
+    /** For tests: point the token endpoint at a local fake. */
+    void setAuthBaseForTesting(String base) { this.AUTH_BASE = base.endsWith("/") ? base : base + "/"; }
+
+    public String getAppOnlyAccessToken(String tenantId, String clientId, Path pfxFile, char[] pfxPassword,
+                                        String scope) throws IOException {
+        String cacheKey = tenantId + "|" + clientId + "|" + pfxFile.toAbsolutePath() + "|" + scope;
+        CachedToken cached = appOnlyCache.get(cacheKey);
+        if (cached != null && System.currentTimeMillis() < cached.expiresAtEpochMs) return cached.accessToken;
+
+        String tokenUrl = AUTH_BASE + tenantId + "/oauth2/v2.0/token";
+        String assertion = buildClientAssertion(clientId, tokenUrl, pfxFile, pfxPassword);
+        HttpRequest req = HttpRequest.newBuilder()
+                .uri(URI.create(tokenUrl))
+                .timeout(REQUEST_TIMEOUT)
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .POST(HttpRequest.BodyPublishers.ofString(
+                        "grant_type=client_credentials"
+                                + "&client_id=" + urlEnc(clientId)
+                                + "&scope=" + urlEnc(scope)
+                                + "&client_assertion_type=" + urlEnc("urn:ietf:params:oauth:client-assertion-type:jwt-bearer")
+                                + "&client_assertion=" + urlEnc(assertion)))
+                .build();
+        HttpResponse<String> resp;
+        try {
+            resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Interrupted while requesting an app-only token", ie);
+        }
+        Map<String, Object> body = MiniJson.parseObject(resp.body());
+        if (resp.statusCode() != 200) {
+            throw new IOException("App-only token request failed (" + resp.statusCode() + "): "
+                    + MiniJson.getString(body, "error_description", resp.body()));
+        }
+        String token = MiniJson.getString(body, "access_token", null);
+        if (token == null) throw new IOException("Token response had no access_token");
+        int expiresIn = MiniJson.getInt(body, "expires_in", 3600);
+        appOnlyCache.put(cacheKey, new CachedToken(token, System.currentTimeMillis() + Math.max(60, expiresIn - 120) * 1000L));
+        return token;
+    }
+
+    /** Signed JWT proving possession of the certificate's private key. Package-private for tests. */
+    static String buildClientAssertion(String clientId, String audience, Path pfxFile, char[] pfxPassword)
+            throws IOException {
+        try {
+            java.security.KeyStore ks = java.security.KeyStore.getInstance("PKCS12");
+            try (java.io.InputStream in = Files.newInputStream(pfxFile)) {
+                ks.load(in, pfxPassword);
+            }
+            java.security.PrivateKey key = null;
+            java.security.cert.X509Certificate cert = null;
+            for (java.util.Enumeration<String> e = ks.aliases(); e.hasMoreElements(); ) {
+                String alias = e.nextElement();
+                if (ks.isKeyEntry(alias)) {
+                    key = (java.security.PrivateKey) ks.getKey(alias, pfxPassword);
+                    cert = (java.security.cert.X509Certificate) ks.getCertificate(alias);
+                    break;
+                }
+            }
+            if (key == null || cert == null) throw new IOException("No private key + certificate found in " + pfxFile);
+
+            java.util.Base64.Encoder b64 = java.util.Base64.getUrlEncoder().withoutPadding();
+            String thumb = b64.encodeToString(
+                    java.security.MessageDigest.getInstance("SHA-256").digest(cert.getEncoded()));
+            long now = System.currentTimeMillis() / 1000;
+            String header = "{\"alg\":\"RS256\",\"typ\":\"JWT\",\"x5t#S256\":\"" + thumb + "\"}";
+            String claims = "{\"aud\":\"" + audience + "\",\"iss\":\"" + clientId + "\",\"sub\":\"" + clientId
+                    + "\",\"jti\":\"" + java.util.UUID.randomUUID() + "\",\"nbf\":" + (now - 30)
+                    + ",\"exp\":" + (now + 600) + "}";
+            String signingInput = b64.encodeToString(header.getBytes(StandardCharsets.UTF_8)) + "."
+                    + b64.encodeToString(claims.getBytes(StandardCharsets.UTF_8));
+            java.security.Signature sig = java.security.Signature.getInstance("SHA256withRSA");
+            sig.initSign(key);
+            sig.update(signingInput.getBytes(StandardCharsets.US_ASCII));
+            return signingInput + "." + b64.encodeToString(sig.sign());
+        } catch (Exception e) {
+            throw new IOException("Could not build the client assertion from " + pfxFile + ": " + e.getMessage(), e);
         }
     }
 

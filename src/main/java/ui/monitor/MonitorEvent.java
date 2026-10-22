@@ -48,10 +48,13 @@ public record MonitorEvent(
     /**
      * When this event <i>happened</i>: for a run outcome, when it finished
      * (a 20-minute transfer belongs at the moment it ended, not when it
-     * began); for everything else, when it was recorded.
+     * began); for "files detected", when the scan finished (the scan starts
+     * before the SSH session is even connected, so its start would put the
+     * detection ahead of "SSH session opened"); for everything else, when
+     * it was recorded.
      */
     public LocalDateTime time() {
-        return isOutcome() && end != null ? end : start;
+        return (isOutcome() || kind == EventKind.FILES_DETECTED) && end != null ? end : start;
     }
 
     /** True for the terminal row of a run: succeeded, failed or skipped. */

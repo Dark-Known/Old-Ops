@@ -247,6 +247,16 @@ public class TransferService {
      */
     public boolean executeTransfer(ScheduledTask task, Consumer<String> logLine, Set<String> eventFileNames)
             throws WatcherSkipException {
+        realTaskId.set(task.getId());
+        try {
+            return executeTransferInner(task, logLine, eventFileNames);
+        } finally {
+            realTaskId.remove();
+        }
+    }
+
+    private boolean executeTransferInner(ScheduledTask task, Consumer<String> logLine, Set<String> eventFileNames)
+            throws WatcherSkipException {
 
         lastFailureClassification.remove(); // fresh for this call — see its own doc comment
 
@@ -1176,8 +1186,7 @@ public class TransferService {
         try (PrintWriter pw = new PrintWriter(new FileWriter(tmpScript))) {
             pw.println("option batch abort");
             pw.println("option confirm off");
-            pw.println("open sftp://" + escapeUrl(target.getUsername())
-                    + ":" + escapeUrl(password) + "@" + target.getHost() + "/ -hostkey=\"*\"");
+            writeOpenLine(pw, target, password, tmpScript);
 
             boolean inbound = task.getTransferDirection() == TransferDirection.INBOUND;
 
@@ -1230,6 +1239,7 @@ public class TransferService {
             Credential target, String password, String dirPath,
             Consumer<String> logLine) throws Exception {
 
+        if (useSftpEngine()) return listViaSftp(target, password, dirPath, logLine);
         logLine.accept("[INFO] Listing remote directory (WinSCP ls): " + dirPath);
 
         File listScript = File.createTempFile("opstool_ls_", ".txt");
@@ -1238,8 +1248,7 @@ public class TransferService {
         try (PrintWriter pw = new PrintWriter(new FileWriter(listScript))) {
             pw.println("option batch abort");
             pw.println("option confirm off");
-            pw.println("open sftp://" + escapeUrl(target.getUsername())
-                    + ":" + escapeUrl(password) + "@" + target.getHost() + "/ -hostkey=\"*\"");
+            writeOpenLine(pw, target, password, listScript);
             pw.println("ls \"" + dirPath + "\"");
             pw.println("close");
             pw.println("exit");
@@ -1253,6 +1262,7 @@ public class TransferService {
             ProcessBuilder pb = new ProcessBuilder(
                     winScpPath, "/script=" + listScript.getAbsolutePath(),
                     "/log=" + listLogFile.getAbsolutePath(), "/loglevel=1");
+            applyScriptPassword(pb, listScript);
             pb.redirectErrorStream(true);
             Process proc = pb.start();
             lsOpenedAt = System.currentTimeMillis();
@@ -1370,6 +1380,7 @@ public class TransferService {
 
     private boolean runWinScpScript(File scriptFile, Consumer<String> logLine,
                                     String taskId) throws Exception {
+        if (useSftpEngine()) return runScriptViaSftp(scriptFile, logLine, taskId);
         // Unique per call (derived from the already-unique scriptFile name)
         // rather than the old fixed shared path — required now that batches
         // can run concurrently (AppSettings.getTransferBatchConcurrency() >
@@ -1381,6 +1392,7 @@ public class TransferService {
                 "/script=" + scriptFile.getAbsolutePath(),
                 "/log=" + logFile.getAbsolutePath(),
                 "/loglevel=1");
+        applyScriptPassword(pb, scriptFile);
         pb.redirectErrorStream(true);
         Process proc = null;
         // Each WinSCP.com process is its own SSH session: report it to the Event Monitor (pseudo task ids
@@ -1389,12 +1401,29 @@ public class TransferService {
         String evTask = taskId != null && !taskId.startsWith("backup-") ? taskId : null;
         long sshOpenedAt = 0;
         String sshEnd = "finished";
+        String realTaskIdRegistered = null;
+        java.util.concurrent.ScheduledFuture<?> watchdog = null;
+        final java.util.concurrent.atomic.AtomicBoolean timedOut = new java.util.concurrent.atomic.AtomicBoolean();
         try {
             proc = pb.start();
             sshOpenedAt = System.currentTimeMillis();
             SshSessionEvents.opened(evTask, "WinSCP transfer", who[1], who[0]);
             if (taskId != null) {
                 activeProcesses.computeIfAbsent(taskId, k -> ConcurrentHashMap.newKeySet()).add(proc);
+            }
+            // Backup helper sessions use pseudo ids ("backup-mkdir"); also register them under the
+            // real task so Cancel can stop them.
+            realTaskIdRegistered = realTaskId.get();
+            if (realTaskIdRegistered != null && !realTaskIdRegistered.equals(taskId)) {
+                activeProcesses.computeIfAbsent(realTaskIdRegistered, k -> ConcurrentHashMap.newKeySet()).add(proc);
+            }
+            final Process watched = proc;
+            long maxMin = winScpMaxRuntimeMinutes();
+            if (maxMin > 0) {
+                watchdog = WATCHDOG.schedule(() -> {
+                    timedOut.set(true);
+                    try { watched.destroyForcibly(); } catch (Exception ignored) {}
+                }, maxMin, java.util.concurrent.TimeUnit.MINUTES);
             }
 
             try (BufferedReader br =
@@ -1409,6 +1438,12 @@ public class TransferService {
                 }
             }
             int exitCode = proc.waitFor();
+            if (timedOut.get()) {
+                sshEnd = "timed out";
+                logLine.accept("[ERROR] WinSCP was stopped after the configured maximum runtime of "
+                        + winScpMaxRuntimeMinutes() + " minute(s) (winscpMaxRuntimeMinutes).");
+                return false;
+            }
             if (exitCode == 0) {
                 logLine.accept("[SUCCESS] Transfer completed successfully.");
                 return true;
@@ -1435,6 +1470,14 @@ public class TransferService {
                 if (set != null) {
                     set.remove(proc);
                     if (set.isEmpty()) activeProcesses.remove(taskId, set);
+                }
+            }
+            if (watchdog != null) watchdog.cancel(false);
+            if (realTaskIdRegistered != null && !realTaskIdRegistered.equals(taskId)) {
+                java.util.Set<Process> set = activeProcesses.get(realTaskIdRegistered);
+                if (set != null) {
+                    set.remove(proc);
+                    if (set.isEmpty()) activeProcesses.remove(realTaskIdRegistered, set);
                 }
             }
             try { logFile.delete(); } catch (Exception ignored) {}
@@ -1634,8 +1677,7 @@ public class TransferService {
             try (PrintWriter pw = new PrintWriter(new FileWriter(scriptFile))) {
                 pw.println("option batch abort");
                 pw.println("option confirm off");
-                pw.println("open sftp://" + escapeUrl(target.getUsername())
-                        + ":" + escapeUrl(password) + "@" + target.getHost() + "/ -hostkey=\"*\"");
+                writeOpenLine(pw, target, password, scriptFile);
                 for (SizedCommand sc : batch) pw.println(sc.command);
                 pw.println("close");
                 pw.println("exit");
@@ -2100,8 +2142,7 @@ public class TransferService {
         try (PrintWriter pw = new PrintWriter(new FileWriter(scriptFile))) {
             pw.println("option batch continue"); // don't abort the whole script if a single mkdir fails (dir exists)
             pw.println("option confirm off");
-            pw.println("open sftp://" + escapeUrl(target.getUsername())
-                    + ":" + escapeUrl(target.getPassword()) + "@" + target.getHost() + "/ -hostkey=\"*\"");
+            writeOpenLine(pw, target, target.getPassword(), scriptFile);
             for (String c : cmds) pw.println(c);
             pw.println("close");
             pw.println("exit");
@@ -2122,8 +2163,7 @@ public class TransferService {
             try (PrintWriter pw = new PrintWriter(new FileWriter(scriptFile))) {
                 pw.println("option batch continue");
                 pw.println("option confirm off");
-                pw.println("open sftp://" + escapeUrl(target.getUsername())
-                        + ":" + escapeUrl(target.getPassword()) + "@" + target.getHost() + "/ -hostkey=\"*\"");
+                writeOpenLine(pw, target, target.getPassword(), scriptFile);
                 for (String p : remotePaths) pw.println("rm " + escapeWinScpRemotePath(p));
                 pw.println("close");
                 pw.println("exit");
@@ -2236,12 +2276,26 @@ public class TransferService {
         }
 
         String accessToken;
+        GraphMailService graph = graphMailService;
         try {
-//            logLine.accept("[DEBUG] OAuth token cache directory: "
-//                    + OAuth2TokenService.sharedTokenDir(storage.getDataDir()).toAbsolutePath());
-            accessToken = oauthService.getValidAccessToken(mailbox, tenantId, clientId, GRAPH_MAIL_SCOPE);
+            if (graphCertificateMode()) {
+                // App-only login with a certificate: no user sign-in and no rotating refresh token.
+                String pfx = util.AppConfig.readValue("graphCertFile");
+                if (pfx == null) {
+                    logLine.accept("[ERROR] graphAuthMode is CERTIFICATE but graphCertFile is not set in app-config.xml");
+                    return false;
+                }
+                String envName = util.AppConfig.readValue("graphCertPasswordEnv");
+                String pw = System.getenv(envName != null ? envName : "OPSTOOL_GRAPH_CERT_PW");
+                accessToken = oauthService.getAppOnlyAccessToken(tenantId, clientId, Paths.get(pfx),
+                        pw == null ? new char[0] : pw.toCharArray(), GRAPH_APP_ONLY_SCOPE);
+                graph = graphMailService.forMailbox(mailbox);
+                logLine.accept("[INFO] Using certificate (app-only) login for " + mailbox);
+            } else {
+                accessToken = oauthService.getValidAccessToken(mailbox, tenantId, clientId, GRAPH_MAIL_SCOPE);
+            }
         } catch (IOException ex) {
-            logLine.accept("[ERROR] OAuth2 token refresh failed: " + ex.getMessage());
+            logLine.accept("[ERROR] OAuth2 token request failed: " + ex.getMessage());
             return false;
         }
 
@@ -2270,7 +2324,7 @@ public class TransferService {
 
         List<GraphMailService.MailMessage> messages;
         try {
-            messages = graphMailService.fetchMessages(
+            messages = graph.fetchMessages(
                     accessToken, folder, criteria, mode, maxResults, afterEpoch, logLine);
         } catch (IOException | InterruptedException ex) {
             if (ex instanceof InterruptedException) Thread.currentThread().interrupt();
@@ -2326,7 +2380,7 @@ public class TransferService {
             // Mark-as-read must happen before move — moving invalidates the message ID.
             if (markRead) {
                 try {
-                    graphMailService.markAsRead(accessToken, m.id);
+                    graph.markAsRead(accessToken, m.id);
                     logLine.accept("[INFO] Marked as read: " + m.subject);
                 } catch (Exception ex) {
                     logLine.accept("[WARN] Failed to mark message as read (" + m.subject + "): " + ex.getMessage());
@@ -2339,7 +2393,7 @@ public class TransferService {
             // else goes to the configured "Others" folder.
             String destinationFolder = resolveMoveFolderName(classification);
             try {
-                graphMailService.moveMessage(accessToken, m.id, destinationFolder, logLine);
+                graph.moveMessage(accessToken, m.id, destinationFolder, logLine);
                 logLine.accept("[INFO] Moved to folder '" + destinationFolder + "': " + m.subject);
             } catch (Exception ex) {
                 logLine.accept("[WARN] Failed to move message (" + m.subject + "): " + ex.getMessage());
@@ -3093,11 +3147,157 @@ public class TransferService {
         return counts;
     }
 
+    private static final String GRAPH_APP_ONLY_SCOPE = "https://graph.microsoft.com/.default";
+
+    /** app-config.xml {@code <graphAuthMode>CERTIFICATE</graphAuthMode>}; anything else = signed-in user (default). */
+    private static boolean graphCertificateMode() {
+        String v = util.AppConfig.readValue("graphAuthMode");
+        return v != null && v.trim().equalsIgnoreCase("CERTIFICATE");
+    }
+
+    // ── WinSCP runtime cap and cancel plumbing ──────────────────────────────
+    private static final java.util.concurrent.ScheduledExecutorService WATCHDOG =
+            java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "winscp-watchdog");
+                t.setDaemon(true);
+                return t;
+            });
+
+    /** Real task id of the transfer running on this thread, so backup helper sessions can be cancelled. */
+    private final ThreadLocal<String> realTaskId = new ThreadLocal<>();
+
+    /** app-config.xml {@code <winscpMaxRuntimeMinutes>}; 0 or absent = no cap (default). */
+    private static long winScpMaxRuntimeMinutes() {
+        try {
+            String v = util.AppConfig.readValue("winscpMaxRuntimeMinutes");
+            return v == null ? 0 : Math.max(0, Long.parseLong(v.trim()));
+        } catch (NumberFormatException e) {
+            return 0;
+        }
+    }
+
+    // ── Java SFTP engine (default) ─────────────────────────────────────────
+    // The planning code still writes small WinSCP-style scripts; with transferEngine=sftp
+    // (default) they are executed by SftpScriptRunner on JSch instead of WinSCP.com.
+    // Set <transferEngine>winscp</transferEngine> in app-config.xml to go back to WinSCP.
+
+    private final ConcurrentHashMap<String, java.util.Set<service.sftp.SftpClient>> activeClients =
+            new ConcurrentHashMap<>();
+
+    private static boolean useSftpEngine() {
+        String v = util.AppConfig.readValue("transferEngine");
+        return v == null || !v.trim().equalsIgnoreCase("winscp");
+    }
+
+    private static final int SFTP_CONNECT_TIMEOUT_MS = 30_000;
+
+    private service.sftp.SftpScriptRunner.Connector sftpConnector() {
+        return (host, port, user, pw) ->
+                service.sftp.JschSftpClient.connect(host, port, user, pw, SFTP_CONNECT_TIMEOUT_MS);
+    }
+
+    private void registerClient(String id, service.sftp.SftpClient c) {
+        if (id != null) activeClients.computeIfAbsent(id, k -> ConcurrentHashMap.newKeySet()).add(c);
+    }
+
+    private void unregisterClient(String id, service.sftp.SftpClient c) {
+        if (id == null) return;
+        java.util.Set<service.sftp.SftpClient> set = activeClients.get(id);
+        if (set != null) {
+            set.remove(c);
+            if (set.isEmpty()) activeClients.remove(id, set);
+        }
+    }
+
+    private boolean runScriptViaSftp(File scriptFile, Consumer<String> logLine, String taskId) throws Exception {
+        String password = scriptPasswords.remove(scriptFile.getAbsolutePath());
+        List<String> script = java.nio.file.Files.readAllLines(scriptFile.toPath(), java.nio.charset.StandardCharsets.UTF_8);
+        String realId = realTaskId.get();
+        String[] who = SshSessionEvents.targetOfWinScpScript(scriptFile);
+        String evTask = taskId != null && !taskId.startsWith("backup-") ? taskId : null;
+        long openedAt = 0;
+        String end = "finished";
+        java.util.concurrent.ScheduledFuture<?> watchdog = null;
+        try {
+            final java.util.concurrent.atomic.AtomicBoolean timedOut = new java.util.concurrent.atomic.AtomicBoolean();
+            final java.util.List<service.sftp.SftpClient> mine = new java.util.concurrent.CopyOnWriteArrayList<>();
+            service.sftp.SftpScriptRunner runner = new service.sftp.SftpScriptRunner(sftpConnector(),
+                    c -> { mine.add(c); registerClient(taskId, c); if (realId != null && !realId.equals(taskId)) registerClient(realId, c); },
+                    c -> { mine.remove(c); unregisterClient(taskId, c); if (realId != null && !realId.equals(taskId)) unregisterClient(realId, c); });
+            long maxMin = winScpMaxRuntimeMinutes();
+            if (maxMin > 0) {
+                watchdog = WATCHDOG.schedule(() -> {
+                    timedOut.set(true);
+                    for (service.sftp.SftpClient c : mine) { try { c.cancel(); } catch (Exception ignored) {} }
+                }, maxMin, java.util.concurrent.TimeUnit.MINUTES);
+            }
+            openedAt = System.currentTimeMillis();
+            SshSessionEvents.opened(evTask, "SFTP transfer", who[1], who[0]);
+            service.sftp.SftpScriptRunner.Outcome out = runner.run(script, password, logLine);
+            if (out.ok()) {
+                logLine.accept("[SUCCESS] Transfer completed successfully.");
+                return true;
+            }
+            end = "failed";
+            logLine.accept("[ERROR] SFTP transfer failed.");
+            return false;
+        } catch (IOException ex) {
+            if (watchdog != null && watchdog.isDone()) {
+                logLine.accept("[ERROR] Transfer stopped after the configured maximum runtime of "
+                        + winScpMaxRuntimeMinutes() + " minute(s) (winscpMaxRuntimeMinutes).");
+                end = "timed out";
+                return false;
+            }
+            end = "error: " + ex.getMessage();
+            if (Thread.currentThread().isInterrupted() || String.valueOf(ex.getMessage()).contains("cancelled")) {
+                logLine.accept("[INFO] Transfer interrupted: " + ex.getMessage());
+                return false;
+            }
+            logLine.accept("[ERROR] SFTP transfer failed: " + ex.getMessage());
+            lastFailureClassification.set(FailureClassifier.classifyThrowable(ex));
+            return false;
+        } finally {
+            if (watchdog != null) watchdog.cancel(false);
+            if (openedAt != 0) SshSessionEvents.closed(evTask, "SFTP transfer", who[1], who[0], end,
+                    System.currentTimeMillis() - openedAt);
+        }
+    }
+
+    private java.util.Map<String, RemoteFileStat> listViaSftp(Credential target, String password, String dirPath,
+                                                              Consumer<String> logLine) throws Exception {
+        logLine.accept("[INFO] Listing remote directory (SFTP): " + dirPath);
+        long openedAt = System.currentTimeMillis();
+        SshSessionEvents.opened(null, "SFTP listing", target.getHost(), target.getUsername());
+        String end = "finished";
+        try (service.sftp.SftpClient c = service.sftp.JschSftpClient.connect(
+                target.getHost(), 22, target.getUsername(), password, SFTP_CONNECT_TIMEOUT_MS)) {
+            java.util.Map<String, RemoteFileStat> stats = new java.util.LinkedHashMap<>();
+            for (service.sftp.RemoteEntry e : c.list(dirPath)) {
+                if (e.directory()) continue;
+                stats.put(dirPath + e.name(), new RemoteFileStat(e.modifiedEpochSeconds() * 1000L, e.size()));
+            }
+            logLine.accept("[INFO] Received " + stats.size() + " file entries from remote listing.");
+            return stats;
+        } catch (IOException ex) {
+            end = "error: " + ex.getMessage();
+            throw ex;
+        } finally {
+            SshSessionEvents.closed(null, "SFTP listing", target.getHost(), target.getUsername(), end,
+                    System.currentTimeMillis() - openedAt);
+        }
+    }
+
     public boolean cancelRunningTask(String taskId) {
         if (taskId == null) return false;
-        java.util.Set<Process> procs = activeProcesses.remove(taskId);
-        if (procs == null || procs.isEmpty()) return false;
         boolean any = false;
+        java.util.Set<service.sftp.SftpClient> clients = activeClients.remove(taskId);
+        if (clients != null) {
+            for (service.sftp.SftpClient c : clients) {
+                try { c.cancel(); any = true; } catch (Exception ignored) {}
+            }
+        }
+        java.util.Set<Process> procs = activeProcesses.remove(taskId);
+        if (procs == null || procs.isEmpty()) return any;
         for (Process p : procs) {
             try { p.destroyForcibly(); any = true; }
             catch (Exception ignored) {}
@@ -3173,6 +3373,25 @@ public class TransferService {
     private String escapeWinScpRemotePath(String path) {
         if (path == null) return "\"\"";
         return '"' + path.replace("\"", "\\\"") + '"';
+    }
+
+    // ── WinSCP password hand-off ────────────────────────────────────────────
+    // The password is NOT written to the script file. The script's open line refers to
+    // %OPSTOOL_SFTP_PW%, which WinSCP expands from the environment of the one process
+    // that runs that script (WinSCP resolves environment variables before parsing a command).
+    private static final String PW_ENV = "OPSTOOL_SFTP_PW";
+    private final java.util.concurrent.ConcurrentHashMap<String, String> scriptPasswords =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    private void writeOpenLine(PrintWriter pw, Credential target, String password, File script) {
+        scriptPasswords.put(script.getAbsolutePath(), password == null ? "" : password);
+        pw.println("open sftp://" + escapeUrl(target.getUsername()) + "@" + target.getHost()
+                + "/ -hostkey=\"*\" -password=\"%" + PW_ENV + "%\"");
+    }
+
+    private void applyScriptPassword(ProcessBuilder pb, File script) {
+        String pwd = scriptPasswords.remove(script.getAbsolutePath());
+        if (pwd != null) pb.environment().put(PW_ENV, pwd.replace("\"", "\"\""));
     }
 
     private String escapeUrl(String s) {

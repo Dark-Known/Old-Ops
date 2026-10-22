@@ -111,6 +111,17 @@ public class Daemon {
         // faster — 3s vs. the scheduler's own 60s-ish poll interval) so a
         // "Run now" click from a thin GUI that owns no scheduler of its own
         // feels responsive, without coupling the two poll loops together.
+        if (service.DaemonControlServer.enabledByConfig()) {
+            try {
+                service.DaemonControlServer.start(new File(dataDir), (action, taskId, who) -> {
+                    runAction(scheduler, action, taskId);
+                    log("Executed GUI command " + action + " for task " + taskId + " via control endpoint (requested by " + who + ")");
+                });
+                log("Control endpoint started — GUI commands are delivered immediately");
+            } catch (Exception e) {
+                log("Control endpoint not started (" + e.getMessage() + ") — using the 3-second command queue only");
+            }
+        }
         service.Workers.service("gui-command-poller", () -> runCommandPollerLoop(dataDir, scheduler));
         log("Command poller started — checking for GUI-requested actions every 3 seconds");
 
@@ -151,18 +162,23 @@ public class Daemon {
         }
     }
 
+    private static void runAction(TaskSchedulerService scheduler,
+                                  service.CommandQueueService.Action action, String taskId) {
+        switch (action) {
+            case RUN_NOW -> scheduler.runNow(taskId);
+            case CANCEL -> scheduler.cancelTask(taskId);
+            case RESTART -> scheduler.restartTask(taskId);
+            case RECONNECT_WATCH -> scheduler.reconnectWatch(taskId);
+            case REFRESH -> scheduler.refresh();
+            // Queued as a system job: a task worker (not the caller's thread) does the actual purge.
+            case PURGE_NOW -> scheduler.requestPurge("manual (from GUI)");
+        }
+    }
+
     private static void handleCommand(File dbDir, TaskSchedulerService scheduler,
                                        service.CommandQueueService.Command cmd) {
         try {
-            switch (cmd.action()) {
-                case RUN_NOW -> scheduler.runNow(cmd.taskId());
-                case CANCEL -> scheduler.cancelTask(cmd.taskId());
-                case RESTART -> scheduler.restartTask(cmd.taskId());
-                case RECONNECT_WATCH -> scheduler.reconnectWatch(cmd.taskId());
-                case REFRESH -> scheduler.refresh();
-                // Queued as a system job: a task worker (not this poller thread) does the actual purge.
-                case PURGE_NOW -> scheduler.requestPurge("manual (from GUI)");
-            }
+            runAction(scheduler, cmd.action(), cmd.taskId());
             log("Executed GUI command " + cmd.action() + " for task " + cmd.taskId()
                     + " (requested by " + cmd.requestedBy() + ")");
             service.CommandQueueService.markDone(dbDir, cmd.id());

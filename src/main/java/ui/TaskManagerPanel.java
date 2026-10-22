@@ -1,5 +1,6 @@
 package ui;
 
+import ui.monitor.TaskChangeView;
 import model.ScheduledTask;
 import service.TaskSchedulerService;
 import service.TransferService;
@@ -1183,44 +1184,8 @@ public class TaskManagerPanel extends JPanel {
 
     // Human-readable labels for the fields captured by snapshotTaskFields(),
     // in the order they should read in a created/edited-task event detail.
-    private static final Map<String, String> TASK_FIELD_LABELS = new LinkedHashMap<>();
-    static {
-        TASK_FIELD_LABELS.put("taskType", "Type");
-        TASK_FIELD_LABELS.put("transferDirection", "Direction");
-        TASK_FIELD_LABELS.put("transferMode", "Transfer mode");
-        TASK_FIELD_LABELS.put("sourceCredential", "Source credential");
-        TASK_FIELD_LABELS.put("targetCredential", "Target credential");
-        TASK_FIELD_LABELS.put("targetUsername", "Target username");
-        TASK_FIELD_LABELS.put("sourcePath", "Source path");
-        TASK_FIELD_LABELS.put("targetPath", "Target path");
-        TASK_FIELD_LABELS.put("additionalTargetPaths", "Additional target paths");
-        TASK_FIELD_LABELS.put("backupSourcePath", "Backup source path");
-        TASK_FIELD_LABELS.put("backupDestinationPath", "Backup destination path");
-        TASK_FIELD_LABELS.put("backupRetentionDays", "Backup retention (days)");
-        TASK_FIELD_LABELS.put("backupSourceUsername", "Backup source credential");
-        TASK_FIELD_LABELS.put("backupDestinationUsername", "Backup destination credential");
-        TASK_FIELD_LABELS.put("imapFolder", "IMAP folder");
-        TASK_FIELD_LABELS.put("mailSearchCriteria", "Mail search criteria");
-        TASK_FIELD_LABELS.put("mailFetchMode", "Mail fetch mode");
-        TASK_FIELD_LABELS.put("mailMailboxAddress", "Mailbox address");
-        TASK_FIELD_LABELS.put("mailTenantId", "Mail tenant ID");
-        TASK_FIELD_LABELS.put("mailClientId", "Mail client ID");
-        TASK_FIELD_LABELS.put("mailFetchScope", "Mail fetch scope");
-        TASK_FIELD_LABELS.put("mailMaxResults", "Mail max results");
-        TASK_FIELD_LABELS.put("mailMarkAsRead", "Mark mail as read");
-        TASK_FIELD_LABELS.put("mailMoveToFolderEnabled", "Move mail to folder");
-        TASK_FIELD_LABELS.put("mailMoveToFolderName", "Move-to folder name");
-        TASK_FIELD_LABELS.put("mailOutputFolder", "Mail output folder");
-        TASK_FIELD_LABELS.put("scheduleType", "Schedule type");
-        TASK_FIELD_LABELS.put("scheduledAt", "Scheduled at");
-        TASK_FIELD_LABELS.put("intervalMinutes", "Interval (minutes)");
-        TASK_FIELD_LABELS.put("intervalSeconds", "Interval (seconds)");
-        TASK_FIELD_LABELS.put("cronExpression", "Cron expression");
-        TASK_FIELD_LABELS.put("watcherEnabled", "Watcher enabled");
-        TASK_FIELD_LABELS.put("inboundWatcherPollIntervalMinutes", "Watcher fallback poll interval (min)");
-        TASK_FIELD_LABELS.put("inboundWatcherMaxAgeMinutes", "Watcher max file age (min)");
-        TASK_FIELD_LABELS.put("retryCount", "Retry count");
-    }
+    // Shared with the Event Monitor, which reads this text back (see ui.monitor.TaskChangeView).
+    private static final Map<String, String> TASK_FIELD_LABELS = TaskChangeView.LABELS;
 
     /**
      * Captures every user-configurable field on a task as label-ready strings,

@@ -63,6 +63,9 @@ public final class CommandQueueService {
      * try again" already covers.
      */
     public static boolean enqueue(File dataDir, String taskId, Action action, String requestedBy) {
+        // Fast path: hand the command straight to the running daemon. Fall back to the queue
+        // table whenever that is not possible (daemon down, endpoint disabled, old daemon).
+        if (DaemonControlClient.send(dataDir, action, taskId, requestedBy)) return true;
         try (Connection c = connection(dataDir)) {
             try (PreparedStatement ps = c.prepareStatement(
                     "INSERT INTO gui_commands (task_id, action, requested_by, requested_at, status) " +
@@ -84,6 +87,7 @@ public final class CommandQueueService {
 
     /** Fetches every command still waiting to be handled, oldest first. */
     public static List<Command> pollPending(File dataDir) {
+        expireStalePending(dataDir);
         List<Command> out = new ArrayList<>();
         try (Connection c = connection(dataDir);
              PreparedStatement ps = c.prepareStatement(
@@ -108,6 +112,26 @@ public final class CommandQueueService {
             log.log(Level.WARNING, "Failed to read pending commands", e);
         }
         return out;
+    }
+
+    /** A PENDING command older than this is not run: the user asked minutes ago and has moved on. */
+    static final long PENDING_TTL_MINUTES = 10;
+
+    /**
+     * Marks PENDING commands older than {@link #PENDING_TTL_MINUTES} as FAILED ("Expired"),
+     * so a daemon that was stopped for hours does not suddenly run a RUN_NOW/RESTART the
+     * user queued earlier.
+     */
+    private static void expireStalePending(File dataDir) {
+        try (Connection c = connection(dataDir);
+             PreparedStatement ps = c.prepareStatement(
+                     "UPDATE gui_commands SET status = 'FAILED', detail = ? WHERE status = 'PENDING' AND requested_at < ?")) {
+            ps.setString(1, "Expired: not picked up within " + PENDING_TTL_MINUTES + " minutes (daemon not running?)");
+            ps.setString(2, LocalDateTime.now().minusMinutes(PENDING_TTL_MINUTES).format(TS));
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            log.log(Level.WARNING, "Failed to expire stale commands", e);
+        }
     }
 
     public static void markDone(File dataDir, long commandId) {

@@ -35,8 +35,37 @@ import java.util.regex.Pattern;
  */
 public class GraphMailService {
 
-    private static final String GRAPH_BASE = "https://graph.microsoft.com/v1.0";
-    private final HttpClient http = HttpClient.newHttpClient();
+    private static final String DEFAULT_GRAPH_BASE = "https://graph.microsoft.com/v1.0";
+    private final HttpClient http;
+    /** "/me" for a signed-in user token; "/users/{mailbox}" for an app-only (certificate) token. */
+    private final String userPath;
+    private String graphBase = DEFAULT_GRAPH_BASE; // overridable for tests only
+
+    /** For tests: talk to a local fake instead of graph.microsoft.com. */
+    void setGraphBaseForTesting(String base) { this.graphBase = base; }
+
+    public GraphMailService() {
+        this(HttpClient.newBuilder().connectTimeout(java.time.Duration.ofSeconds(15)).build(), "/me");
+    }
+
+    private GraphMailService(HttpClient http, String userPath) {
+        this.http = http;
+        this.userPath = userPath;
+    }
+
+    /**
+     * A view of this service that addresses the given mailbox explicitly ({@code /users/{mailbox}}),
+     * as required by app-only tokens, which have no "me". Shares the HTTP client; holds no other state.
+     */
+    public GraphMailService forMailbox(String mailbox) {
+        GraphMailService g = new GraphMailService(http, "/users/" + urlEnc(mailbox));
+        g.graphBase = this.graphBase;
+        return g;
+    }
+
+    String userPath() { return userPath; }
+    private static final java.time.Duration REQUEST_TIMEOUT = java.time.Duration.ofSeconds(60);
+    private static final int MAX_ATTEMPTS = 4;
 
     public static class MailMessage {
         public final String id;
@@ -117,7 +146,7 @@ public class GraphMailService {
         // Graph pages ~10 messages by default and caps a single page at 999;
         // request pages sized to what's still needed, up to that cap.
         int pageSize = Math.min(Math.max(maxResults, 1), 999);
-        String baseUrl = GRAPH_BASE + "/me/mailFolders/" + folderSegment + "/messages"
+        String baseUrl = graphBase + userPath + "/mailFolders/" + folderSegment + "/messages"
                 + "?$top=" + pageSize
                 + "&$select=id,subject,from,receivedDateTime";
         String filterParam = (filter != null && !filter.isEmpty()) ? "&$filter=" + urlEnc(filter) : "";
@@ -192,10 +221,10 @@ public class GraphMailService {
                 // Raw RFC 2822 MIME — closest analog to the old IMAP BODY[] fetch.
                 // Attachments are already embedded in the MIME itself, so no
                 // separate attachment fetch/preference logic applies here.
-                bodyContent = graphGetRaw(accessToken, GRAPH_BASE + "/me/messages/" + id + "/$value");
+                bodyContent = graphGetRaw(accessToken, graphBase + userPath + "/messages/" + id + "/$value");
             } else {
                 Map<String, Object> full = graphGetJson(accessToken,
-                        GRAPH_BASE + "/me/messages/" + id + "?$select=body");
+                        graphBase + userPath + "/messages/" + id + "?$select=body");
                 Map<String, Object> body = MiniJson.getObject(full, "body");
                 if (body != null) {
                     bodyContent = MiniJson.getString(body, "content", "");
@@ -256,7 +285,7 @@ public class GraphMailService {
             throws IOException, InterruptedException {
         Map<String, Object> resp;
         try {
-            resp = graphGetJson(accessToken, GRAPH_BASE + "/me/messages/" + messageId + "/attachments");
+            resp = graphGetJson(accessToken, graphBase + userPath + "/messages/" + messageId + "/attachments");
         } catch (IOException ex) {
             logLine.accept("[WARN] Could not fetch attachments for message " + messageId + ": " + ex.getMessage());
             return new AttachmentBundle("", Collections.emptyList(), Collections.emptyList());
@@ -335,7 +364,7 @@ public class GraphMailService {
             case "SPAM":         return "junkemail";
             case "ARCHIVE":      return "archive";
             default: {
-                String url = GRAPH_BASE + "/me/mailFolders?$filter="
+                String url = graphBase + userPath + "/mailFolders?$filter="
                         + urlEnc("displayName eq '" + folder.trim().replace("'", "''") + "'");
                 Map<String, Object> resp = graphGetJson(accessToken, url);
                 List<Object> arr = MiniJson.getArray(resp, "value");
@@ -352,7 +381,7 @@ public class GraphMailService {
                 // created it by hand in Outlook beforehand.
                 try {
                     String createBody = "{\"displayName\":\"" + MiniJson.escapeString(folder.trim()) + "\"}";
-                    String created = graphPostJson(accessToken, GRAPH_BASE + "/me/mailFolders", createBody);
+                    String created = graphPostJson(accessToken, graphBase + userPath + "/mailFolders", createBody);
                     Map<String, Object> createdObj = MiniJson.parseObject(created);
                     String newId = MiniJson.getString(createdObj, "id", null);
                     if (newId != null) {
@@ -543,7 +572,7 @@ public class GraphMailService {
 
     /** Marks a single message as read. Call before {@link #moveMessage} if doing both — move changes the message ID. */
     public void markAsRead(String accessToken, String messageId) throws IOException, InterruptedException {
-        graphPatch(accessToken, GRAPH_BASE + "/me/messages/" + messageId, "{\"isRead\":true}");
+        graphPatch(accessToken, graphBase + userPath + "/messages/" + messageId, "{\"isRead\":true}");
     }
 
     /**
@@ -562,7 +591,7 @@ public class GraphMailService {
                             Consumer<String> logLine) throws IOException, InterruptedException {
         String destId = resolveFolderSegment(accessToken, destinationFolder, logLine);
         String body = "{\"destinationId\":\"" + MiniJson.escapeString(destId) + "\"}";
-        graphPost(accessToken, GRAPH_BASE + "/me/messages/" + messageId + "/move", body);
+        graphPost(accessToken, graphBase + userPath + "/messages/" + messageId + "/move", body);
     }
 
     // ─── HTTP helpers ────────────────────────────────────────────────────────
@@ -578,8 +607,9 @@ public class GraphMailService {
                 .header("Authorization", "Bearer " + accessToken)
                 .header("Prefer", "IdType=\"ImmutableId\"")
                 .GET()
+                .timeout(REQUEST_TIMEOUT)
                 .build();
-        HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+        HttpResponse<String> resp = sendWithRetry(req);
         if (resp.statusCode() != 200) {
             throw new IOException("Graph API call failed (" + resp.statusCode() + ") for " + url
                     + ": " + resp.body());
@@ -595,8 +625,9 @@ public class GraphMailService {
                 .header("Content-Type", "application/json")
                 .header("Prefer", "IdType=\"ImmutableId\"")
                 .method("PATCH", HttpRequest.BodyPublishers.ofString(jsonBody, StandardCharsets.UTF_8))
+                .timeout(REQUEST_TIMEOUT)
                 .build();
-        HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+        HttpResponse<String> resp = sendWithRetry(req);
         if (resp.statusCode() < 200 || resp.statusCode() >= 300) {
             throw new IOException("Graph PATCH failed (" + resp.statusCode() + ") for " + url
                     + ": " + resp.body());
@@ -611,8 +642,9 @@ public class GraphMailService {
                 .header("Content-Type", "application/json")
                 .header("Prefer", "IdType=\"ImmutableId\"")
                 .POST(HttpRequest.BodyPublishers.ofString(jsonBody, StandardCharsets.UTF_8))
+                .timeout(REQUEST_TIMEOUT)
                 .build();
-        HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+        HttpResponse<String> resp = sendWithRetry(req);
         if (resp.statusCode() < 200 || resp.statusCode() >= 300) {
             throw new IOException("Graph POST failed (" + resp.statusCode() + ") for " + url
                     + ": " + resp.body());
@@ -629,13 +661,36 @@ public class GraphMailService {
                 .header("Content-Type", "application/json")
                 .header("Prefer", "IdType=\"ImmutableId\"")
                 .POST(HttpRequest.BodyPublishers.ofString(jsonBody, StandardCharsets.UTF_8))
+                .timeout(REQUEST_TIMEOUT)
                 .build();
-        HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+        HttpResponse<String> resp = sendWithRetry(req);
         if (resp.statusCode() < 200 || resp.statusCode() >= 300) {
             throw new IOException("Graph POST failed (" + resp.statusCode() + ") for " + url
                     + ": " + resp.body());
         }
         return resp.body();
+    }
+
+    /**
+     * Sends the request, retrying a few times when Graph says it is throttling (429) or
+     * temporarily unavailable (503). Honours Retry-After (capped at 60 s); otherwise backs
+     * off 2, 4, 8 s. Other statuses are returned untouched for the caller to judge.
+     */
+    private HttpResponse<String> sendWithRetry(HttpRequest req) throws IOException, InterruptedException {
+        HttpResponse<String> resp = null;
+        for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+            resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+            int code = resp.statusCode();
+            if ((code != 429 && code != 503) || attempt == MAX_ATTEMPTS) return resp;
+            long waitSec = 2L << (attempt - 1);
+            try {
+                String ra = resp.headers().firstValue("Retry-After").orElse(null);
+                if (ra != null) waitSec = Long.parseLong(ra.trim());
+            } catch (NumberFormatException ignored) {}
+            waitSec = Math.max(1, Math.min(waitSec, 60));
+            Thread.sleep(waitSec * 1000);
+        }
+        return resp;
     }
 
     private String urlEnc(String s) {

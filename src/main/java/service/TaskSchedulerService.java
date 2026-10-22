@@ -132,6 +132,31 @@ public class TaskSchedulerService {
     private final ThreadLocal<String> pendingOutcomeNote = new ThreadLocal<>();
     private final ThreadLocal<Boolean> pendingSuppressActivity = new ThreadLocal<>();
     private final ThreadLocal<Boolean> pendingErrored = new ThreadLocal<>();
+    // Set by executeTask when it skipped because another process held the task's lock.
+    private final ThreadLocal<Boolean> lockSkipped = new ThreadLocal<>();
+
+    /**
+     * This process marked the task RUNNING just before discovering another process holds its
+     * lock. Put back what was there - but only if the row is still exactly what we wrote
+     * (status RUNNING with our start time); if the other process has already moved on, its
+     * values win.
+     */
+    private void restoreAfterLockSkip(String taskId, LocalDateTime wroteStartedAt,
+                                      TaskStatus prevStatus, LocalDateTime prevStartedAt) {
+        try {
+            for (ScheduledTask t : storage.loadTasks()) {
+                if (!taskId.equals(t.getId())) continue;
+                if (t.getStatus() == TaskStatus.RUNNING && wroteStartedAt.equals(t.getLastStartedAt())) {
+                    t.setStatus(prevStatus);
+                    t.setLastStartedAt(prevStartedAt);
+                    storage.saveTask(t);
+                }
+                return;
+            }
+        } catch (Exception e) {
+            // best effort - the winning process rewrites the status when it finishes
+        }
+    }
 
     private TaskWorkerPool.HandlerOutcome consumeOutcomeNote() {
         String note = pendingOutcomeNote.get();
@@ -1342,13 +1367,20 @@ public class TaskSchedulerService {
             if (runKey == null) runKey = RunHistoryService.newRunKey();
             RunHistoryService.beginRunContext(runKey, event.isImmediate() ? "WATCHER" : "SCHEDULE");
             try {
+                final TaskStatus prevStatus = task.getStatus();
+                final LocalDateTime prevStartedAt = task.getLastStartedAt();
                 task.setStatus(TaskStatus.RUNNING);
                 task.setLastStartedAt(now);
                 if (!storage.saveTask(task)) logBackendSaveFailure(task, "RUNNING status at event-triggered run start");
                 refreshMetrics(task.getId(), true);
                 recordStartedEvent(task, now);
+                lockSkipped.remove();
                 executeTask(task, event.getChangedFileNames());
+                if (Boolean.TRUE.equals(lockSkipped.get())) {
+                    restoreAfterLockSkip(task.getId(), now, prevStatus, prevStartedAt);
+                }
             } finally {
+                lockSkipped.remove();
                 RunHistoryService.endRunContext();
             }
         }, () -> {
@@ -1537,6 +1569,7 @@ public class TaskSchedulerService {
             runHistoryService.recordRun(task.getId(), task.getName(), task.getTaskType().name(),
                     TaskRunRecord.Status.SKIPPED, reason, reason, runStartedAt, LocalDateTime.now());
             pendingOutcomeNote.set(reason);
+            lockSkipped.set(true);
             try { lockChannel.close(); } catch (IOException ignored) {}
             try { runningThreads.remove(task.getId()); } catch (Exception ignored) {}
             lastActivityMillis.remove(task.getId());

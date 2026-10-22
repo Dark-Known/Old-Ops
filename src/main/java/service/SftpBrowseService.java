@@ -45,10 +45,11 @@ public final class SftpBrowseService implements AutoCloseable {
     public static SftpBrowseService connect(String host, String username, String password) throws Exception {
         JSch jsch = new JSch();
         Session session = jsch.getSession(username, host, 22);
-        session.setPassword(password == null ? "" : password);
+        util.SshAuth.apply(jsch, session, password);
         Properties config = new Properties();
         config.put("StrictHostKeyChecking", "no");
         session.setConfig(config);
+        util.SshHostKeys.apply(jsch, session);
         try {
             session.connect(8_000);
         } catch (Exception ex) {
