@@ -148,8 +148,9 @@ final class WatcherInfoPopup {
 
     private static Result resolve(XmlStorageService storage, TaskSchedulerService scheduler, ScheduledTask task) {
         Path daemonFile = storage.getDataDir().toPath().resolve("scheduler-status-daemon.dat");
-        if (SchedulerStatusSnapshot.isAlive(daemonFile, SchedulerStatusSnapshot.DEFAULT_STALE_MS)) {
-            SchedulerStatusSnapshot snap = SchedulerStatusSnapshot.read(daemonFile);
+        AppFeeds.Daemon daemon = AppFeeds.daemonNow(daemonFile);
+        if (daemon.alive()) {
+            SchedulerStatusSnapshot snap = daemon.snapshot();
             if (snap != null) {
                 for (SchedulerStatusSnapshot.WatchEntry w : snap.getWatchEntries()) {
                     if (w.taskId().equals(task.getId())) {

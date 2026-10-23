@@ -57,6 +57,14 @@ public class RunHistoryService {
     private final Connection conn;
     private final File dbFile;
 
+    // Dedicated read-only connection for every query. Writes (recordRun, purge...) keep using {@code conn}
+    // under {@code this}; reads take {@code readLock} on {@code rconn}. In WAL mode a reader never blocks the
+    // writer and vice versa, so UI polls no longer queue behind run recording (and vice versa) inside
+    // this process. If the read connection could not be opened, {@link #readGuard()} falls back to the
+    // old behaviour (everything serialized on {@code this} over {@code conn}).
+    private final Connection rconn;
+    private final Object readLock = new Object();
+
     // Notified (on whatever thread recordRun() was called from — usually a
     // scheduler worker thread, never the EDT) after every real outcome is
     // recorded, so the UI can show a toast and refresh live views without
@@ -83,6 +91,12 @@ public class RunHistoryService {
             Class.forName("org.sqlite.JDBC");
             c = DriverManager.getConnection("jdbc:sqlite:" + dbFile.getAbsolutePath());
             try (Statement st = c.createStatement()) {
+                // Same tuning as app.db / background_log.db. This file is written by the Daemon and read by
+                // the GUI at the same time; in the default rollback-journal mode a writer blocks every
+                // reader (the source of the "DB briefly locked" misses in the UI), WAL does not.
+                st.execute("PRAGMA busy_timeout=5000");
+                st.execute("PRAGMA journal_mode=WAL");
+                st.execute("PRAGMA synchronous=NORMAL");
                 migrateLegacyTaskRunsTable(c, st);
                 createTable(st, RUN_TABLE);
                 createTable(st, ACTIVITY_TABLE);
@@ -91,7 +105,26 @@ public class RunHistoryService {
             log.log(Level.SEVERE, "Failed to open/initialize run history database", e);
         }
         this.conn = c;
+        this.rconn = c == null ? null : openReadOnly(dbFile);
     }
+
+    private static Connection openReadOnly(File dbFile) {
+        try {
+            org.sqlite.SQLiteConfig cfg = new org.sqlite.SQLiteConfig();
+            cfg.setReadOnly(true);
+            cfg.setBusyTimeout(5000);
+            return DriverManager.getConnection("jdbc:sqlite:" + dbFile.getAbsolutePath(), cfg.toProperties());
+        } catch (Exception e) {
+            log.log(Level.WARNING, "Read-only history connection unavailable; reads will share the write connection", e);
+            return null;
+        }
+    }
+
+    /** Lock to hold while reading: the independent read lock when we have a read connection, else the write lock. */
+    private Object readGuard() { return rconn != null ? readLock : this; }
+
+    /** Connection to read from (see {@link #readGuard()}). */
+    private Connection rc() { return rconn != null ? rconn : conn; }
 
     private static void createTable(Statement st, String table) throws SQLException {
         st.execute("CREATE TABLE IF NOT EXISTS " + table + " (" +
@@ -454,25 +487,27 @@ public class RunHistoryService {
      * table a given {@code ui.monitor.MonitorEvent} came from — see
      * its {@code source()} field).
      */
-    public synchronized TaskRunRecord getRunById(long id) {
+    public TaskRunRecord getRunById(long id) {
         return getByIdFrom(RUN_TABLE, id);
     }
 
     /** {@code event_monitor_history} counterpart of {@link #getRunById}. */
-    public synchronized TaskRunRecord getActivityEventById(long id) {
+    public TaskRunRecord getActivityEventById(long id) {
         return getByIdFrom(ACTIVITY_TABLE, id);
     }
 
     private TaskRunRecord getByIdFrom(String table, long id) {
-        if (conn == null) return null;
-        try (PreparedStatement ps = conn.prepareStatement("SELECT * FROM " + table + " WHERE id = ?")) {
-            ps.setLong(1, id);
-            try (ResultSet rs = ps.executeQuery()) {
-                return rs.next() ? mapRow(rs) : null;
+        synchronized (readGuard()) {
+            if (rc() == null) return null;
+            try (PreparedStatement ps = rc().prepareStatement("SELECT * FROM " + table + " WHERE id = ?")) {
+                ps.setLong(1, id);
+                try (ResultSet rs = ps.executeQuery()) {
+                    return rs.next() ? mapRow(rs) : null;
+                }
+            } catch (SQLException e) {
+                log.log(Level.WARNING, "Failed to look up row by id in " + table, e);
+                return null;
             }
-        } catch (SQLException e) {
-            log.log(Level.WARNING, "Failed to look up row by id in " + table, e);
-            return null;
         }
     }
 
@@ -487,7 +522,7 @@ public class RunHistoryService {
      * mean "any". {@code from}/{@code to} bound {@code started_at}
      * (inclusive on both ends).
      */
-    public synchronized List<TaskRunRecord> queryRuns(String taskId, TaskRunRecord.Status status,
+    public List<TaskRunRecord> queryRuns(String taskId, TaskRunRecord.Status status,
             LocalDateTime from, LocalDateTime to, int limit) {
         return query(RUN_TABLE, taskId, status, from, to, limit);
     }
@@ -498,49 +533,51 @@ public class RunHistoryService {
      * {@link #queryRuns}. Used to build the Event Monitor's merged live
      * feed; Statistics and the Logs tab never call this.
      */
-    public synchronized List<TaskRunRecord> queryActivityEvents(String taskId, LocalDateTime from, LocalDateTime to, int limit) {
+    public List<TaskRunRecord> queryActivityEvents(String taskId, LocalDateTime from, LocalDateTime to, int limit) {
         return query(ACTIVITY_TABLE, taskId, null, from, to, limit);
     }
 
     private List<TaskRunRecord> query(String table, String taskId, TaskRunRecord.Status status,
             LocalDateTime from, LocalDateTime to, int limit) {
-        List<TaskRunRecord> results = new ArrayList<>();
-        if (conn == null) return results;
+        synchronized (readGuard()) {
+            List<TaskRunRecord> results = new ArrayList<>();
+            if (rc() == null) return results;
 
-        StringBuilder sql = new StringBuilder("SELECT * FROM " + table + " WHERE 1=1");
-        List<Object> params = new ArrayList<>();
-        if (taskId != null) {
-            sql.append(" AND task_id = ?");
-            params.add(taskId);
-        }
-        if (status != null) {
-            sql.append(" AND status = ?");
-            params.add(status.name());
-        }
-        if (from != null) {
-            sql.append(" AND started_at >= ?");
-            params.add(from.format(TS_FMT));
-        }
-        if (to != null) {
-            sql.append(" AND started_at <= ?");
-            params.add(to.format(TS_FMT));
-        }
-        sql.append(" ORDER BY started_at DESC, id DESC LIMIT ?");
-        params.add(limit);
-
-        try (PreparedStatement ps = conn.prepareStatement(sql.toString())) {
-            for (int i = 0; i < params.size(); i++) {
-                ps.setObject(i + 1, params.get(i));
+            StringBuilder sql = new StringBuilder("SELECT * FROM " + table + " WHERE 1=1");
+            List<Object> params = new ArrayList<>();
+            if (taskId != null) {
+                sql.append(" AND task_id = ?");
+                params.add(taskId);
             }
-            try (ResultSet rs = ps.executeQuery()) {
-                while (rs.next()) {
-                    results.add(mapRow(rs));
+            if (status != null) {
+                sql.append(" AND status = ?");
+                params.add(status.name());
+            }
+            if (from != null) {
+                sql.append(" AND started_at >= ?");
+                params.add(from.format(TS_FMT));
+            }
+            if (to != null) {
+                sql.append(" AND started_at <= ?");
+                params.add(to.format(TS_FMT));
+            }
+            sql.append(" ORDER BY started_at DESC, id DESC LIMIT ?");
+            params.add(limit);
+
+            try (PreparedStatement ps = rc().prepareStatement(sql.toString())) {
+                for (int i = 0; i < params.size(); i++) {
+                    ps.setObject(i + 1, params.get(i));
                 }
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        results.add(mapRow(rs));
+                    }
+                }
+            } catch (SQLException e) {
+                log.log(Level.WARNING, "Failed to query " + table, e);
             }
-        } catch (SQLException e) {
-            log.log(Level.WARNING, "Failed to query " + table, e);
+            return results;
         }
-        return results;
     }
 
     /**
@@ -551,18 +588,20 @@ public class RunHistoryService {
      * entirely on the (common) idle tick instead of re-reading the feed every
      * second.
      */
-    public synchronized String getChangeToken() {
-        if (conn == null) return "";
-        StringBuilder sb = new StringBuilder();
-        for (String table : new String[]{RUN_TABLE, ACTIVITY_TABLE}) {
-            try (Statement st = conn.createStatement();
-                 ResultSet rs = st.executeQuery("SELECT COALESCE(MAX(id),0) FROM " + table)) {
-                sb.append(rs.next() ? rs.getLong(1) : 0L).append(':');
-            } catch (SQLException e) {
-                sb.append("?:");
+    public String getChangeToken() {
+        synchronized (readGuard()) {
+            if (rc() == null) return "";
+            StringBuilder sb = new StringBuilder();
+            for (String table : new String[]{RUN_TABLE, ACTIVITY_TABLE}) {
+                try (Statement st = rc().createStatement();
+                     ResultSet rs = st.executeQuery("SELECT COALESCE(MAX(id),0) FROM " + table)) {
+                    sb.append(rs.next() ? rs.getLong(1) : 0L).append(':');
+                } catch (SQLException e) {
+                    sb.append("?:");
+                }
             }
+            return sb.toString();
         }
-        return sb.toString();
     }
 
     /**
@@ -571,17 +610,17 @@ public class RunHistoryService {
      * only needs the one-line {@code reason}; the full log is fetched on
      * demand for the single selected row via {@link #getRunById}.
      */
-    public synchronized List<TaskRunRecord> queryRunSummaries(LocalDateTime from, int limit) {
+    public List<TaskRunRecord> queryRunSummaries(LocalDateTime from, int limit) {
         return querySummaries(RUN_TABLE, from, limit);
     }
 
     /** Like {@link #queryRunSummaries(LocalDateTime, int)} but restricted to one status (e.g. FAILED). */
-    public synchronized List<TaskRunRecord> queryRunSummaries(TaskRunRecord.Status status, LocalDateTime from, int limit) {
+    public List<TaskRunRecord> queryRunSummaries(TaskRunRecord.Status status, LocalDateTime from, int limit) {
         return querySummaries(RUN_TABLE, status, from, limit);
     }
 
     /** Activity-table counterpart of {@link #queryRunSummaries}. */
-    public synchronized List<TaskRunRecord> queryActivitySummaries(LocalDateTime from, int limit) {
+    public List<TaskRunRecord> queryActivitySummaries(LocalDateTime from, int limit) {
         return querySummaries(ACTIVITY_TABLE, from, limit);
     }
 
@@ -590,26 +629,28 @@ public class RunHistoryService {
     }
 
     private List<TaskRunRecord> querySummaries(String table, TaskRunRecord.Status status, LocalDateTime from, int limit) {
-        List<TaskRunRecord> results = new ArrayList<>();
-        if (conn == null) return results;
-        StringBuilder sql = new StringBuilder("SELECT id, task_id, task_name, task_type, status, reason, started_at, "
-                + "ended_at, duration_ms, failure_category, retryable, suggested_action, event_kind, run_key, trigger_src "
-                + "FROM " + table + " WHERE 1=1");
-        if (status != null) sql.append(" AND status = ?");
-        if (from != null) sql.append(" AND started_at >= ?");
-        sql.append(" ORDER BY started_at DESC, id DESC LIMIT ?");
-        try (PreparedStatement ps = conn.prepareStatement(sql.toString())) {
-            int i = 1;
-            if (status != null) ps.setString(i++, status.name());
-            if (from != null) ps.setString(i++, from.format(TS_FMT));
-            ps.setInt(i, limit);
-            try (ResultSet rs = ps.executeQuery()) {
-                while (rs.next()) results.add(mapRow(rs, false));
+        synchronized (readGuard()) {
+            List<TaskRunRecord> results = new ArrayList<>();
+            if (rc() == null) return results;
+            StringBuilder sql = new StringBuilder("SELECT id, task_id, task_name, task_type, status, reason, started_at, "
+                    + "ended_at, duration_ms, failure_category, retryable, suggested_action, event_kind, run_key, trigger_src "
+                    + "FROM " + table + " WHERE 1=1");
+            if (status != null) sql.append(" AND status = ?");
+            if (from != null) sql.append(" AND started_at >= ?");
+            sql.append(" ORDER BY started_at DESC, id DESC LIMIT ?");
+            try (PreparedStatement ps = rc().prepareStatement(sql.toString())) {
+                int i = 1;
+                if (status != null) ps.setString(i++, status.name());
+                if (from != null) ps.setString(i++, from.format(TS_FMT));
+                ps.setInt(i, limit);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) results.add(mapRow(rs, false));
+                }
+            } catch (SQLException e) {
+                log.log(Level.WARNING, "Failed to query summaries from " + table, e);
             }
-        } catch (SQLException e) {
-            log.log(Level.WARNING, "Failed to query summaries from " + table, e);
+            return results;
         }
-        return results;
     }
 
     /**
@@ -708,6 +749,9 @@ public class RunHistoryService {
     }
 
     public synchronized void close() {
+        synchronized (readLock) {
+            if (rconn != null) { try { rconn.close(); } catch (SQLException ignored) {} }
+        }
         if (conn != null) {
             try { conn.close(); } catch (SQLException ignored) {}
         }

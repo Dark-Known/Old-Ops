@@ -36,7 +36,6 @@ public class WatchStatusMonitor {
     public record Event(String taskId, String taskName, String fromMode, String toMode,
                          String detail, LocalDateTime at) {}
 
-    private static final long DAEMON_STALE_MS = SchedulerStatusSnapshot.DEFAULT_STALE_MS;
     private static final int POLL_INTERVAL_MS = 5000;
     private static final int MAX_EVENTS = 100;
 
@@ -64,13 +63,20 @@ public class WatchStatusMonitor {
         this.timer.setInitialDelay(3000);
     }
 
+    private Runnable streamUnsub = () -> { };
+
     public void start() {
         timer.start();
+        // The Daemon pushes a status the moment its state changes (including watcher mode changes), so
+        // re-check at once instead of waiting up to POLL_INTERVAL_MS. poll() is single-flight and thread-safe;
+        // the timer stays as the safety net and for this process's own watch state.
+        streamUnsub = service.DaemonStatusStream.forDataDir(storage.getDataDir()).addListener(this::poll);
         poll(); // establish baseline immediately rather than waiting for the first tick
     }
 
     public void stop() {
         timer.stop();
+        streamUnsub.run();
     }
 
     /** Most-recent-first list of recent fallback transitions, for display in NotificationPanel. */
@@ -109,8 +115,8 @@ public class WatchStatusMonitor {
 
     private List<Event> pollBlocking() {
         List<Event> notable = new ArrayList<>();
-        boolean daemonFresh = SchedulerStatusSnapshot.isAlive(daemonStatusFile, DAEMON_STALE_MS);
-        SchedulerStatusSnapshot snap = daemonFresh ? SchedulerStatusSnapshot.read(daemonStatusFile) : null;
+        AppFeeds.Daemon daemon = AppFeeds.daemonNow(daemonStatusFile); // push stream if live, else one file read
+        SchedulerStatusSnapshot snap = daemon.alive() ? daemon.snapshot() : null;
         Map<String, SchedulerStatusSnapshot.WatchEntry> daemonEntries = new HashMap<>();
         if (snap != null) {
             for (SchedulerStatusSnapshot.WatchEntry w : snap.getWatchEntries()) {
@@ -118,7 +124,7 @@ public class WatchStatusMonitor {
             }
         }
 
-        for (ScheduledTask t : storage.loadTasks()) {
+        for (ScheduledTask t : storage.loadTasksSnapshot()) {
             if (t.getTaskType() != ScheduledTask.TaskType.FILE_TRANSFER || !t.isWatcherEnabled()) continue;
 
             String mode;

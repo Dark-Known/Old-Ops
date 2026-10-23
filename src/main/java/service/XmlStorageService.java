@@ -5,6 +5,7 @@ import model.ScheduledTask;
 
 import java.io.File;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Thin facade in front of the app's task and credential storage.
@@ -153,22 +154,56 @@ public class XmlStorageService {
 
     // ─── Tasks (SQLite-backed — see TaskDbService) ──────────────────────────
 
-    /** All stored tasks. */
+    /** All stored tasks, freshly read. Callers get their own mutable objects - use this when you
+     *  intend to edit and {@link #saveTask} the result. Display-only code should prefer
+     *  {@link #loadTasksSnapshot()}. */
     public List<ScheduledTask> loadTasks() {
         return taskDb.loadAll();
+    }
+
+    // Snapshot cache for read-only consumers (status bar, watcher monitor, event monitor, feeds).
+    // Valid while neither this process (localEpoch) nor any other (monitor TASKS generation) has
+    // touched the tasks table; the age cap is a safety net should the change signal ever stall.
+    private static final long SNAPSHOT_MAX_AGE_MS = 30_000;
+    private final AtomicLong localEpoch = new AtomicLong();
+    private volatile TaskSnapshot snapshot;
+
+    private record TaskSnapshot(List<ScheduledTask> tasks, long monitorGen, long epoch, long loadedAtMs) {}
+
+    /**
+     * Read-only view of all tasks, shared by every caller until the table actually changes.
+     * The list is unmodifiable and its {@link ScheduledTask} objects are shared - <b>do not mutate
+     * them</b>; use {@link #loadTasks()} for anything you will edit and save.
+     */
+    public List<ScheduledTask> loadTasksSnapshot() {
+        DbChangeMonitor monitor = DbChangeMonitor.forDataDir(dataDir);
+        // Read the version stamps BEFORE loading: a write landing mid-load then bumps them and the
+        // very next call reloads, instead of the stale list being stamped as current.
+        long gen = monitor.generation(DbChangeMonitor.Topic.TASKS);
+        long epoch = localEpoch.get();
+        long now = System.currentTimeMillis();
+        TaskSnapshot s = snapshot;
+        if (s != null && s.monitorGen == gen && s.epoch == epoch && now - s.loadedAtMs < SNAPSHOT_MAX_AGE_MS) {
+            return s.tasks;
+        }
+        List<ScheduledTask> fresh = java.util.Collections.unmodifiableList(taskDb.loadAll());
+        snapshot = new TaskSnapshot(fresh, gen, epoch, now);
+        return fresh;
     }
 
     /** Inserts or replaces (by id) a task. Assigns an id if missing. Returns
      *  whether it was actually persisted — false means app.db isn't
      *  connected; see {@link #getConnectionError()}. */
     public boolean saveTask(ScheduledTask task) {
-        return taskDb.save(task);
+        localEpoch.incrementAndGet();
+        try { return taskDb.save(task); } finally { localEpoch.incrementAndGet(); }
     }
 
     /** Deletes the task with the given id, if any. Returns whether it was
      *  actually removed — false means app.db isn't connected or the delete
      *  failed; see {@link #isConnected()} / {@link #getLastTaskSaveError()}. */
     public boolean deleteTask(String id) {
-        return taskDb.delete(id);
+        localEpoch.incrementAndGet();
+        try { return taskDb.delete(id); } finally { localEpoch.incrementAndGet(); }
     }
 }

@@ -8,6 +8,7 @@ import java.nio.file.StandardCopyOption;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.util.List;
+import java.util.function.Consumer;
 import java.util.logging.Logger;
 
 /**
@@ -25,13 +26,34 @@ public final class SchedulerStatusExporter {
 
     private static final Logger log = Logger.getLogger(SchedulerStatusExporter.class.getName());
 
+    /** Longest the file may go without a rewrite: readers treat a file older than ~8 s as "daemon not running". */
+    private static final long DAEMON_HEARTBEAT_MS = 5_000;
+    /** Other processes' files are not used for liveness by anyone, so they only need an occasional refresh. */
+    private static final long OTHER_HEARTBEAT_MS = 60_000;
+    /** Under activity, never rewrite the file more often than the old fixed 2 s cadence. */
+    private static final long MIN_FILE_GAP_MS = 2_000;
+
     private final Path targetFile;
     private final String processLabel;
     private final long pid;
+    private final long heartbeatMs;
+
+    // export() can be called from the 2 s safety tick and from the event-triggered debounce at once.
+    private final Object lock = new Object();
+    private volatile Consumer<String> listener;
+    private String lastFingerprint;
+    private long lastFileWriteMs;
+    private boolean fileDirty;
+    private long filesWritten;
 
     public SchedulerStatusExporter(Path targetFile, String processLabel) {
+        this(targetFile, processLabel, "daemon".equals(processLabel) ? DAEMON_HEARTBEAT_MS : OTHER_HEARTBEAT_MS);
+    }
+
+    public SchedulerStatusExporter(Path targetFile, String processLabel, long heartbeatMs) {
         this.targetFile = targetFile;
         this.processLabel = processLabel;
+        this.heartbeatMs = heartbeatMs;
         long resolvedPid;
         try {
             resolvedPid = ProcessHandle.current().pid();
@@ -40,6 +62,15 @@ public final class SchedulerStatusExporter {
         }
         this.pid = resolvedPid;
     }
+
+    /**
+     * Receives the full snapshot text every time the exported <em>state</em> actually changes (not on a
+     * timer). This is what feeds the push stream; the file below is now just the fallback layer.
+     */
+    public void setListener(Consumer<String> listener) { this.listener = listener; }
+
+    /** How many times the status file has actually been rewritten (diagnostics and tests). */
+    public long filesWritten() { synchronized (lock) { return filesWritten; } }
 
     /** Writes the current snapshot. Safe to call from any thread; never throws. */
     public void export(int poolSize, int activeWorkers, List<TaskDueEvent> pending,
@@ -61,12 +92,7 @@ public final class SchedulerStatusExporter {
                         List<SchedulerStatusSnapshot.SessionEntry> sessionEntries,
                         List<TaskWorkerPool.InFlightTask> inFlight, List<String> liveLines) {
         try {
-            StringBuilder sb = new StringBuilder(512);
-            sb.append("PROC|").append(SchedulerStatusSnapshot.escape(processLabel)).append('|')
-                    .append(pid).append('|')
-                    .append(toEpochMillis(LocalDateTime.now())).append('|')
-                    .append(poolSize).append('|')
-                    .append(activeWorkers).append('\n');
+            StringBuilder sb = new StringBuilder(512); // every record AFTER the PROC header line
 
             for (TaskDueEvent e : pending) {
                 sb.append("P|").append(SchedulerStatusSnapshot.escape(e.getTaskId())).append('|')
@@ -110,6 +136,39 @@ public final class SchedulerStatusExporter {
             sb.append("B|").append(service.Workers.busyBackground()).append('\n');
             for (String l : liveLines) sb.append("L|").append(SchedulerStatusSnapshot.escape(l)).append('\n');
 
+            String procKey = SchedulerStatusSnapshot.escape(processLabel) + '|' + pid + '|' + poolSize + '|' + activeWorkers;
+            // The fingerprint deliberately leaves out the PROC timestamp (it changes every call) so that
+            // "nothing happened" compares equal and costs neither a push nor a file write.
+            String fingerprint = procKey + '\n' + sb;
+            long now = System.currentTimeMillis();
+            String full = "PROC|" + SchedulerStatusSnapshot.escape(processLabel) + '|' + pid + '|'
+                    + now + '|' + poolSize + '|' + activeWorkers + '\n' + sb;
+
+            boolean changed;
+            boolean writeFileNow;
+            synchronized (lock) {
+                changed = !fingerprint.equals(lastFingerprint);
+                if (changed) { lastFingerprint = fingerprint; fileDirty = true; }
+                long since = now - lastFileWriteMs;
+                writeFileNow = (fileDirty && since >= MIN_FILE_GAP_MS) || since >= heartbeatMs;
+            }
+            if (changed) {
+                Consumer<String> l = listener;
+                if (l != null) {
+                    try { l.accept(full); } catch (RuntimeException e) { log.fine("Status listener failed: " + e.getMessage()); }
+                }
+            }
+            if (writeFileNow && writeFile(full)) {
+                synchronized (lock) { lastFileWriteMs = now; fileDirty = false; filesWritten++; }
+            }
+        } catch (RuntimeException e) {
+            log.fine("Scheduler status export skipped: " + e);
+        }
+    }
+
+    /** Atomically replaces the status file. Returns false (leaving the dirty flag set, so it is retried) on failure. */
+    private boolean writeFile(String text) {
+        try {
             Path dir = targetFile.toAbsolutePath().getParent();
             if (dir != null) Files.createDirectories(dir);
             // BUG: previously created a fresh temp file every export() call
@@ -137,7 +196,7 @@ public final class SchedulerStatusExporter {
                         try { Thread.sleep(15); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
                     }
                     try {
-                        Files.writeString(tmp, sb.toString(), StandardCharsets.UTF_8);
+                        Files.writeString(tmp, text, StandardCharsets.UTF_8);
                         try {
                             Files.move(tmp, targetFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
                         } catch (java.nio.file.AtomicMoveNotSupportedException amnse) {
@@ -158,8 +217,10 @@ public final class SchedulerStatusExporter {
                     try { Files.deleteIfExists(tmp); } catch (IOException ignored) { /* best effort */ }
                 }
             }
+            return true;
         } catch (IOException e) {
             log.fine("Scheduler status export skipped: " + e.getMessage());
+            return false;
         }
     }
 

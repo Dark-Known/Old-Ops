@@ -94,8 +94,19 @@ public class EventMonitorPanel extends JPanel {
     private volatile long lastTasksMs;
     private String lastToken;                 // loader thread only
     private int lastRangeIndex = -1;          // loader thread only
+    // Cross-process change signal (see service.DbChangeMonitor): lets the 1 s tick skip the three
+    // MAX(id) token queries entirely while neither history database has been committed to.
+    private static final long TOKEN_SAFETY_MS = 15_000;
+    private long lastRunsGen = -1, lastBgGen = -1, lastTokenCheckMs; // loader thread only
+    private Runnable monitorUnsubRuns = () -> { }, monitorUnsubBg = () -> { };
     private final AtomicBoolean statsLoading = new AtomicBoolean();
     private long lastStatsMs;                 // EDT only
+    // The Statistics tab re-reads up to STATS_QUERY_LIMIT rows. Skip that while run_history.db has not been
+    // committed to and the range is unchanged; the age cap covers the sliding time window. Stamps are written
+    // only after a SUCCESSFUL load, so a busy-database miss is retried on the next tick instead of going stale.
+    private static final long STATS_SAFETY_MS = 60_000;
+    private volatile long lastStatsGen = -1, lastStatsLoadedMs;
+    private volatile int lastStatsRange = -1;
 
     // Toasts
     private ToastManager toasts;
@@ -162,6 +173,11 @@ public class EventMonitorPanel extends JPanel {
         scheduler.getRunHistoryService().addActivityListener(historyListener);
         scheduler.getBackgroundLogService().addListener(historyListener);
 
+        // Rows written by the Daemon (a separate JVM) reach us here within ~0.5 s, without polling the tables.
+        service.DbChangeMonitor monitor = service.DbChangeMonitor.forDataDir(scheduler.getStorage().getDataDir());
+        monitorUnsubRuns = monitor.subscribe(service.DbChangeMonitor.Topic.RUNS, () -> requestLoad(false));
+        monitorUnsubBg = monitor.subscribe(service.DbChangeMonitor.Topic.BGLOG, () -> requestLoad(false));
+
         refresh();
         requestLoad(true);
         DataFeed<AppFeeds.Daemon> daemonFeed = AppFeeds.daemon(daemonStatusFile);
@@ -176,6 +192,8 @@ public class EventMonitorPanel extends JPanel {
         stopped = true;
         if (refreshTimer != null) refreshTimer.stop();
         daemonUnsub.run();
+        monitorUnsubRuns.run();
+        monitorUnsubBg.run();
         loader.shutdownNow();
         // Each open/close of the window builds a fresh panel — without removing these, every reopen
         // would stack another listener onto the shared RunHistoryService, firing forever.
@@ -251,7 +269,7 @@ public class EventMonitorPanel extends JPanel {
             long now = System.currentTimeMillis();
             if (force || now - lastTasksMs > TASKS_REFRESH_MS) {
                 try {
-                    latestById = scheduler.getStorage().loadTasks().stream()
+                    latestById = scheduler.getStorage().loadTasksSnapshot().stream()
                             .collect(Collectors.toMap(ScheduledTask::getId, t -> t, (a, b) -> a));
                     lastTasksMs = now;
                 } catch (Exception ignored) { /* keep the previous snapshot */ }
@@ -260,8 +278,19 @@ public class EventMonitorPanel extends JPanel {
             // Read the token BEFORE querying: a row written mid-query then changes the token and is
             // picked up on the next pass instead of being missed.
             service.BackgroundLogService bgLog = scheduler.getBackgroundLogService();
-            String token = rhs.getChangeToken() + "|" + bgLog.getChangeToken();
             int rangeIdx = prefs.rangeIndex();
+            // Cheapest check first: neither history file committed since the last look (and the range is
+            // unchanged) -> nothing to do, no SQL at all. The stamps are read BEFORE querying so a commit
+            // landing mid-load makes the next pass run again.
+            service.DbChangeMonitor monitor = service.DbChangeMonitor.forDataDir(scheduler.getStorage().getDataDir());
+            long runsGen = monitor.generation(service.DbChangeMonitor.Topic.RUNS);
+            long bgGen = monitor.generation(service.DbChangeMonitor.Topic.BGLOG);
+            if (!force && runsGen == lastRunsGen && bgGen == lastBgGen && rangeIdx == lastRangeIndex
+                    && now - lastTokenCheckMs < TOKEN_SAFETY_MS) return;
+            lastRunsGen = runsGen;
+            lastBgGen = bgGen;
+            lastTokenCheckMs = now;
+            String token = rhs.getChangeToken() + "|" + bgLog.getChangeToken();
             if (!force && token.equals(lastToken) && rangeIdx == lastRangeIndex) return;
 
             MonitorPrefs.Range range = prefs.range();
@@ -410,9 +439,13 @@ public class EventMonitorPanel extends JPanel {
     private void refreshStats(boolean force) {
         long now = System.currentTimeMillis();
         if (!force && now - lastStatsMs < STATS_REFRESH_MS) return;
+        final int rangeHours = statsPanel.getSelectedRangeHours();
+        final long genAtStart = service.DbChangeMonitor.forDataDir(scheduler.getStorage().getDataDir())
+                .generation(service.DbChangeMonitor.Topic.RUNS);
+        if (!force && genAtStart == lastStatsGen && rangeHours == lastStatsRange
+                && now - lastStatsLoadedMs < STATS_SAFETY_MS) return;
         if (!statsLoading.compareAndSet(false, true)) return;
         lastStatsMs = now;
-        final int rangeHours = statsPanel.getSelectedRangeHours();
         try {
             loader.execute(() -> {
                 try {
@@ -427,6 +460,9 @@ public class EventMonitorPanel extends JPanel {
                         if (r.getStartedAt() == null) continue;
                         (r.getStartedAt().isBefore(windowStart) ? prior : current).add(r);
                     }
+                    lastStatsGen = genAtStart;
+                    lastStatsRange = rangeHours;
+                    lastStatsLoadedMs = System.currentTimeMillis();
                     SwingUtilities.invokeLater(() -> { if (!stopped) statsPanel.update(current, prior); });
                 } catch (Exception ignored) {
                     // History DB briefly busy — the next refresh catches up.

@@ -184,11 +184,21 @@ final class RetentionPanel extends JPanel {
         status.setForeground(error ? new Color(0xC62828) : new Color(0x888888));
     }
 
+    private volatile long cachedBgRows = -1, cachedBgRowsGen = -1;
+
     void refreshStatus() {
         if (scheduler == null) return;
         Async.latest(this, () -> {
             long bgSize = scheduler.getBackgroundLogService().sizeBytes();
-            long bgRows = scheduler.getBackgroundLogService().rowCount();
+            // COUNT(*) scans the table; only redo it when background_log.db was actually committed to.
+            // (File sizes below are plain stat() calls, no SQL.)
+            long gen = service.DbChangeMonitor.forDataDir(scheduler.getStorage().getDataDir())
+                    .generation(service.DbChangeMonitor.Topic.BGLOG);
+            if (cachedBgRows < 0 || gen != cachedBgRowsGen) {
+                cachedBgRows = scheduler.getBackgroundLogService().rowCount();
+                cachedBgRowsGen = gen;
+            }
+            long bgRows = cachedBgRows;
             long runSize = scheduler.getRunHistoryService().sizeBytes();
             LocalDateTime last = scheduler.getMaintenance().lastPurgeAt();
             String sum = scheduler.getMaintenance().lastPurgeSummary();

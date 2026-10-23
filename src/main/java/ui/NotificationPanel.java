@@ -57,8 +57,8 @@ public class NotificationPanel extends JPanel {
     private final StatusStrip healthBar; // nullable — see snooze()/isSnoozed()/unsnooze() below
 
     // Only used when healthBar is null (the 2-/3-arg legacy constructors, kept
-    // only so a couple of unwired older experiments — ActionCenterButton,
-    // NotificationBell — still compile; never exercised by the real app,
+    // only so an unwired older experiment — NotificationBell — still
+    // compiles; never exercised by the real app,
     // which always goes through StatusStrip.openFeed()'s 4-arg constructor).
     private final Map<String, java.time.Instant> localSnoozedUntil = new HashMap<>();
 

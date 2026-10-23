@@ -655,8 +655,33 @@ public class TaskSchedulerService {
         java.nio.file.Path file = java.nio.file.Path.of(dataDir, "scheduler-status-" + processLabel + ".dat");
         this.statusExporter = new service.queue.SchedulerStatusExporter(file, processLabel);
         statusExporter.cleanupOrphanedTempFiles();
+        // Event-driven: a task becoming due/cancelled or a worker starting/finishing triggers an export
+        // within ~100 ms. The 2 s tick below stays as a safety net for state with no hook (watch modes,
+        // session counts...). Exports that find nothing changed cost no push and no file write.
+        eventQueue.setChangeListener(this::requestStatusExport);
+        workerPool.setChangeListener(this::requestStatusExport);
         if (statusExportFuture == null || statusExportFuture.isCancelled()) {
             statusExportFuture = scheduler.scheduleAtFixedRate(this::exportStatus, 1, 2, TimeUnit.SECONDS);
+        }
+    }
+
+    /**
+     * Receives the full status text whenever this process's exported state changes (used by the Daemon's
+     * push stream). Call after {@link #enableStatusExport}; ignored if export is not enabled.
+     */
+    public void setStatusListener(java.util.function.Consumer<String> listener) {
+        if (statusExporter != null) statusExporter.setListener(listener);
+    }
+
+    private final java.util.concurrent.atomic.AtomicBoolean statusExportQueued = new java.util.concurrent.atomic.AtomicBoolean();
+
+    /** Coalesces bursts of state changes into a single export ~100 ms later. Cheap enough for hot paths. */
+    private void requestStatusExport() {
+        if (statusExporter == null || !statusExportQueued.compareAndSet(false, true)) return;
+        try {
+            scheduler.schedule(() -> { statusExportQueued.set(false); exportStatus(); }, 100, TimeUnit.MILLISECONDS);
+        } catch (java.util.concurrent.RejectedExecutionException e) {
+            statusExportQueued.set(false); // scheduler shutting down
         }
     }
 

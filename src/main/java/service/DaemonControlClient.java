@@ -23,6 +23,23 @@ public final class DaemonControlClient {
 
     private DaemonControlClient() {}
 
+    /** Where to reach the Daemon's control endpoint (from {@code daemon-control.json}); both fields come from that file. */
+    public record Control(int port, String token) {}
+
+    /** Reads the control file, or returns {@code null} if the Daemon is not running / has the API disabled. */
+    public static Control readControl(File dataDir) {
+        try {
+            File f = new File(dataDir, DaemonControlServer.FILE_NAME);
+            if (!f.isFile()) return null;
+            String json = new String(Files.readAllBytes(f.toPath()), StandardCharsets.UTF_8);
+            Matcher p = PORT.matcher(json), t = TOKEN.matcher(json);
+            if (!p.find() || !t.find()) return null;
+            return new Control(Integer.parseInt(p.group(1)), t.group(1));
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
     /**
      * True if the daemon accepted and ran the command. False means "not delivered, fall back":
      * no control file, daemon not reachable, wrong token, or the daemon reported a failure.

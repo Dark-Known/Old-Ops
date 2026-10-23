@@ -181,8 +181,21 @@ public final class SchedulerStatusSnapshot {
     public static SchedulerStatusSnapshot read(Path file) {
         try {
             if (!Files.isRegularFile(file)) return null;
-            List<String> lines = Files.readAllLines(file, StandardCharsets.UTF_8);
-            if (lines.isEmpty()) return null;
+            return parse(Files.readAllLines(file, StandardCharsets.UTF_8));
+        } catch (IOException e) {
+            return null; // e.g. caught mid-replace on the other process: no snapshot right now
+        }
+    }
+
+    /** Parses the exporter's text format (what the status file and the push stream both carry). */
+    public static SchedulerStatusSnapshot parse(String text) {
+        return text == null ? null : parse(java.util.Arrays.asList(text.split("\\R", -1)));
+    }
+
+    /** Parses the exporter's lines. Returns {@code null} (never throws) for empty or unusable input. */
+    public static SchedulerStatusSnapshot parse(List<String> lines) {
+        try {
+            if (lines == null || lines.isEmpty()) return null;
 
             String label = "unknown";
             long pid = -1;
@@ -260,7 +273,7 @@ public final class SchedulerStatusSnapshot {
                     Collections.unmodifiableList(watchEntries), Collections.unmodifiableList(fireEntries),
                     Collections.unmodifiableList(runningTaskIds), Collections.unmodifiableList(sessionEntries),
                     Collections.unmodifiableList(inFlight), Collections.unmodifiableList(liveLines), backgroundBusy);
-        } catch (IOException | NumberFormatException | ArrayIndexOutOfBoundsException e) {
+        } catch (NumberFormatException | ArrayIndexOutOfBoundsException e) {
             // Most commonly: caught mid-write by the exporter on the other
             // process. The exporter writes atomically (temp file + move) to
             // make this rare, but a defensive caller should still just treat

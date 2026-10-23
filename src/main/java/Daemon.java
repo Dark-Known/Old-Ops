@@ -103,12 +103,16 @@ public class Daemon {
 
         // ── Start background poll loop ───────────────────────────────────────
         scheduler.enableStatusExport(dataDir, "daemon");
+        // Push channel: every real change of the exported state is broadcast to connected GUIs through the
+        // control endpoint's /status/stream. The status file stays as the fallback (older GUI, API disabled).
+        service.StatusBroadcaster statusBus = new service.StatusBroadcaster();
+        scheduler.setStatusListener(statusBus::publish);
         scheduler.start();
         log("Scheduler started — polling every " + pollInterval + " seconds");
 
         // ── Start the GUI command poller ─────────────────────────────────────
         // Separate from the scheduling tick above (and deliberately much
-        // faster — 3s vs. the scheduler's own 60s-ish poll interval) so a
+        // faster — it wakes on database change rather than on a fixed 3s timer) so a
         // "Run now" click from a thin GUI that owns no scheduler of its own
         // feels responsive, without coupling the two poll loops together.
         if (service.DaemonControlServer.enabledByConfig()) {
@@ -116,14 +120,14 @@ public class Daemon {
                 service.DaemonControlServer.start(new File(dataDir), (action, taskId, who) -> {
                     runAction(scheduler, action, taskId);
                     log("Executed GUI command " + action + " for task " + taskId + " via control endpoint (requested by " + who + ")");
-                });
-                log("Control endpoint started — GUI commands are delivered immediately");
+                }, statusBus);
+                log("Control endpoint started — GUI commands are delivered immediately and status is pushed on change");
             } catch (Exception e) {
-                log("Control endpoint not started (" + e.getMessage() + ") — using the 3-second command queue only");
+                log("Control endpoint not started (" + e.getMessage() + ") — using the command queue only (picked up within ~0.5 seconds of being queued)");
             }
         }
         service.Workers.service("gui-command-poller", () -> runCommandPollerLoop(dataDir, scheduler));
-        log("Command poller started — checking for GUI-requested actions every 3 seconds");
+        log("Command poller started — wakes on database change (safety poll every 30 seconds)");
 
         // ── Keep alive ───────────────────────────────────────────────────────
         // The daemon stays alive until the OS kills it.
@@ -131,7 +135,8 @@ public class Daemon {
         while (!Thread.currentThread().isInterrupted()) {
             try {
                 Thread.sleep(60_000);
-                log("Daemon heartbeat — still running");
+                log("Daemon heartbeat — still running (db change monitor: "
+                        + service.DbChangeMonitor.forDataDir(new File(dataDir)).describe() + ")");
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
@@ -145,22 +150,35 @@ public class Daemon {
     // instead of the GUI ever running these itself.
     private static void runCommandPollerLoop(String dataDir, TaskSchedulerService scheduler) {
         File dbDir = new File(dataDir);
-        while (!Thread.currentThread().isInterrupted()) {
-            try {
-                for (service.CommandQueueService.Command cmd : service.CommandQueueService.pollPending(dbDir)) {
-                    handleCommand(dbDir, scheduler, cmd);
+        service.DbChangeMonitor monitor = service.DbChangeMonitor.forDataDir(dbDir);
+        // One long-lived connection; wakes within ~0.5 s of any app.db commit (a GUI enqueue is one),
+        // otherwise only on a slow safety interval. Idle cost is ~2 tiny SELECTs a minute instead of
+        // ~60 fresh connection opens (plus schema DDL) a minute.
+        try (service.CommandQueueService.Poller poller = new service.CommandQueueService.Poller(dbDir)) {
+            while (!Thread.currentThread().isInterrupted()) {
+                // Read the generation BEFORE polling, so a command enqueued mid-poll re-triggers immediately.
+                long seen = monitor.generation(service.DbChangeMonitor.Topic.APP);
+                try {
+                    for (service.CommandQueueService.Command cmd : poller.pollPending()) {
+                        handleCommand(poller, scheduler, cmd);
+                    }
+                } catch (Exception e) {
+                    log("Command poller error: " + e.getMessage());
                 }
-                service.CommandQueueService.pruneOldResolved(dbDir);
-            } catch (Exception e) {
-                log("Command poller error: " + e.getMessage());
-            }
-            try {
-                Thread.sleep(3_000);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
+                try {
+                    monitor.awaitChange(service.DbChangeMonitor.Topic.APP, seen, COMMAND_SAFETY_POLL_MS);
+                    Thread.sleep(COMMAND_MIN_GAP_MS); // coalesce bursts of commits into one poll
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
             }
         }
     }
+
+    /** Longest the command poller sleeps even if no commit is signalled (belt and braces). */
+    private static final long COMMAND_SAFETY_POLL_MS = 30_000;
+    /** Minimum gap between polls when the database is busy with unrelated commits. */
+    private static final long COMMAND_MIN_GAP_MS = 250;
 
     private static void runAction(TaskSchedulerService scheduler,
                                   service.CommandQueueService.Action action, String taskId) {
@@ -175,16 +193,16 @@ public class Daemon {
         }
     }
 
-    private static void handleCommand(File dbDir, TaskSchedulerService scheduler,
+    private static void handleCommand(service.CommandQueueService.Poller poller, TaskSchedulerService scheduler,
                                        service.CommandQueueService.Command cmd) {
         try {
             runAction(scheduler, cmd.action(), cmd.taskId());
             log("Executed GUI command " + cmd.action() + " for task " + cmd.taskId()
                     + " (requested by " + cmd.requestedBy() + ")");
-            service.CommandQueueService.markDone(dbDir, cmd.id());
+            poller.markDone(cmd.id());
         } catch (Exception e) {
             log("GUI command " + cmd.action() + " for task " + cmd.taskId() + " failed: " + e.getMessage());
-            service.CommandQueueService.markFailed(dbDir, cmd.id(), e.getMessage());
+            poller.markFailed(cmd.id(), e.getMessage());
         }
     }
 

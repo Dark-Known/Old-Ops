@@ -71,6 +71,7 @@ public class TaskDbService {
             }
             migrateLegacyXmlColumnIfPresent(c);
             addMissingColumns(c);
+            installChangeTriggers(c); // after any table rebuild above, which would have dropped them
         } catch (Exception e) {
             log.log(Level.SEVERE, "Failed to open/initialize tasks table in app.db", e);
             initError = (e.getClass().getSimpleName() + ": " + e.getMessage());
@@ -121,6 +122,25 @@ public class TaskDbService {
             st.execute("PRAGMA journal_mode=WAL");
             st.execute("PRAGMA synchronous=NORMAL");
             st.execute("PRAGMA busy_timeout=5000");
+        }
+    }
+
+    /**
+     * Keeps a per-table version counter ({@code change_log}) in step with the {@code tasks} table.
+     * Triggers live in the database file, so they fire for <em>every</em> writer - this process,
+     * the other JVM, even an older build - and let {@link DbChangeMonitor} answer "did the task
+     * list change?" with one tiny read instead of every screen re-reading the whole table.
+     * Idempotent: safe to run on every start.
+     */
+    static void installChangeTriggers(Connection c) throws SQLException {
+        try (Statement st = c.createStatement()) {
+            st.execute("CREATE TABLE IF NOT EXISTS change_log (topic TEXT PRIMARY KEY, ver INTEGER NOT NULL DEFAULT 0)");
+            st.execute("INSERT OR IGNORE INTO change_log (topic, ver) VALUES ('tasks', 0)");
+            for (String ev : new String[]{"INSERT", "UPDATE", "DELETE"}) {
+                st.execute("CREATE TRIGGER IF NOT EXISTS trg_tasks_changed_" + ev.toLowerCase()
+                        + " AFTER " + ev + " ON tasks BEGIN "
+                        + "UPDATE change_log SET ver = ver + 1 WHERE topic = 'tasks'; END");
+            }
         }
     }
 

@@ -22,6 +22,17 @@ import java.util.concurrent.DelayQueue;
  */
 public class TaskEventQueue {
 
+    // Tells interested code (the status exporter) that the pending set changed, so it can push an
+    // update at once instead of waiting for its next safety tick. Must be cheap and non-blocking.
+    private volatile Runnable changeListener;
+
+    public void setChangeListener(Runnable r) { this.changeListener = r; }
+
+    private void changed() {
+        Runnable r = changeListener;
+        if (r != null) { try { r.run(); } catch (RuntimeException ignored) { /* a listener must never break scheduling */ } }
+    }
+
     private final DelayQueue<TaskDueEvent> queue = new DelayQueue<>();
     // Most recent pending event per task ID, keyed for cancellation/replacement.
     private final ConcurrentMap<String, TaskDueEvent> pendingByTaskId = new ConcurrentHashMap<>();
@@ -58,6 +69,7 @@ public class TaskEventQueue {
             queue.remove(removed);
         }
         queue.put(event);
+        changed();
     }
 
     /**
@@ -73,13 +85,16 @@ public class TaskEventQueue {
         // may have already replaced it in the index (and removed it from
         // the queue), in which case there's nothing to clean up here.
         pendingByTaskId.remove(event.getTaskId(), event);
+        changed();
         return event;
     }
 
     /** Cancel a task's pending event, if any (task disabled or deleted). */
     public boolean cancel(String taskId) {
         TaskDueEvent existing = pendingByTaskId.remove(taskId);
-        return existing != null && queue.remove(existing);
+        boolean removed = existing != null && queue.remove(existing);
+        if (removed) changed();
+        return removed;
     }
 
     /** Whether this task currently has a pending (not-yet-due) event. */

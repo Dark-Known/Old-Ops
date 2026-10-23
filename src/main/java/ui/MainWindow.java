@@ -45,8 +45,10 @@ public class MainWindow extends JFrame {
     private final java.nio.file.Path daemonStatusFile;
     private JLabel schedulerBadge;
     private javax.swing.Timer schedulerBadgeTimer;
+    private Runnable schedulerBadgeStreamUnsub = () -> { };
     private JLabel dbLabel;
     private javax.swing.Timer dbStatusTimer;
+    private WindowAdapter dbStatusActivationListener;
     // Cross-process: notices when a watcher task's trigger mode falls back
     // from push (native watch / remote SSH push) to plain polling, wherever
     // that task is actually running (Daemon or this GUI) — see its javadoc.
@@ -201,9 +203,15 @@ public class MainWindow extends JFrame {
             schedulerBadgeTimer.stop();
             schedulerBadgeTimer = null;
         }
+        schedulerBadgeStreamUnsub.run(); // re-registered by every buildUI(); don't stack listeners
+        schedulerBadgeStreamUnsub = () -> { };
         if (dbStatusTimer != null) {
             dbStatusTimer.stop();
             dbStatusTimer = null;
+        }
+        if (dbStatusActivationListener != null) { // re-added on every buildUI(); don't stack them
+            removeWindowListener(dbStatusActivationListener);
+            dbStatusActivationListener = null;
         }
 
         Color bgBase = UIManager.getColor("Panel.background");
@@ -291,6 +299,10 @@ public class MainWindow extends JFrame {
         refreshSchedulerBadge();
         schedulerBadgeTimer = new javax.swing.Timer(3000, e -> refreshSchedulerBadge());
         schedulerBadgeTimer.start();
+        // The Daemon pushes status changes and the stream reports when the Daemon drops, so the badge flips
+        // at once; the 3 s timer is only the safety net. Removed in the rebuild teardown (don't stack).
+        schedulerBadgeStreamUnsub = service.DaemonStatusStream.forDataDir(storage.getDataDir())
+                .addListener(() -> javax.swing.SwingUtilities.invokeLater(this::refreshSchedulerBadge));
 
         header.add(titleStack, BorderLayout.WEST);
         header.add(badges, BorderLayout.EAST);
@@ -498,8 +510,15 @@ public class MainWindow extends JFrame {
         statusBar.add(new JSeparator(SwingConstants.VERTICAL));
         statusBar.add(dbLabel);
         refreshDbStatusLabel();
-        dbStatusTimer = new javax.swing.Timer(10_000, e -> refreshDbStatusLabel());
+        // 30 s is plenty for a connection that drops mid-session: any save/query that fails already
+        // surfaces its own error, and the badge is re-checked at once whenever the window regains
+        // focus (below), i.e. exactly when someone is about to look at it. (Was every 10 s.)
+        dbStatusTimer = new javax.swing.Timer(30_000, e -> refreshDbStatusLabel());
         dbStatusTimer.start();
+        dbStatusActivationListener = new WindowAdapter() {
+            @Override public void windowActivated(WindowEvent e) { refreshDbStatusLabel(); }
+        };
+        addWindowListener(dbStatusActivationListener);
 
         add(statusBar, BorderLayout.SOUTH);
 
@@ -508,7 +527,7 @@ public class MainWindow extends JFrame {
 
     /**
      * Re-reads storage.isConnected() live and updates the status-bar badge.
-     * Called once at startup and then every 10s by dbStatusTimer, so a
+     * Called once at startup, then every 30s by dbStatusTimer and on window activation, so a
      * connection that drops mid-session (or recovers) is reflected within
      * seconds instead of the badge being frozen at whatever it showed at
      * launch.
@@ -630,8 +649,7 @@ public class MainWindow extends JFrame {
 
         // File read happens off the EDT; only the restyle runs on it.
         Async.latest("scheduler-badge",
-                () -> service.queue.SchedulerStatusSnapshot.isAlive(
-                        daemonStatusFile, service.queue.SchedulerStatusSnapshot.DEFAULT_STALE_MS),
+                () -> AppFeeds.daemonNow(daemonStatusFile).alive(), // push stream if live, else one file read
                 this::applySchedulerBadge, null);
     }
 

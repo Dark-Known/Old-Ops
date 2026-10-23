@@ -97,6 +97,15 @@ public class TaskWorkerPool {
     // a Swing timer reads a snapshot concurrently without external locking.
     private final ConcurrentLinkedDeque<ActivityEntry> recentActivity = new ConcurrentLinkedDeque<>();
     private volatile boolean running = false;
+    // See TaskEventQueue#setChangeListener: fired when a worker starts or finishes a task.
+    private volatile Runnable changeListener;
+
+    public void setChangeListener(Runnable r) { this.changeListener = r; }
+
+    private void changed() {
+        Runnable r = changeListener;
+        if (r != null) { try { r.run(); } catch (RuntimeException ignored) { /* never break a worker */ } }
+    }
 
     public TaskWorkerPool(TaskEventQueue queue, int workerCount, Consumer<TaskDueEvent> handler) {
         this(queue, workerCount, handler, () -> HandlerOutcome.DEFAULT);
@@ -132,6 +141,7 @@ public class TaskWorkerPool {
                 activeWorkers.incrementAndGet();
                 LocalDateTime startedAt = LocalDateTime.now();
                 inFlightByThread.put(Thread.currentThread().getId(), new InFlightTask(event.getTaskId(), startedAt, Thread.currentThread().getName()));
+                changed();
                 boolean errored = false;
                 String message = null;
                 boolean suppress = false;
@@ -157,6 +167,7 @@ public class TaskWorkerPool {
                         recordActivity(new ActivityEntry(event.getTaskId(), event.getAttempt(),
                                 startedAt, LocalDateTime.now(), errored, message));
                     }
+                    changed();
                 }
             } catch (InterruptedException ie) {
                 if (!running) { Thread.currentThread().interrupt(); return; } // pool shutting down

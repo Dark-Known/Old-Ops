@@ -63,6 +63,14 @@ public class StatusStrip extends JPanel {
     private final JLabel summary = new JLabel();
     /** Task-id -> name, refreshed off the EDT; used by the workers tooltip, which is built live on hover. */
     private volatile Map<String, String> taskNames = Map.of();
+
+    // The failures query only re-runs when run_history.db was actually committed to (see
+    // service.DbChangeMonitor) - or, because the 24 h look-back window slides with time, every couple of minutes.
+    private static final long FAILURES_MAX_AGE_MS = 120_000;
+    private List<TaskRunRecord> cachedFailures;       // Async worker thread only
+    private long cachedFailuresGen = -1, cachedFailuresAtMs;
+    private final java.util.concurrent.atomic.AtomicBoolean refreshQueued = new java.util.concurrent.atomic.AtomicBoolean();
+    private Runnable monitorUnsubRuns = () -> { }, monitorUnsubTasks = () -> { };
     private final JLabel workersChip = new JLabel() {
         @Override public String getToolTipText(java.awt.event.MouseEvent e) { return buildWorkersTooltip(); }
     };
@@ -147,6 +155,19 @@ public class StatusStrip extends JPanel {
         refresh();
         pollTimer = new javax.swing.Timer(15_000, e -> refresh());
         pollTimer.start();
+        if (storage != null) {
+            // Event-driven: a run finished in the Daemon, or a task was edited in another process -> refresh
+            // within ~0.5 s. Bursts coalesce into one EDT refresh. The 15 s timer above stays as the safety net
+            // (and keeps the relative "next run" text current).
+            service.DbChangeMonitor monitor = service.DbChangeMonitor.forDataDir(storage.getDataDir());
+            Runnable queueRefresh = () -> {
+                if (refreshQueued.compareAndSet(false, true)) {
+                    SwingUtilities.invokeLater(() -> { refreshQueued.set(false); refresh(); });
+                }
+            };
+            monitorUnsubRuns = monitor.subscribe(service.DbChangeMonitor.Topic.RUNS, queueRefresh);
+            monitorUnsubTasks = monitor.subscribe(service.DbChangeMonitor.Topic.TASKS, queueRefresh);
+        }
         if (scheduler != null && scheduler.getRunHistoryService() != null) {
             runListener = rec -> {
                 if (rec.getStatus() == TaskRunRecord.Status.FAILED || rec.getStatus() == TaskRunRecord.Status.SUCCESS) {
@@ -175,6 +196,8 @@ public class StatusStrip extends JPanel {
     public void dispose() {
         pollTimer.stop();
         chipTimer.stop();
+        monitorUnsubRuns.run();
+        monitorUnsubTasks.run();
         daemonUnsub.run();
         if (runListener != null && scheduler != null && scheduler.getRunHistoryService() != null) {
             scheduler.getRunHistoryService().removeRunListener(runListener);
@@ -219,15 +242,26 @@ public class StatusStrip extends JPanel {
         Async.latest(this, () -> {
             LocalDateTime since = LocalDateTime.now().minusHours(LOOKBACK_HOURS);
             List<TaskRunRecord> f;
-            try {
-                f = scheduler.getRunHistoryService()
-                        .queryRunSummaries(TaskRunRecord.Status.FAILED, since, QUERY_LIMIT);
-            } catch (Exception e) {
-                return null; // DB briefly locked by a write — next poll tick will catch up
+            long gen = storage == null ? -1
+                    : service.DbChangeMonitor.forDataDir(storage.getDataDir()).generation(service.DbChangeMonitor.Topic.RUNS);
+            long nowMs = System.currentTimeMillis();
+            if (storage != null && cachedFailures != null && gen == cachedFailuresGen
+                    && nowMs - cachedFailuresAtMs < FAILURES_MAX_AGE_MS) {
+                f = cachedFailures; // nothing committed since the last query: no SQL
+            } else {
+                try {
+                    f = scheduler.getRunHistoryService()
+                            .queryRunSummaries(TaskRunRecord.Status.FAILED, since, QUERY_LIMIT);
+                } catch (Exception e) {
+                    return null; // DB briefly locked by a write — next poll tick will catch up
+                }
+                cachedFailures = f;
+                cachedFailuresGen = gen; // stamp read BEFORE the query, so a commit mid-query re-runs next time
+                cachedFailuresAtMs = nowMs;
             }
             try {
                 Map<String, String> names = new java.util.HashMap<>();
-                for (ScheduledTask t : storage.loadTasks()) names.put(t.getId(), t.getName());
+                for (ScheduledTask t : storage.loadTasksSnapshot()) names.put(t.getId(), t.getName());
                 taskNames = names;
             } catch (Exception ignored) { /* keep the previous names */ }
             return new Loaded(f, describeNextScheduledCompact());
@@ -302,7 +336,7 @@ public class StatusStrip extends JPanel {
         try {
             ScheduledTask next = null;
             LocalDateTime soonest = null;
-            for (ScheduledTask t : storage.loadTasks()) {
+            for (ScheduledTask t : storage.loadTasksSnapshot()) {
                 if (t.getStatus() == ScheduledTask.TaskStatus.DISABLED) continue;
                 LocalDateTime candidate = t.getScheduledAt();
                 if (candidate == null) continue;
