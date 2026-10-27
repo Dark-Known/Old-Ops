@@ -12,6 +12,8 @@ public final class EdtWatchdog extends EventQueue {
     private volatile long startedAt;
     private volatile boolean busy;
     private volatile int depth;
+    /** A nested event loop ran inside this event, i.e. a modal dialog was open — time spent in it is not a stall. */
+    private volatile boolean sawNestedLoop;
     private volatile StackTraceElement[] sample;
     private volatile Thread edt;
 
@@ -30,7 +32,8 @@ public final class EdtWatchdog extends EventQueue {
 
     @Override
     protected void dispatchEvent(AWTEvent event) {
-        if (depth == 0) { edt = Thread.currentThread(); startedAt = System.nanoTime(); sample = null; busy = true; }
+        if (depth == 0) { edt = Thread.currentThread(); startedAt = System.nanoTime(); sample = null; sawNestedLoop = false; busy = true; }
+        else sawNestedLoop = true;
         depth++;
         try {
             super.dispatchEvent(event);
@@ -40,7 +43,7 @@ public final class EdtWatchdog extends EventQueue {
                 busy = false;
                 long ms = (System.nanoTime() - startedAt) / 1_000_000;
                 StackTraceElement[] s = sample;
-                if (ms >= thresholdMs() && s != null) {
+                if (ms >= thresholdMs() && s != null && !sawNestedLoop) {
                     StringBuilder sb = new StringBuilder("[EDT stall] ").append(ms).append(" ms in ")
                             .append(event.getClass().getSimpleName());
                     int n = 0;
@@ -64,7 +67,7 @@ public final class EdtWatchdog extends EventQueue {
         while (true) {
             try { Thread.sleep(Math.max(20, thresholdMs() / 3)); } catch (InterruptedException e) { return; }
             Thread t = edt;
-            if (busy && t != null && (System.nanoTime() - startedAt) / 1_000_000 >= thresholdMs() / 2) {
+            if (busy && !sawNestedLoop && t != null && (System.nanoTime() - startedAt) / 1_000_000 >= thresholdMs() / 2) {
                 sample = t.getStackTrace();
             }
         }

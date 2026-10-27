@@ -27,6 +27,7 @@ public final class TaskChangeView {
         LABELS.put("sourcePath", "Source path");
         LABELS.put("targetPath", "Target path");
         LABELS.put("additionalTargetPaths", "Additional target paths");
+        LABELS.put("fileSelectionRules", "File selection rules");
         LABELS.put("backupSourcePath", "Backup source path");
         LABELS.put("backupDestinationPath", "Backup destination path");
         LABELS.put("backupRetentionDays", "Backup retention (days)");

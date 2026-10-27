@@ -162,6 +162,20 @@ public final class JschSftpClient implements SftpClient {
         try { session.disconnect(); } catch (Exception ignored) { }
     }
 
+    @Override
+    public void rename(String from, String to) throws IOException {
+        try {
+            if (channel.stat(to) != null) throw new IOException("rename " + from + " failed: " + to + " already exists");
+        } catch (SftpException e) {
+            if (e.id != ChannelSftp.SSH_FX_NO_SUCH_FILE) throw wrap("rename " + from, e);
+        }
+        try {
+            channel.rename(from, to);
+        } catch (SftpException e) {
+            throw wrap("rename " + from, e);
+        }
+    }
+
     private IOException wrap(String what, SftpException e) {
         return new IOException(cancelled ? what + " cancelled" : what + " failed: " + e.getMessage(), e);
     }

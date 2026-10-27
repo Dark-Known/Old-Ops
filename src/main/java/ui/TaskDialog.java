@@ -132,6 +132,8 @@ public class TaskDialog extends JDialog {
     private JTextField  tfTime;
 
     private JPanel fileTransferPanel;
+    private FileSelectionPanel fileSelectionPanel;
+    private JPanel selectionTab;
     private JPanel backupPanel;
     private JPanel scheduleDetailsPanel;
     private JTabbedPane tabbedPane;
@@ -341,6 +343,22 @@ public class TaskDialog extends JDialog {
         transferTab.add(sourcePanel);
         transferTab.add(Box.createRigidArea(new Dimension(0, 10)));
         transferTab.add(fileTransferPanel);
+
+        // ── File selection (name / size / age conditions + pick) ──────────────
+        fileSelectionPanel = new FileSelectionPanel(existing != null ? existing.getFileSelection() : null);
+        fileSelectionPanel.setTransferMode((String) cbTransferMode.getSelectedItem());
+        fileSelectionPanel.setTaskContext(existing != null ? existing.getId() : null, storage.getDataDir());
+        fileSelectionPanel.setRemoteBrowser(() -> browseRemote(fileSelectionPanel.afterFolderField(),
+                tfTargetHost.getText().trim(), tfTargetUser.getText().trim(),
+                new String(pfTargetPass.getPassword()), (String) cbTargetOs.getSelectedItem()));
+        fileSelectionPanel.setInbound("INBOUND".equals(cbTransferDirection.getSelectedItem()));
+        updateSelectionForWatcher();
+        fileSelectionPanel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        selectionTab = new JPanel();
+        selectionTab.setLayout(new BoxLayout(selectionTab, BoxLayout.Y_AXIS));
+        selectionTab.setOpaque(false);
+        selectionTab.add(fileSelectionPanel);
+        selectionTab.add(Box.createVerticalGlue());
 
         // ── Backup panel ──────────────────────────────────────────────────────
         // Either side (source or destination) may be a plain local folder, or a
@@ -700,11 +718,12 @@ public class TaskDialog extends JDialog {
 
         tabbedPane = new JTabbedPane(JTabbedPane.TOP);
         tabbedPane.setFont(tabbedPane.getFont().deriveFont(Font.PLAIN, 12f));
-        tabbedPane.addTab("General",   general);
-        tabbedPane.addTab("Transfer",  transferTab);
-        tabbedPane.addTab("Backup",    backupPanel);
-        tabbedPane.addTab("Target",    targetPanel);
-        tabbedPane.addTab("Mail/IMAP", mailPanel);
+        tabbedPane.addTab("General",        general);
+        tabbedPane.addTab("Target",         targetPanel);
+        tabbedPane.addTab("Transfer",       transferTab);
+        tabbedPane.addTab("File Selection", selectionTab);
+        tabbedPane.addTab("Backup",         backupPanel);
+        tabbedPane.addTab("Mail/IMAP",      mailPanel);
         tabbedPane.addTab("Schedule",  sched);
         tabbedPane.addTab("Retry",     retryPanel);
 
@@ -712,6 +731,7 @@ public class TaskDialog extends JDialog {
 
         // ── Wire listeners ────────────────────────────────────────────────────
         cbTransferDirection.addActionListener(e -> {
+            fileSelectionPanel.setInbound("INBOUND".equals(cbTransferDirection.getSelectedItem()));
             updateTransferDirectionLabels();
             updateWatcherFieldsVisibility();
             updateTransferTabVisibility();
@@ -719,11 +739,14 @@ public class TaskDialog extends JDialog {
         });
 
         cbTransferMode.addActionListener(e -> {
+            fileSelectionPanel.setTransferMode((String) cbTransferMode.getSelectedItem());
+            updateSelectionForWatcher();
             updateWatcherFieldsVisibility();       // shows/hides baseline row
             checkTransferModeChanged(existing);    // auto-resets baseline if needed
         });
 
         cbWatcherEnabled.addActionListener(e -> {
+            updateSelectionForWatcher();
             updateWatcherFieldsVisibility();
             applyFallbackDefaultsIfNeeded();
             updateScheduleFallbackMode();
@@ -839,6 +862,7 @@ public class TaskDialog extends JDialog {
         boolean isBackup   = "BACKUP".equals(type);
 
         enableTabIfPresent(transferTab,   isTransfer);
+        enableTabIfPresent(selectionTab,  isTransfer);
         enableTabIfPresent(backupPanel,   isBackup);
         enableTabIfPresent(mailPanel,     isMail);
 
@@ -859,6 +883,19 @@ public class TaskDialog extends JDialog {
         }
         updateTransferTabVisibility();
         revalidate(); repaint();
+    }
+
+    /** The watcher only works in LATEST_ONLY; then it replaces the pick and the sent-files memory. */
+    private void updateSelectionForWatcher() {
+        fileSelectionPanel.setWatcherActive(cbWatcherEnabled.isSelected()
+                && "LATEST_ONLY".equals(cbTransferMode.getSelectedItem()));
+    }
+
+    private static boolean sameFolder(String a, String b) {
+        if (a == null || b == null) return false;
+        String x = a.trim().replace('\\', '/').replaceAll("/+$", "");
+        String y = b.trim().replace('\\', '/').replaceAll("/+$", "");
+        return !x.isEmpty() && x.equalsIgnoreCase(y);
     }
 
     private void updateTransferDirectionLabels() {
@@ -1147,6 +1184,31 @@ public class TaskDialog extends JDialog {
                 }
             }
 
+            java.util.List<String> selectionProblems = fileSelectionPanel.validateInput();
+            if (!selectionProblems.isEmpty()) {
+                msg("The file selection conditions need fixing:\n\n  \u2022 " + String.join("\n  \u2022 ", selectionProblems));
+                return;
+            }
+
+            model.FileSelection chosen = fileSelectionPanel.getSelection();
+            if (!"SPECIFIC_FILE".equals(cbTransferMode.getSelectedItem()) && chosen.hasAfterAction()) {
+                boolean inboundDir = "INBOUND".equals(cbTransferDirection.getSelectedItem());
+                String sourceFolder = inboundDir ? tfTargetFolder.getText() : tfSourcePath.getText();
+                if (chosen.getAfterAction() == model.FileSelection.AfterAction.MOVE
+                        && sameFolder(chosen.getAfterFolder(), sourceFolder)) {
+                    msg("The folder for the originals is the same as the folder they are taken from.\n"
+                            + "Choose a different folder, or the moved files would be picked up again.");
+                    return;
+                }
+                if (chosen.getAfterAction() == model.FileSelection.AfterAction.DELETE) {
+                    int c = JOptionPane.showConfirmDialog(this,
+                            "After every successful transfer this task will DELETE the original files\n"
+                                    + (inboundDir ? "on the server." : "on this PC.") + "\n\nSave the task with \"Delete the original\"?",
+                            "Confirm delete", JOptionPane.OK_CANCEL_OPTION, JOptionPane.WARNING_MESSAGE);
+                    if (c != JOptionPane.OK_OPTION) return;
+                }
+            }
+
             // Watcher requires LATEST_ONLY — warn but don't block (the service falls back gracefully)
             if (cbWatcherEnabled.isSelected()
                     && !"LATEST_ONLY".equals(cbTransferMode.getSelectedItem())) {
@@ -1276,6 +1338,7 @@ public class TaskDialog extends JDialog {
                     (String) cbTransferMode.getSelectedItem()));
             t.setSourcePath(tfSourcePath.getText().trim());
             t.setTargetPath(tfTargetFolder.getText().trim());
+            t.setFileSelectionRules(fileSelectionPanel.getSelection().toText());
             {
                 StringBuilder extraPaths = new StringBuilder();
                 for (JTextField f : additionalDestFields) {

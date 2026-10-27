@@ -178,6 +178,20 @@ public class TaskSchedulerService {
         this.transferService = transferService;
         this.logService = new TaskLogService(storage.getDataDir().getAbsolutePath());
         this.runHistoryService = new RunHistoryService(storage.getDataDir().getAbsolutePath());
+        // One Events-feed entry per mail message a mail task handles (see TransferService#fireMailEvent).
+        if (transferService != null) {
+            transferService.setMailEventListener((task, saved, summary, details, start, end, runKey, trigger) -> {
+                try {
+                    runHistoryService.recordEvent(saved ? EventKind.MAIL_PROCESSED : EventKind.MAIL_NOT_SAVED,
+                            task.getId(), task.getName(),
+                            task.getTaskType() != null ? task.getTaskType().name() : null,
+                            saved ? TaskRunRecord.Status.SUCCESS : TaskRunRecord.Status.FAILED,
+                            summary, details, start, end, runKey, trigger);
+                } catch (Exception ignored) {
+                    // Best-effort, like every other scheduler event.
+                }
+            });
+        }
         // Background-thread events get their own database, so they can be purged and vacuumed
         // independently of the run history. Older builds stored them in run history: move them over.
         this.backgroundLogService = new BackgroundLogService(storage.getDataDir().getAbsolutePath());

@@ -101,6 +101,12 @@ public final class SftpScriptRunner {
                             String p = unescapeRemote(t.get(1));
                             if (!client.delete(p)) throw new IOException("Remote file not found: " + p);
                         }
+                        case "mv" -> {
+                            need(client);
+                            String from = unescapeRemote(t.get(1)), to = unescapeRemote(t.get(2));
+                            client.rename(from, to);
+                            log.accept("[INFO] Moved " + from + " -> " + to);
+                        }
                         case "close" -> {
                             if (client != null) { closeClient(client); client = null; }
                         }

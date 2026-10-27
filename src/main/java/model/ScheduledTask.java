@@ -44,6 +44,10 @@ public class ScheduledTask {
     // no XML schema change is needed.
     private String additionalTargetPaths;
 
+    // Which files of the source folder a file-transfer task takes (name / size / age conditions and a
+    // newest/oldest/... pick), stored as FileSelection#toText(). Null or empty = Transfer Mode only.
+    private String fileSelectionRules;
+
     // Backup fields ("D" = today; retention keeps D, D-1 ... D-(retentionDays-1) untouched
     // in the source, and everything older than that is eligible for backup).
     // Every eligible file is archived in a single run (no more day-bucket
@@ -174,6 +178,25 @@ public class ScheduledTask {
     /** Raw semicolon-separated extra destination folders (remote for OUTBOUND, local for INBOUND), or null/empty if none configured. */
     public String getAdditionalTargetPaths()     { return additionalTargetPaths; }
     public void   setAdditionalTargetPaths(String s) { this.additionalTargetPaths = s; }
+
+    /** Raw stored file-selection rules ({@link FileSelection#toText()}), or null/empty when none are set. */
+    public String getFileSelectionRules()        { return fileSelectionRules; }
+    public void   setFileSelectionRules(String s){ this.fileSelectionRules = s; }
+
+    /** The rules parsed; never null (an unset or damaged value gives rules that change nothing). */
+    public FileSelection getFileSelection() {
+        String raw = fileSelectionRules;
+        FileSelection c = parsedSelection;
+        if (c == null || !java.util.Objects.equals(parsedSelectionText, raw)) {
+            c = FileSelection.fromText(raw);
+            parsedSelection = c;
+            parsedSelectionText = raw;
+        }
+        return c;
+    }
+    // Parsed once per stored text: the scheduler and the UI read this on every tick.
+    private transient volatile FileSelection parsedSelection;
+    private transient volatile String parsedSelectionText;
 
     /** Parsed, trimmed, non-empty list of extra destination folders. Empty list if none configured. */
     public java.util.List<String> getAdditionalTargetPathList() {

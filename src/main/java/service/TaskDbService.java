@@ -160,6 +160,7 @@ public class TaskDbService {
                         "source_path TEXT," +
                         "target_path TEXT," +
                         "additional_target_paths TEXT," +
+                        "file_selection TEXT," +
                         "backup_source_path TEXT," +
                         "backup_destination_path TEXT," +
                         "backup_retention_days INTEGER," +
@@ -324,6 +325,7 @@ public class TaskDbService {
     private static final String UPSERT_SQL = "INSERT INTO tasks (" +
             "id, name, task_type, status, source_credential_id, target_credential_id, target_username, " +
             "transfer_direction, transfer_mode, source_path, target_path, additional_target_paths, " +
+            "file_selection, " +
             "backup_source_path, backup_destination_path, backup_retention_days, backup_source_username, " +
             "backup_destination_username, imap_folder, mail_search_criteria, mail_fetch_mode, " +
             "mail_mailbox_address, mail_tenant_id, mail_client_id, mail_fetch_scope, mail_max_results, " +
@@ -332,13 +334,14 @@ public class TaskDbService {
             "cron_expression, watcher_enabled, inbound_watcher_poll_interval_minutes, " +
             "inbound_watcher_max_age_minutes, last_known_remote_file_epoch, last_known_remote_file_size, " +
             "last_run_at, last_started_at, last_run_result, created_at, retry_count" +
-            ") VALUES (" + "?,".repeat(45).replaceAll(",$", "") + ") " +
+            ") VALUES (" + "?,".repeat(46).replaceAll(",$", "") + ") " +
             "ON CONFLICT(id) DO UPDATE SET " +
             "name=excluded.name, task_type=excluded.task_type, status=excluded.status, " +
             "source_credential_id=excluded.source_credential_id, target_credential_id=excluded.target_credential_id, " +
             "target_username=excluded.target_username, transfer_direction=excluded.transfer_direction, " +
             "transfer_mode=excluded.transfer_mode, source_path=excluded.source_path, target_path=excluded.target_path, " +
-            "additional_target_paths=excluded.additional_target_paths, backup_source_path=excluded.backup_source_path, " +
+            "additional_target_paths=excluded.additional_target_paths, file_selection=excluded.file_selection, " +
+            "backup_source_path=excluded.backup_source_path, " +
             "backup_destination_path=excluded.backup_destination_path, backup_retention_days=excluded.backup_retention_days, " +
             "backup_source_username=excluded.backup_source_username, backup_destination_username=excluded.backup_destination_username, " +
             "imap_folder=excluded.imap_folder, mail_search_criteria=excluded.mail_search_criteria, " +
@@ -385,6 +388,7 @@ public class TaskDbService {
             ps.setString(i++, t.getSourcePath());
             ps.setString(i++, t.getTargetPath());
             ps.setString(i++, t.getAdditionalTargetPaths());
+            ps.setString(i++, t.getFileSelectionRules());
             ps.setString(i++, t.getBackupSourcePath());
             ps.setString(i++, t.getBackupDestinationPath());
             ps.setInt(i++, t.getBackupRetentionDays());
@@ -490,6 +494,7 @@ public class TaskDbService {
         t.setSourcePath(rs.getString("source_path"));
         t.setTargetPath(rs.getString("target_path"));
         t.setAdditionalTargetPaths(rs.getString("additional_target_paths"));
+        t.setFileSelectionRules(rs.getString("file_selection"));
         t.setBackupSourcePath(rs.getString("backup_source_path"));
         t.setBackupDestinationPath(rs.getString("backup_destination_path"));
         t.setBackupRetentionDays(rs.getInt("backup_retention_days"));

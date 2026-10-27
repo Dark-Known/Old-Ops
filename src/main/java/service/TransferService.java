@@ -2,6 +2,7 @@ package service;
 
 import com.jcraft.jsch.ChannelSftp;
 import model.Credential;
+import model.FileSelection;
 import model.RemoteFileException;
 import model.RemoteFileMetadata;
 import model.ScheduledTask;
@@ -25,6 +26,7 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
@@ -79,6 +81,8 @@ public class TransferService {
     };
 
     private final XmlStorageService storage;
+    /** LDM/MVT/PTM text handling for mail tasks (header block, routing codes, station lookup, message ids). */
+    private final MailTextProcessor mailText;
     private final RemoteFileMetadataServiceFactory metadataServiceFactory;
     private String winScpPath;
 
@@ -185,6 +189,7 @@ public class TransferService {
 
     public TransferService(XmlStorageService storage) {
         this.storage                = storage;
+        this.mailText               = new MailTextProcessor(storage::getDataDir);
         this.metadataServiceFactory = new RemoteFileMetadataServiceFactory(storage);
         this.winScpPath             = detectWinScp();
         // Shared dataDir-based path, NOT the per-user-home default — the
@@ -282,11 +287,17 @@ public class TransferService {
         if (mode != TransferMode.SPECIFIC_FILE) {
             try {
                 return executeBatchedRemoteTransfer(target, task, logLine);
+            } catch (WatcherSkipException skip) {
+                throw skip; // "no file matched the selection rules" is a skipped run, not a failed one
             } catch (Exception e) {
                 lastFailureClassification.set(FailureClassifier.classifyThrowable(e));
                 logLine.accept("[ERROR] Transfer failed: " + e.getMessage());
                 return false;
             }
+        }
+
+        if (task.getFileSelection().isActive()) {
+            logLine.accept("[INFO] File selection rules are not used in SPECIFIC_FILE mode (it transfers the one named file).");
         }
 
         File scriptFile = null;
@@ -549,6 +560,7 @@ public class TransferService {
             newFiles = null;
         }
 
+        final boolean namedByEvent = newFiles != null;
         if (newFiles == null) {
         if (isOutbound) {
             // OUTBOUND: always scan the LOCAL source directory
@@ -574,6 +586,7 @@ public class TransferService {
                 return false;
             }
 
+            newFiles = applySelectionToCandidates(task, newFiles, logLine); // before the first-run "newest only" cut
             if (lastKnownEpochMillis <= 0 && newFiles != null && !newFiles.isEmpty()) {
                 long maxTs = newFiles.stream()
                         .mapToLong(f -> f.lastModified().toEpochMilli()).max().orElse(0L);
@@ -624,6 +637,7 @@ public class TransferService {
                 return false;
             }
 
+            newFiles = applySelectionToCandidates(task, newFiles, logLine); // before the first-run "newest only" cut
             if (lastKnownEpochMillis <= 0 && newFiles != null && !newFiles.isEmpty()) {
                 long maxTs = newFiles.stream()
                         .mapToLong(f -> f.lastModified().toEpochMilli()).max().orElse(0L);
@@ -636,6 +650,8 @@ public class TransferService {
             }
         }
         }
+
+        if (namedByEvent) newFiles = applySelectionToCandidates(task, newFiles, logLine);
 
         // ── Skip check ────────────────────────────────────────────────────────
         if (newFiles.isEmpty()) {
@@ -686,6 +702,7 @@ public class TransferService {
         } else {
             success = executeWinScpWatcherInbound(task, target, newFiles, logLine);
         }
+        if (success) afterWatcherSuccess(task, target, newFiles, isOutbound, logLine);
 
         // ── Persist new baseline ──────────────────────────────────────────────
         // Guard against the event-driven path (which bypasses the "modified after
@@ -1725,17 +1742,58 @@ public class TransferService {
 
         List<SizedCommand> commands = new ArrayList<>();
 
+        // Optional name/size/age conditions + pick, on top of the mode (see model.FileSelection).
+        final FileSelection selection = task.getFileSelection();
+        final boolean useRules = selection.isActive();
+        if (useRules) logLine.accept("[INFO] File selection rules: " + selection.describe());
+
+        // "Skip files already sent": what this task sent before (a read error stops the run, so nothing is sent twice by accident).
+        final TransferLedger ledger = selection.usesLedger() ? new TransferLedger(storage.getDataDir()) : null;
+        final TransferLedger.Snapshot sentBefore = ledger != null ? ledger.snapshot(task.getId()) : null;
+        List<TransferLedger.Entry> toRecord = new ArrayList<>();          // what this run sends, recorded only after success
+        List<String> inboundRemoteFiles = new ArrayList<>();
+        List<String> inboundLocalCopies = new ArrayList<>();
+        List<Long> inboundSizes = new ArrayList<>();
+        List<File> outboundFiles = new ArrayList<>();
+
         if (inbound) {
             java.util.Map<String, RemoteFileStat> remoteStats;
             if (remotePath.endsWith("*") || new File(task.getSourcePath()).isDirectory()
-                    || mode == TransferMode.LATEST_ONLY) {
+                    || mode == TransferMode.LATEST_ONLY || useRules) {
                 remoteStats = listAllRemoteFileStatsViaWinScp(target, target.getPassword(), remotePath, logLine);
             } else {
                 remoteStats = Collections.emptyMap();
             }
 
             List<String> remoteFiles;
-            if (mode == TransferMode.LATEST_ONLY) {
+            if (useRules) {
+                logLine.accept("[INFO] Mode: " + mode.name() + " with file selection rules (INBOUND)");
+                List<java.util.Map.Entry<String, RemoteFileStat>> picked = selection.select(
+                        remoteStats.entrySet(),
+                        e -> e.getKey(), e -> e.getValue().size, e -> e.getValue().epochMillis, mode);
+                logLine.accept("[INFO] " + picked.size() + " of " + remoteStats.size()
+                        + " remote file(s) selected.");
+                if (picked.isEmpty()) {
+                    return noFileMatched(selection, remotePath, remoteStats.size(), logLine);
+                }
+                if (sentBefore != null) {
+                    int before = picked.size();
+                    picked = picked.stream()
+                            .filter(e -> !sentBefore.wasSent(TransferCleanup.baseName(e.getKey()),
+                                    e.getValue().size, e.getValue().epochMillis, selection.getSentPolicy()))
+                            .collect(Collectors.toList());
+                    if (picked.size() < before) {
+                        logLine.accept("[INFO] Skipped " + (before - picked.size()) + " file(s) already sent ("
+                                + selection.getSentPolicy() + ").");
+                    }
+                    if (picked.isEmpty()) return nothingNew(selection, remotePath, before, logLine);
+                }
+                remoteFiles = picked.stream().map(java.util.Map.Entry::getKey).collect(Collectors.toList());
+                if (selection.getPick() == FileSelection.Pick.ALL
+                        || (selection.getPick() == FileSelection.Pick.BY_MODE && mode != TransferMode.LATEST_ONLY)) {
+                    Collections.sort(remoteFiles);
+                }
+            } else if (mode == TransferMode.LATEST_ONLY) {
                 logLine.accept("[INFO] Mode: Latest file(s) — non-watcher (INBOUND)");
                 if (remoteStats.isEmpty()) {
                     logLine.accept("[ERROR] No files found on remote path: " + remotePath);
@@ -1772,17 +1830,56 @@ public class TransferService {
                 commands.add(new SizedCommand(
                         "get " + escapeWinScpRemotePath(remoteFile) + " " + escapeWinScpPath(destPath), size));
                 downloadedLocalPaths.add(destPath);
+                inboundRemoteFiles.add(remoteFile);
+                inboundLocalCopies.add(destPath);
+                inboundSizes.add(stat != null ? stat.size : -1L);
+                if (stat != null) toRecord.add(new TransferLedger.Entry(fname, stat.size, stat.epochMillis));
             }
 
             boolean ok = runBatchedWinScpCommands(target, target.getPassword(), commands, logLine, task.getId());
             if (ok && !extraDestFolders.isEmpty()) {
                 copyDownloadedFilesToExtraFolders(downloadedLocalPaths, extraDestFolders, logLine);
             }
+            if (ok) {
+                recordSent(ledger, task, toRecord, logLine);
+                afterSuccessRemote(target, selection, inboundRemoteFiles, inboundLocalCopies, inboundSizes, logLine);
+            }
             return ok;
         } else {
             List<File> localFiles;
             File sourceDir = new File(task.getSourcePath());
-            if (mode == TransferMode.LATEST_ONLY) {
+            if (useRules) {
+                logLine.accept("[INFO] Mode: " + mode.name() + " with file selection rules (OUTBOUND)");
+                List<File> candidates;
+                if (sourceDir.isDirectory()) {
+                    File[] files = sourceDir.listFiles(File::isFile);
+                    candidates = files != null ? Arrays.asList(files) : Collections.emptyList();
+                } else {
+                    candidates = sourceDir.isFile() ? Collections.singletonList(sourceDir) : Collections.emptyList();
+                }
+                localFiles = selection.select(candidates, File::getName, File::length, File::lastModified, mode);
+                logLine.accept("[INFO] " + localFiles.size() + " of " + candidates.size()
+                        + " local file(s) selected.");
+                if (localFiles.isEmpty()) {
+                    return noFileMatched(selection, task.getSourcePath(), candidates.size(), logLine);
+                }
+                if (sentBefore != null) {
+                    int before = localFiles.size();
+                    localFiles = localFiles.stream()
+                            .filter(f -> !sentBefore.wasSent(f.getName(), f.length(), f.lastModified(), selection.getSentPolicy()))
+                            .collect(Collectors.toList());
+                    if (localFiles.size() < before) {
+                        logLine.accept("[INFO] Skipped " + (before - localFiles.size()) + " file(s) already sent ("
+                                + selection.getSentPolicy() + ").");
+                    }
+                    if (localFiles.isEmpty()) return nothingNew(selection, task.getSourcePath(), before, logLine);
+                }
+                if (selection.getPick() == FileSelection.Pick.ALL
+                        || (selection.getPick() == FileSelection.Pick.BY_MODE && mode != TransferMode.LATEST_ONLY)) {
+                    localFiles = new ArrayList<>(localFiles);
+                    localFiles.sort(Comparator.comparing(File::getName));
+                }
+            } else if (mode == TransferMode.LATEST_ONLY) {
                 logLine.accept("[INFO] Mode: Latest file(s) (OUTBOUND, non-watcher)");
                 if (sourceDir.isDirectory()) {
                     File[] files = sourceDir.listFiles(File::isFile);
@@ -1815,6 +1912,8 @@ public class TransferService {
                         + " additional destination(s) on the same server: " + String.join(", ", extraDestFolders));
             }
             for (File f : localFiles) {
+                outboundFiles.add(f);
+                toRecord.add(new TransferLedger.Entry(f.getName(), f.length(), f.lastModified()));
                 String remoteDestPath = prepareRemoteDestination(remotePath, f.getName());
                 commands.add(new SizedCommand("put " + escapeWinScpPath(normalizeLocalPath(f.getAbsolutePath()))
                         + " " + escapeWinScpRemotePath(remoteDestPath), f.length()));
@@ -1829,7 +1928,187 @@ public class TransferService {
             }
         }
 
-        return runBatchedWinScpCommands(target, target.getPassword(), commands, logLine, task.getId());
+        boolean ok = runBatchedWinScpCommands(target, target.getPassword(), commands, logLine, task.getId());
+        if (ok) {
+            recordSent(ledger, task, toRecord, logLine);
+            if (selection.hasAfterAction()) {
+                List<TransferCleanup.LocalOriginal> originals = new ArrayList<>();
+                for (int i = 0; i < outboundFiles.size(); i++) {
+                    TransferLedger.Entry e = toRecord.get(i);
+                    originals.add(new TransferCleanup.LocalOriginal(outboundFiles.get(i).toPath(), e.size(), e.mtimeMillis()));
+                }
+                cleanupLocalOriginals(selection, originals, logLine);
+            }
+        }
+        return ok;
+    }
+
+    /**
+     * Nothing in the folder satisfied the file selection rules. By default that is a normal, quiet
+     * outcome (the run is recorded as skipped, not failed — e.g. today's file has not arrived yet);
+     * with "fail if nothing matches" ticked it is a failed run so retries / alerts apply.
+     */
+    private boolean noFileMatched(FileSelection selection, String where, int candidates, Consumer<String> logLine)
+            throws WatcherSkipException {
+        String msg = "No file matched the file selection rules in " + where + " (" + candidates
+                + " file(s) looked at). Rules: " + selection.describe();
+        if (selection.isFailIfNoMatch()) {
+            logLine.accept("[ERROR] " + msg);
+            return false;
+        }
+        logLine.accept("[INFO] " + msg);
+        throw new WatcherSkipException(msg);
+    }
+
+    /** Every file that matched was sent before: a normal, quiet skip (not a failure). */
+    private boolean nothingNew(FileSelection selection, String where, int matched, Consumer<String> logLine)
+            throws WatcherSkipException {
+        String msg = "Nothing new to send in " + where + ": all " + matched + " matching file(s) were already sent ("
+                + selection.getSentPolicy() + ").";
+        logLine.accept("[INFO] " + msg);
+        throw new WatcherSkipException(msg);
+    }
+
+    /** Remembers what this run sent. The transfer already happened, so a failure here is only a warning. */
+    private void recordSent(TransferLedger ledger, ScheduledTask task, List<TransferLedger.Entry> entries,
+                            Consumer<String> logLine) {
+        if (ledger == null || entries.isEmpty()) return;
+        try {
+            ledger.record(task.getId(), entries);
+            logLine.accept("[INFO] Remembered " + entries.size() + " sent file(s) for this task.");
+        } catch (Exception e) {
+            logLine.accept("[WARN] Transfer succeeded but the sent files could not be remembered, so a later run may send them again: "
+                    + e.getMessage());
+        }
+    }
+
+    /** Local originals (uploads): delete or move them. Never throws; the run stays a success. */
+    private void cleanupLocalOriginals(FileSelection selection, List<TransferCleanup.LocalOriginal> originals,
+                                       Consumer<String> logLine) {
+        if (!selection.hasAfterAction() || originals.isEmpty()) return;
+        try {
+            Path archive = selection.getAfterAction() == FileSelection.AfterAction.MOVE
+                    ? Paths.get(selection.getAfterFolder()) : null;
+            TransferCleanup.cleanupLocal(originals, selection.getAfterAction(), archive, logLine, LocalDateTime.now());
+        } catch (Exception e) {
+            logLine.accept("[WARN] The transfer succeeded, but the original file(s) are still in place: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Server originals (downloads): only files whose local copy exists at the right size are touched.
+     * One script deletes or moves them; any problem is a warning and the run stays a success.
+     */
+    private void afterSuccessRemote(Credential target, FileSelection selection, List<String> remoteFiles,
+                                    List<String> localCopies, List<Long> sizes, Consumer<String> logLine) {
+        if (!selection.hasAfterAction() || remoteFiles.isEmpty()) return;
+        List<String> safe = new ArrayList<>();
+        List<String> unsafe = new ArrayList<>();
+        for (int i = 0; i < remoteFiles.size(); i++) {
+            if (TransferCleanup.copyIsComplete(Paths.get(localCopies.get(i)), sizes.get(i))) safe.add(remoteFiles.get(i));
+            else unsafe.add(TransferCleanup.baseName(remoteFiles.get(i)));
+        }
+        if (!unsafe.isEmpty()) {
+            logLine.accept("[WARN] Kept on the server (the copy on this PC is missing or has the wrong size): "
+                    + String.join(", ", unsafe));
+        }
+        if (safe.isEmpty()) return;
+        try {
+            boolean move = selection.getAfterAction() == FileSelection.AfterAction.MOVE;
+            List<String> lines = new ArrayList<>();
+            if (move) {
+                String dir = normalizeRemotePath(selection.getAfterFolder());
+                while (dir.length() > 1 && dir.endsWith("/")) dir = dir.substring(0, dir.length() - 1);
+                java.util.LinkedHashSet<String> mkdirs = new java.util.LinkedHashSet<>();
+                StringBuilder prefix = new StringBuilder(dir.startsWith("/") ? "/" : "");
+                for (String part : dir.split("/")) {
+                    if (part.isEmpty()) continue;
+                    if (prefix.length() > 0 && !prefix.toString().endsWith("/")) prefix.append('/');
+                    prefix.append(part);
+                    mkdirs.add("mkdir " + escapeWinScpRemotePath(prefix.toString()));
+                }
+                runBestEffortWinScpCommands(target, mkdirs, logLine);
+                java.util.Set<String> existing = new java.util.HashSet<>();
+                try {
+                    for (String k : rawRemoteFileStats(target, target.getPassword(), dir, logLine).keySet()) {
+                        existing.add(TransferCleanup.baseName(k));
+                    }
+                } catch (Exception ignored) { /* an empty or new folder: nothing to avoid */ }
+                for (TransferCleanup.RemoteMove m : TransferCleanup.planRemoteMoves(safe, dir, existing, LocalDateTime.now())) {
+                    lines.add("mv " + escapeWinScpRemotePath(m.from()) + " " + escapeWinScpRemotePath(m.to()));
+                }
+            } else {
+                for (String p : safe) lines.add("rm " + escapeWinScpRemotePath(p));
+            }
+            File scriptFile = File.createTempFile("opstool_after_", ".txt");
+            secureTemp(scriptFile);
+            try (PrintWriter pw = new PrintWriter(new FileWriter(scriptFile))) {
+                pw.println("option batch abort");
+                pw.println("option confirm off");
+                writeOpenLine(pw, target, target.getPassword(), scriptFile);
+                for (String l : lines) pw.println(l);
+                pw.println("close");
+                pw.println("exit");
+            }
+            boolean ok;
+            try {
+                ok = runWinScpScript(scriptFile, logLine, "backup-cleanup");
+            } finally {
+                scriptFile.delete();
+            }
+            if (ok) {
+                logLine.accept("[INFO] " + (move ? "Moved " : "Deleted ") + safe.size() + " original file(s) on the server.");
+            } else {
+                logLine.accept("[WARN] The transfer succeeded, but the cleanup on the server did not finish: some original file(s) are still there.");
+            }
+        } catch (Exception e) {
+            logLine.accept("[WARN] The transfer succeeded, but the original file(s) on the server are still in place: " + e.getMessage());
+        }
+    }
+
+    /** Watcher: drops changed files that do not satisfy the selection conditions (the pick step does not apply — every new matching file is sent). */
+    private List<RemoteFileMetadata> applySelectionToCandidates(ScheduledTask task, List<RemoteFileMetadata> files,
+                                                                 Consumer<String> logLine) {
+        FileSelection sel = task.getFileSelection();
+        if (files == null || files.isEmpty() || !sel.hasFilters()) return files;
+        List<RemoteFileMetadata> kept = sel.hasFilters()
+                ? sel.filterOnly(files, RemoteFileMetadata::fileName,
+                        RemoteFileMetadata::size, f -> f.lastModified().toEpochMilli())
+                : files;
+        if (kept.size() != files.size()) {
+            logLine.accept("[INFO] File selection rules kept " + kept.size() + " of " + files.size()
+                    + " changed file(s). Rules: " + sel.describe());
+        }
+        return kept;
+    }
+
+    /** Watcher fire succeeded: remember the files and run the "after a successful transfer" step. */
+    private void afterWatcherSuccess(ScheduledTask task, Credential target, List<RemoteFileMetadata> files,
+                                     boolean outbound, Consumer<String> logLine) {
+        FileSelection sel = task.getFileSelection();
+        // The watcher's own baseline already prevents re-sending, so the sent-files memory is not used here.
+        if (!sel.hasAfterAction()) return;
+        if (outbound) {
+            File dir = new File(resolveOutboundWatchDirectory(task));
+            List<TransferCleanup.LocalOriginal> originals = new ArrayList<>();
+            for (RemoteFileMetadata f : files) {
+                originals.add(new TransferCleanup.LocalOriginal(new File(dir, f.fileName()).toPath(),
+                        f.size(), f.lastModified().toEpochMilli()));
+            }
+            cleanupLocalOriginals(sel, originals, logLine);
+        } else {
+            String remotePath = normalizeRemotePath(task.getTargetPath());
+            String remoteDir = remotePath.endsWith("/") ? remotePath : remotePath + "/";
+            String localDest = normalizeLocalPath(task.getSourcePath());
+            List<String> remote = new ArrayList<>(), local = new ArrayList<>();
+            List<Long> sizes = new ArrayList<>();
+            for (RemoteFileMetadata f : files) {
+                remote.add(remoteDir + f.fileName());
+                local.add(buildLocalDestinationPath(localDest, f.fileName()));
+                sizes.add(f.size());
+            }
+            afterSuccessRemote(target, sel, remote, local, sizes, logLine);
+        }
     }
 
     /**
@@ -2322,10 +2601,31 @@ public class TransferService {
                         ? " | watcher: ON (after " + (afterEpoch > 0 ? Instant.ofEpochMilli(afterEpoch) : "epoch") + ", max " + maxResults + ")"
                         : " | scope: " + scope + (scope == ScheduledTask.MailFetchScope.ALL_MATCHING ? " (max " + maxResults + ")" : "")));
 
+        // Each message is handled end-to-end (download -> write .RCV/attachments -> mark read -> move)
+        // on one of a few worker threads, so several mails arriving together are no longer processed
+        // one after another. Graph allows ~4 concurrent requests per mailbox, hence the small cap.
+        final String token = accessToken;
+        final GraphMailService graphSvc = graph;
+        final boolean markReadFlag = task.isMailMarkAsRead();
+        final Map<String, String> folderIdCache = new java.util.concurrent.ConcurrentHashMap<>();
+        final Object logLock = new Object();
+        final java.util.Set<String> unsavedIds = java.util.concurrent.ConcurrentHashMap.newKeySet();
+        final Consumer<String> safeLog = s -> { synchronized (logLock) { logLine.accept(s); } };
+        // Run key/trigger live in thread-locals of this (task) thread; the mail workers must be handed them.
+        final MailRunContext mailCtx = new MailRunContext(task, mailbox, folder,
+                RunHistoryService.currentRunKey(), RunHistoryService.currentTrigger());
+
         List<GraphMailService.MailMessage> messages;
         try {
             messages = graph.fetchMessages(
-                    accessToken, folder, criteria, mode, maxResults, afterEpoch, logLine);
+                    accessToken, folder, criteria, mode, maxResults, afterEpoch, safeLog,
+                    mailWorkerThreads(),
+                    m -> {
+                        if (!processFetchedMailMessage(m, mode, outputDir, graphSvc, token, markReadFlag,
+                                folderIdCache, logLock, logLine, mailCtx)) {
+                            unsavedIds.add(m.id);
+                        }
+                    });
         } catch (IOException | InterruptedException ex) {
             if (ex instanceof InterruptedException) Thread.currentThread().interrupt();
             logLine.accept("[ERROR] Graph mail task failed: " + ex.getMessage());
@@ -2342,62 +2642,29 @@ public class TransferService {
             return true; // nothing matched — not a failure outside watcher mode
         }
 
-        boolean markRead = task.isMailMarkAsRead();
-
+        // Newest received time across the whole batch becomes the watcher baseline (only reached when every
+        // message was fetched; a fetch failure above returns early without advancing it).
+        // A message whose content could not be written was left in the mailbox on purpose, so the baseline
+        // must stay below it (otherwise watcher mode would never look at it again).
+        long oldestUnsaved = Long.MAX_VALUE;
+        for (GraphMailService.MailMessage m : messages) {
+            if (!unsavedIds.contains(m.id)) continue;
+            try { oldestUnsaved = Math.min(oldestUnsaved, Instant.parse(m.receivedDateTime).toEpochMilli()); }
+            catch (Exception ignored) { /* unparseable: ignore */ }
+        }
         long newestEpoch = 0L;
         for (GraphMailService.MailMessage m : messages) {
-            logLine.accept("[MAIL MESSAGE] " + m.subject + " | from=" + m.from
-                    + " | received=" + m.receivedDateTime);
-            if (m.bodyContent == null || m.bodyContent.isEmpty()) {
-                logLine.accept("[WARN] No payload returned for message id=" + m.id);
-            } else {
-                for (String ln : m.bodyContent.split("\r?\n")) logLine.accept(ln);
-            }
-            logLine.accept("[END MAIL MESSAGE]");
-
-            // Classify once, before naming the file, and reuse for the filename,
-            // attachment placement, and the mailbox folder move below, so all
-            // three stay consistent.
-            String classification = classifyForFolderRouting(m);
-
-            try {
-                Path rcvFile = uniqueRcvPath(outputDir, buildRcvFileName(m, classification));
-                Files.write(rcvFile, buildRcvFileContent(m, mode, logLine).getBytes(StandardCharsets.UTF_8));
-                logLine.accept("[INFO] Wrote " + rcvFile.getFileName());
-            } catch (IOException ex) {
-                logLine.accept("[WARN] Failed to write .RCV file for '" + m.subject + "': " + ex.getMessage());
-            }
-
-            saveAttachmentsToDisk(m, outputDir, classification, logLine);
-
+            if (unsavedIds.contains(m.id)) continue;
             try {
                 long ts = Instant.parse(m.receivedDateTime).toEpochMilli();
-                if (ts > newestEpoch) newestEpoch = ts;
+                if (ts < oldestUnsaved && ts > newestEpoch) newestEpoch = ts;
             } catch (Exception ignored) {
                 // Unparseable timestamp — skip baseline consideration for this message only.
             }
-
-            // Mark-as-read must happen before move — moving invalidates the message ID.
-            if (markRead) {
-                try {
-                    graph.markAsRead(accessToken, m.id);
-                    logLine.accept("[INFO] Marked as read: " + m.subject);
-                } catch (Exception ex) {
-                    logLine.accept("[WARN] Failed to mark message as read (" + m.subject + "): " + ex.getMessage());
-                }
-            }
-
-            // Manual "move to a configured folder" is gone — every processed
-            // message is now routed automatically by content: LDM/PTM
-            // messages go to their respective configured folder, anything
-            // else goes to the configured "Others" folder.
-            String destinationFolder = resolveMoveFolderName(classification);
-            try {
-                graph.moveMessage(accessToken, m.id, destinationFolder, logLine);
-                logLine.accept("[INFO] Moved to folder '" + destinationFolder + "': " + m.subject);
-            } catch (Exception ex) {
-                logLine.accept("[WARN] Failed to move message (" + m.subject + "): " + ex.getMessage());
-            }
+        }
+        if (!unsavedIds.isEmpty()) {
+            logLine.accept("[WARN] " + unsavedIds.size() + " message(s) could not be saved and were left in '"
+                    + folder + "' — they will be retried on the next run.");
         }
 
         if (watcherOn && newestEpoch > 0) {
@@ -2417,6 +2684,195 @@ public class TransferService {
         }
 
         return true;
+    }
+
+    // ─── Per-message processing (runs on a mail worker thread) ──────────────
+
+    /** Worker threads used per mail task run. Override with {@code mailWorkerThreads} in app-config.xml (1 = strictly sequential). */
+    private int mailWorkerThreads() {
+        int n = 4;
+        try {
+            String v = util.AppConfig.readValue("mailWorkerThreads");
+            if (v != null && !v.trim().isEmpty()) n = Integer.parseInt(v.trim());
+        } catch (RuntimeException ignored) { /* bad value -> default */ }
+        return Math.max(1, Math.min(n, 8));
+    }
+
+    /** Guards "pick a free file name, then claim it" so concurrent workers never choose the same name. */
+    private final Object rcvNameLock = new Object();
+
+    /** Receives one event per mail message a run handled; the scheduler wires this to the Events feed. */
+    public interface MailEventListener {
+        void onMailEvent(ScheduledTask task, boolean saved, String summary, String details,
+                         LocalDateTime start, LocalDateTime end, String runKey, String trigger);
+    }
+
+    private volatile MailEventListener mailEventListener;
+
+    public void setMailEventListener(MailEventListener l) { this.mailEventListener = l; }
+
+    /** What the mail workers need to know about the run they belong to (captured on the task thread). */
+    private record MailRunContext(ScheduledTask task, String mailbox, String folder, String runKey, String trigger) {}
+
+    /**
+     * Everything that happens to one fetched message: log its content, write the .RCV file, save
+     * attachments, mark it read, move it to its routed folder. The mailbox is only touched (mark read,
+     * move) after the .RCV file and all attachments were written; if a write fails the message stays
+     * where it is so the next run retries it, and this returns false. Log lines are buffered and
+     * emitted as one block so output from messages handled in parallel doesn't interleave line by
+     * line, and one Events-feed event with the full details is recorded per message.
+     */
+    private boolean processFetchedMailMessage(GraphMailService.MailMessage m, MailFetchMode mode, Path outputDir,
+                                              GraphMailService graph, String accessToken, boolean markRead,
+                                              Map<String, String> folderIdCache, Object logLock,
+                                              Consumer<String> logLine, MailRunContext ctx) {
+        List<String> buf = new ArrayList<>();
+        Consumer<String> log = buf::add;
+        LocalDateTime startedAt = LocalDateTime.now();
+        boolean saved = true;
+        String classification = null;
+        Path rcvFile = null;
+        long rcvBytes = -1;
+        String rcvError = null;
+        List<String> attachReport = new ArrayList<>();
+        String readState = markRead ? "not attempted" : "not requested";
+        String moveState = "not attempted";
+        String destinationFolder = null;
+        try {
+            log.accept("[MAIL MESSAGE] " + m.subject + " | from=" + m.from
+                    + " | received=" + m.receivedDateTime);
+            if (m.bodyContent == null || m.bodyContent.isEmpty()) {
+                log.accept("[WARN] No payload returned for message id=" + m.id);
+            } else {
+                for (String ln : m.bodyContent.split("\r?\n")) log.accept(ln);
+            }
+            log.accept("[END MAIL MESSAGE]");
+
+            // Classify once, before naming the file, and reuse for the filename,
+            // attachment placement, and the mailbox folder move below, so all
+            // three stay consistent.
+            classification = mailText.classifyForFolderRouting(m);
+
+            try {
+                String content = buildRcvFileContent(m, mode, log);
+                synchronized (rcvNameLock) {
+                    rcvFile = uniqueRcvPath(outputDir, buildRcvFileName(m, classification));
+                    Files.createFile(rcvFile); // claim the name before releasing the lock
+                }
+                byte[] bytes = content.getBytes(StandardCharsets.UTF_8);
+                Files.write(rcvFile, bytes);
+                rcvBytes = bytes.length;
+                log.accept("[INFO] Wrote " + rcvFile.getFileName());
+            } catch (IOException ex) {
+                rcvError = ex.getMessage();
+                log.accept("[WARN] Failed to write .RCV file for '" + m.subject + "': " + ex.getMessage());
+                saved = false;
+            }
+
+            if (!saveAttachmentsToDisk(m, outputDir, classification, log, attachReport)) saved = false;
+
+            if (!saved) {
+                moveState = "not moved — content was not fully saved, left in the mailbox for the next run";
+                log.accept("[WARN] Not marking/moving '" + m.subject
+                        + "' because its content was not fully saved — left in the mailbox for the next run.");
+                return false;
+            }
+
+            // Mark-as-read must happen before move — moving invalidates the message ID.
+            if (markRead) {
+                try {
+                    graph.markAsRead(accessToken, m.id);
+                    readState = "yes";
+                    log.accept("[INFO] Marked as read: " + m.subject);
+                } catch (Exception ex) {
+                    if (ex instanceof InterruptedException) Thread.currentThread().interrupt();
+                    readState = "FAILED — " + ex.getMessage();
+                    log.accept("[WARN] Failed to mark message as read (" + m.subject + "): " + ex.getMessage());
+                }
+            }
+
+            // Every processed message is routed automatically by content: LDM/PTM
+            // messages go to their respective configured folder, anything
+            // else goes to the configured "Others" folder.
+            destinationFolder = mailText.resolveMoveFolderName(classification);
+            try {
+                graph.moveMessage(accessToken, m.id, destinationFolder, log, folderIdCache);
+                moveState = "moved to '" + destinationFolder + "'";
+                log.accept("[INFO] Moved to folder '" + destinationFolder + "': " + m.subject);
+            } catch (Exception ex) {
+                if (ex instanceof InterruptedException) Thread.currentThread().interrupt();
+                moveState = "FAILED to move to '" + destinationFolder + "' — " + ex.getMessage();
+                log.accept("[WARN] Failed to move message (" + m.subject + "): " + ex.getMessage());
+            }
+            return true;
+        } finally {
+            synchronized (logLock) {
+                for (String line : buf) logLine.accept(line);
+            }
+            fireMailEvent(ctx, m, mode, classification, saved, rcvFile, rcvBytes, rcvError, attachReport,
+                    readState, moveState, startedAt);
+        }
+    }
+
+    /** Builds and delivers the Events-feed entry for one mail message — a one-line summary plus a full detail block. */
+    private void fireMailEvent(MailRunContext ctx, GraphMailService.MailMessage m, MailFetchMode mode,
+                               String classification, boolean saved, Path rcvFile, long rcvBytes, String rcvError,
+                               List<String> attachReport, String readState, String moveState,
+                               LocalDateTime startedAt) {
+        MailEventListener l = mailEventListener;
+        if (l == null) return;
+        try {
+            LocalDateTime endedAt = LocalDateTime.now();
+            String subject = (m.subject == null || m.subject.isBlank()) ? "(no subject)" : m.subject.trim();
+            String received = m.receivedDateTime;
+            try {
+                received = Instant.parse(m.receivedDateTime).atZone(java.time.ZoneId.systemDefault())
+                        .format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")) + " local (" + m.receivedDateTime + ")";
+            } catch (Exception ignored) { /* keep the raw value */ }
+            int nAtt = m.attachmentFiles == null ? 0 : m.attachmentFiles.size();
+            boolean fromAttachment = mode != MailFetchMode.FULL_MESSAGE
+                    && m.attachmentText != null && !m.attachmentText.trim().isEmpty();
+
+            StringBuilder summary = new StringBuilder();
+            summary.append(classification == null ? "Mail" : classification).append(" \u2014 \"").append(subject).append("\"");
+            if (m.from != null && !m.from.isBlank()) summary.append(" from ").append(m.from);
+            if (saved) {
+                summary.append(" \u2192 ").append(rcvFile != null ? rcvFile.getFileName() : "(no file)");
+                if (nAtt > 0) summary.append(" + ").append(nAtt).append(nAtt == 1 ? " attachment" : " attachments");
+                summary.append("; ").append(moveState);
+            } else {
+                summary.append(" \u2014 NOT saved");
+                if (rcvError != null) summary.append(": ").append(rcvError);
+                summary.append("; left in '").append(ctx.folder()).append("' for the next run");
+            }
+
+            StringBuilder d = new StringBuilder();
+            d.append("Subject:         ").append(subject).append('\n');
+            d.append("From:            ").append(m.from == null ? "" : m.from).append('\n');
+            d.append("Received:        ").append(received).append('\n');
+            d.append("Message ID:      ").append(m.id).append('\n');
+            d.append("Mailbox / folder: ").append(ctx.mailbox()).append(" / ").append(ctx.folder()).append('\n');
+            d.append("Fetch mode:      ").append(mode).append('\n');
+            d.append("Classified as:   ").append(classification == null ? "(not classified)" : classification).append('\n');
+            d.append("Content source:  ").append(mode == MailFetchMode.FULL_MESSAGE ? "raw MIME"
+                    : fromAttachment ? "text attachment (" + String.join(", ", m.attachmentNames) + ")" : "message body").append('\n');
+            d.append("Body length:     ").append(m.bodyContent == null ? 0 : m.bodyContent.length()).append(" chars\n");
+            d.append(".RCV file:       ");
+            if (rcvFile != null && rcvBytes >= 0) d.append(rcvFile).append(" (").append(rcvBytes).append(" bytes)");
+            else d.append("NOT written").append(rcvError != null ? " \u2014 " + rcvError : "");
+            d.append('\n');
+            d.append("Attachments:     ").append(nAtt == 0 ? "none" : String.valueOf(nAtt)).append('\n');
+            for (String a : attachReport) d.append("  - ").append(a).append('\n');
+            d.append("Marked as read:  ").append(readState).append('\n');
+            d.append("Mailbox action:  ").append(moveState).append('\n');
+            d.append("Handled by:      ").append(Thread.currentThread().getName()).append('\n');
+            d.append("Processing time: ").append(java.time.Duration.between(startedAt, endedAt).toMillis()).append(" ms\n");
+
+            l.onMailEvent(ctx.task(), saved, summary.toString(), d.toString(), startedAt, endedAt,
+                    ctx.runKey(), ctx.trigger());
+        } catch (RuntimeException ignored) {
+            // The Events feed is best-effort — never let it break mail processing.
+        }
     }
 
     // ─── Attachment download ────────────────────────────────────────────────
@@ -2441,9 +2897,11 @@ public class TransferService {
      * directory. If it's unset, the previous behavior (attachments nested
      * under the task's {@code outputDir}) is kept for backward compatibility.
      */
-    private void saveAttachmentsToDisk(GraphMailService.MailMessage m, Path outputDir,
-                                        String classification, Consumer<String> logLine) {
-        if (m.attachmentFiles == null || m.attachmentFiles.isEmpty()) return;
+    private boolean saveAttachmentsToDisk(GraphMailService.MailMessage m, Path outputDir,
+                                          String classification, Consumer<String> logLine,
+                                          List<String> report) {
+        if (m.attachmentFiles == null || m.attachmentFiles.isEmpty()) return true;
+        boolean allSaved = true;
 
         String bucket = "LDM".equals(classification) ? "LDM"
                 : "PTM".equals(classification) ? "PTM"
@@ -2460,28 +2918,47 @@ public class TransferService {
             Files.createDirectories(attachmentsDir);
         } catch (IOException ex) {
             logLine.accept("[WARN] Could not create attachments folder '" + attachmentsDir + "': " + ex.getMessage());
-            return;
+            report.add("(all) \u2014 FAILED: could not create folder " + attachmentsDir + ": " + ex.getMessage());
+            return false;
         }
 
         for (GraphMailService.AttachmentFile file : m.attachmentFiles) {
             String safeName = (file.name == null || file.name.trim().isEmpty() ? "attachment" : file.name.trim())
                     .replaceAll("[\\\\/:*?\"<>|]", "_");
-            Path dest = attachmentsDir.resolve(safeName);
-            // Guard against two attachments on the SAME message sharing a name.
-            int suffix = 1;
-            while (Files.exists(dest)) {
-                int extDot = safeName.lastIndexOf('.');
-                String base = extDot > 0 ? safeName.substring(0, extDot) : safeName;
-                String ext  = extDot > 0 ? safeName.substring(extDot) : "";
-                dest = attachmentsDir.resolve(base + "_" + (suffix++) + ext);
+            Path dest;
+            // Guard against two attachments sharing a name — on the same message, or on two messages
+            // handled in parallel that landed in the same folder (same-second LDM/PTM name). The name
+            // is claimed under a lock so concurrent workers can't pick the same one.
+            synchronized (rcvNameLock) {
+                dest = attachmentsDir.resolve(safeName);
+                int suffix = 1;
+                while (Files.exists(dest)) {
+                    int extDot = safeName.lastIndexOf('.');
+                    String base = extDot > 0 ? safeName.substring(0, extDot) : safeName;
+                    String ext  = extDot > 0 ? safeName.substring(extDot) : "";
+                    dest = attachmentsDir.resolve(base + "_" + (suffix++) + ext);
+                }
+                try {
+                    Files.createFile(dest);
+                } catch (IOException ex) {
+                    logLine.accept("[WARN] Failed to save attachment '" + file.name + "': " + ex.getMessage());
+                    report.add(file.name + " \u2014 FAILED: " + ex.getMessage());
+                    allSaved = false;
+                    continue;
+                }
             }
             try {
                 Files.write(dest, file.bytes);
                 logLine.accept("[INFO] Saved attachment '" + file.name + "' -> " + dest);
+                report.add(file.name + " (" + (file.contentType == null || file.contentType.isEmpty() ? "unknown type" : file.contentType)
+                        + ", " + file.bytes.length + " bytes) \u2192 " + dest);
             } catch (IOException ex) {
                 logLine.accept("[WARN] Failed to save attachment '" + file.name + "': " + ex.getMessage());
+                report.add(file.name + " \u2014 FAILED: " + ex.getMessage());
+                allSaved = false;
             }
         }
+        return allSaved;
     }
 
     // ─── .RCV file output ─────────────────────────────────────────────────────
@@ -2579,11 +3056,11 @@ public class TransferService {
         }
 
         boolean useAttachment = m.attachmentText != null && !m.attachmentText.trim().isEmpty();
-        String sourceText = useAttachment ? m.attachmentText : toPlainText(m.bodyContent, m.bodyType);
+        String sourceText = useAttachment ? m.attachmentText : mailText.toPlainText(m.bodyContent, m.bodyType);
 
         if (mode == MailFetchMode.BODY_ONLY) {
-            String bannerStripped = removeAutomatedBanners(sourceText);
-            MarkerMatch marker = findMessageTypeMarker(bannerStripped);
+            String bannerStripped = mailText.removeAutomatedBanners(sourceText);
+            MailTextProcessor.MarkerMatch marker = mailText.findMessageTypeMarker(bannerStripped);
             String markerBody = marker != null ? bannerStripped.substring(marker.index) : bannerStripped;
 
             // For LDM/PTM, the literal marker is immediately followed by an
@@ -2593,7 +3070,7 @@ public class TransferService {
                 markerBody = marker.type + "\n=TEXT" + markerBody.substring(marker.type.length());
             }
 
-            String messageBody = removeBlankLines(stripSignatureAndQuotedContent(markerBody));
+            String messageBody = mailText.removeBlankLines(mailText.stripSignatureAndQuotedContent(markerBody));
 
             if (marker == null) {
                 // Not an LDM/MVT/PTM message — no SITA header applies.
@@ -2603,10 +3080,10 @@ public class TransferService {
             String originCode = null;
             String destinationCode = null;
             if ("LDM".equals(marker.type)) {
-                originCode = extractLdmOriginCode(bannerStripped, messageBody);
-                destinationCode = extractLdmDestinationCode(messageBody);
+                originCode = mailText.extractLdmOriginCode(bannerStripped, messageBody);
+                destinationCode = mailText.extractLdmDestinationCode(messageBody);
             } else if ("PTM".equals(marker.type)) {
-                String[] od = extractPtmOriginDestination(messageBody);
+                String[] od = mailText.extractPtmOriginDestination(messageBody);
                 originCode = od[0];
                 destinationCode = od[1];
             } else {
@@ -2616,10 +3093,10 @@ public class TransferService {
                         + " messages yet — falling back to the configured default SITA address.");
             }
 
-            String originAddress = resolveStationAddress(originCode, marker.type, "ORIGIN", logLine);
-            String destinationAddress = resolveStationAddress(destinationCode, marker.type, "DESTINATION TYPE B", logLine);
+            String originAddress = mailText.resolveStationAddress(originCode, marker.type, "ORIGIN", logLine);
+            String destinationAddress = mailText.resolveStationAddress(destinationCode, marker.type, "DESTINATION TYPE B", logLine);
 
-            String header = buildSitaHeaderBlock(marker.type, originAddress, destinationAddress, nextMessageId());
+            String header = mailText.buildSitaHeaderBlock(marker.type, originAddress, destinationAddress, mailText.nextMessageId());
             return header + messageBody;
         }
 
@@ -2632,474 +3109,8 @@ public class TransferService {
             sb.append("Source: attachment (").append(String.join(", ", m.attachmentNames)).append(")\r\n");
         }
         sb.append("\r\n");
-        sb.append(removeBlankLines(sourceText));
+        sb.append(mailText.removeBlankLines(sourceText));
         return sb.toString();
-    }
-
-    // ─── SITA-style header block (LDM / MVT / PTM) ─────────────────────────
-
-    private static final DateTimeFormatter RCV_HEADER_DATE_FMT = DateTimeFormatter.ofPattern("yyyy/MM/dd HH:mm");
-
-    /**
-     * Builds the fixed-format routing header prepended to LDM/MVT/PTM
-     * message content:
-     *   =HEADER
-     *   RCV,<yyyy/MM/dd HH:mm>
-     *   =PRIORITY
-     *   QU (LDM/MVT) or QN (PTM)
-     *   =DESTINATION TYPE B
-     *   STX,<destination SITA address>
-     *   =ORIGIN
-     *   <origin SITA address>
-     *   =MSGID
-     *   <5-digit sequential id>
-     *   =SMI
-     * The template is identical across all three message types — only the
-     * field values differ. Missing origin/destination addresses (extraction
-     * or lookup failure) are left blank rather than guessed; a WARN is
-     * already logged by the caller in that case.
-     */
-    private String buildSitaHeaderBlock(String messageType, String originAddress,
-                                         String destinationAddress, String msgId) {
-        StringBuilder sb = new StringBuilder();
-        sb.append("=HEADER\n");
-        sb.append("RCV,").append(LocalDateTime.now().format(RCV_HEADER_DATE_FMT)).append("\n");
-        sb.append("=PRIORITY\n");
-        sb.append("PTM".equals(messageType) ? "QN" : "QU").append("\n");
-        sb.append("=DESTINATION TYPE B\n");
-        sb.append("STX,").append(destinationAddress != null ? destinationAddress : "").append("\n");
-        sb.append("=ORIGIN\n");
-        sb.append(originAddress != null ? originAddress : "").append("\n");
-        sb.append("=MSGID\n");
-        sb.append(msgId).append("\n");
-        sb.append("=SMI\n");
-        return sb.toString();
-    }
-
-    // ─── LDM origin / destination extraction ───────────────────────────────
-
-    // Second line of the raw message packet: a dot, a 7-letter SITA address
-    // (3-letter station + 4-letter org code), a space, then a 6-digit
-    // date-time group. Captures the 3-letter station code.
-    private static final Pattern LDM_ORIGIN_SECOND_LINE =
-            Pattern.compile("^\\.([A-Z]{3})[A-Z]{4}\\s+\\d{6}");
-    // An isolated line of exactly 3 uppercase letters immediately followed by
-    // a baggage (B) or cargo (C) distribution line starting with a dot.
-    private static final Pattern LDM_ORIGIN_BEFORE_DISTRIBUTION =
-            Pattern.compile("^([A-Z]{3})\\s*$\\R^(?:B|C)\\s+\\.", Pattern.MULTILINE);
-    // First run of 3 capital letters right after a '-' on the same line.
-    private static final Pattern LDM_DESTINATION_AFTER_DASH =
-            Pattern.compile("-\\s*([A-Z]{3})");
-
-    /**
-     * Origin station code for an LDM message. Tries the "second line of the
-     * packet" SITA-address convention first (against the untouched, pre-
-     * truncation body, since that addressing line precedes the LDM marker);
-     * falls back to the "isolated line before a B/C distribution line"
-     * convention (against the LDM-truncated body) if the first doesn't match.
-     */
-    private String extractLdmOriginCode(String fullBodyText, String ldmBody) {
-        if (fullBodyText != null) {
-            String[] lines = fullBodyText.split("\n", -1);
-            if (lines.length > 1) {
-                Matcher m = LDM_ORIGIN_SECOND_LINE.matcher(lines[1].trim());
-                if (m.find()) return m.group(1);
-            }
-        }
-        if (ldmBody != null) {
-            Matcher m = LDM_ORIGIN_BEFORE_DISTRIBUTION.matcher(ldmBody);
-            if (m.find()) return m.group(1);
-        }
-        return null;
-    }
-
-    /**
-     * Destination Type B station code for an LDM message: only the first
-     * line containing a '-' is checked (per spec) — if that line's dash
-     * isn't immediately followed by 3 capital letters, extraction fails
-     * rather than scanning further lines.
-     */
-    private String extractLdmDestinationCode(String ldmBody) {
-        if (ldmBody == null) return null;
-        for (String line : ldmBody.split("\n", -1)) {
-            int dash = line.indexOf('-');
-            if (dash < 0) continue;
-            Matcher m = LDM_DESTINATION_AFTER_DASH.matcher(line.substring(dash));
-            return m.find() ? m.group(1) : null;
-        }
-        return null;
-    }
-
-    // ─── PTM origin / destination extraction ───────────────────────────────
-
-    // Flight designator + departure date line, e.g. "SV753/06AUG HYDJED":
-    // 2-3 char airline code + 1-4 digit flight number, "/", 2-digit day +
-    // 3-letter month, then a run of 6 capital letters split into two 3-letter
-    // station codes — origin (where these passengers boarded) then the
-    // immediate/transit destination (where they disembark).
-    private static final Pattern PTM_FLIGHT_ORIGIN_DEST =
-            Pattern.compile("^[A-Z0-9]{2,3}\\d{1,4}/\\d{2}[A-Z]{3}\\s+([A-Z]{3})([A-Z]{3})", Pattern.MULTILINE);
-
-    /** Returns {origin, destination} station codes for a PTM message, or {null, null} if not found. */
-    private String[] extractPtmOriginDestination(String ptmBody) {
-        if (ptmBody != null) {
-            Matcher m = PTM_FLIGHT_ORIGIN_DEST.matcher(ptmBody);
-            if (m.find()) return new String[]{m.group(1), m.group(2)};
-        }
-        return new String[]{null, null};
-    }
-
-    // ─── Station code → full SITA address lookup (app-config.xml / JSON) ──
-
-    private Map<String, Object> stationCodeCache;
-    private long stationCodeCacheFileMtime = -1;
-    // (defaultStationAddress is no longer cached here — AppSettings.getDefaultStationAddress()
-    // already does its own cheap mtime-checked caching and stays live-editable.)
-
-    /**
-     * Loads and caches the station-code → 7-character SITA address map from
-     * the JSON file whose path is configured in app-config.xml under
-     * <sitaMessaging><stationCodesFile>. The cache is invalidated whenever
-     * the file's lastModified timestamp changes, so editing the station
-     * codes JSON (by hand, or via a future dedicated editor) takes effect on
-     * the next message processed — no restart needed, same as the other
-     * live settings in {@link AppSettings}. Missing config/file/JSON just
-     * yields an empty map (best-effort — lookups then fail through to the
-     * configured default rather than the app crashing).
-     */
-    private synchronized Map<String, Object> loadStationCodes() {
-        String path = readAppConfigValue("stationCodesFile");
-        if (path == null || path.isEmpty()) return stationCodeCache != null ? stationCodeCache : Collections.emptyMap();
-        File f = new File(path);
-        long mtime = f.exists() ? f.lastModified() : 0L;
-        if (stationCodeCache != null && mtime == stationCodeCacheFileMtime) return stationCodeCache;
-
-        Map<String, Object> loaded = new HashMap<>();
-        try {
-            if (f.exists()) {
-                String json = Files.readString(f.toPath(), StandardCharsets.UTF_8);
-                Map<String, Object> parsed = MiniJson.parseObject(json);
-                if (parsed != null) loaded.putAll(parsed);
-            }
-        } catch (Exception ignored) {
-            // best-effort; invalid JSON just means codes won't expand this read
-        }
-        stationCodeCache = loaded;
-        stationCodeCacheFileMtime = mtime;
-        return stationCodeCache;
-    }
-
-    /** Reads a single top-level-named element's text from app-config.xml. */
-    private String readAppConfigValue(String tagName) {
-        // Delegates to util.AppConfig, which resolves the file next to the
-        // running JAR as a fallback when it's not found relative to the
-        // process's working directory — a plain new File("app-config.xml")
-        // here silently returned null (and therefore no station-code lookup
-        // and no default fallback) whenever the process wasn't launched with
-        // the install directory as its working directory.
-        return AppConfig.readValue(tagName);
-    }
-
-    private String getDefaultStationAddress() {
-        return AppSettings.getDefaultStationAddress();
-    }
-
-    /**
-     * Resolves a station code to its full SITA address via the JSON lookup,
-     * falling back to the <sitaMessaging><defaultStationAddress> configured
-     * in app-config.xml when the code couldn't be extracted from the message
-     * at all, or couldn't be found in the lookup — so =ORIGIN and
-     * =DESTINATION TYPE B are never left blank as long as a default is set.
-     */
-    private String resolveStationAddress(String code, String messageType, String fieldName, Consumer<String> logLine) {
-        if (code != null) {
-            Object v = loadStationCodes().get(code);
-            if (v != null) return v.toString();
-            logLine.accept("[WARN] " + messageType + ": no SITA address configured for station code '" + code
-                    + "' (needed for =" + fieldName + ") — check stationCodesFile in app-config.xml.");
-        }
-        String fallback = getDefaultStationAddress();
-        if (fallback != null && !fallback.isEmpty()) {
-            logLine.accept("[INFO] " + messageType + ": using configured default SITA address '" + fallback
-                    + "' for =" + fieldName + ".");
-            return fallback;
-        }
-        return null;
-    }
-
-    // ─── Sequential 5-digit message id ──────────────────────────────────────
-
-    private final Object msgIdLock = new Object();
-
-    /**
-     * Persistent, sequential 5-digit =MSGID, shared across all LDM/MVT/PTM
-     * messages regardless of task. Stored as a plain counter file in the
-     * app's data directory so it survives restarts; wraps from 99999 back to
-     * 00001. Best-effort: if the counter file can't be read/written, a value
-     * is still returned for the current message rather than failing the run.
-     */
-    private String nextMessageId() {
-        synchronized (msgIdLock) {
-            File counterFile = new File(storage.getDataDir(), "msgid-counter.txt");
-            int next = 1;
-            try {
-                if (counterFile.exists()) {
-                    String s = Files.readString(counterFile.toPath(), StandardCharsets.UTF_8).trim();
-                    int current = Integer.parseInt(s);
-                    next = (current % 99999) + 1;
-                }
-            } catch (Exception ignored) {
-                next = 1;
-            }
-            try {
-                Files.writeString(counterFile.toPath(), String.valueOf(next), StandardCharsets.UTF_8);
-            } catch (IOException ignored) {
-                // best-effort persistence; still return a value for this run
-            }
-            return String.format("%05d", next);
-        }
-    }
-
-    /**
-     * Drops every blank/whitespace-only line so the .RCV file has no gaps
-     * between lines of actual content — HTML paragraph/line breaks and the
-     * earlier cleanup passes leave behind blank lines (collapsed to at most
-     * one), which this removes entirely. Also strips any leading
-     * whitespace (spaces/tabs) from the start of each remaining line —
-     * HTML-to-plain-text conversion and quoted/indented content upstream
-     * can leave lines indented, which this normalizes back to column 0.
-     * Trailing whitespace is left alone (not part of this request).
-     *
-     * <p>Only used for BODY_ONLY/HEADERS_AND_BODY content — never applied
-     * to FULL_MESSAGE (raw MIME), where leading whitespace is sometimes
-     * structurally significant (RFC 2822 header folding).
-     */
-    private String removeBlankLines(String text) {
-        if (text == null || text.isEmpty()) return "";
-        String[] lines = text.split("\n", -1);
-        StringBuilder sb = new StringBuilder();
-        for (String line : lines) {
-            if (line.trim().isEmpty()) continue;
-            String stripped = stripLeadingWhitespace(line);
-            if (sb.length() > 0) sb.append("\n");
-            sb.append(stripped);
-        }
-        return sb.toString();
-    }
-
-    /** Removes only leading spaces/tabs from a single line, leaving the rest of the line untouched. */
-    private static String stripLeadingWhitespace(String line) {
-        int i = 0;
-        while (i < line.length() && (line.charAt(i) == ' ' || line.charAt(i) == '\t')) i++;
-        return line.substring(i);
-    }
-
-    /**
-     * Converts a Graph message body to plain text. Graph returns bodyType
-     * "html" for the vast majority of real-world mail — writing that raw
-     * markup into a .RCV file isn't usable as "body text", so block-level
-     * tags are turned into line breaks, all remaining tags are stripped, and
-     * the handful of entities that actually show up in mail are decoded.
-     * bodyType "text" is returned as-is.
-     */
-    private String toPlainText(String content, String bodyType) {
-        if (content == null) return "";
-        if (!"html".equalsIgnoreCase(bodyType)) return content;
-
-        String html = content;
-        html = html.replaceAll("(?is)<(script|style|head)[^>]*>.*?</\\1>", "");
-        html = html.replaceAll("(?i)<br\\s*/?>", "\n");
-        html = html.replaceAll("(?i)</(p|div|tr|li|h[1-6])>", "\n");
-        html = html.replaceAll("(?i)<(p|div|li)[^>]*>", "\n");
-        html = html.replaceAll("(?s)<[^>]+>", "");
-        html = html.replace("&nbsp;", " ")
-                .replace("&amp;", "&")
-                .replace("&lt;", "<")
-                .replace("&gt;", ">")
-                .replace("&quot;", "\"")
-                .replace("&#39;", "'")
-                .replace("&apos;", "'");
-        html = html.replaceAll("[ \\t]+\\n", "\n");
-        html = html.replaceAll("\\n{3,}", "\n\n");
-        return html.trim();
-    }
-
-    /**
-     * Strips automated banners that mail gateways/clients inject into the
-     * body — Outlook's "first contact" safety tip and generic external-sender
-     * warnings — since they're not part of the actual message. Applied
-     * wherever the banner appears in the text, not just at the start, since
-     * some gateways insert it inline rather than as a strict prefix.
-     */
-    private String removeAutomatedBanners(String text) {
-        if (text == null || text.isEmpty()) return "";
-        String result = text;
-        for (Pattern p : BANNER_REMOVAL_PATTERNS) {
-            result = p.matcher(result).replaceAll("");
-        }
-        return result.replaceAll("\\n{3,}", "\n\n").trim();
-    }
-
-    private static final Pattern[] BANNER_REMOVAL_PATTERNS = new Pattern[] {
-            // Outlook's "You don't often get email from X. Learn why this is
-            // important" safety tip — X varies per message, so match the fixed
-            // wrapper text around it rather than a literal sender.
-            Pattern.compile("(?is)you don't often get email from .*?learn why this is important\\.?"),
-            // "** EXTERNAL EMAIL - Please verify the sender ... **" style banners.
-            Pattern.compile("(?is)\\*\\*\\s*external email\\s*-.*?\\*\\*"),
-            // Common Office 365 default external-sender banner text.
-            Pattern.compile("(?is)this message originated from outside your organization\\.?\\s*"
-                    + "(do not click links or open attachments unless you recognize the sender[^.\\n]*\\.)?"),
-            // "[EXTERNAL]" tag some gateways prepend to the subject/body.
-            Pattern.compile("(?i)^\\s*\\[external]\\s*", Pattern.MULTILINE),
-            Pattern.compile("(?i)^caution:\\s*this email originated from outside.*$", Pattern.MULTILINE),
-    };
-
-    /**
-     * Company convention for these mailboxes: the substantive message content
-     * begins at a literal "LDM" / "MVT" / "PTM" marker in the body — whichever
-     * one starts the actual message — and everything before it (banners,
-     * greetings, etc.) is boilerplate that gets discarded. The marker found
-     * also identifies the message type, which drives the =PRIORITY value and
-     * whether/how origin+destination are extracted. If none of the three
-     * markers are present, no marker is returned and the text is left as-is
-     * (not an LDM/MVT/PTM message, so no SITA header is generated for it).
-     */
-    private static final String[] MESSAGE_TYPE_MARKERS = {"LDM", "MVT", "PTM"};
-
-    private static class MarkerMatch {
-        final String type;
-        final int index;
-        MarkerMatch(String type, int index) { this.type = type; this.index = index; }
-    }
-
-    private MarkerMatch findMessageTypeMarker(String text) {
-        if (text == null) return null;
-        MarkerMatch best = null;
-        for (String type : MESSAGE_TYPE_MARKERS) {
-            int idx = text.indexOf(type);
-            if (idx >= 0 && (best == null || idx < best.index)) {
-                best = new MarkerMatch(type, idx);
-            }
-        }
-        return best;
-    }
-
-    /**
-     * Classifies a message for automatic post-processing folder routing:
-     * checks Subject, attachment text, and body TOGETHER, case-insensitively,
-     * against every configured rule's key (see Settings → Message Routing),
-     * in the order those rules are listed — so if a message could match more
-     * than one key, whichever rule is listed first wins. The "Others"
-     * fallback rule's key is never matched against (it's the catch-all, not
-     * a marker to search for).
-     *
-     * Deliberately separate from findMessageTypeMarker (used for the SITA
-     * header): that one is a strict, single-source, case-sensitive match
-     * against the structured message content, because getting the header
-     * wrong has real consequences. This one is a looser "does this message
-     * relate to this classification at all" check across everywhere the
-     * marker could appear, since misrouting a message to the wrong folder
-     * because of a stray lowercase letter or because the word only appeared
-     * in the subject is the actual reported problem.
-     *
-     * @return the matching rule's key (e.g. "LDM", "PTM", or any custom key
-     *         configured in Settings), or {@code null} if nothing matched
-     *         (routes to the "Others" folder).
-     */
-    private String classifyForFolderRouting(GraphMailService.MailMessage m) {
-        String subject = m.subject != null ? m.subject : "";
-        String attachment = m.attachmentText != null ? m.attachmentText : "";
-        String body = toPlainText(m.bodyContent, m.bodyType);
-
-        String combined = (subject + "\n" + attachment + "\n" + body).toUpperCase(Locale.ROOT);
-        for (util.MailRoutingRule rule : AppSettings.getMailRoutingRules()) {
-            if (rule.isOthers()) continue;
-            String key = rule.getKey();
-            if (key != null && !key.trim().isEmpty() && combined.contains(key.trim().toUpperCase(Locale.ROOT))) {
-                return key.trim();
-            }
-        }
-        return null;
-    }
-
-    /**
-     * Resolves the destination folder name for automatic post-processing
-     * move: looks up the folder configured for this classification (LDM,
-     * PTM, or any custom key added in Settings), falling back to the
-     * "Others" rule's folder if nothing matches. Folder names come from the
-     * live app-settings database (see {@link AppSettings#getMailRoutingRules()})
-     * so a change made in the Settings panel takes effect on the very next
-     * message processed — no restart needed.
-     */
-    private String resolveMoveFolderName(String messageType) {
-        return AppSettings.resolveRoutingFolder(messageType);
-    }
-
-    // Lines matching any of these mark the start of a signature, footer/
-    // disclaimer, or quoted reply history — everything from the first match
-    // onward is dropped. Best-effort: real-world mail signature formats
-    // vary too much to catch every case, but this covers the common ones
-    // (Outlook/Gmail/mobile clients, RFC 3676 "-- " delimiter, disclaimers).
-    private static final Pattern[] BODY_CUTOFF_PATTERNS = new Pattern[] {
-            Pattern.compile("^-- ?$"),
-            Pattern.compile("^_{5,}$"),
-            Pattern.compile("(?i)^-{3,}\\s*original message\\s*-{3,}$"),
-            Pattern.compile("(?i)^on .{5,120} wrote:\\s*$"),
-            Pattern.compile("^from:\\s+\\S.*$", Pattern.CASE_INSENSITIVE),
-            Pattern.compile("^>.*$"),
-            Pattern.compile("(?i)^sent from my (iphone|android|mobile|samsung|ipad).*$"),
-            Pattern.compile("(?i)^get outlook for (ios|android).*$"),
-            Pattern.compile("(?i)^(confidentiality notice|disclaimer)\\b.*$"),
-            // Common sign-off lines — "Thanks & Regards", "Best Regards,", etc.
-            // Anchored to a line containing (at most) a short trailing name/
-            // title so it doesn't accidentally match the phrase mid-sentence.
-            Pattern.compile("(?i)^thanks\\s*(&|and)\\s*regards\\s*,?\\s*$"),
-            Pattern.compile("(?i)^(best|warm|kind|many)\\s+regards\\s*,?\\s*$"),
-            Pattern.compile("(?i)^regards\\s*,?\\s*$"),
-            Pattern.compile("(?i)^(thank\\s*you|thanks)\\s*,?\\s*$"),
-            Pattern.compile("(?i)^(best|sincerely|cheers|respectfully)\\s*,?\\s*$"),
-            Pattern.compile("(?i)^this (e-?mail|message)( and any (attachments|files))?"
-                    + " (is|are|contains|may contain).*confidential.*$"),
-    };
-
-    private String stripSignatureAndQuotedContent(String text) {
-        if (text == null || text.isEmpty()) return "";
-        String[] lines = text.split("\n", -1);
-        int cutoff = lines.length;
-
-        outer:
-        for (int i = 0; i < lines.length; i++) {
-            String line = lines[i].trim();
-            if (line.isEmpty()) continue;
-            for (Pattern p : BODY_CUTOFF_PATTERNS) {
-                if (!p.matcher(line).matches()) continue;
-                // A bare "From:" line is ambiguous on its own (could be body text
-                // someone typed) — only treat it as a quoted-reply header block
-                // when a Sent:/Date: line follows shortly after, matching the
-                // Outlook "From: / Sent: / To: / Subject:" quote-block pattern.
-                if (line.toLowerCase().startsWith("from:")) {
-                    boolean looksLikeQuoteBlock = false;
-                    for (int j = i + 1; j < Math.min(i + 4, lines.length); j++) {
-                        String next = lines[j].trim().toLowerCase();
-                        if (next.startsWith("sent:") || next.startsWith("date:")) {
-                            looksLikeQuoteBlock = true;
-                            break;
-                        }
-                    }
-                    if (!looksLikeQuoteBlock) continue;
-                }
-                cutoff = i;
-                break outer;
-            }
-        }
-
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < cutoff; i++) {
-            sb.append(lines[i]);
-            if (i < cutoff - 1) sb.append("\n");
-        }
-        return sb.toString().trim();
     }
 
     // ─── Cancellation ─────────────────────────────────────────────────────────

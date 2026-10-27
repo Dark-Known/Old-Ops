@@ -133,6 +133,32 @@ public class GraphMailService {
                                            int maxResults, long afterEpochMillis,
                                            Consumer<String> logLine)
             throws IOException, InterruptedException {
+        return fetchMessages(accessToken, folder, searchCriteria, mode, maxResults,
+                afterEpochMillis, logLine, 1, null);
+    }
+
+    /** Called for each message right after its content was fetched, on the worker thread that fetched it. */
+    public interface MessageProcessor {
+        void process(MailMessage message);
+    }
+
+    /**
+     * Same as the 7-argument form, but fetches the messages' bodies/attachments on up to
+     * {@code parallelism} worker threads and, when {@code onFetched} is given, hands each
+     * message to it on the same worker as soon as its own content has arrived — so one
+     * message can already be written/moved while the next ones are still downloading.
+     *
+     * <p>Messages are started oldest-first (same order as before); with {@code parallelism == 1}
+     * the work is strictly sequential. The returned list is always oldest-first regardless of
+     * which worker finished first. {@code onFetched} must handle its own failures; an unchecked
+     * exception from it fails the run.
+     */
+    public List<MailMessage> fetchMessages(String accessToken, String folder,
+                                           String searchCriteria, MailFetchMode mode,
+                                           int maxResults, long afterEpochMillis,
+                                           Consumer<String> logLine,
+                                           int parallelism, MessageProcessor onFetched)
+            throws IOException, InterruptedException {
 
         String folderSegment = resolveFolderSegment(accessToken, folder, logLine);
         String filter = mapSearchCriteriaToFilter(searchCriteria, logLine);
@@ -195,54 +221,89 @@ public class GraphMailService {
         }
         logLine.accept("[INFO] Fetched " + items.size() + " message(s) (cap=" + maxResults + ").");
 
-        List<MailMessage> results = new ArrayList<>();
         // Oldest-first among the fetched batch, mirroring the previous IMAP FETCH ordering.
-        for (int i = items.size() - 1; i >= 0; i--) {
-            Map<String, Object> item = items.get(i);
+        List<Map<String, Object>> oldestFirst = new ArrayList<>(items);
+        Collections.reverse(oldestFirst);
 
-            String id       = MiniJson.getString(item, "id", "");
-            String subject  = MiniJson.getString(item, "subject", "");
-            String received = MiniJson.getString(item, "receivedDateTime", "");
-
-            String from = "";
-            Map<String, Object> fromObj = MiniJson.getObject(item, "from");
-            if (fromObj != null) {
-                Map<String, Object> addr = MiniJson.getObject(fromObj, "emailAddress");
-                if (addr != null) from = MiniJson.getString(addr, "address", "");
-            }
-
-            String bodyContent;
-            String bodyType = "text";
-            String attachmentText = "";
-            List<String> attachmentNames = Collections.emptyList();
-            List<AttachmentFile> attachmentFiles = Collections.emptyList();
-
-            if (mode == MailFetchMode.FULL_MESSAGE) {
-                // Raw RFC 2822 MIME — closest analog to the old IMAP BODY[] fetch.
-                // Attachments are already embedded in the MIME itself, so no
-                // separate attachment fetch/preference logic applies here.
-                bodyContent = graphGetRaw(accessToken, graphBase + userPath + "/messages/" + id + "/$value");
-            } else {
-                Map<String, Object> full = graphGetJson(accessToken,
-                        graphBase + userPath + "/messages/" + id + "?$select=body");
-                Map<String, Object> body = MiniJson.getObject(full, "body");
-                if (body != null) {
-                    bodyContent = MiniJson.getString(body, "content", "");
-                    bodyType    = MiniJson.getString(body, "contentType", "text");
-                } else {
-                    bodyContent = "";
-                }
-
-                AttachmentBundle bundle = fetchTextAttachments(accessToken, id, logLine);
-                attachmentText = bundle.text;
-                attachmentNames = bundle.names;
-                attachmentFiles = bundle.files;
-            }
-
-            results.add(new MailMessage(id, subject, from, received, bodyContent, bodyType,
-                    attachmentText, attachmentNames, attachmentFiles));
+        int threads = Math.max(1, Math.min(parallelism, oldestFirst.size()));
+        if (threads > 1) {
+            logLine.accept("[INFO] Processing " + oldestFirst.size() + " message(s) on " + threads + " worker thread(s).");
         }
-        return results;
+
+        java.util.concurrent.atomic.AtomicInteger threadNo = new java.util.concurrent.atomic.AtomicInteger();
+        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(threads, r -> {
+            Thread t = new Thread(r, "mail-worker-" + threadNo.incrementAndGet());
+            t.setDaemon(true);
+            return t;
+        });
+        try {
+            List<java.util.concurrent.Future<MailMessage>> futures = new ArrayList<>();
+            for (Map<String, Object> item : oldestFirst) {
+                futures.add(pool.submit(() -> {
+                    MailMessage m = fetchOneMessage(accessToken, item, mode, logLine);
+                    if (onFetched != null) onFetched.process(m);
+                    return m;
+                }));
+            }
+            List<MailMessage> results = new ArrayList<>(futures.size());
+            for (java.util.concurrent.Future<MailMessage> f : futures) results.add(f.get());
+            return results;
+        } catch (java.util.concurrent.ExecutionException ee) {
+            Throwable cause = ee.getCause();
+            if (cause instanceof IOException) throw (IOException) cause;
+            if (cause instanceof InterruptedException) throw (InterruptedException) cause;
+            if (cause instanceof RuntimeException) throw (RuntimeException) cause;
+            if (cause instanceof Error) throw (Error) cause;
+            throw new IOException(cause);
+        } finally {
+            pool.shutdownNow(); // also cancels any not-yet-started messages if one failed or the task was cancelled
+        }
+    }
+
+    /** Downloads one message's content (body, or raw MIME, plus attachments) given its list-page entry. */
+    private MailMessage fetchOneMessage(String accessToken, Map<String, Object> item, MailFetchMode mode,
+                                        Consumer<String> logLine) throws IOException, InterruptedException {
+        String id       = MiniJson.getString(item, "id", "");
+        String subject  = MiniJson.getString(item, "subject", "");
+        String received = MiniJson.getString(item, "receivedDateTime", "");
+
+        String from = "";
+        Map<String, Object> fromObj = MiniJson.getObject(item, "from");
+        if (fromObj != null) {
+            Map<String, Object> addr = MiniJson.getObject(fromObj, "emailAddress");
+            if (addr != null) from = MiniJson.getString(addr, "address", "");
+        }
+
+        String bodyContent;
+        String bodyType = "text";
+        String attachmentText = "";
+        List<String> attachmentNames = Collections.emptyList();
+        List<AttachmentFile> attachmentFiles = Collections.emptyList();
+
+        if (mode == MailFetchMode.FULL_MESSAGE) {
+            // Raw RFC 2822 MIME — closest analog to the old IMAP BODY[] fetch.
+            // Attachments are already embedded in the MIME itself, so no
+            // separate attachment fetch/preference logic applies here.
+            bodyContent = graphGetRaw(accessToken, graphBase + userPath + "/messages/" + id + "/$value");
+        } else {
+            Map<String, Object> full = graphGetJson(accessToken,
+                    graphBase + userPath + "/messages/" + id + "?$select=body");
+            Map<String, Object> body = MiniJson.getObject(full, "body");
+            if (body != null) {
+                bodyContent = MiniJson.getString(body, "content", "");
+                bodyType    = MiniJson.getString(body, "contentType", "text");
+            } else {
+                bodyContent = "";
+            }
+
+            AttachmentBundle bundle = fetchTextAttachments(accessToken, id, logLine);
+            attachmentText = bundle.text;
+            attachmentNames = bundle.names;
+            attachmentFiles = bundle.files;
+        }
+
+        return new MailMessage(id, subject, from, received, bodyContent, bodyType,
+                attachmentText, attachmentNames, attachmentFiles);
     }
 
     // ─── Attachments ─────────────────────────────────────────────────────────
@@ -352,6 +413,36 @@ public class GraphMailService {
     // ─── Folder resolution ──────────────────────────────────────────────────
 
     private String resolveFolderSegment(String accessToken, String folder, Consumer<String> logLine)
+            throws IOException, InterruptedException {
+        return resolveFolderSegment(accessToken, folder, logLine, null);
+    }
+
+    /**
+     * Same, but remembers custom-folder ids in {@code cache} (one cache per run/mailbox — folder ids
+     * differ between mailboxes, so it must not outlive the run). Lookup-or-create is serialized on the
+     * cache, so several worker threads moving mail into a not-yet-existing folder create it once
+     * instead of racing (the loser would get a 409 and misfile its message into Inbox).
+     */
+    private String resolveFolderSegment(String accessToken, String folder, Consumer<String> logLine,
+                                        Map<String, String> cache)
+            throws IOException, InterruptedException {
+        if (cache == null || folder == null || folder.trim().isEmpty()) {
+            return resolveFolderSegmentUncached(accessToken, folder, logLine);
+        }
+        String key = folder.trim().toUpperCase(Locale.ROOT);
+        String hit = cache.get(key);
+        if (hit != null) return hit;
+        synchronized (cache) {
+            hit = cache.get(key);
+            if (hit != null) return hit;
+            String id = resolveFolderSegmentUncached(accessToken, folder, logLine);
+            // Don't cache the "defaulting to Inbox" fallback for a custom folder — a later message may succeed.
+            if (!"inbox".equals(id) || "INBOX".equals(key)) cache.put(key, id);
+            return id;
+        }
+    }
+
+    private String resolveFolderSegmentUncached(String accessToken, String folder, Consumer<String> logLine)
             throws IOException, InterruptedException {
         if (folder == null || folder.trim().isEmpty() || folder.equalsIgnoreCase("INBOX")) return "inbox";
         switch (folder.trim().toUpperCase(Locale.ROOT)) {
@@ -589,7 +680,14 @@ public class GraphMailService {
      */
     public void moveMessage(String accessToken, String messageId, String destinationFolder,
                             Consumer<String> logLine) throws IOException, InterruptedException {
-        String destId = resolveFolderSegment(accessToken, destinationFolder, logLine);
+        moveMessage(accessToken, messageId, destinationFolder, logLine, null);
+    }
+
+    /** Same, reusing {@code folderIdCache} (one per run) so the destination folder is looked up once, not per message. */
+    public void moveMessage(String accessToken, String messageId, String destinationFolder,
+                            Consumer<String> logLine, Map<String, String> folderIdCache)
+            throws IOException, InterruptedException {
+        String destId = resolveFolderSegment(accessToken, destinationFolder, logLine, folderIdCache);
         String body = "{\"destinationId\":\"" + MiniJson.escapeString(destId) + "\"}";
         graphPost(accessToken, graphBase + userPath + "/messages/" + messageId + "/move", body);
     }

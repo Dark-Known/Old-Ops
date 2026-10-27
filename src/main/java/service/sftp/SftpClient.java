@@ -38,6 +38,12 @@ public interface SftpClient extends AutoCloseable {
     /** Deletes a remote file. Returns false if it did not exist. */
     boolean delete(String remotePath) throws IOException;
 
+    /**
+     * Renames/moves a remote file within the server. Never replaces an existing file at {@code to}
+     * (the call fails instead), so an archive is never overwritten.
+     */
+    void rename(String from, String to) throws IOException;
+
     /** Aborts whatever is running and closes the connection. Safe to call more than once. */
     void cancel();
 

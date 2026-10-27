@@ -102,6 +102,21 @@ public class SftpScriptRunnerIT {
     }
 
     @Test
+    public void mvMovesAFileAndNeverReplacesAnExistingOne() throws Exception {
+        File base = new File(serverRoot, "mv");
+        base.mkdirs();
+        Files.write(new File(base, "a.txt").toPath(), "A".getBytes(StandardCharsets.UTF_8));
+        Files.write(new File(base, "b.txt").toPath(), "B".getBytes(StandardCharsets.UTF_8));
+        assertTrue(runner.run(script("mv " + qr("/mv/a.txt") + " " + qr("/mv/moved.txt")), PASSWORD, x -> { }).ok());
+        assertFalse(new File(base, "a.txt").exists());
+        assertEquals("A", new String(Files.readAllBytes(new File(base, "moved.txt").toPath()), StandardCharsets.UTF_8));
+        assertFalse("must not replace an existing file",
+                runner.run(script("mv " + qr("/mv/b.txt") + " " + qr("/mv/moved.txt")), PASSWORD, x -> { }).ok());
+        assertEquals("A", new String(Files.readAllBytes(new File(base, "moved.txt").toPath()), StandardCharsets.UTF_8));
+        assertTrue(new File(base, "b.txt").exists());
+    }
+
+    @Test
     public void wrongPasswordFailsTheRun() {
         try {
             SftpScriptRunner.Outcome o = runner.run(script("mkdir " + qr("/sr/nope")), "wrong", x -> { });

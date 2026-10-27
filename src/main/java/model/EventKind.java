@@ -27,6 +27,10 @@ public enum EventKind {
     RUN_CANCELLED    ("Cancelled",        Category.RUN,    Severity.WARN),
     STALE_RECOVERED  ("Stale run reset",  Category.RUN,    Severity.WARN),
 
+    // ── Mail tasks: one event per message handled by a run ───────────
+    MAIL_PROCESSED   ("Mail processed",   Category.RUN,    Severity.INFO),
+    MAIL_NOT_SAVED   ("Mail not saved",   Category.RUN,    Severity.WARN),
+
     // ── Watchers ─────────────────────────────────────────────────────
     WATCH_ARMED      ("Watcher armed",    Category.WATCH,  Severity.INFO),
     WATCH_TRIGGERED  ("Change detected",  Category.WATCH,  Severity.INFO),
