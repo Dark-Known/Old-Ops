@@ -138,6 +138,88 @@ public final class TransferLedger {
         }
     }
 
+    // ── "No new files" tracking ──────────────────────────────────────
+
+    /** When files last arrived for a task, when we started watching it, and when we last alerted (0 = never). */
+    public record State(long lastFilesAt, long watchingSince, long lastAlertAt) {}
+
+    public State state(String taskId) throws IOException {
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                     "SELECT last_files_at, watching_since, last_alert_at FROM task_state WHERE task_id = ?")) {
+            ps.setString(1, taskId);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? new State(rs.getLong(1), rs.getLong(2), rs.getLong(3)) : new State(0, 0, 0);
+            }
+        } catch (SQLException e) {
+            throw new IOException("Cannot read the task state (" + dbFile + "): " + e.getMessage(), e);
+        }
+    }
+
+    /** Starts the "watching since" clock for a task, if it has not started yet. */
+    public void startWatching(String taskId) throws IOException {
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                     "INSERT INTO task_state (task_id, watching_since) VALUES (?, ?) ON CONFLICT(task_id) DO UPDATE SET "
+                             + "watching_since = CASE WHEN watching_since = 0 THEN excluded.watching_since ELSE watching_since END")) {
+            ps.setString(1, taskId);
+            ps.setLong(2, clock.getAsLong());
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new IOException("Cannot write the task state (" + dbFile + "): " + e.getMessage(), e);
+        }
+    }
+
+    /** Files arrived now. Returns true when a "no new files" alert was outstanding (so a "files are back" note is due). */
+    public boolean markFilesTransferred(String taskId) throws IOException {
+        long now = clock.getAsLong();
+        try (Connection c = open()) {
+            c.setAutoCommit(false);
+            try {
+                boolean wasSilent = false;
+                try (PreparedStatement ps = c.prepareStatement("SELECT last_alert_at FROM task_state WHERE task_id = ?")) {
+                    ps.setString(1, taskId);
+                    try (ResultSet rs = ps.executeQuery()) { wasSilent = rs.next() && rs.getLong(1) > 0; }
+                }
+                try (PreparedStatement ps = c.prepareStatement(
+                        "INSERT INTO task_state (task_id, last_files_at, watching_since, last_alert_at) VALUES (?, ?, ?, 0) "
+                                + "ON CONFLICT(task_id) DO UPDATE SET last_files_at = excluded.last_files_at, last_alert_at = 0")) {
+                    ps.setString(1, taskId);
+                    ps.setLong(2, now);
+                    ps.setLong(3, now);
+                    ps.executeUpdate();
+                }
+                c.commit();
+                return wasSilent;
+            } catch (SQLException ex) {
+                try { c.rollback(); } catch (SQLException ignored) { }
+                throw ex;
+            }
+        } catch (SQLException e) {
+            throw new IOException("Cannot write the task state (" + dbFile + "): " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Claims the right to raise the "no new files" alert: true for exactly one caller (even across the GUI and the
+     * Daemon) when no alert was raised yet or the last one is at least {@code everyMillis} old ({@code <= 0}: always).
+     */
+    public boolean claimSilenceAlert(String taskId, long everyMillis) throws IOException {
+        long now = clock.getAsLong();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                     "UPDATE task_state SET last_alert_at = ? WHERE task_id = ? AND (last_alert_at = 0 OR ? <= 0 OR ? - last_alert_at >= ?)")) {
+            ps.setLong(1, now);
+            ps.setString(2, taskId);
+            ps.setLong(3, everyMillis);
+            ps.setLong(4, now);
+            ps.setLong(5, everyMillis);
+            return ps.executeUpdate() > 0;
+        } catch (SQLException e) {
+            throw new IOException("Cannot write the task state (" + dbFile + "): " + e.getMessage(), e);
+        }
+    }
+
     // ── internals ────────────────────────────────────────────────────
 
     /** Opens the file (creating it and the table on first use) and drops entries past the retention. */
@@ -158,6 +240,9 @@ public final class TransferLedger {
                     + "task_id TEXT NOT NULL, name TEXT NOT NULL, size INTEGER NOT NULL, "
                     + "mtime INTEGER NOT NULL, sent_at INTEGER NOT NULL, "
                     + "PRIMARY KEY (task_id, name, size, mtime))");
+            st.execute("CREATE TABLE IF NOT EXISTS task_state ("
+                    + "task_id TEXT PRIMARY KEY, last_files_at INTEGER NOT NULL DEFAULT 0, "
+                    + "watching_since INTEGER NOT NULL DEFAULT 0, last_alert_at INTEGER NOT NULL DEFAULT 0)");
             st.execute("CREATE INDEX IF NOT EXISTS idx_sent_files_task_name ON sent_files (task_id, name)");
             st.execute("CREATE INDEX IF NOT EXISTS idx_sent_files_sent_at ON sent_files (sent_at)");
         } catch (SQLException e) {

@@ -44,7 +44,7 @@ public class CredentialManagerPanel extends JPanel {
     // per refresh() (a DB count query per credential) and looked up by the
     // row renderer, same "compute once, render many" split TaskManagerPanel
     // uses for its own per-row daemon-derived fields.
-    private final Map<String, Integer> usageByUsername = new HashMap<>();
+    private final Map<String, Integer> usageByName = new HashMap<>();
 
     public CredentialManagerPanel(XmlStorageService storage, RunHistoryService auditLog) {
         this.storage = storage;
@@ -88,7 +88,7 @@ public class CredentialManagerPanel extends JPanel {
         btnDelete.addActionListener(e -> {
             Credential c = credList.getSelectedValue();
             if (c == null) { JOptionPane.showMessageDialog(this, "Select a credential to delete."); return; }
-            String username = c.getUsername();
+            String username = c.getName();   // credentials are identified by name
             int inUse = storage.countTasksUsingCredential(username);
             String warning = inUse > 0
                 ? "\n\nWarning: " + inUse + " task" + (inUse == 1 ? " is" : "s are")
@@ -96,7 +96,7 @@ public class CredentialManagerPanel extends JPanel {
                     + "Deleting it will make " + (inUse == 1 ? "that task" : "those tasks") + " fail at their next run."
                 : "";
             int ok = JOptionPane.showConfirmDialog(this,
-                "Delete credential for \"" + username + "\"?" + warning,
+                "Delete credential \"" + username + "\" (" + c.getUsername() + "@" + c.getHost() + ")?" + warning,
                 "Confirm Delete", JOptionPane.YES_NO_OPTION,
                 inUse > 0 ? JOptionPane.WARNING_MESSAGE : JOptionPane.QUESTION_MESSAGE);
             if (ok == JOptionPane.YES_OPTION) {
@@ -108,7 +108,7 @@ public class CredentialManagerPanel extends JPanel {
                     if (storage.isConnected()) {
                         String detail = storage.getLastCredentialSaveError();
                         logActivityFailed("Credential delete failed",
-                                "Could not delete credential for " + username
+                                "Could not delete credential " + username
                                         + " — database connected, but this write failed"
                                         + (detail != null ? ": " + detail : "."));
                         JOptionPane.showMessageDialog(this,
@@ -119,7 +119,7 @@ public class CredentialManagerPanel extends JPanel {
                     } else {
                         String detail = storage.getConnectionError();
                         logActivityFailed("Credential delete failed",
-                                "Could not delete credential for " + username
+                                "Could not delete credential " + username
                                         + " — database not connected"
                                         + (detail != null ? ": " + detail : "."));
                         JOptionPane.showMessageDialog(this,
@@ -129,7 +129,7 @@ public class CredentialManagerPanel extends JPanel {
                     }
                     return;
                 }
-                logActivity("Credential deleted", "Deleted credential for " + username
+                logActivity("Credential deleted", "Deleted credential " + username + " (login " + c.getUsername() + ")"
                         + " (host: " + c.getHost() + ", OS type: " + c.getOsType() + ")"
                         + (inUse > 0 ? " — was in use by " + inUse + " task" + (inUse == 1 ? "" : "s")
                                 + ", which will fail at their next run" : ""));
@@ -159,8 +159,8 @@ public class CredentialManagerPanel extends JPanel {
             List<model.ScheduledTask> tasks = storage.loadTasks();
             Map<String, Integer> usage = new HashMap<>();
             for (Credential c : creds) {
-                usage.put(c.getUsername(),
-                        service.XmlStorageService.countTasksUsingCredential(tasks, c.getUsername()));
+                usage.put(c.getName(),
+                        service.XmlStorageService.countTasksUsingCredential(tasks, c.getName()));
             }
             return new Loaded(creds, usage);
         }, this::applyLoaded, e -> System.err.println("Credential refresh failed: " + e));
@@ -170,16 +170,16 @@ public class CredentialManagerPanel extends JPanel {
 
     private void applyLoaded(Loaded loaded) {
         Credential selected = credList.getSelectedValue();
-        String selectedUsername = selected != null ? selected.getUsername() : null;
+        String selectedUsername = selected != null ? selected.getName() : null;
 
         listModel.clear();
-        usageByUsername.clear();
-        usageByUsername.putAll(loaded.usage());
+        usageByName.clear();
+        usageByName.putAll(loaded.usage());
         for (Credential c : loaded.creds()) listModel.addElement(c);
 
         if (selectedUsername != null) {
             for (int i = 0; i < listModel.size(); i++) {
-                if (selectedUsername.equals(listModel.get(i).getUsername())) {
+                if (selectedUsername.equals(listModel.get(i).getName())) {
                     credList.setSelectedIndex(i);
                     break;
                 }
@@ -233,7 +233,7 @@ public class CredentialManagerPanel extends JPanel {
             currentIcon = new IconTile(glyph, Color.WHITE, tileBg);
             add(currentIcon, BorderLayout.WEST);
 
-            int inUse = usageByUsername.getOrDefault(c.getUsername(), 0);
+            int inUse = usageByName.getOrDefault(c.getName(), 0);
             if (inUse > 0) {
                 usagePill.setText(inUse + (inUse == 1 ? " task" : " tasks"));
                 usagePill.setColors(AppTheme.SUCCESS_FG, AppTheme.SUCCESS_BG);
@@ -281,14 +281,20 @@ public class CredentialManagerPanel extends JPanel {
      * wider-visibility surface than the credential itself, and "changed" is
      * all an operator needs to know here).
      */
-    private String buildCredentialChangeDetail(boolean isAdd, String user, String host,
-            String oldHost, String newHost, String oldPassword, String newPassword,
+    private String buildCredentialChangeDetail(boolean isAdd, String name, String oldName, String user, String oldUser,
+            String host, String oldHost, String newHost, String oldPassword, String newPassword,
             String oldOsType, String newOsType) {
-        String target = user + "@" + host;
+        String target = "\"" + name + "\" (" + user + "@" + host + ")";
         if (isAdd) {
-            return "Added credential for " + target + " (OS type: " + newOsType + ").";
+            return "Added credential " + target + " (OS type: " + newOsType + ").";
         }
         java.util.List<String> changes = new java.util.ArrayList<>();
+        if (oldName != null && !oldName.equals(name)) {
+            changes.add("renamed from \"" + oldName + "\" (tasks that used it now use \"" + name + "\")");
+        }
+        if (oldUser != null && !oldUser.equals(user)) {
+            changes.add("username changed from \"" + oldUser + "\" to \"" + user + "\"");
+        }
         if (oldHost != null && !oldHost.equals(newHost)) {
             changes.add("host changed from \"" + oldHost + "\" to \"" + newHost + "\"");
         }
@@ -299,9 +305,9 @@ public class CredentialManagerPanel extends JPanel {
             changes.add("OS type changed from " + oldOsType + " to " + newOsType);
         }
         if (changes.isEmpty()) {
-            return "Edited credential for " + target + " — no fields actually changed (re-saved as-is).";
+            return "Edited credential " + target + " — no fields actually changed (re-saved as-is).";
         }
-        return "Edited credential for " + target + " — " + String.join("; ", changes) + ".";
+        return "Edited credential " + target + " — " + String.join("; ", changes) + ".";
     }
 
     private void logActivity(String title, String detail) {
@@ -339,13 +345,15 @@ public class CredentialManagerPanel extends JPanel {
         JDialog dlg = new JDialog(
             (Frame) SwingUtilities.getWindowAncestor(this),
             existing == null ? "Add Credential" : "Edit Credential", true);
-        dlg.setSize(460, 380);
+        dlg.setSize(480, 420);
         dlg.setLocationRelativeTo(this);
         dlg.setLayout(new BorderLayout(10, 10));
 
         JPanel form = new JPanel(new GridBagLayout());
         form.setBorder(new EmptyBorder(15, 15, 5, 15));
 
+        JTextField    tfName = new JTextField(existing != null ? existing.getName()     : "", 22);
+        tfName.setToolTipText("A unique name for this credential, e.g. \"Server A admin\". Tasks refer to it by this name.");
         JTextField    tfHost = new JTextField(existing != null ? existing.getHost()     : "", 22);
         JTextField    tfUser = new JTextField(existing != null ? existing.getUsername() : "", 22);
         JPasswordField tfPass = new JPasswordField(22);
@@ -354,15 +362,11 @@ public class CredentialManagerPanel extends JPanel {
         JComboBox<String> cbOs = new JComboBox<>(new String[]{"WINDOWS", "LINUX"});
         if (existing != null) cbOs.setSelectedItem(existing.getOsType());
 
-        addFormRow(form, "Hostname / IP *", tfHost, 0);
-        addFormRow(form, "Username *",       tfUser, 1);
-        // Make username read-only when editing (it is the key)
-        if (existing != null) {
-            tfUser.setEditable(false);
-            tfUser.setBackground(AppTheme.isDark() ? new Color(0x3A3A3A) : new Color(0xF0F0F0));
-        }
-        addFormRow(form, "Password *",  tfPass, 2);
-        addFormRow(form, "OS Type *",   cbOs,   3);
+        addFormRow(form, "Credential name *", tfName, 0);
+        addFormRow(form, "Hostname / IP *", tfHost, 1);
+        addFormRow(form, "Username *",       tfUser, 2);
+        addFormRow(form, "Password *",  tfPass, 3);
+        addFormRow(form, "OS Type *",   cbOs,   4);
 
         JButton btnTest = new JButton("Test Connection");
         btnTest.setToolTipText("Opens a real SFTP session with the fields above to verify they work");
@@ -392,11 +396,11 @@ public class CredentialManagerPanel extends JPanel {
         });
         JPanel testRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
         testRow.add(btnTest);
-        addFormRow(form, "", testRow, 4);
+        addFormRow(form, "", testRow, 5);
 
         addFormRow(form, "",
-            new JLabel("<html><i style='color:#888'>Password stored as plain text in"
-                + " credentials.db</i></html>"), 5);
+            new JLabel("<html><i style='color:#888'>Renaming updates the tasks that use this credential."
+                + " Passwords are stored encrypted.</i></html>"), 6);
 
         JButton btnSave   = new GradientButton("Save");
         JButton btnCancel = new JButton("Cancel");
@@ -409,6 +413,14 @@ public class CredentialManagerPanel extends JPanel {
             if (host.isEmpty() || user.isEmpty()) {
                 JOptionPane.showMessageDialog(dlg, "Host and Username are required."); return;
             }
+            String credName = tfName.getText().trim().isEmpty() ? user + "@" + host : tfName.getText().trim();
+            if (storage.isCredentialNameTaken(credName, existing != null ? existing.getId() : null)) {
+                JOptionPane.showMessageDialog(dlg,
+                        "A credential named \"" + credName + "\" already exists.\nChoose a different name "
+                                + "(the same username can be used on many servers, the name must be unique).",
+                        "Name already used", JOptionPane.WARNING_MESSAGE);
+                return;
+            }
             if (pass.isEmpty()) {
                 JOptionPane.showMessageDialog(dlg, "Password is required."); return;
             }
@@ -419,8 +431,10 @@ public class CredentialManagerPanel extends JPanel {
             String oldHost = existing != null ? existing.getHost() : null;
             String oldPassword = existing != null ? existing.getPassword() : null;
             String oldOsType = existing != null ? existing.getOsType() : null;
+            String oldName = existing != null ? existing.getName() : null;
+            String oldUser = existing != null ? existing.getUsername() : null;
             if (c.getId() == null) c.setId(UUID.randomUUID().toString());
-            c.setName(user + "@" + host);
+            c.setName(credName);
             c.setHost(host);
             c.setUsername(user);
             c.setPassword(pass);
@@ -433,7 +447,7 @@ public class CredentialManagerPanel extends JPanel {
                 if (storage.isConnected()) {
                     String detail = storage.getLastCredentialSaveError();
                     logActivityFailed("Credential save failed",
-                            "Could not save credential for " + user + "@" + host
+                            "Could not save credential " + credName + " (" + user + "@" + host + ")"
                                     + " — database connected, but this write failed"
                                     + (detail != null ? ": " + detail : "."));
                     JOptionPane.showMessageDialog(dlg,
@@ -445,7 +459,7 @@ public class CredentialManagerPanel extends JPanel {
                 } else {
                     String detail = storage.getConnectionError();
                     logActivityFailed("Credential save failed",
-                            "Could not save credential for " + user + "@" + host
+                            "Could not save credential " + credName + " (" + user + "@" + host + ")"
                                     + " — database not connected"
                                     + (detail != null ? ": " + detail : "."));
                     JOptionPane.showMessageDialog(dlg,
@@ -457,7 +471,7 @@ public class CredentialManagerPanel extends JPanel {
                 return;
             }
             logActivity(existing == null ? "Credential added" : "Credential edited",
-                    buildCredentialChangeDetail(existing == null, user, host, oldHost, host,
+                    buildCredentialChangeDetail(existing == null, credName, oldName, user, oldUser, host, oldHost, host,
                             oldPassword, pass, oldOsType, c.getOsType()));
             refresh();
             dlg.dispose();

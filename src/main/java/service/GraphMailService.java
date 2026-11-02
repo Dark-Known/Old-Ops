@@ -9,6 +9,10 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeFormatterBuilder;
 import java.util.*;
@@ -66,6 +70,7 @@ public class GraphMailService {
     String userPath() { return userPath; }
     private static final java.time.Duration REQUEST_TIMEOUT = java.time.Duration.ofSeconds(60);
     private static final int MAX_ATTEMPTS = 4;
+    private static final java.time.Duration ATTACHMENT_TIMEOUT = java.time.Duration.ofMinutes(5);
 
     public static class MailMessage {
         public final String id;
@@ -101,16 +106,55 @@ public class GraphMailService {
         }
     }
 
-    /** A single downloadable (non-inline, file-type) attachment's raw content. */
+    /**
+     * A single downloadable (non-inline, file-type) attachment. Small ones are kept in memory; anything over
+     * {@link #IN_MEMORY_LIMIT} stays in a temporary file, so a big attachment never has to fit in the heap.
+     * Call {@link #discard()} when done with it (the temporary file is also removed when the JVM exits).
+     */
     public static class AttachmentFile {
+        /** Attachments up to this size are held in memory; bigger ones are spilled to a temporary file. */
+        public static final int IN_MEMORY_LIMIT = 1024 * 1024;
+
         public final String name;
         public final String contentType;
-        public final byte[] bytes;
+        private final byte[] bytes;   // null when spilled
+        private final Path spill;     // null when in memory
+        private final long length;
 
         AttachmentFile(String name, String contentType, byte[] bytes) {
             this.name = name != null ? name : "attachment";
             this.contentType = contentType != null ? contentType : "";
             this.bytes = bytes != null ? bytes : new byte[0];
+            this.spill = null;
+            this.length = this.bytes.length;
+        }
+
+        AttachmentFile(String name, String contentType, Path spill, long length) {
+            this.name = name != null ? name : "attachment";
+            this.contentType = contentType != null ? contentType : "";
+            this.bytes = null;
+            this.spill = spill;
+            this.length = length;
+        }
+
+        /** Size in bytes. */
+        public long length() { return length; }
+
+        /** True when the content lives in a temporary file rather than in memory. */
+        boolean isSpilled() { return spill != null; }
+
+        /** Writes the content to {@code dest} (which may already exist as an empty placeholder). */
+        public void copyTo(Path dest) throws IOException {
+            if (spill != null) Files.copy(spill, dest, StandardCopyOption.REPLACE_EXISTING);
+            else Files.write(dest, bytes);
+        }
+
+        /** The whole content as bytes (reads the temporary file back if spilled — use for small text only). */
+        byte[] readAll() throws IOException { return spill != null ? Files.readAllBytes(spill) : bytes; }
+
+        /** Removes the temporary file, if any. Safe to call more than once. */
+        public void discard() {
+            if (spill != null) { try { Files.deleteIfExists(spill); } catch (IOException ignored) { } }
         }
     }
 
@@ -308,7 +352,7 @@ public class GraphMailService {
 
     // ─── Attachments ─────────────────────────────────────────────────────────
 
-    private static class AttachmentBundle {
+    static class AttachmentBundle {
         final String text;
         final List<String> names;
         final List<AttachmentFile> files;
@@ -342,7 +386,132 @@ public class GraphMailService {
      * used here to distinguish file attachments from item/reference ones
      * client-side instead.
      */
-    private AttachmentBundle fetchTextAttachments(String accessToken, String messageId, Consumer<String> logLine)
+    AttachmentBundle fetchTextAttachments(String accessToken, String messageId, Consumer<String> logLine)
+            throws IOException, InterruptedException {
+        String base = graphBase + userPath + "/messages/" + messageId + "/attachments";
+        Map<String, Object> resp;
+        try {
+            // Metadata only (no contentBytes): the file contents are then streamed one by one, so the
+            // heap never holds a whole mail's worth of base64 text plus its decoded copy.
+            resp = graphGetJson(accessToken, base + "?$select=id,name,contentType,size,isInline");
+        } catch (IOException ex) {
+            logLine.accept("[INFO] Attachment list without contents not available (" + ex.getMessage()
+                    + ") \u2014 using the full list instead.");
+            return fetchTextAttachmentsInline(accessToken, messageId, logLine);
+        }
+
+        List<Object> arr = MiniJson.getArray(resp, "value");
+        if (arr == null || arr.isEmpty()) return new AttachmentBundle("", Collections.emptyList(), Collections.emptyList());
+
+        StringBuilder combined = new StringBuilder();
+        List<String> textNames = new ArrayList<>();
+        List<AttachmentFile> files = new ArrayList<>();
+        try {
+            for (Object o : arr) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> att = (Map<String, Object>) o;
+                if (MiniJson.getBoolean(att, "isInline", false)) continue;
+                String odataType = MiniJson.getString(att, "@odata.type", "");
+                String name = MiniJson.getString(att, "name", "(unnamed)");
+                if (!"#microsoft.graph.fileAttachment".equals(odataType)) {
+                    logLine.accept("[INFO] Skipping non-file attachment '" + name + "' (" + odataType
+                            + ") \u2014 no downloadable content.");
+                    continue;
+                }
+                String contentType = MiniJson.getString(att, "contentType", "");
+                String id = MiniJson.getString(att, "id", null);
+                int size = MiniJson.getInt(att, "size", -1);
+                if (id == null || id.isEmpty()) {
+                    logLine.accept("[WARN] Attachment '" + name + "' has no id \u2014 skipped.");
+                    continue;
+                }
+                AttachmentFile f;
+                try {
+                    f = downloadAttachment(accessToken, base + "/" + urlEnc(id), name, contentType, size);
+                } catch (IOException ex) {
+                    logLine.accept("[WARN] Could not download attachment '" + name + "': " + ex.getMessage());
+                    continue;
+                }
+                files.add(f);
+                if (isTextAttachment(name, contentType)) {
+                    String text = new String(f.readAll(), StandardCharsets.UTF_8);
+                    if (combined.length() > 0) combined.append("\n\n");
+                    combined.append(text);
+                    textNames.add(name);
+                }
+            }
+        } catch (IOException | InterruptedException | RuntimeException e) {
+            for (AttachmentFile f : files) f.discard();   // do not leave temporary files behind
+            throw e;
+        }
+        return new AttachmentBundle(combined.toString(), textNames, files);
+    }
+
+    /**
+     * Streams one attachment's raw bytes from {@code .../attachments/{id}/$value}: a small one into memory, a big
+     * one straight into a temporary file. If that endpoint refuses, falls back to fetching just that one attachment
+     * as JSON (still one at a time).
+     */
+    private AttachmentFile downloadAttachment(String accessToken, String attachmentUrl, String name,
+                                              String contentType, int sizeHint) throws IOException, InterruptedException {
+        boolean small = sizeHint >= 0 && sizeHint <= AttachmentFile.IN_MEMORY_LIMIT;
+        HttpRequest req = HttpRequest.newBuilder()
+                .uri(URI.create(attachmentUrl + "/$value"))
+                .header("Authorization", "Bearer " + accessToken)
+                .header("Prefer", "IdType=\"ImmutableId\"")
+                .GET()
+                .timeout(ATTACHMENT_TIMEOUT)
+                .build();
+        if (small) {
+            HttpResponse<byte[]> r = sendWithRetry(req, HttpResponse.BodyHandlers.ofByteArray());
+            if (r.statusCode() == 200) return new AttachmentFile(name, contentType, r.body());
+        } else {
+            sweepStaleTempFiles();
+            Path tmp = Files.createTempFile("opstool-att-", ".part");
+            try {
+                HttpResponse<Path> r = sendWithRetry(req, HttpResponse.BodyHandlers.ofFile(tmp,
+                        StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING));
+                if (r.statusCode() == 200) {
+                    long len = Files.size(tmp);
+                    if (len <= AttachmentFile.IN_MEMORY_LIMIT) {            // size hint was missing or wrong
+                        byte[] b = Files.readAllBytes(tmp);
+                        Files.deleteIfExists(tmp);
+                        return new AttachmentFile(name, contentType, b);
+                    }
+                    return new AttachmentFile(name, contentType, tmp, len);
+                }
+            } catch (IOException | InterruptedException | RuntimeException e) {
+                try { Files.deleteIfExists(tmp); } catch (IOException ignored) { }
+                throw e;
+            }
+            try { Files.deleteIfExists(tmp); } catch (IOException ignored) { }
+        }
+        // Fallback: this single attachment as JSON (base64) — memory is bounded by one attachment.
+        Map<String, Object> one = graphGetJson(accessToken, attachmentUrl);
+        String b64 = MiniJson.getString(one, "contentBytes", null);
+        if (b64 == null || b64.isEmpty()) throw new IOException("no content returned");
+        try {
+            return new AttachmentFile(name, contentType, Base64.getDecoder().decode(b64));
+        } catch (IllegalArgumentException ex) {
+            throw new IOException("content could not be decoded");
+        }
+    }
+
+    private static final java.util.concurrent.atomic.AtomicBoolean SWEPT = new java.util.concurrent.atomic.AtomicBoolean();
+
+    /** Once per run of the program: removes attachment temp files a crashed earlier run left behind (older than a day). */
+    private static void sweepStaleTempFiles() {
+        if (!SWEPT.compareAndSet(false, true)) return;
+        try (var dir = Files.newDirectoryStream(Path.of(System.getProperty("java.io.tmpdir")), "opstool-att-*.part")) {
+            long cutoff = System.currentTimeMillis() - 24L * 3600 * 1000;
+            for (Path p : dir) {
+                try { if (Files.getLastModifiedTime(p).toMillis() < cutoff) Files.deleteIfExists(p); } catch (IOException ignored) { }
+            }
+        } catch (IOException | RuntimeException ignored) { }
+    }
+
+    /** The previous way: one request returning every attachment with its base64 content. Used only as a fallback. */
+    private AttachmentBundle fetchTextAttachmentsInline(String accessToken, String messageId, Consumer<String> logLine)
             throws IOException, InterruptedException {
         Map<String, Object> resp;
         try {
@@ -361,38 +530,28 @@ public class GraphMailService {
         for (Object o : arr) {
             @SuppressWarnings("unchecked")
             Map<String, Object> att = (Map<String, Object>) o;
-
-            if (MiniJson.getBoolean(att, "isInline", false)) continue; // embedded images etc., not real attachments
-
-            // Only file attachments carry contentBytes; item attachments
-            // (forwarded emails) and reference attachments (e.g. a
-            // SharePoint/OneDrive link) don't — skip those, there is
-            // nothing to download.
+            if (MiniJson.getBoolean(att, "isInline", false)) continue;
             String odataType = MiniJson.getString(att, "@odata.type", "");
             String name = MiniJson.getString(att, "name", "(unnamed)");
             if (!"#microsoft.graph.fileAttachment".equals(odataType)) {
                 logLine.accept("[INFO] Skipping non-file attachment '" + name + "' (" + odataType
-                        + ") — no downloadable content.");
+                        + ") \u2014 no downloadable content.");
                 continue;
             }
-
             String contentType = MiniJson.getString(att, "contentType", "");
             String b64 = MiniJson.getString(att, "contentBytes", null);
             if (b64 == null || b64.isEmpty()) {
-                logLine.accept("[WARN] Attachment '" + name + "' has no contentBytes — skipped.");
+                logLine.accept("[WARN] Attachment '" + name + "' has no contentBytes \u2014 skipped.");
                 continue;
             }
-
             byte[] raw;
             try {
                 raw = Base64.getDecoder().decode(b64);
             } catch (IllegalArgumentException ex) {
-                logLine.accept("[WARN] Could not decode attachment '" + name + "' — skipped.");
+                logLine.accept("[WARN] Could not decode attachment '" + name + "' \u2014 skipped.");
                 continue;
             }
-
             files.add(new AttachmentFile(name, contentType, raw));
-
             if (isTextAttachment(name, contentType)) {
                 String text = new String(raw, StandardCharsets.UTF_8);
                 if (combined.length() > 0) combined.append("\n\n");
@@ -775,10 +934,23 @@ public class GraphMailService {
      * off 2, 4, 8 s. Other statuses are returned untouched for the caller to judge.
      */
     private HttpResponse<String> sendWithRetry(HttpRequest req) throws IOException, InterruptedException {
-        HttpResponse<String> resp = null;
+        return sendWithRetry(req, HttpResponse.BodyHandlers.ofString());
+    }
+
+    private <T> HttpResponse<T> sendWithRetry(HttpRequest req, HttpResponse.BodyHandler<T> handler)
+            throws IOException, InterruptedException {
+        HttpResponse<T> resp = null;
         for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-            resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+            long t0 = System.currentTimeMillis();
+            try {
+                resp = http.send(req, handler);
+            } catch (IOException | RuntimeException ex) {
+                GraphCallLog.record("graph", req.method(), req.uri(), userPath, 0, System.currentTimeMillis() - t0, -1, null, attempt,
+                        ex.getClass().getSimpleName() + ": " + ex.getMessage());
+                throw ex;
+            }
             int code = resp.statusCode();
+            logCall(req, resp, userPath, System.currentTimeMillis() - t0, attempt);
             if ((code != 429 && code != 503) || attempt == MAX_ATTEMPTS) return resp;
             long waitSec = 2L << (attempt - 1);
             try {
@@ -789,6 +961,22 @@ public class GraphMailService {
             Thread.sleep(waitSec * 1000);
         }
         return resp;
+    }
+
+    private static void logCall(HttpRequest req, HttpResponse<?> resp, String mailbox, long millis, int attempt) {
+        int code = resp.statusCode();
+        String note = "";
+        if (code < 200 || code >= 300) {
+            Object b = resp.body();
+            note = b instanceof String ? GraphCallLog.errorText((String) b)
+                    : b instanceof byte[] ? GraphCallLog.errorText(new String((byte[]) b, StandardCharsets.UTF_8)) : "";
+            String ra = resp.headers().firstValue("Retry-After").orElse(null);
+            if (ra != null) note += (note.isEmpty() ? "" : " ") + "(Retry-After " + ra + " s)";
+        }
+        long len = resp.headers().firstValueAsLong("Content-Length").orElse(-1);
+        GraphCallLog.record("graph", req.method(), req.uri(), mailbox, code, millis, len,
+                resp.headers().firstValue("request-id").orElse(resp.headers().firstValue("client-request-id").orElse(null)),
+                attempt, note);
     }
 
     private String urlEnc(String s) {

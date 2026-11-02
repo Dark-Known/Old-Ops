@@ -65,6 +65,7 @@ public final class CommandQueueService {
     public static boolean enqueue(File dataDir, String taskId, Action action, String requestedBy) {
         // Fast path: hand the command straight to the running daemon. Fall back to the queue
         // table whenever that is not possible (daemon down, endpoint disabled, old daemon).
+        DaemonCallLog.configure(dataDir);
         if (DaemonControlClient.send(dataDir, action, taskId, requestedBy)) return true;
         try (Connection c = connection(dataDir)) {
             try (PreparedStatement ps = c.prepareStatement(
@@ -76,9 +77,12 @@ public final class CommandQueueService {
                 ps.setString(4, LocalDateTime.now().format(TS));
                 ps.executeUpdate();
             }
+            DaemonCallLog.record("queue", "ENQUEUE", "gui_commands", 202, 0, action.name(), taskId, requestedBy,
+                    "Control endpoint not reachable; queued in the database for the service to pick up");
             return true;
         } catch (SQLException e) {
             log.log(Level.WARNING, "Failed to enqueue command " + action + " for task " + taskId, e);
+            DaemonCallLog.record("queue", "ENQUEUE", "gui_commands", 0, 0, action.name(), taskId, requestedBy, String.valueOf(e.getMessage()));
             return false;
         }
     }

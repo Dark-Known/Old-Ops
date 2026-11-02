@@ -23,11 +23,12 @@ public final class TaskChangeView {
         LABELS.put("transferMode", "Transfer mode");
         LABELS.put("sourceCredential", "Source credential");
         LABELS.put("targetCredential", "Target credential");
-        LABELS.put("targetUsername", "Target username");
+        LABELS.put("targetUsername", "Target credential");
         LABELS.put("sourcePath", "Source path");
         LABELS.put("targetPath", "Target path");
         LABELS.put("additionalTargetPaths", "Additional target paths");
         LABELS.put("fileSelectionRules", "File selection rules");
+        LABELS.put("watchOptions", "What is reported");
         LABELS.put("backupSourcePath", "Backup source path");
         LABELS.put("backupDestinationPath", "Backup destination path");
         LABELS.put("backupRetentionDays", "Backup retention (days)");
@@ -182,6 +183,7 @@ public final class TaskChangeView {
                 case "FILE_TRANSFER" -> "File transfer (SFTP)";
                 case "OUTLOOK_MAIL" -> "Mail download (Outlook / Microsoft 365)";
                 case "BACKUP" -> "Backup";
+                case "FOLDER_WATCH" -> "Watch a folder (no transfer)";
                 default -> v;
             };
             case "Direction" -> switch (v) {
@@ -253,6 +255,12 @@ public final class TaskChangeView {
             add(where, v, "Additional target paths", inbound ? "Also copied to (this PC)" : "Also sent to (remote folders)");
             add(where, v, "Source credential", "Source login");
             out.add(new Section("Where", where));
+        } else if (type.equals("FOLDER_WATCH")) {
+            List<String[]> where = new ArrayList<>();
+            add(where, v, "Backup source path", "Folder watched");
+            add(where, v, "Backup source credential", "Server login (blank = this PC or a network share)");
+            add(where, v, "What is reported", "Reports");
+            out.add(new Section("Where", where));
         } else if (type.equals("BACKUP")) {
             List<String[]> where = new ArrayList<>();
             add(where, v, "Backup source path", "Back up from");
@@ -322,6 +330,7 @@ public final class TaskChangeView {
                         : "Uploads " + which + (local != null ? " from " + local : "") + " to " + server
                                 + (remote != null ? " (" + remote + ")" : "");
             }
+            case "FOLDER_WATCH" -> s = "Watches " + v.getOrDefault("Backup source path", "a folder") + " for new and changed files (nothing is transferred)";
             case "BACKUP" -> s = "Backs up " + v.getOrDefault("Backup source path", "files")
                     + (v.get("Backup destination path") != null ? " to " + v.get("Backup destination path") : "");
             case "OUTLOOK_MAIL" -> s = "Reads mail from " + v.getOrDefault("Mailbox address", "a mailbox")

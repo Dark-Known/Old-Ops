@@ -19,6 +19,7 @@ public enum EventKind {
     // ── Run lifecycle ────────────────────────────────────────────────
     RUN_STARTED      ("Started",          Category.RUN,    Severity.INFO),
     FILES_DETECTED   ("Files detected",   Category.RUN,    Severity.INFO),
+    FILES_CHANGED    ("Files changed",    Category.RUN,    Severity.INFO),
     RUN_SUCCEEDED    ("Succeeded",        Category.RUN,    Severity.INFO),
     RUN_FAILED       ("Failed",           Category.RUN,    Severity.ERROR),
     RUN_SKIPPED      ("Skipped",          Category.RUN,    Severity.INFO),
@@ -26,6 +27,10 @@ public enum EventKind {
     RETRIES_EXHAUSTED("Retries exhausted",Category.RUN,    Severity.ERROR),
     RUN_CANCELLED    ("Cancelled",        Category.RUN,    Severity.WARN),
     STALE_RECOVERED  ("Stale run reset",  Category.RUN,    Severity.WARN),
+
+    NO_FILES         ("No files found",   Category.RUN,    Severity.WARN),
+    FILES_OVERDUE    ("No new files",     Category.RUN,    Severity.WARN),
+    FILES_RESUMED    ("Files arriving again", Category.RUN, Severity.INFO),
 
     // ── Mail tasks: one event per message handled by a run ───────────
     MAIL_PROCESSED   ("Mail processed",   Category.RUN,    Severity.INFO),
@@ -52,6 +57,31 @@ public enum EventKind {
     HEALTH           ("Health",           Category.SYSTEM, Severity.WARN),
     SYSTEM_ERROR     ("System error",     Category.SYSTEM, Severity.ERROR),
 
+    // ── Socket / link monitor (reports pushed by another server's application) ──
+    LINK_DOWN        ("Link down",        Category.SYSTEM, Severity.WARN),
+    LINK_STALLED     ("Link stalled",     Category.SYSTEM, Severity.WARN),
+    LINK_FLAPPING    ("Link flapping",    Category.SYSTEM, Severity.WARN),
+    LINK_SILENT      ("Link source silent", Category.SYSTEM, Severity.WARN),
+    LINK_UP          ("Link restored",    Category.SYSTEM, Severity.INFO),
+    LINK_REPORT      ("Link report received", Category.SYSTEM, Severity.INFO),
+    LINK_HEARTBEAT   ("Link heartbeat",   Category.SYSTEM, Severity.DEBUG),
+    LINK_REJECTED    ("Link request rejected", Category.SYSTEM, Severity.WARN),
+
+    // ── Outlook mail API and the background service (monitored, can alert) ──
+    GRAPH_FAILING    ("Outlook mail API failing", Category.SYSTEM, Severity.WARN),
+    GRAPH_RECOVERED  ("Outlook mail API working again", Category.SYSTEM, Severity.INFO),
+    SERVICE_COMMAND_FAILED("Service command failed", Category.SYSTEM, Severity.WARN),
+
+    // ── Alert delivery (cards sent to Teams) ──
+    ALERT_QUEUED     ("Alert queued",     Category.ALERT,  Severity.INFO),
+    ALERT_RETRY      ("Alert retry",      Category.ALERT,  Severity.WARN),
+    REPORT_SENT      ("Report sent",      Category.ALERT,  Severity.INFO),
+    REPORT_VIEWED    ("Report opened",    Category.ALERT,  Severity.INFO),
+    REPORT_DOWNLOADED("Report downloaded", Category.ALERT, Severity.INFO),
+    REPORT_REJECTED  ("Report request refused", Category.ALERT, Severity.WARN),
+    ALERT_SENT       ("Alert sent",       Category.ALERT,  Severity.INFO),
+    ALERT_FAILED     ("Alert not delivered", Category.ALERT, Severity.WARN),
+
     // ── Background work (the app's own worker threads) ───────────────
     BACKGROUND_STARTED  ("Background job started",  Category.BACKGROUND, Severity.INFO),
     BACKGROUND_COMPLETED("Background job finished", Category.BACKGROUND, Severity.INFO),
@@ -61,12 +91,12 @@ public enum EventKind {
     UI_STALL            ("UI stall",                Category.BACKGROUND, Severity.WARN);
 
     public enum Category {
-        RUN("Runs"), WATCH("Watchers"), QUEUE("Queue"), SSH("SSH"), SYSTEM("System"), BACKGROUND("Background");
+        RUN("Runs"), WATCH("Watchers"), QUEUE("Queue"), SSH("SSH"), SYSTEM("System"), BACKGROUND("Background"), ALERT("Teams alerts");
         private final String label;
         Category(String label) { this.label = label; }
         public String label() { return label; }
         /** True for categories whose events are not about any one scheduled task. */
-        public boolean taskless() { return this == SYSTEM || this == BACKGROUND; }
+        public boolean taskless() { return this == SYSTEM || this == BACKGROUND || this == ALERT; }
     }
 
     /** Ordered least → most severe so {@code compareTo} can be used for "at least this level". */

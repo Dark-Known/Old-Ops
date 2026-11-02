@@ -61,6 +61,11 @@ public class FileSelectionPanel extends JPanel {
     private final JTextField tfAfterFolder = new JTextField(24);
     private final JButton btnAfterBrowse = new JButton("Browse\u2026");
     private final JLabel lblAfterNote = new JLabel(" ");
+    private final JCheckBox cbAlert = new JCheckBox("Alert me when a run finds no files");
+    private final JCheckBox cbSilence = new JCheckBox("Alert me if no new file arrives for");
+    private final JSpinner spSilence = spinner(10, 100_000);
+    private final JSpinner spAlertEvery = spinner(60, 100_000);
+    private final JLabel lblAlertNote = new JLabel(" ");
     private final JLabel lblAfterFolder = new JLabel("Move to folder");
     private JPanel sink;
     private int outerY;
@@ -80,7 +85,7 @@ public class FileSelectionPanel extends JPanel {
     private boolean watcherActive;
     private final JLabel lblWatcherNote = new JLabel(
             "<html><body style='width:420px'>The watcher is on: it sends every new matching file and remembers what it sent, "
-                    + "so \"Send newest N\" and \"Files sent before\" are not used.</body></html>");
+                    + "so \"Send newest N\", \"Files sent before\" and the per-run no-files alert are not used (\"no new file for N minutes\" still works).</body></html>");
     private boolean loading;
 
     public FileSelectionPanel(FileSelection initial) {
@@ -106,11 +111,11 @@ public class FileSelectionPanel extends JPanel {
 
         int y = 0;
         section("Which files to take");
-        put(note("<html><body style='width:420px'>Leave empty to use the Transfer Mode alone. Conditions look at the <b>file name</b> only "
+        introNote = note("<html><body style='width:420px'>Leave empty to use the Transfer Mode alone. Conditions look at the <b>file name</b> only "
                 + "(not the folder). Text may contain <code>{today}</code>, <code>{yesterday}</code>, "
                 + "<code>{tomorrow}</code> or e.g. <code>{today:yyyyMMdd}</code> — replaced by that date on every run. "
-                + "A wildcard accepts several patterns separated by <code>;</code>, e.g. <code>*.csv;report_??.txt</code>.</body></html>"),
-                gbc(0, y++, 3, 1.0));
+                + "A wildcard accepts several patterns separated by <code>;</code>, e.g. <code>*.csv;report_??.txt</code>.</body></html>");
+        put(introNote, gbc(0, y++, 3, 1.0));
 
         put(rulesBox, gbc(0, y++, 3, 1.0));
 
@@ -144,6 +149,7 @@ public class FileSelectionPanel extends JPanel {
         pickRow.add(cbPick);
         pickRow.add(spCount);
         pickRow.add(cbTies);
+        pickRowPanel = pickRow;
         put(pickRow, gbc(0, y++, 3, 1.0));
         put(cbFail, gbc(0, y++, 3, 1.0));
 
@@ -187,6 +193,27 @@ public class FileSelectionPanel extends JPanel {
 
         put(Box.createVerticalStrut(8), gbc(0, y++, 3, 0));
 
+        // ── Alerts ───────────────────────────────────────────────────
+        y = 0;
+        section("Alerts");
+        put(cbAlert, gbc(0, y++, 3, 1.0));
+        JPanel silenceRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
+        silenceRow.setOpaque(false);
+        silenceRow.add(cbSilence);
+        silenceRow.add(spSilence);
+        silenceRow.add(new JLabel("minutes"));
+        cbSilence.setToolTipText("<html>For tasks that get files regularly (say every 2 minutes): if nothing arrives for this long,<br>"
+                + "an alert is raised \u2014 also for watcher tasks. Time while this program is not running does not count.</html>");
+        put(silenceRow, gbc(0, y++, 3, 1.0));
+        JPanel alertRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
+        alertRow.setOpaque(false);
+        alertRow.add(new JLabel("Do not repeat the alert for"));
+        alertRow.add(spAlertEvery);
+        alertRow.add(new JLabel("minutes  (0 = alert on every run)"));
+        put(alertRow, gbc(0, y++, 3, 1.0));
+        lblAlertNote.setFont(lblAlertNote.getFont().deriveFont(Font.PLAIN, 11f));
+        put(lblAlertNote, gbc(0, y++, 3, 1.0));
+
         y = 0;
         section("Check your conditions");
         JPanel testRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
@@ -205,6 +232,10 @@ public class FileSelectionPanel extends JPanel {
 
         btnForget.addActionListener(e -> forgetSentFiles());
         btnAfterBrowse.addActionListener(e -> browseAfterFolder());
+        cbAlert.addActionListener(e -> ch0());
+        cbSilence.addActionListener(e -> ch0());
+        spSilence.addChangeListener(e -> ch0());
+        spAlertEvery.addChangeListener(e -> ch0());
         cbSent.addActionListener(e -> ch0());
         cbAfter.addActionListener(e -> ch0());
         tfAfterFolder.getDocument().addDocumentListener(docListener(this::ch0));
@@ -254,6 +285,9 @@ public class FileSelectionPanel extends JPanel {
         s.setPickCount((int) Math.max(1, num(spCount)));
         s.setKeepTies(cbTies.isSelected());
         s.setFailIfNoMatch(cbFail.isSelected());
+        s.setSilenceMinutes(cbSilence.isSelected() ? (int) Math.max(1, num(spSilence)) : 0);
+        s.setAlertNoFiles(cbAlert.isSelected());
+        s.setAlertRepeatMinutes((int) Math.max(0, num(spAlertEvery)));
         s.setSentPolicy((SentPolicy) cbSent.getSelectedItem());
         s.setAfterAction((AfterAction) cbAfter.getSelectedItem());
         s.setAfterFolder(tfAfterFolder.getText());
@@ -299,6 +333,10 @@ public class FileSelectionPanel extends JPanel {
             spCount.setValue(s.getPickCount());
             cbTies.setSelected(s.isKeepTies());
             cbFail.setSelected(s.isFailIfNoMatch());
+            cbSilence.setSelected(s.getSilenceMinutes() > 0);
+            spSilence.setValue((long) (s.getSilenceMinutes() > 0 ? s.getSilenceMinutes() : 10));
+            cbAlert.setSelected(s.isAlertNoFiles());
+            spAlertEvery.setValue((long) s.getAlertRepeatMinutes());
             cbSent.setSelectedItem(s.getSentPolicy());
             cbAfter.setSelectedItem(s.getAfterAction());
             tfAfterFolder.setText(s.getAfterFolder());
@@ -405,6 +443,15 @@ public class FileSelectionPanel extends JPanel {
         cbPick.setEnabled(!watcherActive);
         cbSent.setEnabled(!watcherActive);
         lblWatcherNote.setVisible(watcherActive);
+        cbAlert.setEnabled(!watcherActive);
+        spSilence.setEnabled(cbSilence.isSelected());
+        spAlertEvery.setEnabled((cbAlert.isSelected() && !watcherActive) || cbSilence.isSelected());
+        String looked = inbound ? "on the server" : "in this PC's folder";
+        lblAlertNote.setText("<html><body style='width:420px'>When a scheduled or manual run looks " + looked
+                + " and finds nothing to " + (inbound ? "receive" : "send") + " (empty, nothing matches the conditions, or "
+                + "everything was already sent), an alert appears in the Events list and as a pop-up, saying where it looked and why. "
+                + "Not used with the watcher: there, \"nothing changed\" is normal \u2014 use the \"no new file for N minutes\" alert instead, "
+                + "which also works for watcher tasks.</body></html>");
         boolean move = cbAfter.getSelectedItem() == AfterAction.MOVE;
         tfAfterFolder.setEnabled(move);
         btnAfterBrowse.setEnabled(move && (!inbound || remoteBrowser != null));
@@ -505,8 +552,12 @@ public class FileSelectionPanel extends JPanel {
     private void put(Component c, GridBagConstraints g) { sink.add(c, g); }
 
     /** Starts a titled group; everything added with {@link #put} afterwards goes into it. */
+    private final java.util.Map<String, JPanel> sections = new java.util.HashMap<>();
+    private JComponent introNote, pickRowPanel;
+
     private void section(String title) {
         JPanel sec = new JPanel(new GridBagLayout());
+        sections.put(title, sec);
         sec.setOpaque(false);
         sec.setBorder(BorderFactory.createCompoundBorder(
                 BorderFactory.createTitledBorder(title),
@@ -515,6 +566,29 @@ public class FileSelectionPanel extends JPanel {
         g.fill = GridBagConstraints.HORIZONTAL;
         super.add(sec, g);
         sink = sec;
+    }
+
+    /**
+     * "Watch a folder" tasks transfer nothing: only the name conditions, the settle time and the "no new file" alert apply, so the
+     * pick, "files sent before" and "after a successful transfer" settings are hidden.
+     */
+    public void setWatchMode(boolean watch) {
+        for (String t : new String[] {"Files sent before", "After a successful transfer"}) {
+            JPanel sec = sections.get(t);
+            if (sec != null) sec.setVisible(!watch);
+        }
+        if (introNote != null) introNote.setVisible(!watch);
+        if (pickRowPanel != null) pickRowPanel.setVisible(!watch);
+        cbFail.setVisible(!watch);
+        cbAlert.setVisible(!watch);
+        setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(UIManager.getColor("Component.borderColor")),
+                BorderFactory.createCompoundBorder(
+                        new TitledBorder(watch ? "Which files to watch  (optional \u2014 leave empty to watch every file)"
+                                : "File Selection  (optional \u2014 which files to take)"),
+                        new EmptyBorder(8, 10, 10, 10))));
+        revalidate();
+        repaint();
     }
 
     /** INBOUND: lets the dialog open its server-folder browser for the "move to" folder. */

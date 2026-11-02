@@ -44,6 +44,7 @@ public class MainWindow extends JFrame {
     // itself to active so scheduling doesn't just stop.
     private final java.nio.file.Path daemonStatusFile;
     private JLabel schedulerBadge;
+    private JLabel linkBadge;
     private javax.swing.Timer schedulerBadgeTimer;
     private Runnable schedulerBadgeStreamUnsub = () -> { };
     private JLabel dbLabel;
@@ -249,6 +250,10 @@ public class MainWindow extends JFrame {
         // "Daemon vs GUI scheduler hand-off" note above the field declarations.
         schedulerBadge = statusChip("Scheduler: checking...", new Color(0xE0A458));
         badges.add(schedulerBadge);
+        // Socket links reported by other servers: only shown while at least one source is configured.
+        linkBadge = statusChip("API", new Color(0x7FA7C9));
+        linkBadge.setVisible(false);
+        badges.add(linkBadge);
 
         // The failure/notification badge itself lives inside StatusStrip,
         // added as a full-width row below this header (see near add(header, ...)
@@ -297,7 +302,8 @@ public class MainWindow extends JFrame {
         // (2s) plus the staleness window, so a real Daemon shutdown is
         // detected within a few seconds.
         refreshSchedulerBadge();
-        schedulerBadgeTimer = new javax.swing.Timer(3000, e -> refreshSchedulerBadge());
+        refreshLinkBadge();
+        schedulerBadgeTimer = new javax.swing.Timer(3000, e -> { refreshSchedulerBadge(); refreshLinkBadge(); });
         schedulerBadgeTimer.start();
         // The Daemon pushes status changes and the stream reports when the Daemon drops, so the badge flips
         // at once; the 3 s timer is only the safety net. Removed in the rebuild teardown (don't stack).
@@ -312,6 +318,7 @@ public class MainWindow extends JFrame {
         credPanel = new CredentialManagerPanel(storage, scheduler.getRunHistoryService());
         RunHistoryPanel runHistoryPanel = new RunHistoryPanel(storage, scheduler.getRunHistoryService());
         SettingsPanel settingsPanel = new SettingsPanel(transferService, scheduler);
+        ApiPanel linkPanel = new ApiPanel(storage.getDataDir(), storage::loadTasksSnapshot, scheduler.getRunHistoryService());
 
         CardLayout cards = new CardLayout();
         JPanel content = new JPanel(cards);
@@ -320,6 +327,7 @@ public class MainWindow extends JFrame {
         content.add(wrapCard(taskPanel), "Tasks");
         content.add(wrapCard(credPanel), "Credentials");
         content.add(wrapCard(runHistoryPanel), "Logs");
+        content.add(wrapCard(linkPanel), "API");
         content.add(wrapCard(settingsPanel), "Settings");
 
         JPanel sidebar = new JPanel();
@@ -330,17 +338,19 @@ public class MainWindow extends JFrame {
                 new EmptyBorder(16, 8, 16, 8)));
         sidebar.setPreferredSize(new Dimension(152, 0));
 
-        String[] navNames = { "Tasks", "Credentials", "Logs", "Settings" };
+        String[] navNames = { "Tasks", "Credentials", "Logs", "API", "Settings" };
         Icon[] navIcons = {
                 VectorIcons.checklist(navIdleFg, 18),
                 VectorIcons.key(navIdleFg, 18),
                 VectorIcons.document(navIdleFg, 18),
+                VectorIcons.pulse(navIdleFg, 18),
                 VectorIcons.sliders(navIdleFg, 18)
         };
         Icon[] navIconsSelected = {
                 VectorIcons.checklist(AppTheme.ACCENT, 18),
                 VectorIcons.key(AppTheme.ACCENT, 18),
                 VectorIcons.document(AppTheme.ACCENT, 18),
+                VectorIcons.pulse(AppTheme.ACCENT, 18),
                 VectorIcons.sliders(AppTheme.ACCENT, 18)
         };
         JToggleButton[] navButtons = new JToggleButton[navNames.length];
@@ -651,6 +661,34 @@ public class MainWindow extends JFrame {
         Async.latest("scheduler-badge",
                 () -> AppFeeds.daemonNow(daemonStatusFile).alive(), // push stream if live, else one file read
                 this::applySchedulerBadge, null);
+    }
+
+    private record LinkSummary(int sources, int problems, boolean live) {}
+
+    private void refreshLinkBadge() {
+        if (linkBadge == null) return;
+        java.io.File dir = storage.getDataDir();
+        Async.latest("link-badge", () -> {
+            int n = 0;
+            for (service.LinkMonitor.Source s : service.LinkMonitorConfig.load(dir).sources) if (s.enabled()) n++;
+            service.LinkStatusFile.Status st = service.LinkStatusFile.read(dir);
+            boolean live = st != null && st.fresh(System.currentTimeMillis());
+            return new LinkSummary(n, live ? st.problems() : 0, live);
+        }, sum -> {
+            if (linkBadge == null) return;
+            linkBadge.setVisible(sum.sources() > 0);
+            if (sum.sources() == 0) return;
+            if (!sum.live()) {
+                restyleChip(linkBadge, "API: no status", new Color(0xE0A458));
+                linkBadge.setToolTipText("The background service has not reported link status recently.");
+            } else if (sum.problems() > 0) {
+                restyleChip(linkBadge, "API: " + sum.problems() + " down", new Color(0xC97F7F));
+                linkBadge.setToolTipText("Open Settings > Socket link monitor for details.");
+            } else {
+                restyleChip(linkBadge, "API: OK (" + sum.sources() + ")", new Color(0x7FC98F));
+                linkBadge.setToolTipText("All monitored socket links are reporting healthy.");
+            }
+        }, null);
     }
 
     private void applySchedulerBadge(boolean daemonAlive) {

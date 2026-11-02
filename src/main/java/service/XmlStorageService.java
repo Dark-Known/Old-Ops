@@ -100,23 +100,46 @@ public class XmlStorageService {
         return new File(dataDir, "creds_" + safe + ".xml");
     }
 
-    /** Look up credentials by username. */
-    public Credential loadCredentialByUsername(String username) {
-        return credentialDb.loadByUsername(username);
+    /** Look up a credential by its (unique) name — what tasks store to say which credential they use. */
+    public Credential loadCredentialByName(String name) {
+        return credentialDb.loadByName(name);
     }
 
-    /** Save (insert or replace, keyed by username) a credential. Returns
-     *  whether it was actually persisted — false means app.db isn't
-     *  connected; see {@link #getConnectionError()}. */
-    public boolean saveCredential(Credential cred) {
-        return credentialDb.save(cred);
+    public Credential loadCredentialById(String id) {
+        return credentialDb.loadById(id);
     }
 
-    /** Delete the stored credential for the given username. Returns whether
-     *  it was actually removed — false means app.db isn't connected or the
-     *  delete failed; see {@link #isConnected()} / {@link #getLastCredentialSaveError()}. */
-    public boolean deleteCredential(String username) {
-        return credentialDb.delete(username);
+    /** True when another credential already has this name (ignoring case). */
+    public boolean isCredentialNameTaken(String name, String exceptId) {
+        return credentialDb.isNameTaken(name, exceptId);
+    }
+
+    /**
+     * Saves a credential (new, or an existing one by id). If an existing credential was renamed, the tasks that use
+     * it are pointed at the new name in the same step; if that fails the rename is undone, so a credential is never
+     * left with tasks still pointing at its old name. Returns whether everything was persisted; on false see
+     * {@link #getLastCredentialSaveError()} (also for a duplicate name) and {@link #getConnectionError()}.
+     */
+    public synchronized boolean saveCredential(Credential cred) {
+        Credential before = cred.getId() == null ? null : credentialDb.loadById(cred.getId());
+        String oldName = before != null ? before.getName() : null;
+        if (!credentialDb.save(cred)) return false;
+        if (oldName != null && !oldName.equals(cred.getName())) {
+            if (taskDb.renameCredentialReferences(oldName, cred.getName()) < 0) {
+                String why = taskDb.getLastSaveError();
+                credentialDb.save(before);   // put the old name back: tasks still use it
+                credentialDb.setLastSaveError("Could not update the tasks that use this credential"
+                        + (why != null ? " (" + why + ")" : "") + "; the rename was not applied");
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** Delete the credential with the given name. Returns whether it was actually removed — false means app.db isn't
+     *  connected or the delete failed; see {@link #isConnected()} / {@link #getLastCredentialSaveError()}. */
+    public boolean deleteCredential(String name) {
+        return credentialDb.delete(name);
     }
 
     /** List every credential stored. */
@@ -125,27 +148,27 @@ public class XmlStorageService {
     }
 
     /**
-     * Counts how many tasks currently reference this username as a
+     * Counts how many tasks currently reference this credential name as a
      * File Transfer target, a Backup source, or a Backup destination
      * credential — the three places a task can point at a saved
-     * credential by username (see ScheduledTask#targetUsername,
+     * credential by name (see ScheduledTask#targetUsername,
      * #backupSourceUsername, #backupDestinationUsername). Used by the
      * Credential Manager to show an in-use count and warn before deleting
      * a credential something still depends on.
      */
-    public int countTasksUsingCredential(String username) {
-        return countTasksUsingCredential(loadTasks(), username);
+    public int countTasksUsingCredential(String name) {
+        return countTasksUsingCredential(loadTasks(), name);
     }
 
     /** Same count over an already-loaded task list — lets callers that count many
      *  credentials load the task table once instead of once per credential. */
-    public static int countTasksUsingCredential(List<ScheduledTask> tasks, String username) {
-        if (username == null || username.isEmpty()) return 0;
+    public static int countTasksUsingCredential(List<ScheduledTask> tasks, String name) {
+        if (name == null || name.isEmpty()) return 0;
         int count = 0;
         for (ScheduledTask t : tasks) {
-            if (username.equals(t.getTargetUsername())
-                    || username.equals(t.getBackupSourceUsername())
-                    || username.equals(t.getBackupDestinationUsername())) {
+            if (name.equals(t.getTargetUsername())
+                    || name.equals(t.getBackupSourceUsername())
+                    || name.equals(t.getBackupDestinationUsername())) {
                 count++;
             }
         }
@@ -197,6 +220,16 @@ public class XmlStorageService {
     public boolean saveTask(ScheduledTask task) {
         localEpoch.incrementAndGet();
         try { return taskDb.save(task); } finally { localEpoch.incrementAndGet(); }
+    }
+
+    /**
+     * Saves only the run-state columns of a task (status, times, result, retry count, watcher/mail markers),
+     * never its settings. Use this from the scheduler and transfer code, which hold task objects that can be
+     * stale; use {@link #saveTask} only for edits made by a person.
+     */
+    public boolean saveTaskRunState(ScheduledTask task) {
+        localEpoch.incrementAndGet();
+        try { return taskDb.saveRunState(task); } finally { localEpoch.incrementAndGet(); }
     }
 
     /** Deletes the task with the given id, if any. Returns whether it was

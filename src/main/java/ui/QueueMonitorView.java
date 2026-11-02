@@ -291,6 +291,7 @@ public class QueueMonitorView extends JPanel {
             if (isDetection) return "\u25C9";                                   // ◉ detection
             if (isStarted) return "\u25B6";                                     // ▶ started (worker picked it up)
             if ("OUTLOOK_MAIL".equals(row.taskType())) return "\u2709";          // ✉ mail
+            if ("FOLDER_WATCH".equals(row.taskType())) return "\u25CE";          // ◎ watching a folder
             if ("BACKUP".equals(row.taskType())) return "\u25A3";                // ▣ backup / local copy
             if (row.direction() == ScheduledTask.TransferDirection.INBOUND) return "\u2193";  // ↓ inbound
             if (row.direction() == ScheduledTask.TransferDirection.OUTBOUND) return "\u2191"; // ↑ outbound

@@ -1226,6 +1226,7 @@ public class TaskManagerPanel extends JPanel {
         f.put("targetPath", t.getTargetPath());
         f.put("additionalTargetPaths", t.getAdditionalTargetPaths());
         f.put("fileSelectionRules", t.getFileSelection().describe());
+        f.put("watchOptions", t.getWatchOptions());
         f.put("backupSourcePath", t.getBackupSourcePath());
         f.put("backupDestinationPath", t.getBackupDestinationPath());
         f.put("backupRetentionDays", String.valueOf(t.getBackupRetentionDays()));

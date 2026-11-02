@@ -193,7 +193,8 @@ public class TaskDbService {
                         "last_started_at TEXT," +
                         "last_run_result TEXT," +
                         "created_at TEXT," +
-                        "retry_count INTEGER" +
+                        "retry_count INTEGER," +
+                        "watch_options TEXT" +
                         ")";
 
     /**
@@ -333,8 +334,8 @@ public class TaskDbService {
             "mail_output_folder, schedule_type, scheduled_at, interval_minutes, interval_seconds, " +
             "cron_expression, watcher_enabled, inbound_watcher_poll_interval_minutes, " +
             "inbound_watcher_max_age_minutes, last_known_remote_file_epoch, last_known_remote_file_size, " +
-            "last_run_at, last_started_at, last_run_result, created_at, retry_count" +
-            ") VALUES (" + "?,".repeat(46).replaceAll(",$", "") + ") " +
+            "last_run_at, last_started_at, last_run_result, created_at, retry_count, watch_options" +
+            ") VALUES (" + "?,".repeat(47).replaceAll(",$", "") + ") " +
             "ON CONFLICT(id) DO UPDATE SET " +
             "name=excluded.name, task_type=excluded.task_type, status=excluded.status, " +
             "source_credential_id=excluded.source_credential_id, target_credential_id=excluded.target_credential_id, " +
@@ -359,7 +360,7 @@ public class TaskDbService {
             "last_known_remote_file_epoch=excluded.last_known_remote_file_epoch, " +
             "last_known_remote_file_size=excluded.last_known_remote_file_size, " +
             "last_run_at=excluded.last_run_at, last_started_at=excluded.last_started_at, " +
-            "last_run_result=excluded.last_run_result, created_at=excluded.created_at, retry_count=excluded.retry_count";
+            "last_run_result=excluded.last_run_result, created_at=excluded.created_at, retry_count=excluded.retry_count, watch_options=excluded.watch_options";
 
     /**
      * Inserts or replaces (by id) a task. Assigns an id if missing, same as the
@@ -422,6 +423,7 @@ public class TaskDbService {
             ps.setString(i++, t.getLastRunResult());
             ps.setString(i++, t.getCreatedAt() != null ? t.getCreatedAt().format(DT_FMT) : null);
             ps.setInt(i++, t.getRetryCount());
+            ps.setString(i++, t.getWatchOptions());
             ps.executeUpdate();
             lastSaveError = null;
             return true;
@@ -429,6 +431,76 @@ public class TaskDbService {
             log.log(Level.WARNING, "Failed to save task " + t.getId(), e);
             lastSaveError = e.getClass().getSimpleName() + ": " + e.getMessage();
             return false;
+        }
+    }
+
+    /**
+     * Writes only what a <i>run</i> changes — status, start/finish times, last result, retry count and the
+     * watcher / mail progress markers — and leaves every setting column alone. The scheduler and the transfer
+     * code hold a task object that may be minutes old by the time a long run saves; a whole-row {@link #save}
+     * from it would silently put back the old paths, schedule or credentials if someone edited the task in the
+     * meantime, and would bring back a task deleted during the run. A task that no longer exists is not an error:
+     * nothing is written and {@code true} is returned.
+     */
+    public synchronized boolean saveRunState(ScheduledTask t) {
+        if (conn == null) return false;
+        if (t.getId() == null || t.getId().isEmpty()) return false;
+        try (PreparedStatement ps = conn.prepareStatement(
+                "UPDATE tasks SET status=?, last_run_at=?, last_started_at=?, last_run_result=?, retry_count=?, "
+                        + "last_known_remote_file_epoch=?, last_known_remote_file_size=?, mail_last_known_epoch=? WHERE id=?")) {
+            int i = 1;
+            ps.setString(i++, t.getStatus() != null ? t.getStatus().name() : null);
+            ps.setString(i++, t.getLastRunAt() != null ? t.getLastRunAt().format(DT_FMT) : null);
+            ps.setString(i++, t.getLastStartedAt() != null ? t.getLastStartedAt().format(DT_FMT) : null);
+            ps.setString(i++, t.getLastRunResult());
+            ps.setInt(i++, t.getRetryCount());
+            ps.setLong(i++, t.getLastKnownRemoteFileEpoch());
+            ps.setLong(i++, t.getLastKnownRemoteFileSize());
+            ps.setLong(i++, t.getMailLastKnownEpoch());
+            ps.setString(i, t.getId());
+            ps.executeUpdate();
+            lastSaveError = null;
+            return true;
+        } catch (SQLException e) {
+            log.log(Level.WARNING, "Failed to save run state of task " + t.getId(), e);
+            lastSaveError = e.getClass().getSimpleName() + ": " + e.getMessage();
+            return false;
+        }
+    }
+
+    /**
+     * Points every task that uses the credential called {@code oldName} (as File Transfer target, or as Backup source
+     * or destination) at {@code newName}. Only those three columns are written, so nothing a running task or an open
+     * editor holds is overwritten. Returns the number of tasks changed, or -1 on failure.
+     */
+    public synchronized int renameCredentialReferences(String oldName, String newName) {
+        if (conn == null || oldName == null || oldName.isEmpty() || newName == null || newName.isEmpty()) return -1;
+        try {
+            conn.setAutoCommit(false);
+            int changed;
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "UPDATE tasks SET "
+                            + "target_username = CASE WHEN target_username = ? THEN ? ELSE target_username END, "
+                            + "backup_source_username = CASE WHEN backup_source_username = ? THEN ? ELSE backup_source_username END, "
+                            + "backup_destination_username = CASE WHEN backup_destination_username = ? THEN ? ELSE backup_destination_username END "
+                            + "WHERE target_username = ? OR backup_source_username = ? OR backup_destination_username = ?")) {
+                int i = 1;
+                for (int k = 0; k < 3; k++) { ps.setString(i++, oldName); ps.setString(i++, newName); }
+                for (int k = 0; k < 3; k++) ps.setString(i++, oldName);
+                changed = ps.executeUpdate();
+                conn.commit();
+            } catch (SQLException e) {
+                conn.rollback();
+                throw e;
+            } finally {
+                conn.setAutoCommit(true);
+            }
+            lastSaveError = null;
+            return changed;
+        } catch (SQLException e) {
+            log.log(Level.WARNING, "Failed to rename credential references " + oldName + " -> " + newName, e);
+            lastSaveError = e.getClass().getSimpleName() + ": " + e.getMessage();
+            return -1;
         }
     }
 
@@ -537,6 +609,7 @@ public class TaskDbService {
         String createdAt = rs.getString("created_at");
         if (createdAt != null && !createdAt.isEmpty()) t.setCreatedAt(LocalDateTime.parse(createdAt, DT_FMT));
         t.setRetryCount(rs.getInt("retry_count"));
+        t.setWatchOptions(rs.getString("watch_options"));
         return t;
     }
 

@@ -19,8 +19,8 @@ import java.util.logging.Logger;
  * {@link util.AppSettings}'s own {@code settings} table, each service using
  * its own table ({@code credentials} here) in the same file rather than a
  * separate {@code .db} file per concern. One row per credential in the
- * {@code credentials} table, keyed by username (matching the old
- * one-file-per-username invariant). A single shared {@link Connection} is
+ * {@code credentials} table, identified by a unique credential
+ * <i>name</i> (the login username is not unique: the same one can exist on many servers). A single shared {@link Connection} is
  * kept open and all access is synchronized — write volume here is a handful
  * of edits per session, so a connection pool would be overkill, and SQLite
  * only supports one writer at a time regardless.
@@ -60,6 +60,20 @@ public class CredentialDbService {
         }
     }
 
+    /**
+     * A credential is identified by its <b>name</b>, which is unique (the same login username can exist on many
+     * servers). Tasks refer to a credential by that name. Column order is the same as in older builds so a legacy
+     * {@code credentials.db} can still be imported column by column.
+     */
+    private static final String CREATE_TABLE_SQL = "CREATE TABLE IF NOT EXISTS %T% (" +
+            "id TEXT PRIMARY KEY," +
+            "name TEXT NOT NULL UNIQUE," +
+            "host TEXT," +
+            "username TEXT NOT NULL," +
+            "password TEXT," +
+            "os_type TEXT" +
+            ")";
+
     /** Marks a password column value as encrypted; anything else is legacy plaintext. */
     private static final String ENC_PREFIX = "enc:";
 
@@ -95,14 +109,7 @@ public class CredentialDbService {
             c = DriverManager.getConnection("jdbc:sqlite:" + dbFile.getAbsolutePath());
             applyPragmas(c);
             try (Statement st = c.createStatement()) {
-                st.execute("CREATE TABLE IF NOT EXISTS credentials (" +
-                        "id TEXT PRIMARY KEY," +
-                        "name TEXT," +
-                        "host TEXT," +
-                        "username TEXT UNIQUE NOT NULL," +
-                        "password TEXT," +
-                        "os_type TEXT" +
-                        ")");
+                st.execute(CREATE_TABLE_SQL.replace("%T%", "credentials"));
             }
         } catch (Exception e) {
             log.log(Level.SEVERE, "Failed to open/initialize credentials table in app.db", e);
@@ -111,6 +118,7 @@ public class CredentialDbService {
         this.conn = c;
         this.connectionError = initError;
         if (this.conn != null) {
+            migrateToNamedCredentials();
             migrateLegacyCredentialsDbIfPresent();
             migrateLegacyXmlIfPresent();
             encryptPlaintextRows();
@@ -166,39 +174,123 @@ public class CredentialDbService {
         return connectionError;
     }
 
+    /** Lets the storage facade report a failure of a larger operation (a rename that could not update its tasks). */
+    void setLastSaveError(String message) { this.lastSaveError = message; }
+
     /** Short exception summary from the most recent failed {@link #save}, or
      *  null if the last save succeeded. See TaskDbService#getLastSaveError. */
     public String getLastSaveError() {
         return lastSaveError;
     }
 
-    /** Look up a credential by username, or null if none is stored. */
-    public synchronized Credential loadByUsername(String username) {
-        if (conn == null || username == null || username.isEmpty()) return null;
-        try (PreparedStatement ps = conn.prepareStatement("SELECT * FROM credentials WHERE username = ?")) {
-            ps.setString(1, username);
-            try (ResultSet rs = ps.executeQuery()) {
-                if (rs.next()) return mapRow(rs);
+    /**
+     * One-time upgrade of a database from before credentials had names: the old table made the login username the
+     * unique key. The table is rebuilt so the <i>name</i> is the key, and every existing credential gets its old
+     * username as its name. Tasks already refer to credentials by that username, so no task needs to change; rename
+     * a credential afterwards from the Credentials page and the tasks that use it follow.
+     */
+    private void migrateToNamedCredentials() {
+        try {
+            String ddl = null;
+            try (Statement st = conn.createStatement();
+                 ResultSet rs = st.executeQuery("SELECT sql FROM sqlite_master WHERE type='table' AND name='credentials'")) {
+                if (rs.next()) ddl = rs.getString(1);
+            }
+            if (ddl == null || !ddl.replaceAll("\\s+", " ").toUpperCase().contains("USERNAME TEXT UNIQUE")) return;
+
+            conn.setAutoCommit(false);
+            try (Statement st = conn.createStatement()) {
+                st.execute("DROP TABLE IF EXISTS credentials_new");
+                st.execute(CREATE_TABLE_SQL.replace("%T%", "credentials_new"));
+                st.execute("INSERT INTO credentials_new (id, name, host, username, password, os_type) "
+                        + "SELECT id, username, host, username, password, os_type FROM credentials");
+                st.execute("DROP TABLE credentials");
+                st.execute("ALTER TABLE credentials_new RENAME TO credentials");
+                conn.commit();
+                log.info("Credentials are now identified by a unique name; existing credentials were named after their username.");
+            } catch (SQLException e) {
+                conn.rollback();
+                throw e;
+            } finally {
+                conn.setAutoCommit(true);
             }
         } catch (SQLException e) {
-            log.log(Level.WARNING, "Failed to load credential for username " + username, e);
+            log.log(Level.SEVERE, "Could not upgrade the credentials table to named credentials", e);
+        }
+    }
+
+    private static String clean(String s) { return s == null ? "" : s.trim(); }
+
+    /** Look up a credential by its name (exact match first, then ignoring case), or null if none is stored. */
+    public synchronized Credential loadByName(String name) {
+        name = clean(name);
+        if (conn == null || name.isEmpty()) return null;
+        try {
+            for (String sql : new String[]{"SELECT * FROM credentials WHERE name = ?",
+                                           "SELECT * FROM credentials WHERE name = ? COLLATE NOCASE"}) {
+                try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                    ps.setString(1, name);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        if (rs.next()) return mapRow(rs);
+                    }
+                }
+            }
+        } catch (SQLException e) {
+            log.log(Level.WARNING, "Failed to load credential named " + name, e);
         }
         return null;
     }
 
+    /** Look up a credential by its id, or null. */
+    public synchronized Credential loadById(String id) {
+        if (conn == null || id == null || id.isEmpty()) return null;
+        try (PreparedStatement ps = conn.prepareStatement("SELECT * FROM credentials WHERE id = ?")) {
+            ps.setString(1, id);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) return mapRow(rs);
+            }
+        } catch (SQLException e) {
+            log.log(Level.WARNING, "Failed to load credential " + id, e);
+        }
+        return null;
+    }
+
+    /** True when another credential (not {@code exceptId}) already uses this name, ignoring case. */
+    public synchronized boolean isNameTaken(String name, String exceptId) {
+        name = clean(name);
+        if (conn == null || name.isEmpty()) return false;
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT 1 FROM credentials WHERE name = ? COLLATE NOCASE AND id <> ?")) {
+            ps.setString(1, name);
+            ps.setString(2, exceptId == null ? "" : exceptId);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next();
+            }
+        } catch (SQLException e) {
+            log.log(Level.WARNING, "Failed to check credential name " + name, e);
+            return false;
+        }
+    }
+
     /**
-     * Inserts or replaces (by username) a credential. Assigns an id if missing.
-     * Returns whether it was actually persisted (see TaskDbService#save's
-     * javadoc for why this matters).
+     * Inserts a new credential or updates the one with the same id (so a credential can be renamed).
+     * A blank name defaults to {@code username@host}. Refuses a name another credential already has.
+     * Returns whether it was actually persisted (see TaskDbService#save's javadoc for why this matters).
      */
     public synchronized boolean save(Credential cred) {
         if (conn == null) return false;
         if (cred.getId() == null || cred.getId().isEmpty()) {
             cred.setId(java.util.UUID.randomUUID().toString());
         }
+        cred.setName(clean(cred.getName()).isEmpty()
+                ? clean(cred.getUsername()) + "@" + clean(cred.getHost()) : clean(cred.getName()));
+        if (isNameTaken(cred.getName(), cred.getId())) {
+            lastSaveError = "A credential named \"" + cred.getName() + "\" already exists - choose a different name";
+            return false;
+        }
         String sql = "INSERT INTO credentials (id, name, host, username, password, os_type) VALUES (?,?,?,?,?,?) " +
-                "ON CONFLICT(username) DO UPDATE SET id=excluded.id, name=excluded.name, host=excluded.host, " +
-                "password=excluded.password, os_type=excluded.os_type";
+                "ON CONFLICT(id) DO UPDATE SET name=excluded.name, host=excluded.host, " +
+                "username=excluded.username, password=excluded.password, os_type=excluded.os_type";
         try (PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setString(1, cred.getId());
             ps.setString(2, cred.getName());
@@ -210,24 +302,24 @@ public class CredentialDbService {
             lastSaveError = null;
             return true;
         } catch (SQLException e) {
-            log.log(Level.WARNING, "Failed to save credential for username " + cred.getUsername(), e);
+            log.log(Level.WARNING, "Failed to save credential " + cred.getName(), e);
             lastSaveError = e.getClass().getSimpleName() + ": " + e.getMessage();
             return false;
         }
     }
 
-    /** Deletes the credential for the given username, if any. Returns whether
+    /** Deletes the credential with the given name, if any. Returns whether
      *  it was actually removed — see TaskDbService#save's javadoc for why
      *  this matters. */
-    public synchronized boolean delete(String username) {
-        if (conn == null || username == null || username.isEmpty()) return false;
-        try (PreparedStatement ps = conn.prepareStatement("DELETE FROM credentials WHERE username = ?")) {
-            ps.setString(1, username);
+    public synchronized boolean delete(String name) {
+        if (conn == null || name == null || name.isEmpty()) return false;
+        try (PreparedStatement ps = conn.prepareStatement("DELETE FROM credentials WHERE name = ?")) {
+            ps.setString(1, name);
             ps.executeUpdate();
             lastSaveError = null;
             return true;
         } catch (SQLException e) {
-            log.log(Level.WARNING, "Failed to delete credential for username " + username, e);
+            log.log(Level.WARNING, "Failed to delete credential " + name, e);
             lastSaveError = e.getClass().getSimpleName() + ": " + e.getMessage();
             return false;
         }
@@ -238,7 +330,7 @@ public class CredentialDbService {
         List<Credential> list = new ArrayList<>();
         if (conn == null) return list;
         try (Statement st = conn.createStatement();
-             ResultSet rs = st.executeQuery("SELECT * FROM credentials ORDER BY name")) {
+             ResultSet rs = st.executeQuery("SELECT * FROM credentials ORDER BY name COLLATE NOCASE")) {
             while (rs.next()) list.add(mapRow(rs));
         } catch (SQLException e) {
             log.log(Level.WARNING, "Failed to load credentials", e);
@@ -255,7 +347,7 @@ public class CredentialDbService {
         try {
             c.setPassword(reveal(rs.getString("password")));
         } catch (RuntimeException e) {
-            log.log(Level.WARNING, "Could not decrypt password for " + c.getUsername()
+            log.log(Level.WARNING, "Could not decrypt password for " + c.getName()
                     + " (key file missing or changed?) - re-enter it in the credentials screen", e);
             c.setPassword("");
         }
@@ -290,7 +382,8 @@ public class CredentialDbService {
             try (ResultSet rs = st.executeQuery("SELECT COUNT(*) FROM legacy_creds.credentials")) {
                 migrated = rs.next() ? rs.getInt(1) : 0;
             }
-            st.execute("INSERT INTO credentials SELECT * FROM legacy_creds.credentials");
+            st.execute("INSERT INTO credentials (id, name, host, username, password, os_type) "
+                    + "SELECT id, username, host, username, password, os_type FROM legacy_creds.credentials");
             st.execute("DETACH DATABASE legacy_creds");
             if (migrated > 0) {
                 log.info("Migrated " + migrated + " credential(s) from legacy credentials.db into app.db");
@@ -330,9 +423,9 @@ public class CredentialDbService {
                     org.w3c.dom.Element e = (org.w3c.dom.Element) nodes.item(i);
                     Credential c = new Credential();
                     c.setId(e.getAttribute("id"));
-                    c.setName(text(e, "name"));
                     c.setHost(text(e, "host"));
                     c.setUsername(text(e, "username"));
+                    c.setName(c.getUsername());   // tasks of that era refer to the username
                     c.setPassword(text(e, "password"));
                     c.setOsType(text(e, "osType"));
                     if (c.getUsername() != null && !c.getUsername().isEmpty()) {

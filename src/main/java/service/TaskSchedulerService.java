@@ -149,7 +149,7 @@ public class TaskSchedulerService {
                 if (t.getStatus() == TaskStatus.RUNNING && wroteStartedAt.equals(t.getLastStartedAt())) {
                     t.setStatus(prevStatus);
                     t.setLastStartedAt(prevStartedAt);
-                    storage.saveTask(t);
+                    storage.saveTaskRunState(t);
                 }
                 return;
             }
@@ -189,6 +189,17 @@ public class TaskSchedulerService {
                             summary, details, start, end, runKey, trigger);
                 } catch (Exception ignored) {
                     // Best-effort, like every other scheduler event.
+                }
+            });
+        }
+        // "No files found" alerts: one Events-feed entry (warning) that also pops a toast in the GUI.
+        if (transferService != null) {
+            transferService.setNoFilesListener(new TransferService.NoFilesListener() {
+                @Override public void noFiles(ScheduledTask task, String summary, String details) {
+                    recordFileAlert(EventKind.NO_FILES, TaskRunRecord.Status.SKIPPED, task, summary, details);
+                }
+                @Override public void resumed(ScheduledTask task, String summary, String details) {
+                    recordFileAlert(EventKind.FILES_RESUMED, TaskRunRecord.Status.SUCCESS, task, summary, details);
                 }
             });
         }
@@ -508,7 +519,7 @@ public class TaskSchedulerService {
 
     /**
      * Logs (application log + Event Monitor activity feed) when one of this
-     * scheduler's internal {@code storage.saveTask(...)} calls silently
+     * scheduler's internal {@code storage.saveTaskRunState(...)} calls silently
      * fails. Purely additive — every call site below keeps running exactly
      * the same control flow it always did; this only makes a previously
      * invisible failure visible, since every one of these writes was
@@ -577,7 +588,99 @@ public class TaskSchedulerService {
     }
 
     /** Periodic check (on the scheduler clock, not a worker): queues a purge when the schedule says it is due. */
+    /** Records one file-alert event (best-effort, like every other scheduler event). */
+    private void recordFileAlert(EventKind kind, TaskRunRecord.Status status, ScheduledTask task, String summary, String details) {
+        try {
+            LocalDateTime now = LocalDateTime.now();
+            runHistoryService.recordEvent(kind, task.getId(), task.getName(),
+                    task.getTaskType() != null ? task.getTaskType().name() : null,
+                    status, summary, details, now, now,
+                    RunHistoryService.currentRunKey(), RunHistoryService.currentTrigger());
+        } catch (Exception ignored) {
+            // Best-effort.
+        }
+    }
+
+    /** When this scheduler started: time the program was not running is not counted as "no files arrived". */
+    private volatile long startedAtMillis = System.currentTimeMillis();
+
+    /**
+     * For every file-transfer task that asked to be told when no new file arrives for N minutes (File Selection →
+     * Alerts), raises the alert once the quiet time passes. Works for watcher tasks too, which have no run to hook
+     * an alert onto when nothing changes. The GUI and the Daemon both check; the shared state lets only one of them alert.
+     */
+    private void checkSilenceAlerts() {
+        TransferLedger ledger = new TransferLedger(storage.getDataDir());
+        long now = System.currentTimeMillis();
+        for (ScheduledTask t : storage.loadTasksSnapshot()) {
+            try {
+                boolean watchOnly = t.getTaskType() == ScheduledTask.TaskType.FOLDER_WATCH;
+                if ((t.getTaskType() != ScheduledTask.TaskType.FILE_TRANSFER && !watchOnly) || t.getStatus() == TaskStatus.DISABLED) continue;
+                model.FileSelection sel = t.getFileSelection();
+                if (sel.getSilenceMinutes() <= 0) continue;
+                TransferLedger.State st = ledger.state(t.getId());
+                long limit = sel.getSilenceMinutes() * 60_000L;
+                SilenceWatch.Verdict v = SilenceWatch.judge(st.lastFilesAt(), st.watchingSince(), startedAtMillis, now, limit);
+                if (v == SilenceWatch.Verdict.START) { ledger.startWatching(t.getId()); continue; }
+                if (v != SilenceWatch.Verdict.OVERDUE) continue;
+                if (!ledger.claimSilenceAlert(t.getId(), sel.getAlertRepeatMinutes() * 60_000L)) continue;
+                boolean inbound = !watchOnly && t.getTransferDirection() == ScheduledTask.TransferDirection.INBOUND;
+                long ref = Math.max(st.lastFilesAt() > 0 ? st.lastFilesAt() : st.watchingSince(), startedAtMillis);
+                String last = st.lastFilesAt() > 0
+                        ? java.time.Instant.ofEpochMilli(st.lastFilesAt()).atZone(java.time.ZoneId.systemDefault())
+                                .format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
+                        : "none since this task has been watched";
+                String where = watchOnly ? t.getBackupSourcePath() : inbound ? t.getTargetPath() : t.getSourcePath();
+                String summary = "No new files for " + ((now - ref) / 60_000) + " min (limit " + sel.getSilenceMinutes() + " min) \u2014 "
+                        + (watchOnly ? "nothing new in " : inbound ? "nothing received from " : "nothing to send from ") + where;
+                String details = "Task:        " + t.getName() + "\n"
+                        + "Direction:   " + (watchOnly ? "WATCH ONLY (nothing is transferred)" : inbound ? "INBOUND (download from the server)" : "OUTBOUND (upload from this PC)") + "\n"
+                        + (watchOnly ? "Watching the folder: " : inbound ? "Watching the server folder: " : "Watching this PC's folder: ") + where + "\n"
+                        + (watchOnly ? "Last new file seen: " : "Last files transferred: ") + last + "\n"
+                        + "Alert after: " + sel.getSilenceMinutes() + " min without a new file"
+                        + (t.isWatcherEnabled() ? " (watcher is on)" : "") + "\n"
+                        + "Time:        " + LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")) + "\n\n"
+                        + "Check that the sender is still producing files. You can change or turn off this alert in the task: File Selection tab \u2192 Alerts.";
+                recordFileAlert(EventKind.FILES_OVERDUE, TaskRunRecord.Status.SKIPPED, t, summary, details);
+            } catch (Exception e) {
+                log.fine("Silence check failed for task " + t.getId() + ": " + e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Socket-link monitor: serves the endpoint another server's application posts to and raises alerts for it.
+     * Created in {@link #start()}; null while this instance is not started (the window never starts one, so only the Daemon serves it).
+     */
+    private volatile LinkMonitorService linkMonitor;
+    private volatile AlertDispatcher alertDispatcher;
+    private volatile MonitorEvents monitorEvents;
+
+    private void recordLinkAlert(LinkMonitor.Alert a) {
+        EventKind.Severity sev = a.kind().defaultSeverity();
+        TaskRunRecord.Status status = sev == EventKind.Severity.WARN || sev == EventKind.Severity.ERROR
+                ? TaskRunRecord.Status.FAILED : TaskRunRecord.Status.SUCCESS;
+        try {
+            LocalDateTime now = LocalDateTime.now();
+            runHistoryService.recordEvent(a.kind(), null, a.label(), "LINK_MONITOR", status,
+                    a.summary(), a.details(), now, now, null, null);
+        } catch (Exception ignored) {
+            // Best-effort, like every other scheduler event.
+        }
+    }
+
     private void maintenanceTick() {
+        try {
+            LinkMonitorService lm = linkMonitor;
+            if (started && lm != null) lm.tick();
+        } catch (Exception e) {
+            log.warning("Socket-link check failed: " + e);
+        }
+        try {
+            if (started) checkSilenceAlerts();
+        } catch (Exception e) {
+            log.warning("No-new-files check failed: " + e);
+        }
         try {
             if (started && !purgeQueued.get() && maintenance.purgeDue()) requestPurge("scheduled");
         } catch (Exception e) {
@@ -846,6 +949,24 @@ public class TaskSchedulerService {
     public void start() {
         if (started) return;
         started = true;
+        startedAtMillis = System.currentTimeMillis();
+        try {
+            LinkMonitorService lm = new LinkMonitorService(storage.getDataDir(), this::recordLinkAlert);
+            lm.refresh();
+            linkMonitor = lm;
+        } catch (Exception e) {
+            log.warning("Socket-link monitor not started: " + e);
+        }
+        try {
+            AlertDispatcher ad = new AlertDispatcher(storage.getDataDir(), runHistoryService, logService);
+            ad.start();
+            alertDispatcher = ad;
+            MonitorEvents me = new MonitorEvents(runHistoryService);
+            me.start();
+            monitorEvents = me;
+        } catch (Exception e) {
+            log.warning("Alert dispatcher not started: " + e);
+        }
         workerPool.start();
         localWatchManager.start();
         remotePushWatcher.start();
@@ -869,6 +990,15 @@ public class TaskSchedulerService {
 
     public void stop() {
         started = false;
+        LinkMonitorService lm = linkMonitor;
+        linkMonitor = null;
+        if (lm != null) lm.close();
+        AlertDispatcher ad = alertDispatcher;
+        alertDispatcher = null;
+        MonitorEvents me = monitorEvents;
+        monitorEvents = null;
+        if (me != null) me.close();
+        if (ad != null) ad.close();
         workerPool.stop();
         localWatchManager.stop();
         remotePushWatcher.stop();
@@ -897,7 +1027,7 @@ public class TaskSchedulerService {
             eventQueue.cancel(t.getId());
             t.setStatus(TaskStatus.RUNNING);
             t.setLastStartedAt(LocalDateTime.now());
-            if (!storage.saveTask(t)) logBackendSaveFailure(t, "RUNNING status at run start");
+            if (!storage.saveTaskRunState(t)) logBackendSaveFailure(t, "RUNNING status at run start");
             refreshMetrics(t.getId(), true);
             // Hand the run to the worker pool like any other fire; a free worker picks it up at once.
             eventQueue.publish(TaskDueEvent.manual(t.getId()));
@@ -999,7 +1129,7 @@ public class TaskSchedulerService {
                         task.setLastStartedAt(null);
                         task.setLastRunResult("FAILED (stale)");
                         task.setStatus(TaskStatus.PENDING);
-                        if (!storage.saveTask(task)) logBackendSaveFailure(task, "PENDING status after stale-RUNNING recovery");
+                        if (!storage.saveTaskRunState(task)) logBackendSaveFailure(task, "PENDING status after stale-RUNNING recovery");
                         lastActivityMillis.remove(task.getId());
                         // falls through to get (re)published below
                     } else {
@@ -1266,6 +1396,74 @@ public class TaskSchedulerService {
         }
     }
 
+    /** Tasks whose last look found nothing, so the run is shown as skipped instead of a success. */
+    private final java.util.concurrent.ConcurrentHashMap<String, Boolean> folderWatchQuiet = new java.util.concurrent.ConcurrentHashMap<>();
+
+    private List<FolderWatch.Item> listFolder(ScheduledTask task, java.util.function.Consumer<String> log) throws Exception {
+        String dir = task.getBackupSourcePath() == null ? "" : task.getBackupSourcePath().trim();
+        if (dir.isEmpty()) throw new java.io.IOException("No folder to watch is set on this task.");
+        String credName = task.getBackupSourceUsername() == null ? "" : task.getBackupSourceUsername().trim();
+        if (credName.isEmpty()) return FolderWatch.listLocal(dir);
+        model.Credential cred = transferService.credentialByName(credName, "watch", log);
+        if (cred == null) throw new java.io.IOException("No credential named '" + credName + "'.");
+        try (RemoteFileMetadataServiceFactory.ManagedMetadataService m = new RemoteFileMetadataServiceFactory(storage).create(task, cred)) {
+            List<FolderWatch.Item> out = new ArrayList<>();
+            for (model.RemoteFileMetadata f : m.service().getFilesModifiedAfter(TransferPaths.normalizeRemotePath(dir), java.time.Instant.EPOCH))
+                out.add(new FolderWatch.Item(f.fileName(), f.size(), f.lastModified().toEpochMilli()));
+            return out;
+        }
+    }
+
+    /** One look at a watched folder: records what is new or changed as events; true unless the folder could not be read. */
+    private boolean runFolderWatch(ScheduledTask task, java.util.function.Consumer<String> log) throws Exception {
+        boolean remote = task.getBackupSourceUsername() != null && !task.getBackupSourceUsername().trim().isEmpty();
+        String where = task.getBackupSourcePath() + (remote ? " (SFTP, " + task.getBackupSourceUsername().trim() + ")" : "");
+        log.accept("[INFO] Watching folder: " + where);
+        FolderWatch.Outcome o = new FolderWatch(storage.getDataDir(), this::listFolder).look(task, log);
+        if (o.baseline()) {
+            log.accept("[INFO] First look: " + o.watching() + " file(s) already there are remembered and not reported.");
+            recordSchedulerEvent(EventKind.WATCH_ARMED, task, TaskRunRecord.Status.SUCCESS,
+                    "Watching " + task.getBackupSourcePath() + " (" + o.watching() + " file(s) already there)",
+                    "Folder: " + where + "\nThe " + o.watching() + " file(s) found now are remembered; only files that appear or change from now on are reported.");
+            return true;
+        }
+        if (!o.added().isEmpty()) {
+            log.accept("[INFO] " + o.added().size() + " new file(s) in " + where);
+            recordFolderFiles(EventKind.FILES_DETECTED, task, o.added(), where, "New file(s)");
+        }
+        if (!o.changed().isEmpty()) {
+            log.accept("[INFO] " + o.changed().size() + " changed file(s) in " + where);
+            recordFolderFiles(EventKind.FILES_CHANGED, task, o.changed(), where, "Changed file(s)");
+        }
+        if (o.resumed()) {
+            recordFileAlert(EventKind.FILES_RESUMED, TaskRunRecord.Status.SUCCESS, task, "Files are arriving again",
+                    "Task:  " + task.getName() + "\nFolder: " + where + "\nNew files were found again, ending the \"no new files\" alert.");
+        }
+        if (o.quiet()) {
+            log.accept("[INFO] Nothing new or changed (" + o.watching() + " file(s) watched).");
+            folderWatchQuiet.put(task.getId(), Boolean.TRUE);
+        }
+        return true;
+    }
+
+    private void recordFolderFiles(EventKind kind, ScheduledTask task, List<FolderWatch.Item> files, String where, String title) {
+        StringBuilder names = new StringBuilder();
+        int shown = 0;
+        for (FolderWatch.Item f : files) {
+            if (shown >= 5) { names.append(", +").append(files.size() - shown).append(" more"); break; }
+            if (shown++ > 0) names.append(", ");
+            names.append(f.name()).append(" (").append(TransferService.humanReadableBytes(Math.max(f.size(), 0))).append(')');
+        }
+        StringBuilder d = new StringBuilder(title).append(" in ").append(where).append(":\n");
+        for (FolderWatch.Item f : files) {
+            d.append("  ").append(f.name()).append(" | size=").append(f.size()).append(" | modified=")
+                    .append(java.time.Instant.ofEpochMilli(f.mtimeMillis()).atZone(java.time.ZoneId.systemDefault())
+                            .format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))).append('\n');
+        }
+        recordSchedulerEvent(kind, task, TaskRunRecord.Status.SUCCESS,
+                files.size() + (kind == EventKind.FILES_CHANGED ? " file(s) changed: " : " new file(s): ") + names, d.toString());
+    }
+
     private void recordDetectionEvent(ScheduledTask task, List<model.RemoteFileMetadata> files, LocalDateTime scanStartedAt) {
         if (files == null || files.isEmpty()) return;
         LocalDateTime now = LocalDateTime.now();
@@ -1410,7 +1608,7 @@ public class TaskSchedulerService {
                 final LocalDateTime prevStartedAt = task.getLastStartedAt();
                 task.setStatus(TaskStatus.RUNNING);
                 task.setLastStartedAt(now);
-                if (!storage.saveTask(task)) logBackendSaveFailure(task, "RUNNING status at event-triggered run start");
+                if (!storage.saveTaskRunState(task)) logBackendSaveFailure(task, "RUNNING status at event-triggered run start");
                 refreshMetrics(task.getId(), true);
                 recordStartedEvent(task, now);
                 lockSkipped.remove();
@@ -1505,7 +1703,7 @@ public class TaskSchedulerService {
         List<ScheduledTask> tasks = storage.loadTasks();
         tasks.stream().filter(t -> t.getId().equals(taskId)).findFirst().ifPresent(t -> {
             t.setStatus(TaskStatus.PENDING);
-            if (!storage.saveTask(t)) logBackendSaveFailure(t, "PENDING status on restart");
+            if (!storage.saveTaskRunState(t)) logBackendSaveFailure(t, "PENDING status on restart");
         });
         refreshMetrics(taskId, false);
         runNow(taskId);
@@ -1670,6 +1868,19 @@ public class TaskSchedulerService {
                 case BACKUP:
                     success = transferService.executeBackup(task, emitCap);
                     break;
+                case FOLDER_WATCH:
+                    try {
+                        success = runFolderWatch(task, emitCap);
+                        if (success && folderWatchQuiet.remove(task.getId()) != null) {
+                            skipped = true;
+                            skipReason = "No new or changed files";
+                        }
+                    } catch (Exception e) {
+                        emitCap.accept("[ERROR] Could not look at the folder: " + e.getMessage());
+                        failureReason = "Could not look at the folder: " + e.getMessage();
+                        success = false;
+                    }
+                    break;
                 default:
                     emitCap.accept("[ERROR] Unknown task type: " + task.getTaskType());
                     success = false;
@@ -1696,7 +1907,7 @@ public class TaskSchedulerService {
             pendingOutcomeNote.set(retryReason + " (will retry)");
             task.setStatus(TaskStatus.RETRYING);
             task.setLastStartedAt(null);
-            if (!storage.saveTask(task)) logBackendSaveFailure(task, "RETRYING status before scheduled retry");
+            if (!storage.saveTaskRunState(task)) logBackendSaveFailure(task, "RETRYING status before scheduled retry");
             lastActivityMillis.remove(task.getId());
             scheduler.schedule(() -> retryTask(task), 5, TimeUnit.SECONDS);
             return;
@@ -1722,7 +1933,7 @@ public class TaskSchedulerService {
             } else {
                 t.setStatus(finalSuccess ? TaskStatus.SUCCESS : TaskStatus.FAILED);
             }
-            if (!storage.saveTask(t)) logBackendSaveFailure(t, "run result/status after completion");
+            if (!storage.saveTaskRunState(t)) logBackendSaveFailure(t, "run result/status after completion");
             // Publish the task's next occurrence immediately — this is what
             // eliminates the old "wait for the next shared poll tick" delay.
             // Works uniformly for every schedule type: computeNextFireDelayMs
@@ -1829,12 +2040,12 @@ public class TaskSchedulerService {
             if (t.getRetryCount() > 0) {
                 t.setRetryCount(t.getRetryCount() - 1);
                 t.setStatus(TaskStatus.PENDING);
-                if (!storage.saveTask(t)) logBackendSaveFailure(t, "retry count/PENDING status before re-run");
+                if (!storage.saveTaskRunState(t)) logBackendSaveFailure(t, "retry count/PENDING status before re-run");
                 retryTriggered.add(t.getId()); // so the run it starts is labelled RETRY, not MANUAL
                 runNow(t.getId());
             } else {
                 t.setStatus(TaskStatus.FAILED);
-                if (!storage.saveTask(t)) logBackendSaveFailure(t, "FAILED status after retries exhausted");
+                if (!storage.saveTaskRunState(t)) logBackendSaveFailure(t, "FAILED status after retries exhausted");
                 recordSchedulerEvent(EventKind.RETRIES_EXHAUSTED, t, TaskRunRecord.Status.FAILED,
                         "All retry attempts used \u2014 task marked FAILED",
                         "The task failed and every configured automatic retry also failed. It stays FAILED until it is re-run or edited.");

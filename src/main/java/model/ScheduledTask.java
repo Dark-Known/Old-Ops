@@ -7,7 +7,7 @@ import util.*;
 
 public class ScheduledTask {
     //TODO: consider splitting enums into separate files if they grow too large or need additional methods/fields in the future
-    public enum TaskType   { FILE_TRANSFER, OUTLOOK_MAIL, BACKUP }
+    public enum TaskType   { FILE_TRANSFER, OUTLOOK_MAIL, BACKUP, FOLDER_WATCH }
     public enum TaskStatus  { PENDING, RUNNING, RETRYING, SUCCESS, FAILED, DISABLED }
     public enum ScheduleType { RUN_NOW, ONCE, DAILY, WEEKLY, INTERVAL_MINUTES, INTERVAL_SECONDS }
     public enum TransferDirection { OUTBOUND, INBOUND }
@@ -55,6 +55,10 @@ public class ScheduledTask {
     // batches internally, the same batching used for file transfers (see
     // AppSettings.getTransferBatchMaxBytes()/getTransferBatchIntervalSeconds()).
     private String backupSourcePath;
+    // FOLDER_WATCH ("watch a folder, no transfer") reuses backupSourcePath as the folder to watch and
+    // backupSourceUsername as the optional SFTP credential name (blank = a folder on this PC or a network share).
+    // The file name rules, settle time and "no new file for N minutes" alert are the task's File Selection.
+    private String watchOptions;       // WatchOptions#toText(): what to report (new files, changed files)
     private String backupDestinationPath;
     private int backupRetentionDays;   // how many most-recent days to KEEP in place (D..D-(n-1))
 
@@ -137,6 +141,7 @@ public class ScheduledTask {
         this.backupRetentionDays = 3;
         this.backupSourceUsername = "";
         this.backupDestinationUsername = "";
+        this.watchOptions = "";
     }
 
     // ── Getters / Setters ────────────────────────────────────────────────────
@@ -209,6 +214,8 @@ public class ScheduledTask {
         return result;
     }
 
+    public String getWatchOptions()              { return watchOptions == null ? "" : watchOptions; }
+    public void   setWatchOptions(String o)      { this.watchOptions = o == null ? "" : o; }
     public String getBackupSourcePath()          { return backupSourcePath; }
     public void   setBackupSourcePath(String s)  { this.backupSourcePath = s; }
 

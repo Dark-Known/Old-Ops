@@ -197,6 +197,8 @@ public class TransferService {
         // GUI runs as the logged-in user, so a user-home-based token path
         // would put them in two different, mutually invisible directories.
         this.oauthService           = new OAuth2TokenService(OAuth2TokenService.sharedTokenDir(storage.getDataDir()));
+        GraphCallLog.configure(storage.getDataDir());
+        DaemonCallLog.configure(storage.getDataDir());
     }
 
     /** Exposed so the UI's "Authorize Mailbox" flow can enroll without duplicating OAuth logic. */
@@ -722,7 +724,7 @@ public class TransferService {
 
             task.setLastKnownRemoteFileEpoch(newEpoch);
             task.setLastKnownRemoteFileSize(newSize);
-            if (!storage.saveTask(task)) {
+            if (!storage.saveTaskRunState(task)) {
                 // This was previously fire-and-forget. If this write doesn't
                 // persist, the watcher baseline never actually advances, so the
                 // NEXT run will see these same files as still-new and re-transfer
@@ -1378,11 +1380,7 @@ public class TransferService {
         return fileStats;
     }
 
-    private static String remoteListingDirFor(String remotePath) {
-        return remotePath.endsWith("*")
-                ? remotePath.substring(0, remotePath.lastIndexOf('/') + 1)
-                : remotePath.endsWith("/") ? remotePath : remotePath + "/";
-    }
+    private static String remoteListingDirFor(String remotePath) { return TransferPaths.remoteListingDirFor(remotePath); }
 
     /** Full remote file listing WITH sizes, keyed by full remote path — used for size-based batching. */
     private java.util.Map<String, RemoteFileStat> listAllRemoteFileStatsViaWinScp(
@@ -1522,23 +1520,7 @@ public class TransferService {
 
     private static <T> List<List<T>> chunkBySize(
             List<T> items, java.util.function.ToLongFunction<T> sizeOf, long maxBytes) {
-        List<List<T>> out = new ArrayList<>();
-        if (items.isEmpty()) return out;
-        if (maxBytes <= 0) maxBytes = Long.MAX_VALUE;
-        List<T> current = new ArrayList<>();
-        long currentSize = 0;
-        for (T item : items) {
-            long sz = Math.max(sizeOf.applyAsLong(item), 0);
-            if (!current.isEmpty() && currentSize + sz > maxBytes) {
-                out.add(current);
-                current = new ArrayList<>();
-                currentSize = 0;
-            }
-            current.add(item);
-            currentSize += sz;
-        }
-        if (!current.isEmpty()) out.add(current);
-        return out;
+        return TransferBatching.chunkBySize(items, sizeOf, maxBytes);
     }
 
     private static List<List<Path>> chunkPathsBySize(List<Path> files) {
@@ -1774,7 +1756,7 @@ public class TransferService {
                 logLine.accept("[INFO] " + picked.size() + " of " + remoteStats.size()
                         + " remote file(s) selected.");
                 if (picked.isEmpty()) {
-                    return noFileMatched(selection, remotePath, remoteStats.size(), logLine);
+                    return noFileMatched(task, selection, remotePath, remoteStats.size(), logLine);
                 }
                 if (sentBefore != null) {
                     int before = picked.size();
@@ -1786,7 +1768,7 @@ public class TransferService {
                         logLine.accept("[INFO] Skipped " + (before - picked.size()) + " file(s) already sent ("
                                 + selection.getSentPolicy() + ").");
                     }
-                    if (picked.isEmpty()) return nothingNew(selection, remotePath, before, logLine);
+                    if (picked.isEmpty()) return nothingNew(task, selection, remotePath, before, logLine);
                 }
                 remoteFiles = picked.stream().map(java.util.Map.Entry::getKey).collect(Collectors.toList());
                 if (selection.getPick() == FileSelection.Pick.ALL
@@ -1797,6 +1779,7 @@ public class TransferService {
                 logLine.accept("[INFO] Mode: Latest file(s) — non-watcher (INBOUND)");
                 if (remoteStats.isEmpty()) {
                     logLine.accept("[ERROR] No files found on remote path: " + remotePath);
+                    reportNoFiles(task, selection, remotePath, "Nothing was found on the server.", logLine);
                     return false;
                 }
                 long maxTs = remoteStats.values().stream().mapToLong(s -> s.epochMillis).max().getAsLong();
@@ -1811,6 +1794,7 @@ public class TransferService {
                     Collections.sort(remoteFiles);
                 } else if (remotePath.endsWith("*") || new File(task.getSourcePath()).isDirectory()) {
                     logLine.accept("[WARN] No files found on remote path: " + remotePath);
+                    reportNoFiles(task, selection, remotePath, "Nothing was found on the server.", logLine);
                     return false;
                 } else {
                     remoteFiles = Collections.singletonList(remotePath);
@@ -1841,6 +1825,8 @@ public class TransferService {
                 copyDownloadedFilesToExtraFolders(downloadedLocalPaths, extraDestFolders, logLine);
             }
             if (ok) {
+                noFilesAlerts.reset(task.getId());
+                markArrival(task, selection, logLine);
                 recordSent(ledger, task, toRecord, logLine);
                 afterSuccessRemote(target, selection, inboundRemoteFiles, inboundLocalCopies, inboundSizes, logLine);
             }
@@ -1861,7 +1847,7 @@ public class TransferService {
                 logLine.accept("[INFO] " + localFiles.size() + " of " + candidates.size()
                         + " local file(s) selected.");
                 if (localFiles.isEmpty()) {
-                    return noFileMatched(selection, task.getSourcePath(), candidates.size(), logLine);
+                    return noFileMatched(task, selection, task.getSourcePath(), candidates.size(), logLine);
                 }
                 if (sentBefore != null) {
                     int before = localFiles.size();
@@ -1872,7 +1858,7 @@ public class TransferService {
                         logLine.accept("[INFO] Skipped " + (before - localFiles.size()) + " file(s) already sent ("
                                 + selection.getSentPolicy() + ").");
                     }
-                    if (localFiles.isEmpty()) return nothingNew(selection, task.getSourcePath(), before, logLine);
+                    if (localFiles.isEmpty()) return nothingNew(task, selection, task.getSourcePath(), before, logLine);
                 }
                 if (selection.getPick() == FileSelection.Pick.ALL
                         || (selection.getPick() == FileSelection.Pick.BY_MODE && mode != TransferMode.LATEST_ONLY)) {
@@ -1885,6 +1871,7 @@ public class TransferService {
                     File[] files = sourceDir.listFiles(File::isFile);
                     if (files == null || files.length == 0) {
                         logLine.accept("[ERROR] No files found in source folder: " + task.getSourcePath());
+                        reportNoFiles(task, selection, task.getSourcePath(), "The source folder has no files.", logLine);
                         return false;
                     }
                     long maxTs = Arrays.stream(files).mapToLong(File::lastModified).max().getAsLong();
@@ -1900,6 +1887,7 @@ public class TransferService {
                     localFiles = files != null ? Arrays.asList(files) : Collections.emptyList();
                     if (localFiles.isEmpty()) {
                         logLine.accept("[WARN] No files found in source folder: " + task.getSourcePath());
+                        reportNoFiles(task, selection, task.getSourcePath(), "The source folder has no files.", logLine);
                         return false;
                     }
                 } else {
@@ -1930,6 +1918,8 @@ public class TransferService {
 
         boolean ok = runBatchedWinScpCommands(target, target.getPassword(), commands, logLine, task.getId());
         if (ok) {
+            noFilesAlerts.reset(task.getId());
+            markArrival(task, selection, logLine);
             recordSent(ledger, task, toRecord, logLine);
             if (selection.hasAfterAction()) {
                 List<TransferCleanup.LocalOriginal> originals = new ArrayList<>();
@@ -1948,10 +1938,12 @@ public class TransferService {
      * outcome (the run is recorded as skipped, not failed — e.g. today's file has not arrived yet);
      * with "fail if nothing matches" ticked it is a failed run so retries / alerts apply.
      */
-    private boolean noFileMatched(FileSelection selection, String where, int candidates, Consumer<String> logLine)
-            throws WatcherSkipException {
+    private boolean noFileMatched(ScheduledTask task, FileSelection selection, String where, int candidates,
+                                  Consumer<String> logLine) throws WatcherSkipException {
         String msg = "No file matched the file selection rules in " + where + " (" + candidates
                 + " file(s) looked at). Rules: " + selection.describe();
+        reportNoFiles(task, selection, where, candidates == 0
+                ? "The folder is empty." : candidates + " file(s) are there, but none matches the file selection rules.", logLine);
         if (selection.isFailIfNoMatch()) {
             logLine.accept("[ERROR] " + msg);
             return false;
@@ -1960,11 +1952,76 @@ public class TransferService {
         throw new WatcherSkipException(msg);
     }
 
+    /** Receives the "no files found" alerts of runs whose task asked for them; the scheduler wires this to the Events feed. */
+    public interface NoFilesListener {
+        void noFiles(ScheduledTask task, String summary, String details);
+        /** Files are arriving again after a "no new files" alert. */
+        void resumed(ScheduledTask task, String summary, String details);
+    }
+
+    private volatile NoFilesListener noFilesListener;
+    public void setNoFilesListener(NoFilesListener l) { this.noFilesListener = l; }
+
+    /** When each task was last alerted about missing files (this process only); cleared when a run transfers files again. */
+    private final AlertThrottle noFilesAlerts = new AlertThrottle();
+
+    /**
+     * A run found nothing to send or receive. If the task asked for it (File Selection → Alerts), raises one alert
+     * with where it looked and why, but not again within the task's repeat time. Never throws: an alert problem must
+     * not change the outcome of the run.
+     */
+    private void reportNoFiles(ScheduledTask task, FileSelection selection, String where, String why,
+                               Consumer<String> logLine) {
+        try {
+            if (!selection.isAlertNoFiles() || noFilesListener == null) return;
+            long now = System.currentTimeMillis();
+            long every = selection.getAlertRepeatMinutes() * 60_000L;
+            if (!noFilesAlerts.tryRaise(task.getId(), every, now)) {
+                logLine.accept("[INFO] No-files alert already raised " + noFilesAlerts.minutesSince(task.getId(), now)
+                        + " min ago; not repeating yet.");
+                return;
+            }
+            boolean inbound = task.getTransferDirection() == TransferDirection.INBOUND;
+            String summary = (inbound ? "No files received from " : "No files to send from ") + where;
+            String mode = task.getTransferMode() != null ? task.getTransferMode().name() : "ENTIRE_FOLDER";
+            String details = "Task:        " + task.getName() + "\n"
+                    + "Direction:   " + (inbound ? "INBOUND (download from the server)" : "OUTBOUND (upload from this PC)") + "\n"
+                    + (inbound ? "Looked on the server: " : "Looked in this PC's folder: ") + where + "\n"
+                    + "Mode:        " + mode + "\n"
+                    + "Rules:       " + selection.describe() + "\n"
+                    + "What happened: " + why + "\n"
+                    + "Time:        " + LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")) + "\n\n"
+                    + "You can turn this alert off in the task: File Selection tab → Alerts.";
+            noFilesListener.noFiles(task, summary, details);
+            logLine.accept("[WARN] Alert raised: " + summary);
+        } catch (Exception e) {
+            logLine.accept("[WARN] Could not raise the no-files alert: " + e.getMessage());
+        }
+    }
+
+    /** Files were just transferred: restarts the "no new files" clock and, if an alert was outstanding, says files are back. */
+    private void markArrival(ScheduledTask task, FileSelection selection, Consumer<String> logLine) {
+        if (selection.getSilenceMinutes() <= 0) return;
+        try {
+            boolean wasSilent = new TransferLedger(storage.getDataDir()).markFilesTransferred(task.getId());
+            NoFilesListener l = noFilesListener;
+            if (wasSilent && l != null) {
+                String when = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+                l.resumed(task, "Files are arriving again", "Task:  " + task.getName() + "\nFiles were transferred at " + when
+                        + ", ending the \"no new files\" alert.");
+            }
+        } catch (Exception e) {
+            if (logLine != null) logLine.accept("[WARN] Could not record the file arrival time: " + e.getMessage());
+        }
+    }
+
     /** Every file that matched was sent before: a normal, quiet skip (not a failure). */
-    private boolean nothingNew(FileSelection selection, String where, int matched, Consumer<String> logLine)
-            throws WatcherSkipException {
+    private boolean nothingNew(ScheduledTask task, FileSelection selection, String where, int matched,
+                               Consumer<String> logLine) throws WatcherSkipException {
         String msg = "Nothing new to send in " + where + ": all " + matched + " matching file(s) were already sent ("
                 + selection.getSentPolicy() + ").";
+        reportNoFiles(task, selection, where, "All " + matched + " matching file(s) were already sent before ("
+                + selection.getSentPolicy() + "), so there is nothing new.", logLine);
         logLine.accept("[INFO] " + msg);
         throw new WatcherSkipException(msg);
     }
@@ -2086,6 +2143,7 @@ public class TransferService {
     private void afterWatcherSuccess(ScheduledTask task, Credential target, List<RemoteFileMetadata> files,
                                      boolean outbound, Consumer<String> logLine) {
         FileSelection sel = task.getFileSelection();
+        markArrival(task, sel, null);
         // The watcher's own baseline already prevents re-sending, so the sent-files memory is not used here.
         if (!sel.hasAfterAction()) return;
         if (outbound) {
@@ -2669,7 +2727,7 @@ public class TransferService {
 
         if (watcherOn && newestEpoch > 0) {
             task.setMailLastKnownEpoch(newestEpoch);
-            if (!storage.saveTask(task)) {
+            if (!storage.saveTaskRunState(task)) {
                 // Same risk as the file-transfer baseline above: if this doesn't
                 // persist, the next run re-sees (and may re-fetch/re-move) the
                 // same already-processed message(s).
@@ -2806,6 +2864,8 @@ public class TransferService {
             }
             return true;
         } finally {
+            // Attachments over 1 MB live in temporary files while the message is processed: remove them now.
+            if (m.attachmentFiles != null) for (GraphMailService.AttachmentFile f : m.attachmentFiles) f.discard();
             synchronized (logLock) {
                 for (String line : buf) logLine.accept(line);
             }
@@ -2948,10 +3008,10 @@ public class TransferService {
                 }
             }
             try {
-                Files.write(dest, file.bytes);
+                file.copyTo(dest);
                 logLine.accept("[INFO] Saved attachment '" + file.name + "' -> " + dest);
                 report.add(file.name + " (" + (file.contentType == null || file.contentType.isEmpty() ? "unknown type" : file.contentType)
-                        + ", " + file.bytes.length + " bytes) \u2192 " + dest);
+                        + ", " + file.length() + " bytes) \u2192 " + dest);
             } catch (IOException ex) {
                 logLine.accept("[WARN] Failed to save attachment '" + file.name + "': " + ex.getMessage());
                 report.add(file.name + " \u2014 FAILED: " + ex.getMessage());
@@ -3321,9 +3381,9 @@ public class TransferService {
     private Credential resolveTargetCredential(ScheduledTask task, Consumer<String> logLine) {
         String uname = task.getTargetUsername();
         if (uname != null && !uname.isEmpty()) {
-            Credential c = storage.loadCredentialByUsername(uname);
+            Credential c = storage.loadCredentialByName(uname);
             if (c != null) return c;
-            logLine.accept("[ERROR] No credential found for username '" + uname
+            logLine.accept("[ERROR] No credential named '" + uname
                     + "' in credentials.db (" + storage.getDataDir().getAbsolutePath() + ")");
             return null;
         }
@@ -3336,15 +3396,20 @@ public class TransferService {
         return null;
     }
 
-    /** Resolves a username to a stored {@link Credential} for a Backup source/destination side, or null if blank/not found. */
-    private Credential resolveNamedCredential(String username, String sideLabel, Consumer<String> logLine) {
-        if (username == null || username.trim().isEmpty()) return null;
-        Credential c = storage.loadCredentialByUsername(username.trim());
+    /** Resolves a credential name to a stored {@link Credential} for a Backup source/destination side, or null if blank/not found. */
+    private Credential resolveNamedCredential(String credentialName, String sideLabel, Consumer<String> logLine) {
+        if (credentialName == null || credentialName.trim().isEmpty()) return null;
+        Credential c = storage.loadCredentialByName(credentialName.trim());
         if (c == null) {
-            logLine.accept("[ERROR] No credential found for backup " + sideLabel + " username '" + username
-                    + "' in credentials.db (" + storage.getDataDir().getAbsolutePath() + ")");
+            logLine.accept("[ERROR] No credential named '" + credentialName + "' for backup " + sideLabel
+                    + " in credentials.db (" + storage.getDataDir().getAbsolutePath() + ")");
         }
         return c;
+    }
+
+    /** The stored credential with this name, or null (an error line is logged). Used by "Watch a folder" tasks. */
+    public Credential credentialByName(String name, String sideLabel, Consumer<String> logLine) {
+        return resolveNamedCredential(name, sideLabel, logLine);
     }
 
     // ─── Local file helpers ───────────────────────────────────────────────────
@@ -3359,32 +3424,13 @@ public class TransferService {
 
     // ─── Path / escaping helpers ──────────────────────────────────────────────
 
-    private String normalizeLocalPath(String path) {
-        if (path == null) return "";
-        return path.trim()
-                .replace("/", "\\")
-                .replaceAll("\\\\{2,}", "\\\\");
-    }
+    private String normalizeLocalPath(String path) { return TransferPaths.normalizeLocalPath(path); }
 
-    private String normalizeRemotePath(String path) {
-        if (path == null) return "";
-        String normalized = path.trim().replace("\\", "/");
-        normalized = normalized.replaceAll("/+", "/");
-        if (normalized.matches("^[A-Za-z]:/.*")) {
-            normalized = "/" + normalized;
-        }
-        return normalized;
-    }
+    private String normalizeRemotePath(String path) { return TransferPaths.normalizeRemotePath(path); }
 
-    private String escapeWinScpPath(String path) {
-        if (path == null) return "\"\"";
-        return '"' + path.replace("\\", "\\\\").replace("\"", "\\\"") + '"';
-    }
+    private String escapeWinScpPath(String path) { return TransferPaths.escapeWinScpPath(path); }
 
-    private String escapeWinScpRemotePath(String path) {
-        if (path == null) return "\"\"";
-        return '"' + path.replace("\"", "\\\"") + '"';
-    }
+    private String escapeWinScpRemotePath(String path) { return TransferPaths.escapeWinScpRemotePath(path); }
 
     // ── WinSCP password hand-off ────────────────────────────────────────────
     // The password is NOT written to the script file. The script's open line refers to
@@ -3412,18 +3458,9 @@ public class TransferService {
     private String maskPasswords(String line)  { return line.replaceAll("(?i)(password[=:])\\S+", "$1****"); }
     private String nvl(String s, String def)   { return (s != null && !s.isEmpty()) ? s : def; }
 
-    private String buildLocalDestinationPath(String dir, String fileName) {
-        return normalizeLocalPath(Paths.get(dir, fileName).toString());
-    }
+    private String buildLocalDestinationPath(String dir, String fileName) { return TransferPaths.buildLocalDestinationPath(dir, fileName); }
 
-    private String prepareRemoteDestination(String remotePath, String fileName) {
-        if (remotePath.endsWith("/") || remotePath.endsWith("\\")) return remotePath + fileName;
-        String last = remotePath.contains("/")
-                ? remotePath.substring(remotePath.lastIndexOf('/') + 1)
-                : remotePath.contains("\\")
-                ? remotePath.substring(remotePath.lastIndexOf('\\') + 1) : remotePath;
-        return last.contains(".") ? remotePath : remotePath + "/" + fileName;
-    }
+    private String prepareRemoteDestination(String remotePath, String fileName) { return TransferPaths.prepareRemoteDestination(remotePath, fileName); }
 
     private void secureTemp(File f) {
         f.setReadable(false, false); f.setReadable(true, true);

@@ -68,6 +68,7 @@ public class TaskDialog extends JDialog {
 
     // ── Target system credentials ─────────────────────────────────────────────
     private JPanel    targetPanel;
+    private JComboBox<String> cbTargetCredential;   // editable: pick a saved credential by name, or type a new name
     private JTextField  tfTargetHost;
     private JTextField  tfTargetUser;
     private JPasswordField pfTargetPass;
@@ -135,6 +136,9 @@ public class TaskDialog extends JDialog {
     private FileSelectionPanel fileSelectionPanel;
     private JPanel selectionTab;
     private JPanel backupPanel;
+    private JPanel watchPanel;
+    private JTextField tfWatchPath, tfWatchCredential;
+    private JCheckBox cbWatchRemote, cbWatchNew, cbWatchChanged;
     private JPanel scheduleDetailsPanel;
     private JTabbedPane tabbedPane;
     // Watcher checkbox lives in the dialog header (above the tabs) so it is the
@@ -228,7 +232,7 @@ public class TaskDialog extends JDialog {
         general    = titledPanel("General");
         tfName     = makeField(new JTextField(existing != null ? existing.getName() : "", 28));
         cbTaskType = makeCombo(new JComboBox<>(new String[]{
-                "FILE_TRANSFER", "OUTLOOK_MAIL", "BACKUP"}));
+                "FILE_TRANSFER", "OUTLOOK_MAIL", "BACKUP", "FOLDER_WATCH"}));
         if (existing != null) cbTaskType.setSelectedItem(existing.getTaskType().name());
 
         addRow(general, "Task Name *", tfName,     0);
@@ -345,7 +349,8 @@ public class TaskDialog extends JDialog {
         transferTab.add(fileTransferPanel);
 
         // ── File selection (name / size / age conditions + pick) ──────────────
-        fileSelectionPanel = new FileSelectionPanel(existing != null ? existing.getFileSelection() : null);
+        fileSelectionPanel = new FileSelectionPanel(existing != null ? existing.getFileSelection()
+                : new model.FileSelection().setAlertNoFiles(true));   // new tasks: alert on by default; the person can untick it
         fileSelectionPanel.setTransferMode((String) cbTransferMode.getSelectedItem());
         fileSelectionPanel.setTaskContext(existing != null ? existing.getId() : null, storage.getDataDir());
         fileSelectionPanel.setRemoteBrowser(() -> browseRemote(fileSelectionPanel.afterFolderField(),
@@ -391,12 +396,41 @@ public class TaskDialog extends JDialog {
         addRow(backupPanel, "Source Folder *",      withBrowseButton(tfBackupSourcePath, () ->
                 browseBackupSide(tfBackupSourcePath, cbBackupSourceRemote, tfBackupSourceUsername)), 0);
         addRow(backupPanel, "",                     cbBackupSourceRemote, 1);
-        addRow(backupPanel, "Source Username",      tfBackupSourceUsername, 2);
+        addRow(backupPanel, "Source Credential",    tfBackupSourceUsername, 2);
         addRow(backupPanel, "Backup Folder *",      withBrowseButton(tfBackupDestinationPath, () ->
                 browseBackupSide(tfBackupDestinationPath, cbBackupDestinationRemote, tfBackupDestinationUsername)), 4);
         addRow(backupPanel, "",                     cbBackupDestinationRemote, 5);
-        addRow(backupPanel, "Destination Username", tfBackupDestinationUsername, 6);
+        addRow(backupPanel, "Destination Credential", tfBackupDestinationUsername, 6);
         addRow(backupPanel, "Days to keep (D..) *", spBackupRetentionDays, 8);
+
+        // ── Watch a folder (no transfer) ──────────────────────────────────────
+        // Looks at a folder on this PC, a network share, or over SFTP and reports files that appear or change.
+        // The folder is kept in the backup-source fields (the credential name too, so renaming or deleting a credential
+        // treats it like any other); file name rules, settle time and the "no new file" alert are on the File Selection tab.
+        watchPanel = titledPanel("Watch a folder  (nothing is transferred)");
+        boolean existingWatch = existing != null && existing.getTaskType() == ScheduledTask.TaskType.FOLDER_WATCH;
+        String watchCred = existingWatch && existing.getBackupSourceUsername() != null ? existing.getBackupSourceUsername() : "";
+        model.WatchOptions watchOpts = existingWatch ? model.WatchOptions.parse(existing.getWatchOptions()) : model.WatchOptions.DEFAULT;
+        tfWatchPath = makeField(new JTextField(existingWatch && existing.getBackupSourcePath() != null ? existing.getBackupSourcePath() : "", 28));
+        cbWatchRemote = new JCheckBox("Folder is on a server (SFTP)", !watchCred.isEmpty());
+        tfWatchCredential = makeField(new JTextField(watchCred, 20));
+        tfWatchCredential.setEnabled(cbWatchRemote.isSelected());
+        cbWatchRemote.addActionListener(e -> tfWatchCredential.setEnabled(cbWatchRemote.isSelected()));
+        cbWatchNew = new JCheckBox("Report new files", watchOpts.onNew());
+        cbWatchChanged = new JCheckBox("Report changed files (size or modified time changed)", watchOpts.onChanged());
+        addRow(watchPanel, "Folder to watch *", withBrowseButton(tfWatchPath, () ->
+                browseBackupSide(tfWatchPath, cbWatchRemote, tfWatchCredential)), 0);
+        addRow(watchPanel, "",                  cbWatchRemote, 1);
+        addRow(watchPanel, "Credential",        tfWatchCredential, 2);
+        addRow(watchPanel, "",                  cbWatchNew, 4);
+        addRow(watchPanel, "",                  cbWatchChanged, 5);
+        JTextArea watchNote = new JTextArea("The first look only remembers the files already there. After that, every time the Schedule tab runs this task "
+                + "(try every 30\u201360 seconds) new and changed files are listed in the Event Monitor and can be sent to Teams "
+                + "(API \u2192 Teams alerts \u2192 Per task: choose \"Files detected\" / \"Files changed\"). "
+                + "Use the File Selection tab to watch only some names, wait until a file has stopped changing, and to be alerted when nothing new arrives for N minutes.");
+        watchNote.setEditable(false); watchNote.setOpaque(false); watchNote.setLineWrap(true); watchNote.setWrapStyleWord(true);
+        watchNote.setForeground(UIManager.getColor("Label.disabledForeground"));
+        addRow(watchPanel, "", watchNote, 7);
 
         // ── Mail / Outlook panel (Microsoft Graph) ────────────────────────────
         // Reads mail via Microsoft Graph rather than IMAP: Microsoft has disabled
@@ -528,14 +562,25 @@ public class TaskDialog extends JDialog {
         // ── Target credentials panel ──────────────────────────────────────────
         targetPanel = titledPanel("Target System Credentials");
 
-        String existingUser = existing != null ? existing.getTargetUsername() : null;
-        Credential existingCred = existingUser != null
-                ? storage.loadCredentialByUsername(existingUser) : null;
+        // A task stores the NAME of its credential (unique); the login username is just one field of it.
+        String existingCredName = existing != null ? existing.getTargetUsername() : null;
+        Credential existingCred = existingCredName != null && !existingCredName.isEmpty()
+                ? storage.loadCredentialByName(existingCredName) : null;
+
+        java.util.List<String> savedNames = new java.util.ArrayList<>();
+        for (Credential c : storage.loadAllCredentials()) savedNames.add(c.getName());
+        cbTargetCredential = makeCombo(new JComboBox<>(savedNames.toArray(new String[0])));
+        cbTargetCredential.setEditable(true);
+        cbTargetCredential.setSelectedItem(existingCred != null ? existingCred.getName()
+                : (existingCredName != null ? existingCredName : ""));
+        cbTargetCredential.setToolTipText("<html>Name of the saved credential this task uses. Pick a saved one, or type a new name<br>"
+                + "(left empty it becomes <i>username@host</i>). Tasks that pick the same name share it.</html>");
 
         tfTargetHost = makeField(new JTextField(
                 existingCred != null ? existingCred.getHost() : "", 28));
         tfTargetUser = makeField(new JTextField(
-                existingUser != null ? existingUser : "", 28));
+                existingCred != null ? nz(existingCred.getUsername())
+                        : (existingCredName != null ? existingCredName : ""), 28));
         pfTargetPass = makePasswordField(new JPasswordField(28));
         cbTargetOs   = makeCombo(new JComboBox<>(new String[]{"WINDOWS", "LINUX"}));
 
@@ -544,26 +589,29 @@ public class TaskDialog extends JDialog {
             cbTargetOs.setSelectedItem(existingCred.getOsType());
         }
 
-        tfTargetUser.addKeyListener(new java.awt.event.KeyAdapter() {
-            @Override
-            public void keyReleased(java.awt.event.KeyEvent e) {
-                String username = tfTargetUser.getText().trim();
-                if (!username.isEmpty()) {
-                    Credential cred = storage.loadCredentialByUsername(username);
-                    if (cred != null) {
-                        pfTargetPass.setText(cred.getPassword() != null ? cred.getPassword() : "");
-                        tfTargetHost.setText(cred.getHost()     != null ? cred.getHost()     : "");
-                        cbTargetOs.setSelectedItem(
-                                cred.getOsType() != null ? cred.getOsType() : "WINDOWS");
-                    }
-                }
+        // Choosing (or typing exactly) a saved name fills the other fields from it. A new name fills nothing.
+        Runnable fillFromSaved = () -> {
+            Object sel = cbTargetCredential.getEditor().getItem();
+            String typed = sel == null ? "" : sel.toString().trim();
+            if (typed.isEmpty()) return;
+            Credential cred = storage.loadCredentialByName(typed);
+            if (cred != null) {
+                tfTargetHost.setText(nz(cred.getHost()));
+                tfTargetUser.setText(nz(cred.getUsername()));
+                pfTargetPass.setText(nz(cred.getPassword()));
+                cbTargetOs.setSelectedItem(cred.getOsType() != null ? cred.getOsType() : "WINDOWS");
             }
+        };
+        cbTargetCredential.addActionListener(e -> fillFromSaved.run());
+        cbTargetCredential.getEditor().getEditorComponent().addFocusListener(new java.awt.event.FocusAdapter() {
+            @Override public void focusLost(java.awt.event.FocusEvent e) { fillFromSaved.run(); }
         });
 
-        addRow(targetPanel, "Hostname / IP",  tfTargetHost, 0);
-        addRow(targetPanel, "Username",        tfTargetUser, 1);
-        addRow(targetPanel, "Password",        pfTargetPass, 2);
-        addRow(targetPanel, "OS Type",         cbTargetOs,   3);
+        addRow(targetPanel, "Credential name", cbTargetCredential, 0);
+        addRow(targetPanel, "Hostname / IP",   tfTargetHost, 1);
+        addRow(targetPanel, "Username",        tfTargetUser, 2);
+        addRow(targetPanel, "Password",        pfTargetPass, 3);
+        addRow(targetPanel, "OS Type",         cbTargetOs,   4);
 
         JButton btnTestConnection = new JButton("Test Connection");
         btnTestConnection.setToolTipText("Opens a real SFTP session with the fields above to verify they work");
@@ -595,10 +643,12 @@ public class TaskDialog extends JDialog {
                 }
             }
             if (result != null && result.success) {
-                Credential cred = storage.loadCredentialByUsername(user);
+                String credName = targetCredentialName();
+                Credential cred = storage.loadCredentialByName(credName);
+                if (cred != null && !confirmSharedCredentialChange(existing, cred, host, user)) return;
                 if (cred == null) cred = new Credential();
                 if (cred.getId() == null) cred.setId(UUID.randomUUID().toString());
-                cred.setName(user + "@" + host);
+                cred.setName(cred.getName() != null ? cred.getName() : credName);
                 cred.setHost(host);
                 cred.setUsername(user);
                 cred.setPassword(pass);
@@ -635,7 +685,7 @@ public class TaskDialog extends JDialog {
                     logActivity(true, "Credential saved",
                             "Credential for " + user + "@" + host + " saved via Test Connection.");
                     JOptionPane.showMessageDialog(this,
-                            "Connection verified — credential for \"" + user + "\" has been saved and is now "
+                            "Connection verified — credential \"" + cred.getName() + "\" has been saved and is now "
                                     + "visible on the Credentials page.",
                             "Credential Saved", JOptionPane.INFORMATION_MESSAGE);
                 }
@@ -643,7 +693,7 @@ public class TaskDialog extends JDialog {
         });
         JPanel testConnectionRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
         testConnectionRow.add(btnTestConnection);
-        addRow(targetPanel, "", testConnectionRow, 4);
+        addRow(targetPanel, "", testConnectionRow, 5);
 
         // ── Schedule panel ────────────────────────────────────────────────────
         JPanel sched = titledPanel("Schedule");
@@ -711,6 +761,7 @@ public class TaskDialog extends JDialog {
         // with their fields vertically centered out of the visible viewport).
         anchorTop(general,     2);
         anchorTop(backupPanel, 11);
+        anchorTop(watchPanel,  9);
         anchorTop(targetPanel, 6);
         anchorTop(mailPanel,   23);
         anchorTop(sched,       3);
@@ -723,6 +774,7 @@ public class TaskDialog extends JDialog {
         tabbedPane.addTab("Transfer",       transferTab);
         tabbedPane.addTab("File Selection", selectionTab);
         tabbedPane.addTab("Backup",         backupPanel);
+        tabbedPane.addTab("Watch folder",   watchPanel);
         tabbedPane.addTab("Mail/IMAP",      mailPanel);
         tabbedPane.addTab("Schedule",  sched);
         tabbedPane.addTab("Retry",     retryPanel);
@@ -755,6 +807,12 @@ public class TaskDialog extends JDialog {
         cbTaskType.addActionListener(e -> {
             updateVisibility();
             updateMailFieldsVisibility();
+            // A watcher has to look repeatedly: a new watch task starts with "every 60 seconds" instead of "run once".
+            if (existing == null && "FOLDER_WATCH".equals(cbTaskType.getSelectedItem())
+                    && "RUN_NOW".equals(cbScheduleType.getSelectedItem())) {
+                cbScheduleType.setSelectedItem("INTERVAL_SECONDS");
+                tfInterval.setText("60");
+            }
         });
 
         cbScheduleType.addActionListener(e -> updateScheduleDetails());
@@ -860,10 +918,16 @@ public class TaskDialog extends JDialog {
         boolean isTransfer = "FILE_TRANSFER".equals(type);
         boolean isMail     = "OUTLOOK_MAIL".equals(type);
         boolean isBackup   = "BACKUP".equals(type);
+        boolean isWatch    = "FOLDER_WATCH".equals(type);
 
         enableTabIfPresent(transferTab,   isTransfer);
-        enableTabIfPresent(selectionTab,  isTransfer);
+        enableTabIfPresent(selectionTab,  isTransfer || isWatch);
         enableTabIfPresent(backupPanel,   isBackup);
+        enableTabIfPresent(watchPanel,    isWatch);
+        if (fileSelectionPanel != null) {
+            fileSelectionPanel.setWatchMode(isWatch);
+            if (isWatch) { fileSelectionPanel.setTransferMode("ENTIRE_FOLDER"); fileSelectionPanel.setWatcherActive(false); }
+        }
         enableTabIfPresent(mailPanel,     isMail);
 
         // Watcher checkbox (header) only applies to file transfers; mail has its
@@ -1013,9 +1077,10 @@ public class TaskDialog extends JDialog {
     private void updateTransferTabVisibility() {
         if (tabbedPane == null) return;
         boolean isBackup = "BACKUP".equals(cbTaskType.getSelectedItem());
-        enableTabIfPresent(targetPanel, !isBackup);
-        if (isBackup && tabbedPane.getSelectedComponent() == targetPanel) {
-            tabbedPane.setSelectedComponent(backupPanel);
+        boolean isWatch  = "FOLDER_WATCH".equals(cbTaskType.getSelectedItem());
+        enableTabIfPresent(targetPanel, !isBackup && !isWatch);
+        if ((isBackup || isWatch) && tabbedPane.getSelectedComponent() == targetPanel) {
+            tabbedPane.setSelectedComponent(isWatch ? watchPanel : backupPanel);
         }
     }
 
@@ -1027,7 +1092,7 @@ public class TaskDialog extends JDialog {
     private void updateMailFieldsVisibility() {
         boolean isMail = "OUTLOOK_MAIL".equals(cbTaskType.getSelectedItem());
         if (targetPanel != null && tabbedPane != null)
-            enableTabIfPresent(targetPanel, !isMail);
+            enableTabIfPresent(targetPanel, !isMail && !"FOLDER_WATCH".equals(cbTaskType.getSelectedItem()));
         if (tabbedPane != null) { tabbedPane.revalidate(); tabbedPane.repaint(); }
         if (targetPanel != null) { targetPanel.revalidate(); targetPanel.repaint(); }
         revalidate(); repaint();
@@ -1145,6 +1210,7 @@ public class TaskDialog extends JDialog {
         boolean isMail      = "OUTLOOK_MAIL".equals(cbTaskType.getSelectedItem());
 
         boolean isBackup    = "BACKUP".equals(cbTaskType.getSelectedItem());
+        boolean isWatch     = "FOLDER_WATCH".equals(cbTaskType.getSelectedItem());
 
         String targetHost = tfTargetHost.getText().trim();
         String targetUser = tfTargetUser.getText().trim();
@@ -1152,7 +1218,7 @@ public class TaskDialog extends JDialog {
 
         // Mail and Backup tasks don't use the SFTP-style target credential.
         // Every FILE_TRANSFER task requires one — local→local is not supported.
-        if (!isMail && !isBackup) {
+        if (!isMail && !isBackup && !isWatch) {
             if (targetHost.isEmpty()) { msg("Target hostname / IP is required."); return; }
             if (targetUser.isEmpty()) { msg("Target username is required.");       return; }
             if (targetPass.isEmpty()) { msg("Target password is required.");       return; }
@@ -1252,6 +1318,19 @@ public class TaskDialog extends JDialog {
                         "Mailbox not yet authorized", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
                 if (choice != JOptionPane.YES_OPTION) return;
             }
+        } else if (isWatch) {
+            if (tfWatchPath.getText().trim().isEmpty()) { msg("The folder to watch is required."); return; }
+            if (cbWatchRemote.isSelected() && tfWatchCredential.getText().trim().isEmpty()) {
+                msg("Credential (the name of a saved credential) is required when the folder is on a server."); return;
+            }
+            if (!cbWatchNew.isSelected() && !cbWatchChanged.isSelected()) {
+                msg("Choose what to report: new files, changed files, or both."); return;
+            }
+            java.util.List<String> watchProblems = fileSelectionPanel.validateInput();
+            if (!watchProblems.isEmpty()) {
+                msg("The file conditions need fixing:\n\n  \u2022 " + String.join("\n  \u2022 ", watchProblems));
+                return;
+            }
         } else if (isBackup) {
             if (tfBackupSourcePath.getText().trim().isEmpty()) { msg("Backup source folder is required."); return; }
             if (tfBackupDestinationPath.getText().trim().isEmpty()) { msg("Backup destination folder is required."); return; }
@@ -1262,21 +1341,26 @@ public class TaskDialog extends JDialog {
                 return;
             }
             if (srcRemote && tfBackupSourceUsername.getText().trim().isEmpty()) {
-                msg("Source Username is required when 'Source is remote' is checked."); return;
+                msg("Source Credential (the name of a saved credential) is required when 'Source is remote' is checked."); return;
             }
             if (destRemote && tfBackupDestinationUsername.getText().trim().isEmpty()) {
-                msg("Destination Username is required when 'Destination is remote' is checked."); return;
+                msg("Destination Credential (the name of a saved credential) is required when 'Destination is remote' is checked."); return;
             }
         }
 
         // ── Persist credential file creds_<username>.xml ──────────────────────
         // Skipped for mail (uses OAuth2, not a stored credential) and backup
         // (backup credentials are persisted separately, see below).
-        if (!isMail && !isBackup && !targetUser.isEmpty()) {
-            Credential cred = storage.loadCredentialByUsername(targetUser);
-            if (cred == null) cred = new Credential();
+        String credName = targetCredentialName();
+        if (!isMail && !isBackup && !isWatch && !targetUser.isEmpty()) {
+            Credential cred = storage.loadCredentialByName(credName);
+            if (cred != null) {
+                if (!confirmSharedCredentialChange(existing, cred, targetHost, targetUser)) return;
+            } else {
+                cred = new Credential();
+            }
             if (cred.getId() == null) cred.setId(UUID.randomUUID().toString());
-            cred.setName(targetUser + "@" + targetHost);
+            cred.setName(cred.getName() != null ? cred.getName() : credName);
             cred.setHost(targetHost);
             cred.setUsername(targetUser);
             cred.setPassword(targetPass);
@@ -1327,7 +1411,7 @@ public class TaskDialog extends JDialog {
 
         // Mail tasks use OAuth2/Graph, so targetUsername is left blank for them
         // (and for Backup, which stores its own source/destination usernames).
-        t.setTargetUsername(!isMail && !isBackup ? targetUser : "");
+        t.setTargetUsername(!isMail && !isBackup && !isWatch ? credName : "");   // the credential's name (field name is historical)
         t.setSourceCredentialId(
                 tfSourceUser.getText().trim() + "@" + tfSourceHost.getText().trim());
 
@@ -1374,6 +1458,12 @@ public class TaskDialog extends JDialog {
             if (mailWatcherEpochShouldReset) {
                 t.setMailLastKnownEpoch(0L);
             }
+        } else if (isWatch) {
+            t.setBackupSourcePath(tfWatchPath.getText().trim());
+            t.setBackupSourceUsername(cbWatchRemote.isSelected() ? tfWatchCredential.getText().trim() : "");
+            t.setWatchOptions(new model.WatchOptions(cbWatchNew.isSelected(), cbWatchChanged.isSelected()).toText());
+            t.setFileSelectionRules(fileSelectionPanel.getSelection().toText());
+            t.setWatcherEnabled(false);
         } else if (isBackup) {
             t.setBackupSourcePath(tfBackupSourcePath.getText().trim());
             t.setBackupDestinationPath(tfBackupDestinationPath.getText().trim());
@@ -1557,14 +1647,14 @@ public class TaskDialog extends JDialog {
         String username = usernameField.getText().trim();
         if (username.isEmpty()) {
             JOptionPane.showMessageDialog(this,
-                    "Enter the Username first — it must match a saved credential.",
+                    "Enter the credential name first — it must match a saved credential.",
                     "Browse", JOptionPane.WARNING_MESSAGE);
             return;
         }
-        Credential cred = storage.loadCredentialByUsername(username);
+        Credential cred = storage.loadCredentialByName(username);
         if (cred == null) {
             JOptionPane.showMessageDialog(this,
-                    "No saved credential found for username \"" + username + "\".\n"
+                    "No saved credential named \"" + username + "\".\n"
                             + "Save one first (e.g. via a File Transfer task's Target Credentials tab, "
                             + "or the Credentials page).",
                     "Browse", JOptionPane.WARNING_MESSAGE);
@@ -1702,6 +1792,32 @@ public class TaskDialog extends JDialog {
     private JPasswordField makePasswordField(JPasswordField field) {
         field.setMaximumSize(new Dimension(Integer.MAX_VALUE, field.getPreferredSize().height));
         return field;
+    }
+
+    private static String nz(String s) { return s == null ? "" : s; }
+
+    /**
+     * A saved credential is shared by name: changing its server or login changes it for every task that uses it.
+     * When that would affect other tasks, asks first. Returns false if the operator chose to go back.
+     */
+    private boolean confirmSharedCredentialChange(ScheduledTask existing, Credential cred, String host, String user) {
+        boolean changes = !host.equals(nz(cred.getHost())) || !user.equals(nz(cred.getUsername()));
+        int others = storage.countTasksUsingCredential(cred.getName())
+                - (existing != null && cred.getName().equalsIgnoreCase(nz(existing.getTargetUsername())) ? 1 : 0);
+        if (!changes || others <= 0) return true;
+        int answer = JOptionPane.showConfirmDialog(this,
+                "The saved credential \"" + cred.getName() + "\" is also used by " + others + " other task"
+                        + (others == 1 ? "" : "s") + ".\nSaving will change its server and username for all of them.\n\n"
+                        + "Change it for all of them?  Choose No to go back and give this task its own credential name.",
+                "Shared credential", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
+        return answer == JOptionPane.YES_OPTION;
+    }
+
+    /** The credential name the operator chose or typed; empty becomes {@code username@host}. */
+    private String targetCredentialName() {
+        Object item = cbTargetCredential.getEditor().getItem();
+        String typed = item == null ? "" : item.toString().trim();
+        return typed.isEmpty() ? tfTargetUser.getText().trim() + "@" + tfTargetHost.getText().trim() : typed;
     }
 
     private JComboBox<String> makeCombo(JComboBox<String> combo) {

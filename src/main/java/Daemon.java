@@ -195,13 +195,18 @@ public class Daemon {
 
     private static void handleCommand(service.CommandQueueService.Poller poller, TaskSchedulerService scheduler,
                                        service.CommandQueueService.Command cmd) {
+        long t0 = System.currentTimeMillis();
         try {
             runAction(scheduler, cmd.action(), cmd.taskId());
             log("Executed GUI command " + cmd.action() + " for task " + cmd.taskId()
                     + " (requested by " + cmd.requestedBy() + ")");
+            service.DaemonCallLog.record("queue", "EXECUTE", "gui_commands", 200, System.currentTimeMillis() - t0,
+                    cmd.action().name(), cmd.taskId(), cmd.requestedBy(), "Executed (queued at " + cmd.requestedAt() + ")");
             poller.markDone(cmd.id());
         } catch (Exception e) {
             log("GUI command " + cmd.action() + " for task " + cmd.taskId() + " failed: " + e.getMessage());
+            service.DaemonCallLog.record("queue", "EXECUTE", "gui_commands", 500, System.currentTimeMillis() - t0,
+                    cmd.action().name(), cmd.taskId(), cmd.requestedBy(), String.valueOf(e.getMessage()));
             poller.markFailed(cmd.id(), e.getMessage());
         }
     }

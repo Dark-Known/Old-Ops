@@ -138,6 +138,9 @@ public final class FileSelection {
     private boolean failIfNoMatch;        // nothing matched = failed run instead of a skipped one
     private SentPolicy sentPolicy = SentPolicy.ALWAYS;
     private AfterAction afterAction = AfterAction.KEEP;
+    private boolean alertNoFiles = false;      // raise an alert when a run finds no file to send/receive
+    private int silenceMinutes = 0;            // alert when no file has arrived for this long (0 = off); works with watchers
+    private int alertRepeatMinutes = 60;       // do not repeat the alert for the same task within this time (0 = every run)
     private String afterFolder = "";      // target folder for AfterAction.MOVE (remote for downloads, local for uploads)
 
     public List<Rule> getRules()                 { return rules; }
@@ -168,6 +171,12 @@ public final class FileSelection {
     public FileSelection setPickCount(int v)             { pickCount = Math.max(1, v); return this; }
     public FileSelection setKeepTies(boolean v)          { keepTies = v; return this; }
     public FileSelection setFailIfNoMatch(boolean v)     { failIfNoMatch = v; return this; }
+    public int getSilenceMinutes()               { return silenceMinutes; }
+    public FileSelection setSilenceMinutes(int m)        { silenceMinutes = Math.max(0, m); return this; }
+    public boolean isAlertNoFiles()              { return alertNoFiles; }
+    public int getAlertRepeatMinutes()           { return alertRepeatMinutes; }
+    public FileSelection setAlertNoFiles(boolean b)      { alertNoFiles = b; return this; }
+    public FileSelection setAlertRepeatMinutes(int m)    { alertRepeatMinutes = Math.max(0, m); return this; }
     public FileSelection setSentPolicy(SentPolicy p)     { sentPolicy = p == null ? SentPolicy.ALWAYS : p; return this; }
     public FileSelection setAfterAction(AfterAction a)   { afterAction = a == null ? AfterAction.KEEP : a; return this; }
     public FileSelection setAfterFolder(String f)        { afterFolder = f == null ? "" : f.trim(); return this; }
@@ -214,6 +223,7 @@ public final class FileSelection {
                 problems.add("Condition " + n + " has an invalid date placeholder: " + e.getMessage());
             }
         }
+        if (alertRepeatMinutes < 0) problems.add("The alert repeat time cannot be negative.");
         if (afterAction == AfterAction.MOVE && afterFolder.isBlank()) {
             problems.add("\"Move the original to a folder\" needs a folder.");
         }
@@ -429,7 +439,7 @@ public final class FileSelection {
 
     /** One readable line, e.g. {@code name ends with ".csv" AND NOT name contains "tmp" · settled 30s · newest 1}. */
     public String describe() {
-        if (!isActive() && !hasAfterAction()) return "no file selection rules (Transfer Mode only)";
+        if (!isActive() && !hasAfterAction() && !alertNoFiles && silenceMinutes == 0) return "no file selection rules (Transfer Mode only)";
         List<String> parts = new ArrayList<>();
         List<String> inc = new ArrayList<>(), exc = new ArrayList<>();
         for (Rule r : rules) (r.exclude ? exc : inc).add(r.toString().replaceFirst("^NOT ", ""));
@@ -450,6 +460,8 @@ public final class FileSelection {
         if (failIfNoMatch && isActive()) parts.add("fail if nothing matches");
         if (afterAction == AfterAction.DELETE) parts.add("then delete the original");
         if (afterAction == AfterAction.MOVE) parts.add("then move the original to " + afterFolder);
+        if (silenceMinutes > 0) parts.add("alert if no file for " + silenceMinutes + " min");
+        if (alertNoFiles) parts.add("alert if no files" + (alertRepeatMinutes > 0 ? " (at most every " + alertRepeatMinutes + " min)" : ""));
         return String.join(" · ", parts);
     }
 
@@ -464,7 +476,7 @@ public final class FileSelection {
 
     /** Serialized form kept in the task's {@code file_selection} column; empty string when there are no rules. */
     public String toText() {
-        if (!isActive() && !failIfNoMatch && !hasAfterAction()) return "";
+        if (!isActive() && !failIfNoMatch && !hasAfterAction() && !alertNoFiles && silenceMinutes == 0) return "";
         StringBuilder sb = new StringBuilder("v=1\n");
         sb.append("match=").append(matchMode.name()).append('\n');
         sb.append("pick=").append(pick.name()).append('\n');
@@ -479,6 +491,9 @@ public final class FileSelection {
         sb.append("skipTemp=").append(skipTempFiles ? 1 : 0).append('\n');
         sb.append("sent=").append(sentPolicy.name()).append('\n');
         sb.append("after=").append(afterAction.name()).append('\n');
+        sb.append("alert=").append(alertNoFiles ? 1 : 0).append('\n');
+        sb.append("silence=").append(silenceMinutes).append('\n');
+        sb.append("alertEvery=").append(alertRepeatMinutes).append('\n');
         sb.append("afterFolder=").append(URLEncoder.encode(afterFolder, StandardCharsets.UTF_8)).append('\n');
         for (Rule r : rules) {
             sb.append("rule=").append(r.exclude ? 'X' : 'I').append('|').append(r.op.name()).append('|')
@@ -512,6 +527,9 @@ public final class FileSelection {
                     case "skipTemp":      s.setSkipTempFiles("1".equals(v)); break;
                     case "sent":          s.setSentPolicy(SentPolicy.valueOf(v)); break;
                     case "after":         s.setAfterAction(AfterAction.valueOf(v)); break;
+                    case "alert":         s.setAlertNoFiles("1".equals(v)); break;
+                    case "silence":       s.setSilenceMinutes(Integer.parseInt(v)); break;
+                    case "alertEvery":    s.setAlertRepeatMinutes(Integer.parseInt(v)); break;
                     case "afterFolder":   s.setAfterFolder(URLDecoder.decode(v, StandardCharsets.UTF_8)); break;
                     case "rule": {
                         String[] f = v.split("\\|", 4);

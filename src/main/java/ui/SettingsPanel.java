@@ -184,6 +184,8 @@ public class SettingsPanel extends JPanel {
         outer.add(card("Daemon", daemonPanel));
         outer.add(Box.createVerticalStrut(12));
 
+        // The socket link monitor has its own page: "API" in the sidebar.
+
         // Retention: how long / how large the log databases may grow (purged by a task worker)
         retentionPanel = new RetentionPanel(scheduler);
         outer.add(card("Data retention & purge", retentionPanel));

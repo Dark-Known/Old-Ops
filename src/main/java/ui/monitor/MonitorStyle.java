@@ -52,6 +52,7 @@ public final class MonitorStyle {
             case SYSTEM -> new Color(0x6E6FA8);
             case SSH -> new Color(0x8A6FB0);
             case BACKGROUND -> new Color(0x5B8FA3);
+            case ALERT -> new Color(0x5059C9);
         };
     }
 

@@ -320,4 +320,25 @@ public class FileSelectionTest {
         assertTrue(d, d.contains("then move the original to /done"));
         assertTrue(new FileSelection().setAfterAction(FileSelection.AfterAction.DELETE).describe().contains("then delete the original"));
     }
+
+    @Test public void alertSettingsSurviveSavingAndDefaultToOff() {
+        FileSelection s = new FileSelection().setAlertNoFiles(true).setAlertRepeatMinutes(15);
+        FileSelection back = FileSelection.fromText(s.toText());
+        assertTrue(back.isAlertNoFiles());
+        assertEquals(15, back.getAlertRepeatMinutes());
+        assertFalse("tasks saved before alerts existed do not alert", FileSelection.fromText("").isAlertNoFiles());
+        assertFalse("an alert alone does not turn the file rules on", s.isActive());
+        assertTrue(s.describe().contains("alert if no files"));
+        assertEquals(0, new FileSelection().setAlertRepeatMinutes(-5).getAlertRepeatMinutes());
+    }
+
+    @Test public void silenceAlertSurvivesSavingAloneAndIsOffByDefault() {
+        FileSelection s = new FileSelection().setSilenceMinutes(10);
+        FileSelection back = FileSelection.fromText(s.toText());
+        assertEquals(10, back.getSilenceMinutes());
+        assertEquals(0, FileSelection.fromText("").getSilenceMinutes());
+        assertFalse("does not turn the file rules on", s.isActive());
+        assertTrue(s.describe().contains("alert if no file for 10 min"));
+        assertEquals(0, new FileSelection().setSilenceMinutes(-3).getSilenceMinutes());
+    }
 }

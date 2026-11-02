@@ -247,12 +247,20 @@ public class OAuth2TokenService {
                     .build();
 
             HttpResponse<String> resp;
+            long t0 = System.currentTimeMillis();
             try {
                 resp = http.send(req, HttpResponse.BodyHandlers.ofString());
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
                 throw new IOException("Interrupted while refreshing OAuth2 token", ie);
+            } catch (IOException ioe) {
+                GraphCallLog.record("token", "POST", req.uri(), accountKey, 0, System.currentTimeMillis() - t0, -1, null, 1,
+                        "Refresh token grant: " + ioe.getClass().getSimpleName() + ": " + ioe.getMessage());
+                throw ioe;
             }
+            GraphCallLog.record("token", "POST", req.uri(), accountKey, resp.statusCode(), System.currentTimeMillis() - t0, -1,
+                    resp.headers().firstValue("request-id").orElse(null), 1,
+                    resp.statusCode() == 200 ? "Refresh token grant" : "Refresh token grant: " + GraphCallLog.errorText(resp.body()));
 
             Map<String, Object> body = MiniJson.parseObject(resp.body());
             if (resp.statusCode() != 200) {
@@ -311,12 +319,20 @@ public class OAuth2TokenService {
                                 + "&client_assertion=" + urlEnc(assertion)))
                 .build();
         HttpResponse<String> resp;
+        long t0 = System.currentTimeMillis();
         try {
             resp = http.send(req, HttpResponse.BodyHandlers.ofString());
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
             throw new IOException("Interrupted while requesting an app-only token", ie);
+        } catch (IOException ioe) {
+            GraphCallLog.record("token", "POST", req.uri(), clientId, 0, System.currentTimeMillis() - t0, -1, null, 1,
+                    "App-only (certificate) token: " + ioe.getClass().getSimpleName() + ": " + ioe.getMessage());
+            throw ioe;
         }
+        GraphCallLog.record("token", "POST", req.uri(), clientId, resp.statusCode(), System.currentTimeMillis() - t0, -1,
+                resp.headers().firstValue("request-id").orElse(null), 1,
+                resp.statusCode() == 200 ? "App-only (certificate) token" : "App-only (certificate) token: " + GraphCallLog.errorText(resp.body()));
         Map<String, Object> body = MiniJson.parseObject(resp.body());
         if (resp.statusCode() != 200) {
             throw new IOException("App-only token request failed (" + resp.statusCode() + "): "

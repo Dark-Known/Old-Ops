@@ -472,7 +472,7 @@ public class RemotePushWatcher {
     private Credential resolveCredential(ScheduledTask task) {
         String uname = task.getTargetUsername();
         if (uname != null && !uname.isEmpty()) {
-            return storage.loadCredentialByUsername(uname);
+            return storage.loadCredentialByName(uname);
         }
         if (task.getTargetCredentialId() != null && !task.getTargetCredentialId().isEmpty()) {
             return storage.loadAllCredentials().stream()
