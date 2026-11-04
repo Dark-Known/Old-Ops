@@ -246,9 +246,12 @@ public class RemotePushWatcher {
         boolean opened = false;
         long openedAt = 0;
         String endReason = null;
+        final service.sftp.SessionLog sl = new service.sftp.SessionLog();   // transcript shown in the Event Monitor
         try {
             JSch jsch = new JSch();
             session = jsch.getSession(cred.getUsername(), cred.getHost(), 22);
+            session.setLogger(sl.jschLogger());
+            sl.add("Connecting to " + cred.getHost() + ":22 as " + cred.getUsername() + " (remote " + os + ")");
             util.SshAuth.apply(jsch, session, cred.getPassword());
             Properties config = new Properties();
             config.put("StrictHostKeyChecking", "no");
@@ -261,26 +264,30 @@ public class RemotePushWatcher {
                 session.connect(15_000);
             } catch (Exception ex) {
                 service.SshSessionEvents.failedDetached(taskId, "remote change listener (" + os + "), stays open while the watcher is armed", cred.getHost(),
-                        cred.getUsername(), ex.getMessage());
+                        cred.getUsername(), ex.getMessage(), sl.text());
                 throw ex;
             }
             opened = true;
             openedAt = System.currentTimeMillis();
-            service.SshSessionEvents.openedDetached(taskId, "remote change listener (" + os + "), stays open while the watcher is armed", cred.getHost(), cred.getUsername());
+            service.SshSessionEvents.openedDetached(taskId, "remote change listener (" + os + "), stays open while the watcher is armed", cred.getHost(), cred.getUsername(), sl.text());
             handle.session = session;
             if (handle.closed) return; // stopped/replaced while connecting: never start a remote process
 
             channel = (ChannelExec) session.openChannel("exec");
             handle.channel = channel;
-            channel.setCommand(os == RemoteOs.WINDOWS
+            String remoteCommand = os == RemoteOs.WINDOWS
                     ? buildWindowsCommand(rawTargetPath)
-                    : buildLinuxCommand(rawTargetPath));
+                    : buildLinuxCommand(rawTargetPath);
+            sl.add("Starting remote change listener: " + (remoteCommand.length() > 300
+                    ? remoteCommand.substring(0, 300) + "\u2026" : remoteCommand));
+            channel.setCommand(remoteCommand);
             channel.setInputStream(null);
             channel.setErrStream(new ByteArrayOutputStream()); // discard; failures surface via the marker or a closed stream
 
             InputStream in = channel.getInputStream();
             channel.connect(15_000);
             if (handle.closed) return; // finally{} tears the channel + session down
+            sl.add("Listener running; waiting for change events");
             reasonByTaskId.put(taskId, "connected (" + os + "), waiting for first change event");
 
             BufferedReader reader = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8));
@@ -309,6 +316,7 @@ public class RemotePushWatcher {
                     } else {
                         reason = "remote host has no inotifywait installed (or exec was refused)";
                     }
+                    sl.add("Remote reported: " + reason);
                     log.info("Watcher task " + taskId + ": " + reason + "; falling back to scheduled polling only for "
                             + (UNSUPPORTED_RETRY_MS / 60000) + " min.");
                     markUnsupported(taskId, reason);
@@ -320,6 +328,7 @@ public class RemotePushWatcher {
                 // can fetch exactly this file instead of re-deriving "what's new"
                 // from a baseline-filtered directory scan.
                 reasonByTaskId.put(taskId, "connected (" + os + "), streaming remote change events");
+                sl.add("Remote says changed: " + line);
                 scheduleFire(taskId, line);
             }
             if (!sawAnyLine && !handle.closed) {
@@ -328,11 +337,13 @@ public class RemotePushWatcher {
                 String reason = "remote exec (" + os + ") produced no output — most likely the SSH server refused"
                         + " the exec channel (some SFTP-only servers do)";
                 log.info("Watcher task " + taskId + ": " + reason + "; falling back to scheduled polling only.");
+                sl.add(reason);
                 markUnsupported(taskId, reason);
                 endReason = "remote exec produced no output";
             }
         } catch (Exception e) {
             endReason = "error: " + e.getMessage();
+            sl.add("Error: " + e.getMessage());
             if (!handle.closed) {
                 String reason = "connection failed (" + os + "): " + e.getMessage();
                 log.info("Watcher task " + taskId + ": remote push listener unavailable (" + e.getMessage()
@@ -347,7 +358,7 @@ public class RemotePushWatcher {
                         cred.getUsername(),
                         handle.closed ? "watcher stopped or reconfigured"
                                 : endReason != null ? endReason : "remote side ended the stream",
-                        System.currentTimeMillis() - openedAt);
+                        System.currentTimeMillis() - openedAt, sl.text());
             }
             activeByTaskId.remove(taskId, handle);
         }

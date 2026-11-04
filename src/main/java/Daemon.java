@@ -60,6 +60,12 @@ public class Daemon {
         log("Data directory : " + dataDir);
         log("Log file       : " + logPath);
         log("JVM            : " + System.getProperty("java.version"));
+        util.MemoryTrimmer.start(new File(dataDir, "logs"), "daemon");
+        boolean lean = java.lang.management.ManagementFactory.getRuntimeMXBean().getInputArguments()
+                .stream().anyMatch(a -> a.startsWith("-Xmx"));
+        log("JVM flags      : " + java.lang.management.ManagementFactory.getRuntimeMXBean().getInputArguments());
+        if (!lean) log("WARNING: started with no heap settings (default G1, heap ceiling = 1/4 of RAM). "
+                + "Re-run packaging\\install-service.ps1 as Administrator to reinstall the service with the lean flags.");
 
         // ── Wire services (same classes the GUI uses) ────────────────────────
         XmlStorageService storage      = new XmlStorageService(dataDir);

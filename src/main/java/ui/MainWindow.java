@@ -25,7 +25,8 @@ public class MainWindow extends JFrame {
     private final TaskSchedulerService scheduler;
 
     private TaskManagerPanel taskPanel;
-    private CredentialManagerPanel credPanel;
+    private LazyPanel<CredentialManagerPanel> credLazy;
+    private LazyPanel<RunHistoryPanel> logsLazy;
     private StatusStrip statusStrip;
     private ToastManager toastManager;
     private java.awt.event.ComponentListener sidebarResizeListener;
@@ -114,6 +115,8 @@ public class MainWindow extends JFrame {
 
         showStartupFailures();
     }
+    public static void startMemoryReports(String dir) { util.MemoryTrimmer.start(new java.io.File(dir, "logs"), "gui"); }
+
     private String loadDataDir() {
         String defaultDir = "C:\\OpsTools\\Data";
         String val = util.AppConfig.readValue("dataDir");
@@ -315,20 +318,21 @@ public class MainWindow extends JFrame {
 
         // ── Sidebar navigation (Tasks / Credentials / Logs / Settings) ─────────
         taskPanel = new TaskManagerPanel(storage, scheduler);
-        credPanel = new CredentialManagerPanel(storage, scheduler.getRunHistoryService());
-        RunHistoryPanel runHistoryPanel = new RunHistoryPanel(storage, scheduler.getRunHistoryService());
-        SettingsPanel settingsPanel = new SettingsPanel(transferService, scheduler);
-        ApiPanel linkPanel = new ApiPanel(storage.getDataDir(), storage::loadTasksSnapshot, scheduler.getRunHistoryService());
+        // Only the Tasks page is built now; the others are built the first time they are opened.
+        credLazy = new LazyPanel<>(() -> new CredentialManagerPanel(storage, scheduler.getRunHistoryService()), this::wrapCard);
+        logsLazy = new LazyPanel<>(() -> new RunHistoryPanel(storage, scheduler.getRunHistoryService()), this::wrapCard);
+        LazyPanel<ApiPanel> apiLazy = new LazyPanel<>(() -> new ApiPanel(storage.getDataDir(), storage::loadTasksSnapshot, scheduler.getRunHistoryService()), this::wrapCard);
+        LazyPanel<SettingsPanel> settingsLazy = new LazyPanel<>(() -> new SettingsPanel(transferService, scheduler), this::wrapCard);
 
         CardLayout cards = new CardLayout();
         JPanel content = new JPanel(cards);
         content.setBackground(bgBase);
         content.setBorder(new EmptyBorder(18, 20, 18, 20));
         content.add(wrapCard(taskPanel), "Tasks");
-        content.add(wrapCard(credPanel), "Credentials");
-        content.add(wrapCard(runHistoryPanel), "Logs");
-        content.add(wrapCard(linkPanel), "API");
-        content.add(wrapCard(settingsPanel), "Settings");
+        content.add(credLazy, "Credentials");
+        content.add(logsLazy, "Logs");
+        content.add(apiLazy, "API");
+        content.add(settingsLazy, "Settings");
 
         JPanel sidebar = new JPanel();
         sidebar.setLayout(new BoxLayout(sidebar, BoxLayout.Y_AXIS));
@@ -374,6 +378,13 @@ public class MainWindow extends JFrame {
             navButtons[i] = btn;
             navGroup.add(btn);
             btn.addActionListener(e -> {
+                switch (navNames[idx]) {   // build the page on first visit
+                    case "Credentials" -> credLazy.get();
+                    case "Logs" -> logsLazy.get();
+                    case "API" -> apiLazy.get();
+                    case "Settings" -> settingsLazy.get();
+                    default -> { }
+                }
                 cards.show(content, navNames[idx]);
                 for (int j = 0; j < navButtons.length; j++) {
                     boolean sel = j == idx;
@@ -383,8 +394,8 @@ public class MainWindow extends JFrame {
                     navButtons[j].setIcon(sel ? navIconsSelected[j] : navIcons[j]);
                 }
                 if (navNames[idx].equals("Tasks")) taskPanel.refresh();
-                if (navNames[idx].equals("Credentials")) credPanel.refresh();
-                if (navNames[idx].equals("Logs")) runHistoryPanel.refresh();
+                if (navNames[idx].equals("Credentials")) credLazy.get().refresh();
+                if (navNames[idx].equals("Logs")) logsLazy.get().refresh();
             });
             sidebar.add(btn);
             sidebar.add(Box.createVerticalStrut(4));
@@ -442,12 +453,12 @@ public class MainWindow extends JFrame {
                     // Logs tab for anyone who does want to see it; it just
                     // doesn't pop a toast or bump the failure bell.
                     if (isInternalConcurrencySkip(record)) {
-                        runHistoryPanel.onRunRecorded(record);
+                        { RunHistoryPanel rh = logsLazy.builtOrNull(); if (rh != null) rh.onRunRecorded(record); }
                         return;
                     }
                     toastManager.showToast(record);
                     if (statusStrip != null) statusStrip.refresh();
-                    runHistoryPanel.onRunRecorded(record);
+                    { RunHistoryPanel rh = logsLazy.builtOrNull(); if (rh != null) rh.onRunRecorded(record); }
                 });
         scheduler.getRunHistoryService().addRunListener(runListener);
 

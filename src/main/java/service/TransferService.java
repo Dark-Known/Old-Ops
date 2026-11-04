@@ -704,7 +704,14 @@ public class TransferService {
         } else {
             success = executeWinScpWatcherInbound(task, target, newFiles, logLine);
         }
-        if (success) afterWatcherSuccess(task, target, newFiles, isOutbound, logLine);
+        try {
+            if (success) afterWatcherSuccess(task, target, newFiles, isOutbound, logLine);
+        } finally {
+            persistentSftp.note(task.getId(), success ? "Fire finished: transfer and cleanup done, closing the session"
+                    : "Fire finished: the transfer failed, closing the session");
+            persistentSftp.close(task.getId(), success ? "fire finished: " + newFiles.size() + " file(s) transferred"
+                    : "fire finished: transfer failed");
+        }
 
         // ── Persist new baseline ──────────────────────────────────────────────
         // Guard against the event-driven path (which bypasses the "modified after
@@ -1156,6 +1163,8 @@ public class TransferService {
                 if (destParent != null) Files.createDirectories(destParent);
                 channel.get(remoteFile, destPath);
                 downloadedLocalPaths.add(destPath);
+                persistentSftp.note(task.getId(), "get " + remoteFile + " \u2192 " + destPath + " ("
+                        + Math.max(meta.size(), 0) + " bytes in " + elapsedMs(fileStart) + " ms)");
                 logLine.accept("[INFO] Queued inbound: " + remoteFile + " → " + destPath
                         + " (" + elapsedMs(fileStart) + "ms, " + humanReadableBytes(Math.max(meta.size(), 0)) + ")");
                 return Math.max(meta.size(), 0);
@@ -1171,9 +1180,8 @@ public class TransferService {
                     + humanReadableBytes(totalBytes) + " total, 1 batch(es), 1 session(s), " + concurrency
                     + " worker thread(s). Timing — connect: " + elapsedMs(t0, transferStart) + "ms, transfer: "
                     + elapsedMs(transferStart) + "ms, total: " + elapsedMs(t0) + "ms.");
-            // See the matching comment in executeWinScpWatcherOutbound — same
-            // "scoped to one fire, closed immediately after" lifecycle.
-            persistentSftp.close(task.getId());
+            // The session stays open for the "after a successful transfer" step (delete/move originals), which
+            // runs on this same connection; executeTransfer closes it, with the reason, once that step is done.
             return true;
         } catch (Exception ex) {
             logLine.accept("[ERROR] Inbound watcher SFTP transfer failed after " + elapsedMs(t0) + "ms: " + ex.getMessage());
@@ -1806,13 +1814,17 @@ public class TransferService {
                         + " additional local destination(s): " + String.join(", ", extraDestFolders));
             }
             List<String> downloadedLocalPaths = new ArrayList<>();
+            final boolean deleteInSession = selection.getAfterAction() == FileSelection.AfterAction.DELETE;
             for (String remoteFile : remoteFiles) {
                 String fname    = remoteFile.substring(remoteFile.lastIndexOf('/') + 1);
                 String destPath = buildLocalDestinationPath(localPath, fname);
                 RemoteFileStat stat = remoteStats.get(remoteFile);
                 long size = stat != null ? stat.size : 0L;
+                // "Delete originals": WinSCP removes each file itself, right after that file has downloaded
+                // successfully and in the same session - no second connection to the server is needed.
                 commands.add(new SizedCommand(
-                        "get " + escapeWinScpRemotePath(remoteFile) + " " + escapeWinScpPath(destPath), size));
+                        "get " + (deleteInSession ? "-delete " : "") + escapeWinScpRemotePath(remoteFile) + " "
+                                + escapeWinScpPath(destPath), size));
                 downloadedLocalPaths.add(destPath);
                 inboundRemoteFiles.add(remoteFile);
                 inboundLocalCopies.add(destPath);
@@ -1828,7 +1840,12 @@ public class TransferService {
                 noFilesAlerts.reset(task.getId());
                 markArrival(task, selection, logLine);
                 recordSent(ledger, task, toRecord, logLine);
-                afterSuccessRemote(target, selection, inboundRemoteFiles, inboundLocalCopies, inboundSizes, logLine);
+                if (deleteInSession) {
+                    logLine.accept("[INFO] Deleted " + inboundRemoteFiles.size()
+                            + " original file(s) on the server in the same session as the download.");
+                } else {
+                    afterSuccessRemote(target, selection, inboundRemoteFiles, inboundLocalCopies, inboundSizes, logLine);
+                }
             }
             return ok;
         } else {
@@ -2165,8 +2182,83 @@ public class TransferService {
                 local.add(buildLocalDestinationPath(localDest, f.fileName()));
                 sizes.add(f.size());
             }
-            afterSuccessRemote(target, sel, remote, local, sizes, logLine);
+            if (!afterSuccessRemoteOnOpenSession(task, target, sel, remote, local, sizes, logLine)) {
+                afterSuccessRemote(target, sel, remote, local, sizes, logLine);   // fallback: its own connection
+            }
         }
+    }
+
+    /**
+     * The "after a successful transfer" step for watcher downloads, run on the SSH session the download used:
+     * no new connection. Only originals whose local copy is complete are touched. Returns false only if the open
+     * session could not be used at all (the caller then falls back to a separate connection).
+     */
+    private boolean afterSuccessRemoteOnOpenSession(ScheduledTask task, Credential target, FileSelection sel,
+                                                    List<String> remoteFiles, List<String> localCopies,
+                                                    List<Long> sizes, Consumer<String> logLine) {
+        final String id = task.getId();
+        ChannelSftp ch;
+        try {
+            ch = persistentSftp.getChannel(id, target);
+        } catch (Exception e) {
+            logLine.accept("[WARN] Could not reuse the SSH session for the cleanup step (" + e.getMessage()
+                    + "); using a separate connection.");
+            return false;
+        }
+        boolean move = sel.getAfterAction() == FileSelection.AfterAction.MOVE;
+        persistentSftp.note(id, "Cleanup requested: " + (move ? "move originals to " + sel.getAfterFolder() : "delete originals")
+                + " after a successful transfer (" + remoteFiles.size() + " file(s))");
+        List<String> safe = new ArrayList<>();
+        for (int i = 0; i < remoteFiles.size(); i++) {
+            boolean complete = TransferCleanup.copyIsComplete(Paths.get(localCopies.get(i)), sizes.get(i));
+            if (complete) safe.add(remoteFiles.get(i));
+            else {
+                String m = "Kept " + TransferCleanup.baseName(remoteFiles.get(i)) + " on the server: the copy on this PC is missing or has the wrong size";
+                persistentSftp.note(id, m);
+                logLine.accept("[WARN] " + m);
+            }
+        }
+        int done = 0;
+        try {
+            if (move) {
+                String dir = normalizeRemotePath(sel.getAfterFolder());
+                while (dir.length() > 1 && dir.endsWith("/")) dir = dir.substring(0, dir.length() - 1);
+                StringBuilder prefix = new StringBuilder(dir.startsWith("/") ? "/" : "");
+                for (String part : dir.split("/")) {
+                    if (part.isEmpty()) continue;
+                    if (prefix.length() > 0 && !prefix.toString().endsWith("/")) prefix.append('/');
+                    prefix.append(part);
+                    try { ch.stat(prefix.toString()); }
+                    catch (com.jcraft.jsch.SftpException missing) {
+                        ch.mkdir(prefix.toString());
+                        persistentSftp.note(id, "mkdir " + prefix);
+                    }
+                }
+                java.util.Set<String> existing = new java.util.HashSet<>();
+                try {
+                    for (Object o : ch.ls(dir)) existing.add(((ChannelSftp.LsEntry) o).getFilename());
+                } catch (com.jcraft.jsch.SftpException ignored) { /* new/empty folder */ }
+                persistentSftp.note(id, "ls " + dir + " \u2192 " + existing.size() + " existing entries (to avoid overwriting)");
+                for (TransferCleanup.RemoteMove m : TransferCleanup.planRemoteMoves(safe, dir, existing, LocalDateTime.now())) {
+                    ch.rename(m.from(), m.to());
+                    persistentSftp.note(id, "mv " + m.from() + " \u2192 " + m.to());
+                    done++;
+                }
+            } else {
+                for (String p : safe) {
+                    ch.rm(p);
+                    persistentSftp.note(id, "rm " + p);
+                    done++;
+                }
+            }
+            if (done > 0) logLine.accept("[INFO] " + (move ? "Moved " : "Deleted ") + done
+                    + " original file(s) on the server, in the same SSH session as the download.");
+        } catch (Exception e) {
+            persistentSftp.note(id, "Cleanup failed after " + done + " file(s): " + e.getMessage());
+            logLine.accept("[WARN] The transfer succeeded, but the cleanup on the server did not finish ("
+                    + e.getMessage() + "): some original file(s) are still there.");
+        }
+        return true;
     }
 
     /**
@@ -2417,14 +2509,12 @@ public class TransferService {
             }
             String destPath = normalizeLocalPath(new File(dayDestDir, c.name).getAbsolutePath());
             commands.add(new SizedCommand(
-                    "get " + escapeWinScpRemotePath(c.remotePath) + " " + escapeWinScpPath(destPath), c.size));
+                    "get -delete " + escapeWinScpRemotePath(c.remotePath) + " " + escapeWinScpPath(destPath), c.size));
         }
         try {
             boolean ok = runBatchedWinScpCommands(sourceCred, sourceCred.getPassword(), commands, logLine, taskId);
-            if (ok) {
-                // Remove originals from the remote source now that they've landed locally.
-                deleteRemoteFilesViaWinScp(sourceCred, candidates.stream().map(c -> c.remotePath).collect(Collectors.toList()), logLine);
-            }
+            // Originals are removed by WinSCP itself ("get -delete"), file by file, in the same session as the download.
+            if (ok) logLine.accept("[INFO] Removed " + candidates.size() + " original file(s) from the remote source in the same session.");
             return ok;
         } catch (Exception ex) {
             logLine.accept("[ERROR] Remote\u2192local backup failed: " + ex.getMessage());
@@ -3280,12 +3370,35 @@ public class TransferService {
         }
     }
 
+    /** One line saying why a script session was opened, from what the script does (shown as the session's purpose). */
+    private static String describeScript(List<String> script, String taskId) {
+        int get = 0, put = 0, rm = 0, mv = 0, mkdir = 0;
+        for (String l : script) {
+            String t = l.trim().toLowerCase();
+            if (t.startsWith("get ")) get++;
+            else if (t.startsWith("put ")) put++;
+            else if (t.startsWith("rm ")) rm++;
+            else if (t.startsWith("mv ")) mv++;
+            else if (t.startsWith("mkdir ")) mkdir++;
+        }
+        List<String> parts = new ArrayList<>();
+        if (get > 0) parts.add("download " + get + " file(s)");
+        if (put > 0) parts.add("upload " + put + " file(s)");
+        if (rm > 0) parts.add("delete " + rm + " original(s)");
+        if (mv > 0) parts.add("move " + mv + " original(s)");
+        if (mkdir > 0) parts.add("create " + mkdir + " folder(s)");
+        String what = parts.isEmpty() ? "SFTP commands" : String.join(", ", parts);
+        boolean cleanup = taskId != null && taskId.equals("backup-cleanup");
+        return (cleanup ? "SFTP cleanup after a successful transfer: " : "SFTP: ") + what;
+    }
+
     private boolean runScriptViaSftp(File scriptFile, Consumer<String> logLine, String taskId) throws Exception {
         String password = scriptPasswords.remove(scriptFile.getAbsolutePath());
         List<String> script = java.nio.file.Files.readAllLines(scriptFile.toPath(), java.nio.charset.StandardCharsets.UTF_8);
         String realId = realTaskId.get();
         String[] who = SshSessionEvents.targetOfWinScpScript(scriptFile);
         String evTask = taskId != null && !taskId.startsWith("backup-") ? taskId : null;
+        final String purpose = describeScript(script, taskId);
         long openedAt = 0;
         String end = "finished";
         java.util.concurrent.ScheduledFuture<?> watchdog = null;
@@ -3303,8 +3416,10 @@ public class TransferService {
                 }, maxMin, java.util.concurrent.TimeUnit.MINUTES);
             }
             openedAt = System.currentTimeMillis();
-            SshSessionEvents.opened(evTask, "SFTP transfer", who[1], who[0]);
+            SshSessionEvents.opened(evTask, purpose, who[1], who[0]);
             service.sftp.SftpScriptRunner.Outcome out = runner.run(script, password, logLine);
+            service.sftp.SessionLog.currentOrNew().add(out.ok() ? "Script finished: all commands succeeded"
+                    : "Script finished: a command failed");
             if (out.ok()) {
                 logLine.accept("[SUCCESS] Transfer completed successfully.");
                 return true;
@@ -3329,7 +3444,7 @@ public class TransferService {
             return false;
         } finally {
             if (watchdog != null) watchdog.cancel(false);
-            if (openedAt != 0) SshSessionEvents.closed(evTask, "SFTP transfer", who[1], who[0], end,
+            if (openedAt != 0) SshSessionEvents.closed(evTask, purpose, who[1], who[0], end,
                     System.currentTimeMillis() - openedAt);
         }
     }
@@ -3338,7 +3453,8 @@ public class TransferService {
                                                               Consumer<String> logLine) throws Exception {
         logLine.accept("[INFO] Listing remote directory (SFTP): " + dirPath);
         long openedAt = System.currentTimeMillis();
-        SshSessionEvents.opened(null, "SFTP listing", target.getHost(), target.getUsername());
+        final String listPurpose = "SFTP listing of " + dirPath + " (find the files to transfer)";
+        SshSessionEvents.opened(null, listPurpose, target.getHost(), target.getUsername());
         String end = "finished";
         try (service.sftp.SftpClient c = service.sftp.JschSftpClient.connect(
                 target.getHost(), 22, target.getUsername(), password, SFTP_CONNECT_TIMEOUT_MS)) {
@@ -3353,7 +3469,7 @@ public class TransferService {
             end = "error: " + ex.getMessage();
             throw ex;
         } finally {
-            SshSessionEvents.closed(null, "SFTP listing", target.getHost(), target.getUsername(), end,
+            SshSessionEvents.closed(null, listPurpose, target.getHost(), target.getUsername(), end,
                     System.currentTimeMillis() - openedAt);
         }
     }

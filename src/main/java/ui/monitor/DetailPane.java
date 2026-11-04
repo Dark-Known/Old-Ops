@@ -223,13 +223,22 @@ public class DetailPane extends JPanel {
         logArea.setText(currentLog);
         logArea.setCaretPosition(0);
         logToggle.setVisible(!currentLog.isEmpty());
+        // An SSH session's log IS the point of its event, so show it straight away instead of behind the toggle.
+        boolean ssh = false;
+        for (MonitorEvent e : row.events) if (e.kind().category() == EventKind.Category.SSH) { ssh = true; break; }
+        if (ssh && !currentLog.isEmpty()) {
+            logToggle.setSelected(true);
+            logToggle.setText("Hide raw log");
+            logScroll.setVisible(true);
+        }
         if (currentLog.isEmpty()) { logToggle.setSelected(false); logToggle.setText("Show raw log"); logScroll.setVisible(false); }
     }
 
     private static String headline(FeedRow row) {
         return switch (row.type) {
             case BUCKET -> row.count + " identical runs";
-            case RUN -> "Run \u00b7 " + row.count + " events";
+            case RUN -> (row.head.runKey() != null && row.head.runKey().startsWith("watch:") ? "Watcher" : "Run")
+                    + " \u00b7 " + row.count + " events";
             case EVENT -> row.head.kind().category().label() + " \u00b7 " + row.head.kind().label();
         };
     }

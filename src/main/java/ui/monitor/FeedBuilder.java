@@ -184,7 +184,7 @@ public final class FeedBuilder {
 
         LocalDateTime time = outcomeEv != null ? outcomeEv.time() : latest.time();
         return new FeedRow(FeedRow.Type.RUN, 0, "r:" + runKey, head, vis, List.of(), vis.size(), time,
-                first != null ? first : time, outcome, "Run", summary, trigger, dur,
+                first != null ? first : time, outcome, runKey.startsWith("watch:") ? "Watcher" : "Run", summary, trigger, dur,
                 filesEv != null ? filesText(filesEv.summary()) : null, true, false);
     }
 

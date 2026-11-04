@@ -21,19 +21,25 @@ public final class JschSftpClient implements SftpClient {
 
     private final Session session;
     private final ChannelSftp channel;
+    private final SessionLog log;
     private volatile boolean cancelled;
 
-    private JschSftpClient(Session session, ChannelSftp channel) {
+    private JschSftpClient(Session session, ChannelSftp channel, SessionLog log) {
         this.session = session;
         this.channel = channel;
+        this.log = log;
     }
 
     public static JschSftpClient connect(String host, int port, String username, String password,
                                          int connectTimeoutMs) throws IOException {
         Session session = null;
+        final SessionLog log = SessionLog.currentOrNew();
         try {
             JSch jsch = new JSch();
             session = jsch.getSession(username, host, port);
+            // JSch's own protocol messages (banner, key exchange, authentication) go into the session's transcript.
+            session.setLogger(log.jschLogger());
+            log.add("Connecting to " + host + ":" + port + " as " + username);
             util.SshAuth.apply(jsch, session, password);
             util.SshHostKeys.apply(jsch, session);
             session.setServerAliveInterval(SERVER_ALIVE_MS);
@@ -41,8 +47,10 @@ public final class JschSftpClient implements SftpClient {
             session.connect(connectTimeoutMs);
             ChannelSftp ch = (ChannelSftp) session.openChannel("sftp");
             ch.connect(connectTimeoutMs);
-            return new JschSftpClient(session, ch);
+            log.add("SFTP channel open (server protocol version " + ch.getServerVersion() + ")");
+            return new JschSftpClient(session, ch, log);
         } catch (Exception e) {
+            log.add("Connect failed: " + e.getMessage());
             if (session != null) session.disconnect();
             throw new IOException("SFTP connect to " + host + ":" + port + " failed: " + e.getMessage(), e);
         }
@@ -53,6 +61,7 @@ public final class JschSftpClient implements SftpClient {
     public List<RemoteEntry> list(String remoteDir) throws IOException {
         try {
             Vector<ChannelSftp.LsEntry> raw = channel.ls(remoteDir);
+            log.add("ls " + remoteDir + " \u2192 " + raw.size() + " entries");
             List<RemoteEntry> out = new ArrayList<>();
             for (ChannelSftp.LsEntry e : raw) {
                 String n = e.getFilename();
@@ -70,10 +79,11 @@ public final class JschSftpClient implements SftpClient {
     public RemoteEntry stat(String remotePath) throws IOException {
         try {
             SftpATTRS a = channel.stat(remotePath);
+            log.add("stat " + remotePath + " \u2192 " + (a.isDir() ? "directory" : a.getSize() + " bytes"));
             String n = remotePath.substring(remotePath.lastIndexOf('/') + 1);
             return new RemoteEntry(n, a.getSize(), a.getMTime(), a.isDir());
         } catch (SftpException e) {
-            if (e.id == ChannelSftp.SSH_FX_NO_SUCH_FILE) return null;
+            if (e.id == ChannelSftp.SSH_FX_NO_SUCH_FILE) { log.add("stat " + remotePath + " \u2192 not found"); return null; }
             throw wrap("stat " + remotePath, e);
         }
     }
@@ -85,7 +95,10 @@ public final class JschSftpClient implements SftpClient {
         File tmp = File.createTempFile(".opstool-", ".part", dir);
         try {
             long remoteMtime = channel.stat(remotePath).getMTime();
+            long t0 = System.currentTimeMillis();
             channel.get(remotePath, tmp.getAbsolutePath());
+            log.add("get " + remotePath + " \u2192 " + local.getName() + " (" + tmp.length() + " bytes in "
+                    + (System.currentTimeMillis() - t0) + " ms)");
             tmp.setLastModified(remoteMtime * 1000L); // keep the remote timestamp, like WinSCP does
             Files.move(tmp.toPath(), local.toPath(), StandardCopyOption.REPLACE_EXISTING);
         } catch (SftpException e) {
@@ -99,9 +112,13 @@ public final class JschSftpClient implements SftpClient {
     public void upload(File local, String remotePath) throws IOException {
         String part = remotePath + ".part";
         try {
+            long t0 = System.currentTimeMillis();
             channel.put(local.getAbsolutePath(), part, ChannelSftp.OVERWRITE);
+            log.add("put " + local.getName() + " \u2192 " + part + " (" + local.length() + " bytes in "
+                    + (System.currentTimeMillis() - t0) + " ms)");
             try {
                 channel.rename(part, remotePath);
+                log.add("rename " + part + " \u2192 " + remotePath);
             } catch (SftpException renameFailed) {
                 // Some servers refuse to rename over an existing file: remove it and retry once.
                 try { channel.rm(remotePath); } catch (SftpException ignored) { }
@@ -132,6 +149,7 @@ public final class JschSftpClient implements SftpClient {
             } catch (SftpException notThere) {
                 try {
                     channel.mkdir(path.toString());
+                    log.add("mkdir " + path);
                 } catch (SftpException e) {
                     throw wrap("mkdir " + path, e);
                 }
@@ -143,9 +161,10 @@ public final class JschSftpClient implements SftpClient {
     public boolean delete(String remotePath) throws IOException {
         try {
             channel.rm(remotePath);
+            log.add("rm " + remotePath);
             return true;
         } catch (SftpException e) {
-            if (e.id == ChannelSftp.SSH_FX_NO_SUCH_FILE) return false;
+            if (e.id == ChannelSftp.SSH_FX_NO_SUCH_FILE) { log.add("rm " + remotePath + " \u2192 not found"); return false; }
             throw wrap("delete " + remotePath, e);
         }
     }
@@ -158,6 +177,7 @@ public final class JschSftpClient implements SftpClient {
 
     @Override
     public void close() {
+        log.add("Closing session");
         try { channel.disconnect(); } catch (Exception ignored) { }
         try { session.disconnect(); } catch (Exception ignored) { }
     }
@@ -171,12 +191,14 @@ public final class JschSftpClient implements SftpClient {
         }
         try {
             channel.rename(from, to);
+            log.add("mv " + from + " \u2192 " + to);
         } catch (SftpException e) {
             throw wrap("rename " + from, e);
         }
     }
 
     private IOException wrap(String what, SftpException e) {
+        log.add("ERROR " + what + ": " + e.getMessage());
         return new IOException(cancelled ? what + " cancelled" : what + " failed: " + e.getMessage(), e);
     }
 }

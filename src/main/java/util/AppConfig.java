@@ -61,17 +61,31 @@ public final class AppConfig {
     }
 
     /** Reads a single top-level-named element's text from app-config.xml, or null if absent/unreadable. */
+    // The XML was re-parsed (a DocumentBuilder plus a full DOM) on every call. Parse once per file change instead.
+    private static final java.util.Map<String, String> CACHE = new java.util.concurrent.ConcurrentHashMap<>();
+    private static volatile String cachedPath;
+    private static volatile long cachedStamp = -1;
+
     public static String readValue(String tagName) {
         try {
             File configFile = locate();
             if (configFile == null) return null;
+            String path = configFile.getAbsolutePath();
+            long stamp = configFile.lastModified() ^ (configFile.length() << 20);
+            if (!path.equals(cachedPath) || stamp != cachedStamp) {
+                CACHE.clear();
+                cachedPath = path;
+                cachedStamp = stamp;
+            }
+            String hit = CACHE.get(tagName);
+            if (hit != null) return hit.isEmpty() ? null : hit;
+            String val = "";
             DocumentBuilder builder = DocumentBuilderFactory.newInstance().newDocumentBuilder();
             Document doc = builder.parse(configFile);
             NodeList nodes = doc.getElementsByTagName(tagName);
-            if (nodes.getLength() > 0) {
-                String val = nodes.item(0).getTextContent().trim();
-                if (!val.isEmpty()) return val;
-            }
+            if (nodes.getLength() > 0) val = nodes.item(0).getTextContent().trim();
+            CACHE.put(tagName, val);
+            return val.isEmpty() ? null : val;
         } catch (Exception ignored) {
             // best-effort — missing/invalid config just means the caller falls back
         }

@@ -72,13 +72,26 @@ public final class SftpScriptRunner {
                         }
                         case "get" -> {
                             need(client);
-                            String remote = unescapeRemote(t.get(1));
-                            File local = new File(unescapeLocal(t.get(2)));
+                            int ai = 1;
+                            boolean deleteAfter = false;
+                            while (ai < t.size() && t.get(ai).startsWith("-")) {      // WinSCP-style switches: -delete
+                                if (t.get(ai).equalsIgnoreCase("-delete")) deleteAfter = true;
+                                ai++;
+                            }
+                            String remote = unescapeRemote(t.get(ai));
+                            File local = new File(unescapeLocal(t.get(ai + 1)));
                             RemoteEntry re = client.stat(remote);
                             if (re == null) throw new IOException("Remote file not found: " + remote);
                             if (local.isDirectory()) local = new File(local, re.name());
                             client.download(remote, local);
                             log.accept("[INFO] Downloaded " + remote + " (" + re.size() + " bytes)");
+                            if (deleteAfter) {
+                                // Same session, but only once the copy on this PC is verified to be complete.
+                                if (!local.isFile() || local.length() != re.size()) {
+                                    throw new IOException("Kept " + remote + " on the server: the copy on this PC is missing or has the wrong size");
+                                }
+                                if (!client.delete(remote)) throw new IOException("Could not delete " + remote + " on the server");
+                            }
                         }
                         case "put" -> {
                             need(client);

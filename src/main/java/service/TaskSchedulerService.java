@@ -231,12 +231,12 @@ public class TaskSchedulerService {
             if (tid == null) { // genuinely not a task session
                 switch (e.phase()) {
                     case OPENED -> SshSessionEvents.uiOpened(e.purpose(), e.host(), e.user());
-                    case CLOSED -> SshSessionEvents.uiClosed(e.purpose(), e.host(), e.user(), e.openMs());
-                    default -> SshSessionEvents.uiFailed(e.purpose(), e.host(), e.user(), e.reason());
+                    case CLOSED -> SshSessionEvents.uiClosed(e.purpose(), e.host(), e.user(), e.openMs(), e.log());
+                    default -> SshSessionEvents.uiFailed(e.purpose(), e.host(), e.user(), e.reason(), e.log());
                 }
                 return;
             }
-            e = new SshSessionEvents.Event(e.phase(), tid, e.purpose(), e.host(), e.user(), e.reason(), e.openMs(), e.detached());
+            e = new SshSessionEvents.Event(e.phase(), tid, e.purpose(), e.host(), e.user(), e.reason(), e.openMs(), e.detached(), e.log(), e.runKey());
         }
         ScheduledTask t = lookupTask(e.taskId());
         String who = SshSessionEvents.who(e.host(), e.user());
@@ -259,16 +259,26 @@ public class TaskSchedulerService {
         }
         String name = t != null ? t.getName() : "(task " + e.taskId() + ")";
         String type = t != null && t.getTaskType() != null ? t.getTaskType().name() : null;
+        String details = e.log() != null && !e.log().isBlank()
+                ? msg + "\n\nSession log (what was said on this connection):\n" + e.log() : msg;
         if (e.detached()) {
-            // Long-lived session (remote watcher): belongs to the task, not to any one run.
-            try {
-                LocalDateTime now = LocalDateTime.now();
-                runHistoryService.recordEvent(kind, e.taskId(), name, type, status, msg, msg, now, now, null, null);
-            } catch (Exception ignored) { }
+            // Long-lived session (remote watcher): belongs to the task, not to any one run, so it joins the
+            // task's watcher group (armed -> session opened -> ... -> closed) instead of floating alone.
+            recordWatchEvent(kind, e.taskId(), name, type, status, msg, details,
+                    e.phase() == SshSessionEvents.Phase.OPENED ? WatchStep.OPEN : WatchStep.END);
         } else {
             // Opened/closed while a run executes: recordSchedulerEvent attaches the run key (the
             // calling thread's run context, else the task's in-flight run).
-            recordSchedulerEvent(kind, e.taskId(), name, type, status, msg, msg);
+            if (e.runKey() != null) {
+                // The session belongs to a known run (it may be closed from another thread, e.g. the idle reaper).
+                try {
+                    LocalDateTime now = LocalDateTime.now();
+                    runHistoryService.recordEvent(kind, e.taskId(), name, type, status, msg, details, now, now,
+                            e.runKey(), RunHistoryService.currentTrigger());
+                } catch (Exception ignored) { }
+            } else {
+                recordSchedulerEvent(kind, e.taskId(), name, type, status, msg, details);
+            }
         }
     }
 
@@ -299,6 +309,34 @@ public class TaskSchedulerService {
      * change what the scheduler does. The run key comes from the calling
      * thread's run context if it has one, else from the task's in-flight run.
      */
+    // ── Watcher groups ───────────────────────────────────────────────────
+    // A watcher is not a run, but its events belong together: "armed", the SSH session it keeps open, and the
+    // eventual "closed" / "lost". They share one group key so the Event Monitor shows them as one Watcher row.
+    private enum WatchStep { OPEN, KEEP, END }
+    private static final class WatchGroup { final String key; boolean ended; WatchGroup(String k) { key = k; } }
+    private final ConcurrentMap<String, WatchGroup> watchGroups = new ConcurrentHashMap<>();
+
+    private synchronized String watchGroupKey(String taskId, WatchStep step) {
+        WatchGroup g = watchGroups.get(taskId);
+        if (g == null || g.ended) {
+            g = new WatchGroup("watch:" + taskId + ":" + System.currentTimeMillis());
+            watchGroups.put(taskId, g);
+        }
+        if (step == WatchStep.END) g.ended = true;
+        return g.key;
+    }
+
+    private void recordWatchEvent(EventKind kind, String taskId, String taskName, String taskType,
+                                  TaskRunRecord.Status status, String message, String details, WatchStep step) {
+        try {
+            LocalDateTime now = LocalDateTime.now();
+            runHistoryService.recordEvent(kind, taskId, taskName, taskType, status, message, details,
+                    now, now, watchGroupKey(taskId, step), null);
+        } catch (Exception ignored) {
+            // Best-effort.
+        }
+    }
+
     private void recordSchedulerEvent(EventKind kind, String taskId, String taskName, String taskType,
                                       TaskRunRecord.Status status, String message, String details) {
         try {
@@ -341,15 +379,18 @@ public class TaskSchedulerService {
         if (curPush) {
             EventKind kind = everPushed.contains(t.getId()) ? EventKind.WATCH_RESTORED : EventKind.WATCH_ARMED;
             everPushed.add(t.getId());
-            recordSchedulerEvent(kind, t, TaskRunRecord.Status.SUCCESS,
+            recordWatchEvent(kind, t.getId(), t.getName(), t.getTaskType() != null ? t.getTaskType().name() : null,
+                    TaskRunRecord.Status.SUCCESS,
                     (kind == EventKind.WATCH_RESTORED ? "Instant triggering restored via " : "Instant triggering armed via ") + via,
-                    status.detail());
+                    status.detail(), WatchStep.KEEP);
         } else if (cur == WatchMode.POLLING_ONLY_UNSUPPORTED) {
-            recordSchedulerEvent(EventKind.WATCH_UNSUPPORTED, t, TaskRunRecord.Status.SUCCESS,
-                    "Instant triggering is not supported here — using scheduled polling only", status.detail());
+            recordWatchEvent(EventKind.WATCH_UNSUPPORTED, t.getId(), t.getName(), t.getTaskType() != null ? t.getTaskType().name() : null,
+                    TaskRunRecord.Status.SUCCESS,
+                    "Instant triggering is not supported here — using scheduled polling only", status.detail(), WatchStep.END);
         } else if (cur == WatchMode.POLLING_ONLY && prevPush) {
-            recordSchedulerEvent(EventKind.WATCH_DEGRADED, t, TaskRunRecord.Status.SUCCESS,
-                    "Instant triggering lost — falling back to scheduled polling", status.detail());
+            recordWatchEvent(EventKind.WATCH_DEGRADED, t.getId(), t.getName(), t.getTaskType() != null ? t.getTaskType().name() : null,
+                    TaskRunRecord.Status.SUCCESS,
+                    "Instant triggering lost — falling back to scheduled polling", status.detail(), WatchStep.END);
         }
         // POLLING_ONLY with no prior push is the transient "not yet attempted" state — not an event.
     }
@@ -1109,6 +1150,7 @@ public class TaskSchedulerService {
             }
             lastEventWatchMode.keySet().retainAll(liveIds);
             everPushed.retainAll(liveIds);
+            watchGroups.keySet().retainAll(liveIds);
 
             for (ScheduledTask task : tasks) {
                 if (task.getStatus() == TaskStatus.DISABLED || task.getStatus() == TaskStatus.RETRYING) {

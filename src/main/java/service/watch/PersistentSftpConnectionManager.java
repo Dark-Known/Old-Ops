@@ -85,6 +85,10 @@ public class PersistentSftpConnectionManager {
     /** One task's kept-warm SSH session plus however many SFTP channel slots
      *  have been opened on it so far (grown lazily, up to whatever concurrency
      *  a given fire actually asks for). */
+    /** Why these sessions exist, shown as the purpose of their events in the Event Monitor. */
+    private static final String PURPOSE =
+            "SFTP connection for this run (listing, transfers and cleanup of originals)";
+
     private static final class Entry {
         final Session session;
         final ConcurrentHashMap<Integer, ChannelSftp> slots = new ConcurrentHashMap<>();
@@ -93,6 +97,8 @@ public class PersistentSftpConnectionManager {
         int connectCount;
         final long openedAtMillis = System.currentTimeMillis();
         String host, user;
+        volatile service.sftp.SessionLog log;
+        volatile String runKey;
 
         Entry(Session session, String fingerprint, int connectCount) {
             this.session = session;
@@ -199,6 +205,10 @@ public class PersistentSftpConnectionManager {
     private Entry connect(String taskId, Credential credential, int connectCount) throws Exception {
         JSch jsch = new JSch();
         Session session = jsch.getSession(credential.getUsername(), credential.getHost(), 22);
+        final service.sftp.SessionLog sl = new service.sftp.SessionLog();
+        session.setLogger(sl.jschLogger());
+        sl.add("Connecting to " + credential.getHost() + ":22 as " + credential.getUsername()
+                + (connectCount > 1 ? " (reconnect #" + (connectCount - 1) + ")" : ""));
         util.SshAuth.apply(jsch, session, credential.getPassword());
         Properties config = new Properties();
         config.put("StrictHostKeyChecking", "no");
@@ -207,8 +217,9 @@ public class PersistentSftpConnectionManager {
         try {
             session.connect(CONNECT_TIMEOUT_MILLIS);
         } catch (Exception ex) {
-            service.SshSessionEvents.failed(taskId, "SFTP transfer", credential.getHost(),
-                    credential.getUsername(), ex.getMessage());
+            sl.add("Connect failed: " + ex.getMessage());
+            service.SshSessionEvents.failedInRun(taskId, PURPOSE, credential.getHost(),
+                    credential.getUsername(), ex.getMessage(), service.RunHistoryService.currentRunKey(), sl.text());
             throw ex;
         }
         // Keep the connection alive across long idle gaps between watcher
@@ -222,8 +233,11 @@ public class PersistentSftpConnectionManager {
         Entry entry = new Entry(session, fingerprint(credential), connectCount);
         entry.host = credential.getHost();
         entry.user = credential.getUsername();
-        service.SshSessionEvents.opened(taskId, "SFTP transfer"
-                + (connectCount > 1 ? ", reconnect #" + (connectCount - 1) : ""), entry.host, entry.user);
+        entry.log = sl;
+        entry.runKey = service.RunHistoryService.currentRunKey();   // the run this session was opened for
+        service.SshSessionEvents.openedInRun(taskId, PURPOSE
+                + (connectCount > 1 ? ", reconnect #" + (connectCount - 1) : ""), entry.host, entry.user,
+                entry.runKey, sl.text());
         return entry;
     }
 
@@ -237,9 +251,18 @@ public class PersistentSftpConnectionManager {
      * its target credential changes, so the next fire reconnects cleanly
      * instead of reusing a session against a stale target.
      */
-    public synchronized void close(String taskId) {
+    public synchronized void close(String taskId) { close(taskId, "run finished"); }
+
+    /** Closes the task's connection and records why in the session's log and closing event. */
+    public synchronized void close(String taskId, String reason) {
         Entry e = entries.remove(taskId);
-        if (e != null) closeQuietly(taskId, e, "run finished");
+        if (e != null) closeQuietly(taskId, e, reason);
+    }
+
+    /** Adds a line to the transcript of the task's open session (shown in the Event Monitor). No-op if none is open. */
+    public void note(String taskId, String text) {
+        Entry e = entries.get(taskId);
+        if (e != null && e.log != null) e.log.add(text);
     }
 
     public synchronized void closeAll() {
@@ -259,7 +282,8 @@ public class PersistentSftpConnectionManager {
             try { if (c.isConnected()) c.disconnect(); } catch (Exception ignored) {}
         }
         try { if (e.session != null && e.session.isConnected()) e.session.disconnect(); } catch (Exception ignored) {}
-        if (wasOpen) service.SshSessionEvents.closed(taskId, "SFTP transfer", e.host, e.user, reason,
-                System.currentTimeMillis() - e.openedAtMillis);
+        if (e.log != null) e.log.add("Closing session: " + reason);
+        if (wasOpen) service.SshSessionEvents.closedInRun(taskId, PURPOSE, e.host, e.user, reason,
+                System.currentTimeMillis() - e.openedAtMillis, e.runKey, e.log != null ? e.log.text() : null);
     }
 }

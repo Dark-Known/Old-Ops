@@ -157,18 +157,18 @@ public final class AppSettings {
         HARD_DEFAULTS.put(KEY_DEFAULT_STATION_ADDR, "");
         HARD_DEFAULTS.put(KEY_ATTACHMENT_DOWNLOAD_DIR, "");
         HARD_DEFAULTS.put(KEY_LOG_LEVEL, "INFO");
-        HARD_DEFAULTS.put(KEY_JVM_MIN_HEAP, "512M");
+        HARD_DEFAULTS.put(KEY_JVM_MIN_HEAP, "64M");
         // Lowered from the previous 2G default. This app's actual live
         // object footprint (a task list, a few in-memory logs each capped
         // at 500KB, a handful of SQLite connections) is a small fraction
         // of that — 2G was simply how high the JVM was ALLOWED to grow,
         // and the JVM tends to grow committed heap toward Xmx over a long
         // session before a full GC reclaims it, which reads as "using 2GB"
-        // in Task Manager even when live data is far smaller. 768M gives
+        // in Task Manager even when live data is far smaller. 512M gives
         // comfortable headroom for normal operation while capping the
         // worst case much lower; raise it in Settings if a deployment
         // genuinely needs more (e.g. very large attachment downloads).
-        HARD_DEFAULTS.put(KEY_JVM_MAX_HEAP, "768M");
+        HARD_DEFAULTS.put(KEY_JVM_MAX_HEAP, "512M");
         // Default: aim for each batch to finish in ~5s assuming a conservative
         // ~5 MB/s link -> 5 * 5*1024*1024 = 26214400 bytes (~25 MB) per batch.
         HARD_DEFAULTS.put(KEY_TRANSFER_BATCH_TARGET_SECONDS, "5");
