@@ -78,6 +78,8 @@ public class RemotePushWatcher {
     /** Keep-alive line the remote script prints every few seconds; ignored here. Its real job is
      *  to make the remote process fail a write (and exit) once the SSH channel is gone. */
     private static final String HEARTBEAT = "__HB__";
+    /** Final line of the Windows listener: "__END__<why>". */
+    private static final String END_PREFIX = "__END__";
 
     private final XmlStorageService storage;
     // taskId, changedFileNames -> wake the task up now, naming exactly the file(s)
@@ -240,18 +242,50 @@ public class RemotePushWatcher {
         listenerExecutor.submit(() -> runListener(task.getId(), cred, task.getTargetPath(), os, handle));
     }
 
+    /** Connection attempts before giving up and letting the scheduler fall back to polling. */
+    private static final int MAX_RECONNECTS = 3;
+    private static final long[] RECONNECT_DELAYS_MS = {2_000, 5_000, 15_000};
+
+    /**
+     * Runs the listener and, if its stream ends on its own (network blip, server restart, remote process
+     * exit), reconnects in place a few times before giving up. A short glitch therefore no longer flips the task
+     * to "polling only" and back; only a connection that stays down does.
+     */
     private void runListener(String taskId, Credential cred, String rawTargetPath, RemoteOs os, ListenerHandle handle) {
+        try {
+            int attempt = 0;
+            while (!handle.closed) {
+                boolean retry = runListenerOnce(taskId, cred, rawTargetPath, os, handle, attempt);
+                if (!retry || handle.closed || attempt >= MAX_RECONNECTS) break;
+                reasonByTaskId.put(taskId, "connection lost - reconnecting (attempt " + (attempt + 1) + " of "
+                        + MAX_RECONNECTS + ")...");
+                try { Thread.sleep(RECONNECT_DELAYS_MS[attempt]); }
+                catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
+                attempt++;
+            }
+        } finally {
+            activeByTaskId.remove(taskId, handle);
+        }
+    }
+
+    /** One connection of the listener. Returns true if it ended unexpectedly and is worth retrying. */
+    private boolean runListenerOnce(String taskId, Credential cred, String rawTargetPath, RemoteOs os,
+                                    ListenerHandle handle, int attempt) {
         Session session = null;
         ChannelExec channel = null;
         boolean opened = false;
         long openedAt = 0;
         String endReason = null;
+        boolean retry = false;
+        final ByteArrayOutputStream errBuf = new ByteArrayOutputStream();
+        final long[] lastOutputAt = {0};
         final service.sftp.SessionLog sl = new service.sftp.SessionLog();   // transcript shown in the Event Monitor
         try {
             JSch jsch = new JSch();
             session = jsch.getSession(cred.getUsername(), cred.getHost(), 22);
             session.setLogger(sl.jschLogger());
-            sl.add("Connecting to " + cred.getHost() + ":22 as " + cred.getUsername() + " (remote " + os + ")");
+            sl.add("Connecting to " + cred.getHost() + ":22 as " + cred.getUsername() + " (remote " + os + ")"
+                    + (attempt > 0 ? " - reconnect attempt " + attempt + " of " + MAX_RECONNECTS : ""));
             util.SshAuth.apply(jsch, session, cred.getPassword());
             Properties config = new Properties();
             config.put("StrictHostKeyChecking", "no");
@@ -271,7 +305,7 @@ public class RemotePushWatcher {
             openedAt = System.currentTimeMillis();
             service.SshSessionEvents.openedDetached(taskId, "remote change listener (" + os + "), stays open while the watcher is armed", cred.getHost(), cred.getUsername(), sl.text());
             handle.session = session;
-            if (handle.closed) return; // stopped/replaced while connecting: never start a remote process
+            if (handle.closed) return false; // stopped/replaced while connecting: never start a remote process
 
             channel = (ChannelExec) session.openChannel("exec");
             handle.channel = channel;
@@ -281,23 +315,26 @@ public class RemotePushWatcher {
             sl.add("Starting remote change listener: " + (remoteCommand.length() > 300
                     ? remoteCommand.substring(0, 300) + "\u2026" : remoteCommand));
             channel.setCommand(remoteCommand);
-            channel.setInputStream(null);
-            channel.setErrStream(new ByteArrayOutputStream()); // discard; failures surface via the marker or a closed stream
+            if (os != RemoteOs.WINDOWS) channel.setInputStream(handle.lease); // Linux: a byte every 10 s, end-of-input when we close; the Windows script does not read stdin
+            channel.setErrStream(errBuf);       // what the remote process complained about, shown if the stream ends
 
             InputStream in = channel.getInputStream();
             channel.connect(15_000);
-            if (handle.closed) return; // finally{} tears the channel + session down
+            if (handle.closed) return false; // finally{} tears the channel + session down
             sl.add("Listener running; waiting for change events");
             reasonByTaskId.put(taskId, "connected (" + os + "), waiting for first change event");
 
             BufferedReader reader = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8));
             boolean sawAnyLine = false;
+            String endNote = null;
             String line;
             while (!handle.closed && (line = reader.readLine()) != null) {
                 line = line.trim();
                 if (line.isEmpty()) continue;
                 sawAnyLine = true;
+                lastOutputAt[0] = System.currentTimeMillis();
                 if (line.equals(HEARTBEAT)) continue;
+                if (line.startsWith(END_PREFIX)) { endNote = line.substring(END_PREFIX.length()); continue; }
                 if (line.contains(UNAVAILABLE_MARKER)) {
                     // Windows side now appends ":<real PS error text>" after the
                     // marker (path-not-found message, or $_.Exception.Message
@@ -331,11 +368,35 @@ public class RemotePushWatcher {
                 sl.add("Remote says changed: " + line);
                 scheduleFire(taskId, line);
             }
-            if (!sawAnyLine && !handle.closed) {
+            long upNow = System.currentTimeMillis() - openedAt;
+            // Silence from the very start means the server refused the exec channel. A stream that ended later
+            // (even before any file changed) was a working listener that got cut - that is a drop, not "unsupported".
+            if ((sawAnyLine || upNow >= 10_000) && !handle.closed && !unsupportedBackoffActive(taskId)) {
+                // The remote side ended the stream by itself. Say exactly what we know about why.
+                long up = System.currentTimeMillis() - openedAt;
+                long quiet = lastOutputAt[0] == 0 ? up : System.currentTimeMillis() - lastOutputAt[0];
+                int exit = channel.getExitStatus();
+                String err = plainStderr(errBuf.toString(StandardCharsets.UTF_8).trim());
+                if (err.length() > 600) err = err.substring(0, 600) + "\u2026";
+                endReason = "the remote listener ended after " + (up / 1000) + " s (last output " + (quiet / 1000) + " s ago, "
+                        + (exit >= 0 ? "exit status " + exit
+                           : session.isConnected() ? "no exit status yet, but the SSH session is still connected, so the listener stopped by itself"
+                           : "no exit status - the connection was cut")
+                        + (endNote == null ? "" : ", the listener's last words: \"" + endNote + "\"")
+                        + (err.isEmpty() ? "" : ", it said: " + err) + ")";
+                sl.add("Stream ended: " + endReason + "; session " + (session.isConnected() ? "still connected" : "disconnected"));
+                retry = true;
+            }
+            if (!sawAnyLine && upNow < 10_000 && !handle.closed) {
                 // Channel closed with no output at all — most likely exec was
                 // refused outright (e.g. an SFTP-subsystem-only server).
-                String reason = "remote exec (" + os + ") produced no output — most likely the SSH server refused"
-                        + " the exec channel (some SFTP-only servers do)";
+                String err0 = plainStderr(errBuf.toString(StandardCharsets.UTF_8).trim());
+                if (err0.length() > 600) err0 = err0.substring(0, 600) + "\u2026";
+                int exit0 = channel.getExitStatus();
+                String reason = "remote exec (" + os + ") produced no output within " + (upNow / 1000) + " s"
+                        + (exit0 >= 0 ? " (exit status " + exit0 + ")" : "")
+                        + (err0.isEmpty() ? " and wrote nothing to stderr - the SSH server may have refused the exec channel (some SFTP-only servers do)"
+                                          : "; the remote shell said: " + err0);
                 log.info("Watcher task " + taskId + ": " + reason + "; falling back to scheduled polling only.");
                 sl.add(reason);
                 markUnsupported(taskId, reason);
@@ -345,10 +406,14 @@ public class RemotePushWatcher {
             endReason = "error: " + e.getMessage();
             sl.add("Error: " + e.getMessage());
             if (!handle.closed) {
-                String reason = "connection failed (" + os + "): " + e.getMessage();
-                log.info("Watcher task " + taskId + ": remote push listener unavailable (" + e.getMessage()
-                        + "); falling back to scheduled polling only.");
-                markUnsupported(taskId, reason);
+                if (opened && attempt < MAX_RECONNECTS) {
+                    retry = true;       // a live connection dropped: try again before declaring polling-only
+                } else {
+                    String reason = "connection failed (" + os + "): " + e.getMessage();
+                    log.info("Watcher task " + taskId + ": remote push listener unavailable (" + e.getMessage()
+                            + "); falling back to scheduled polling only.");
+                    markUnsupported(taskId, reason);
+                }
             }
         } finally {
             if (channel != null && channel.isConnected()) channel.disconnect();
@@ -356,95 +421,40 @@ public class RemotePushWatcher {
             if (opened) {
                 service.SshSessionEvents.closedDetached(taskId, "remote change listener (" + os + "), stays open while the watcher is armed", cred.getHost(),
                         cred.getUsername(),
-                        handle.closed ? "watcher stopped or reconfigured"
-                                : endReason != null ? endReason : "remote side ended the stream",
+                        (handle.closed ? "watcher stopped or reconfigured"
+                                : endReason != null ? endReason : "remote side ended the stream")
+                                + (retry && !handle.closed && attempt < MAX_RECONNECTS
+                                        ? " \u2014 reconnecting (attempt " + (attempt + 1) + " of " + MAX_RECONNECTS + ")" : ""),
                         System.currentTimeMillis() - openedAt, sl.text());
             }
-            activeByTaskId.remove(taskId, handle);
         }
+        return retry && !handle.closed;
+    }
+
+    private boolean unsupportedBackoffActive(String taskId) {
+        Long until = unsupportedUntil.get(taskId);
+        return until != null && System.currentTimeMillis() < until;
     }
 
     // ─── Command builders ───────────────────────────────────────────────────
 
-    /** Linux: guarded single command — fails closed with the sentinel if
-     *  inotifywait isn't installed, rather than letting the shell's own
-     *  "command not found" text on stderr look like a filename. */
+    /** Linux: guarded single command (see {@code resources/scripts/watcher/linux/listener.sh}). */
     private String buildLinuxCommand(String rawTargetPath) {
-        String remoteDir = normalizeLinuxPath(rawTargetPath);
-        return "sh -c \"command -v inotifywait >/dev/null 2>&1 && "
-                + "exec inotifywait -m -q -e create -e close_write -e moved_to "
-                + "--format '%f' " + shellQuoteSingle(remoteDir)
-                + " || echo " + UNAVAILABLE_MARKER + "\"";
+        return ListenerScripts.linux(normalizeLinuxPath(rawTargetPath), HEARTBEAT, UNAVAILABLE_MARKER);
     }
 
-    /**
-     * Windows: a small PowerShell loop around {@link java.nio.file}'s remote
-     * cousin, {@code System.IO.FileSystemWatcher}. Sent via
-     * {@code -EncodedCommand} (base64 of the UTF-16LE script) instead of an
-     * inline string — this is the standard way to hand PowerShell a
-     * multi-line script through a transport (like SSH exec) that only
-     * carries a single command-line string, and it avoids the otherwise
-     * painful problem of a Windows OpenSSH server passing the command
-     * through {@code cmd.exe} first (its default) before PowerShell ever
-     * sees it, which would otherwise mangle quoting.
-     *
-     * <p>The script watches for Created/Changed/Renamed and prints just the
-     * changed file's name per event — the Java side treats any line the
-     * same way it treats an inotifywait line: "something changed, go check."
-     *
-     * <p>{@code Wait-Event}'s {@code -SourceIdentifier} parameter only
-     * accepts a single string, not an array — passing it a comma-separated
-     * list of our three subscription names throws
-     * "Cannot convert 'System.Object[]' to the type 'System.String'".
-     * Calling {@code Wait-Event} with no filter at all is the correct fix:
-     * it waits for the next event from *any* registered subscription in this
-     * session, which is exactly the three Created/Changed/Renamed
-     * registrations above (nothing else is registered in this script).
-     */
+    /** Windows: PowerShell around System.IO.FileSystemWatcher, sent with -EncodedCommand (see {@code resources/scripts/watcher/windows/}). */
     private String buildWindowsCommand(String rawTargetPath) {
-        String dir = normalizeWindowsPath(rawTargetPath);
-        String script =
-                "$ErrorActionPreference = 'Stop'\n" +
-                "try {\n" +
-                "  $p = '" + psQuoteSingle(dir) + "'\n" +
-                "  if (-not (Test-Path -LiteralPath $p -PathType Container)) {\n" +
-                "    Write-Output ('" + UNAVAILABLE_MARKER + ":path not found or not a directory: ' + $p)\n" +
-                "    exit\n" +
-                "  }\n" +
-                "  $w = New-Object System.IO.FileSystemWatcher $p\n" +
-                "  $w.IncludeSubdirectories = $false\n" +
-                "  $w.EnableRaisingEvents = $true\n" +
-                "  Register-ObjectEvent -InputObject $w -EventName Created -SourceIdentifier PushCreate | Out-Null\n" +
-                "  Register-ObjectEvent -InputObject $w -EventName Changed -SourceIdentifier PushChange | Out-Null\n" +
-                "  Register-ObjectEvent -InputObject $w -EventName Renamed -SourceIdentifier PushRename | Out-Null\n" +
-                // Self-terminate when the SSH channel goes away. Windows OpenSSH does not
-                // reliably kill a child powershell.exe when the channel/session closes, so a
-                // loop that only blocks in Wait-Event is orphaned forever under sshd.exe.
-                // (1) stdin EOF: sshd closes the child's stdin when the channel closes.
-                // (2) heartbeat: a write to the dead stdout pipe throws, which ends the script.
-                "  $in = [Console]::OpenStandardInput()\n" +
-                "  $buf = New-Object byte[] 1\n" +
-                "  $rd = $in.ReadAsync($buf, 0, 1)\n" +
-                "  while ($true) {\n" +
-                "    $e = Wait-Event -Timeout 5\n" +
-                "    if ($rd.IsCompleted) { break }\n" +
-                "    if ($e -eq $null) { [Console]::Out.WriteLine('" + HEARTBEAT + "'); [Console]::Out.Flush(); continue }\n" +
-                "    Write-Output $e.SourceEventArgs.Name\n" +
-                "    Remove-Event -EventIdentifier $e.EventIdentifier\n" +
-                "  }\n" +
-                "} catch {\n" +
-                "  Write-Output ('" + UNAVAILABLE_MARKER + ":' + $_.Exception.Message)\n" +
-                "} finally {\n" +
-                "  Get-EventSubscriber -ErrorAction SilentlyContinue | Unregister-Event -ErrorAction SilentlyContinue\n" +
-                "  if ($w) { $w.EnableRaisingEvents = $false; $w.Dispose() }\n" +
-                "}\n" +
-                "exit\n";
+        return ListenerScripts.windows(normalizeWindowsPath(rawTargetPath), HEARTBEAT, END_PREFIX, UNAVAILABLE_MARKER);
+    }
 
-        String encoded = Base64.getEncoder().encodeToString(script.getBytes(StandardCharsets.UTF_16LE));
-        // -NonInteractive + -NoProfile keep this fast and free of profile-script
-        // noise on stdout; -ExecutionPolicy Bypass is scoped to this process only
-        // (does not alter the host's persistent policy).
-        return "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " + encoded;
+    /** Windows PowerShell writes progress and errors to stderr as CLIXML; keep only the error text, drop progress records. */
+    static String plainStderr(String raw) {
+        if (raw == null || !raw.startsWith("#< CLIXML")) return raw == null ? "" : raw;
+        StringBuilder sb = new StringBuilder();
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("<S S=\"Error\">(.*?)</S>", java.util.regex.Pattern.DOTALL).matcher(raw);
+        while (m.find()) sb.append(m.group(1).replace("_x000D__x000A_", " ").replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&").trim()).append(' ');
+        return sb.toString().trim();
     }
 
     private void markUnsupported(String taskId, String reason) {
@@ -551,14 +561,31 @@ public class RemotePushWatcher {
         return normalized;
     }
 
-    private static String shellQuoteSingle(String path) {
-        return "'" + path.replace("'", "'\\''") + "'";
-    }
 
-    /** Escapes a value for embedding inside a PowerShell single-quoted string
-     *  literal — PowerShell's own quoting rule is simply "double any single quote". */
-    private static String psQuoteSingle(String value) {
-        return value.replace("'", "''");
+
+    /** The remote listener's stdin: one newline every 10 s (its lease), then end-of-input once closed. */
+    static final class LeaseStream extends InputStream {
+        private final Object lock = new Object();
+        private volatile boolean ended;
+
+        @Override public int read(byte[] b, int off, int len) {
+            synchronized (lock) {
+                if (!ended) {
+                    try { lock.wait(10_000); } catch (InterruptedException e) { Thread.currentThread().interrupt(); return -1; }
+                }
+            }
+            if (ended) return -1;
+            b[off] = '\n';
+            return 1;
+        }
+
+        @Override public int read() {
+            byte[] one = new byte[1];
+            int n = read(one, 0, 1);
+            return n < 0 ? -1 : one[0];
+        }
+
+        void end() { synchronized (lock) { ended = true; lock.notifyAll(); } }
     }
 
     private static final class ListenerHandle {
@@ -567,6 +594,7 @@ public class RemotePushWatcher {
         volatile boolean closed = false;
         volatile Session session;
         volatile ChannelExec channel;
+        final LeaseStream lease = new LeaseStream();
 
         ListenerHandle(String taskId, String path) {
             this.taskId = taskId;
@@ -579,6 +607,14 @@ public class RemotePushWatcher {
 
         void close() {
             closed = true;
+            // Tell the remote process to stop FIRST (end-of-input), and give it a moment to exit and take its
+            // cmd.exe/shell parent with it; only then drop the connection. Disconnecting straight away is what
+            // used to leave powershell.exe / cmd.exe / inotifywait running on the server.
+            lease.end();
+            try {
+                long until = System.currentTimeMillis() + 1500;
+                while (channel != null && !channel.isClosed() && System.currentTimeMillis() < until) Thread.sleep(50);
+            } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
             try {
                 if (channel != null && channel.isConnected()) channel.disconnect();
             } catch (Exception ignored) {}

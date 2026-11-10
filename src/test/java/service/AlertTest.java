@@ -33,7 +33,7 @@ public class AlertTest {
         AlertConfig c = enabled(url).withTask("t1", new AlertConfig.TaskRule(AlertConfig.Mode.OFF, java.util.Set.of()))
                 .withTask("t2", new AlertConfig.TaskRule(AlertConfig.Mode.CUSTOM, EnumSet.of(EventKind.NO_FILES)));
         c.save(dir);
-        String raw = Files.readString(new File(dir, AlertConfig.FILE_NAME).toPath());
+        String raw = AppDb.get(dir, AlertConfig.KV_NAME);
         assertTrue("secret not stored in clear", !raw.contains("SECRET123"));
         AlertConfig back = AlertConfig.load(dir);
         assertEquals(url, back.webhookUrl);
@@ -176,8 +176,8 @@ public class AlertTest {
                 List<AlertCallLog.Entry> calls = AlertCallLog.readRecent(dir, 10);
                 assertEquals(2, calls.size());
                 assertEquals(202, calls.get(0).status());
-                assertTrue("the log keeps the card, not the file", !Files.readString(new File(dir, AlertCallLog.FILE_NAME).toPath()).contains("contentBase64"));
-                assertTrue("the secret address is never logged", !Files.readString(new File(dir, AlertCallLog.FILE_NAME).toPath()).contains("/hook"));
+                assertTrue("the log keeps the card, not the file", !Files.readString(new File(new File(dir, "logs"), AlertCallLog.FILE_NAME).toPath()).contains("contentBase64"));
+                assertTrue("the secret address is never logged", !Files.readString(new File(new File(dir, "logs"), AlertCallLog.FILE_NAME).toPath()).contains("/hook"));
             }
         }
     }
@@ -262,22 +262,45 @@ public class AlertTest {
             enabled(hook.url()).save(dir);
             AlertQueueStore store = new AlertQueueStore(dir);
             long now = System.currentTimeMillis();
-            File fresh = store.save(sample(false), now - 60_000);
-            File old = store.save(sample(false), now - 30L * 3600_000L);
-            assertTrue(fresh.isFile() && old.isFile());
+            store.save(sample(false), now - 60_000);
+            store.save(sample(false), now - 30L * 3600_000L);
+            assertEquals(2, queued(dir));
             RunHistoryService history = new RunHistoryService(dir.getAbsolutePath());
             try (AlertDispatcher d = new AlertDispatcher(dir, history, null, System::currentTimeMillis, new AlertDispatcher.HttpPoster(), 0)) {
                 d.start();
-                waitFor(() -> hook.bodies.size() >= 1 && !fresh.exists());
+                waitFor(() -> hook.bodies.size() >= 1 && queued(dir) == 0);
                 assertEquals("only the recent one is sent", 1, hook.bodies.size());
                 assertTrue(hook.bodies.get(0).contains("Orders"));
-                assertTrue("both files are gone", !fresh.exists() && !old.exists());
+                assertEquals("both rows are gone", 0, queued(dir));
                 List<String> kinds = new ArrayList<>();
                 waitFor(() -> history.queryActivityEvents("id1", LocalDateTime.now().minusHours(1), LocalDateTime.now().plusMinutes(1), 50).size() >= 3);
                 for (TaskRunRecord r : history.queryActivityEvents("id1", LocalDateTime.now().minusHours(1), LocalDateTime.now().plusMinutes(1), 50)) kinds.add(r.getEventKind());
                 assertTrue(kinds.toString(), kinds.contains("ALERT_QUEUED") && kinds.contains("ALERT_SENT") && kinds.contains("ALERT_FAILED"));
             }
         }
+    }
+
+    private static int queued(File dir) {
+        try (java.sql.Connection c = AppDb.open(dir); java.sql.Statement st = c.createStatement(); java.sql.ResultSet rs = st.executeQuery("SELECT count(*) FROM alert_queue")) {
+            return rs.next() ? rs.getInt(1) : -1;
+        } catch (java.sql.SQLException e) { throw new RuntimeException(e); }
+    }
+
+    @Test public void settingsAndQueueFromOlderVersionsMoveIntoTheDatabase() throws Exception {
+        File dir = Files.createTempDirectory("alertmig").toFile();
+        java.util.Properties p = new java.util.Properties();
+        p.setProperty("enabled", "true"); p.setProperty("throttleMinutes", "7");
+        try (java.io.OutputStream o = new java.io.FileOutputStream(new File(dir, AlertConfig.FILE_NAME))) { p.store(o, "old"); }
+        File q = new File(dir, AlertQueueStore.DIR); q.mkdirs();
+        Files.writeString(new File(q, "1.json").toPath(), "{\"queuedAt\":\"5\",\"kind\":\"\",\"taskName\":\"Old\"}");
+        AlertConfig c = AlertConfig.load(dir);
+        assertEquals(7, c.throttleMinutes);
+        assertTrue(!new File(dir, AlertConfig.FILE_NAME).exists() && new File(dir, AlertConfig.FILE_NAME + ".migrated").isFile());
+        assertEquals(7, AlertConfig.load(dir).throttleMinutes);
+        AlertQueueStore store = new AlertQueueStore(dir);
+        assertTrue(!q.exists());
+        assertEquals(1, store.load().size());
+        assertEquals("Old", store.load().get(0).alert().taskName());
     }
 
     @Test public void aQueuedAlertIsSavedUntilItIsDelivered() throws Exception {
@@ -293,11 +316,10 @@ public class AlertTest {
         try (AlertDispatcher d = new AlertDispatcher(dir, history, null, System::currentTimeMillis, slow, 0)) {
             d.onRecord(rec("t1", "Orders", TaskRunRecord.Status.FAILED, null, "Upload failed"));
             assertTrue(inPost.await(5, java.util.concurrent.TimeUnit.SECONDS));
-            File[] saved = new File(dir, AlertQueueStore.DIR).listFiles((x, n) -> n.endsWith(".json"));
-            assertEquals("kept on disk while it is being sent", 1, saved.length);
+            assertEquals("kept in the table while it is being sent", 1, queued(dir));
             release.countDown();
-            waitFor(() -> new File(dir, AlertQueueStore.DIR).listFiles((x, n) -> n.endsWith(".json")).length == 0);
-            assertEquals(0, new File(dir, AlertQueueStore.DIR).listFiles((x, n) -> n.endsWith(".json")).length);
+            waitFor(() -> queued(dir) == 0);
+            assertEquals(0, queued(dir));
         }
     }
 

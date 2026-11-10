@@ -35,7 +35,7 @@ public class DaemonCallLogTest {
         assertEquals(500, log.get(1).status());
         assertEquals("not running", log.get(1).response());
         assertEquals(403, log.get(2).status());
-        assertTrue("the token is never written", !Files.readString(new File(dir, DaemonCallLog.FILE_NAME).toPath()).contains("wrong"));
+        assertTrue("the token is never written", !Files.readString(new File(new File(dir, "logs"), DaemonCallLog.FILE_NAME).toPath()).contains("wrong"));
         assertEquals("Status poll", DaemonCallLog.describe(log.get(3)));
     }
 }

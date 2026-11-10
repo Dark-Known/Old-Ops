@@ -20,6 +20,7 @@ D:\OPS\OpsTransferTool-source\src\main\java\service\AlertQueueStore.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\AlertReport.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\AlertReportServer.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\AlertThrottle.java
+D:\OPS\OpsTransferTool-source\src\main\java\service\AppDb.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\BackgroundJobs.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\BackgroundLogService.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\CommandQueueService.java
@@ -44,6 +45,7 @@ D:\OPS\OpsTransferTool-source\src\main\java\service\LinkStatusFile.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\LinkTls.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\LinkTokens.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\LocalFileMetadataService.java
+D:\OPS\OpsTransferTool-source\src\main\java\service\LogFiles.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\MailTextProcessor.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\MaintenanceService.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\MonitorEvents.java
@@ -60,6 +62,7 @@ D:\OPS\OpsTransferTool-source\src\main\java\service\RemoteFileMetadataServiceFac
 D:\OPS\OpsTransferTool-source\src\main\java\service\RunHistoryService.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\sftp\JschSftpClient.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\sftp\RemoteEntry.java
+D:\OPS\OpsTransferTool-source\src\main\java\service\sftp\SessionLog.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\sftp\SftpClient.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\sftp\SftpScriptRunner.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\SftpBrowseService.java
@@ -77,6 +80,7 @@ D:\OPS\OpsTransferTool-source\src\main\java\service\TransferCleanup.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\TransferLedger.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\TransferPaths.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\TransferService.java
+D:\OPS\OpsTransferTool-source\src\main\java\service\watch\ListenerScripts.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\watch\LocalWatchManager.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\watch\PersistentSftpConnectionManager.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\watch\RemotePushWatcher.java
@@ -106,6 +110,7 @@ D:\OPS\OpsTransferTool-source\src\main\java\ui\GradientToggleButton.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\HealthBanner.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\IconTile.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\IssueGrouping.java
+D:\OPS\OpsTransferTool-source\src\main\java\ui\LazyPanel.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\LinkActivityPanel.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\LinkConnectPanel.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\LinkMonitorPanel.java
@@ -158,8 +163,12 @@ D:\OPS\OpsTransferTool-source\src\main\java\util\AppSettings.java
 D:\OPS\OpsTransferTool-source\src\main\java\util\CryptoUtil.java
 D:\OPS\OpsTransferTool-source\src\main\java\util\ImapSearchCriteria.java
 D:\OPS\OpsTransferTool-source\src\main\java\util\KeyProtector.java
+D:\OPS\OpsTransferTool-source\src\main\java\util\LeanLaunch.java
 D:\OPS\OpsTransferTool-source\src\main\java\util\MailFetchMode.java
 D:\OPS\OpsTransferTool-source\src\main\java\util\MailRoutingRule.java
+D:\OPS\OpsTransferTool-source\src\main\java\util\MemoryReport.java
+D:\OPS\OpsTransferTool-source\src\main\java\util\MemoryTrimmer.java
 D:\OPS\OpsTransferTool-source\src\main\java\util\MiniJson.java
+D:\OPS\OpsTransferTool-source\src\main\java\util\NetErr.java
 D:\OPS\OpsTransferTool-source\src\main\java\util\SshAuth.java
 D:\OPS\OpsTransferTool-source\src\main\java\util\SshHostKeys.java

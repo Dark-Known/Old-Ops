@@ -113,6 +113,7 @@ ui\monitor\QueuePanel$WatchRow.class
 ui\monitor\MonitorEvent.class
 service\queue\SchedulerStatusSnapshot$SessionEntry.class
 ui\ToastManager$2.class
+service\AppDb.class
 ui\RunHistoryPanel$Loaded.class
 service\AlertReportServer.class
 ui\monitor\QueuePanel$Section$1.class
@@ -164,6 +165,7 @@ ui\QueueMonitorView$3.class
 service\GraphMailService.class
 service\SftpBrowseService.class
 service\TaskSchedulerService.class
+util\MemoryTrimmer.class
 ui\DirectoryBrowserDialog$HomeIcon.class
 util\ImapSearchCriteria.class
 service\FailureClassifier.class
@@ -193,6 +195,7 @@ service\ConnectionTestService.class
 Daemon$2.class
 service\RemoteFileMetadataService.class
 ui\ActionCenterButton$RoundedLineBorder.class
+ui\LazyPanel.class
 ui\WatcherInfoPopup.class
 service\LinkMonitor$State.class
 ui\TaskDialog$1.class
@@ -227,6 +230,7 @@ ui\LinkActivityPanel$2.class
 service\OAuth2TokenService$CachedToken.class
 model\FileSelection$AfterAction.class
 service\DaemonControlServer.class
+Daemon$3.class
 export\PdfTableWriter.class
 ui\ActionCenterButton$2.class
 service\TransferLedger.class
@@ -238,8 +242,11 @@ ui\monitor\MonitorStyle.class
 ui\VectorIcons$10.class
 service\SilenceWatch.class
 service\TaskLogService.class
+util\MemoryReport.class
 service\BackgroundLogService.class
+service\sftp\SessionLog.class
 model\TaskRunRecord.class
+util\NetErr.class
 model\RemoteFileException.class
 service\CredentialDbService.class
 ui\VectorIcons$6.class
@@ -298,6 +305,7 @@ service\XmlStorageService.class
 service\DbChangeMonitor.class
 service\FolderWatch.class
 ui\HealthBanner$1.class
+service\TaskSchedulerService$WatchGroup.class
 ui\monitor\DetailPane.class
 ui\StatusStrip$1.class
 service\LinkTls$Material.class
@@ -326,6 +334,7 @@ ui\MainWindow.class
 service\LocalFileMetadataService.class
 service\LinkMonitorConfig.class
 service\DbChangeMonitor$Watch.class
+service\TaskSchedulerService$WatchStep.class
 ui\monitor\QueuePanel$PendingRow.class
 ui\QueueMonitorView$ActivityRow.class
 ui\VectorIcons$8.class
@@ -378,6 +387,7 @@ ui\Async.class
 service\TransferService$NoFilesListener.class
 model\ScheduledTask$TaskType.class
 model\ScheduledTask$TransferDirection.class
+service\watch\ListenerScripts.class
 ui\components\StatCard.class
 AdminElevation.class
 service\sftp\SftpClient.class
@@ -397,12 +407,15 @@ ui\LinkMonitorPanel$SourceForm.class
 service\LinkMonitorConfig$Issued.class
 service\queue\SchedulerStatusExporter.class
 ui\LinkMonitorPanel.class
+service\LogFiles.class
 App.class
 ui\StatisticsPanel$1.class
 ui\LinkOverviewPanel.class
+service\sftp\SessionLog$1.class
 ui\ApiPanel$ItemRenderer.class
 service\Workers$LaneStat.class
 ui\NotificationPanel$Loaded.class
+service\watch\RemotePushWatcher$LeaseStream.class
 ui\RunHistoryPanel$5.class
 util\KeyProtector.class
 ui\RunHistoryPanel$ExportTask.class
@@ -412,6 +425,7 @@ service\LinkMonitorService.class
 ui\monitor\QueuePanel$Section$Model.class
 ui\TaskManagerPanel$2.class
 model\Credential.class
+util\LeanLaunch.class
 ui\Theme$2.class
 service\TransferService$BackupCandidate.class
 ui\monitor\FilterChip.class

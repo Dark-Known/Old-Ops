@@ -73,9 +73,9 @@ public final class DaemonCallLog {
 
     static synchronized void write(File d, Entry e) {
         try {
-            File f = new File(d, FILE_NAME);
+            File f = LogFiles.file(d, FILE_NAME);
             if (f.length() > MAX_BYTES) {
-                Files.move(f.toPath(), new File(d, FILE_NAME + ".1").toPath(), StandardCopyOption.REPLACE_EXISTING);
+                Files.move(f.toPath(), LogFiles.file(d, FILE_NAME + ".1").toPath(), StandardCopyOption.REPLACE_EXISTING);
             }
             String line = "{\"t\":" + e.time() + ",\"channel\":\"" + esc(e.channel()) + "\",\"method\":\"" + esc(e.method())
                     + "\",\"path\":\"" + esc(e.path()) + "\",\"status\":" + e.status() + ",\"ms\":" + e.millis()
@@ -90,7 +90,7 @@ public final class DaemonCallLog {
     public static List<Entry> readRecent(File dataDir, int limit) {
         Deque<Entry> out = new ArrayDeque<>();
         for (String name : new String[] { FILE_NAME + ".1", FILE_NAME }) {
-            File f = new File(dataDir, name);
+            File f = LogFiles.file(dataDir, name);
             if (!f.isFile()) continue;
             try (BufferedReader r = Files.newBufferedReader(f.toPath(), StandardCharsets.UTF_8)) {
                 String line;

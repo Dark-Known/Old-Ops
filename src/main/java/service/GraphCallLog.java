@@ -101,9 +101,9 @@ public final class GraphCallLog {
 
     static synchronized void write(File d, Entry e) {
         try {
-            File f = new File(d, FILE_NAME);
+            File f = LogFiles.file(d, FILE_NAME);
             if (f.length() > MAX_BYTES) {
-                Files.move(f.toPath(), new File(d, FILE_NAME + ".1").toPath(), StandardCopyOption.REPLACE_EXISTING);
+                Files.move(f.toPath(), LogFiles.file(d, FILE_NAME + ".1").toPath(), StandardCopyOption.REPLACE_EXISTING);
             }
             String line = "{\"t\":" + e.time() + ",\"kind\":\"" + esc(e.kind()) + "\",\"method\":\"" + esc(e.method())
                     + "\",\"target\":\"" + esc(e.target()) + "\",\"mailbox\":\"" + esc(e.mailbox())
@@ -120,7 +120,7 @@ public final class GraphCallLog {
     public static List<Entry> readRecent(File dataDir, int limit) {
         Deque<Entry> out = new ArrayDeque<>();
         for (String name : new String[] { FILE_NAME + ".1", FILE_NAME }) {
-            File f = new File(dataDir, name);
+            File f = LogFiles.file(dataDir, name);
             if (!f.isFile()) continue;
             try (BufferedReader r = Files.newBufferedReader(f.toPath(), StandardCharsets.UTF_8)) {
                 String line;

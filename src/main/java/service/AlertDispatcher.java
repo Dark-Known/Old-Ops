@@ -84,7 +84,7 @@ public final class AlertDispatcher implements AutoCloseable {
     private java.util.function.Consumer<TaskRunRecord> runListener, eventListener;
 
     public AlertDispatcher(File dataDir, RunHistoryService history, TaskLogService logs) {
-        this(dataDir, history, logs, System::currentTimeMillis, new HttpPoster(), 2000);
+        this(dataDir, history, logs, System::currentTimeMillis, new HttpPoster(), 5000);
         this.serveReports = true;
     }
 
@@ -115,12 +115,12 @@ public final class AlertDispatcher implements AutoCloseable {
     void restoreQueued() {
         for (AlertQueueStore.Job j : store.load()) {
             if (clock.getAsLong() - j.queuedAt() > MAX_AGE_MS) {
-                store.delete(j.file());
+                store.delete(j.id());
                 event(EventKind.ALERT_FAILED, j.alert(), TaskRunRecord.Status.FAILED, "Alert expired: " + j.alert().title(),
                         "It was still waiting when the service restarted, more than 24 hours after it was raised, so it was not sent.");
                 continue;
             }
-            submit(j.file(), j.alert(), currentConfig(), "Alert queued again after a restart: ");
+            submit(j.id(), j.alert(), currentConfig(), "Alert queued again after a restart: ");
         }
     }
 
@@ -254,8 +254,8 @@ public final class AlertDispatcher implements AutoCloseable {
     }
 
     private synchronized AlertConfig currentConfig() {
-        File f = new File(dataDir, AlertConfig.FILE_NAME);
-        long stamp = f.isFile() ? f.lastModified() * 31 + f.length() : -1;
+        long stamp = AppDb.stamp(dataDir, AlertConfig.KV_NAME);
+        if (stamp == -1 && new File(dataDir, AlertConfig.FILE_NAME).isFile()) stamp = -3; // legacy file still to import
         if (stamp != configStamp) { configStamp = stamp; config = AlertConfig.load(dataDir); ensureReportServer(config); }
         return config;
     }
@@ -269,12 +269,12 @@ public final class AlertDispatcher implements AutoCloseable {
 
     /** Saves the alert (so a restart does not lose it), queues it for the worker threads and says so in the Event Monitor. */
     private void enqueue(AlertConfig cfg, TeamsCard.Alert alert, TaskRunRecord rec) {
-        File f = null;
-        try { f = store.save(alert, clock.getAsLong()); } catch (IOException e) { log.log(Level.WARNING, "Alert not saved to the queue folder", e); }
+        long f = -1;
+        try { f = store.save(alert, clock.getAsLong()); } catch (IOException e) { log.log(Level.WARNING, "Alert not saved to the queue table", e); }
         submit(f, alert, cfg, "Alert queued: ");
     }
 
-    private void submit(File file, TeamsCard.Alert alert, AlertConfig cfg, String prefix) {
+    private void submit(long file, TeamsCard.Alert alert, AlertConfig cfg, String prefix) {
         int depth = pending.incrementAndGet();
         try {
             sender.execute(() -> {
@@ -291,7 +291,7 @@ public final class AlertDispatcher implements AutoCloseable {
     }
 
     /** Runs on a worker thread: uses the settings as they are now, and removes the saved copy once the alert is done with. */
-    private void deliverQueued(File file, TeamsCard.Alert alert) {
+    private void deliverQueued(long file, TeamsCard.Alert alert) {
         AlertConfig cfg = currentConfig();
         try {
             if (!cfg.ready()) {
@@ -523,7 +523,8 @@ public final class AlertDispatcher implements AutoCloseable {
                 Thread.currentThread().interrupt();
                 return new Result(0, "", "interrupted", System.currentTimeMillis() - t0);
             } catch (Exception e) {
-                return new Result(0, "", e.getClass().getSimpleName() + ": " + e.getMessage(), System.currentTimeMillis() - t0);
+                long ms = System.currentTimeMillis() - t0;
+                return new Result(0, "", util.NetErr.describe(e, URI.create(url), ms, 10_000), ms);
             }
         }
     }

@@ -134,7 +134,7 @@ final class LinkConnectPanel {
             for (int i = 1; i < v.addresses().size(); i++) sb.append("  ").append(v.addresses().get(i)).append("/socketLink/events\n");
         }
         sb.append("\nTest from server A\n");
-        sb.append("  PowerShell  Invoke-RestMethod ").append(url).append("/socketLink/health\n");
+        sb.append("  PowerShell  ").append(util.Scripts.raw("link/link-health-check.ps1", "URL", url)).append("\n");
         sb.append("  curl        curl ").append(c.tlsEnabled ? "--cacert link-server.cer " : "").append(url).append("/socketLink/health\n");
         sb.append("  Answer: ok\n");
         sb.append("\nSend a message\n");
@@ -177,12 +177,9 @@ final class LinkConnectPanel {
         how.append("Install it     certutil -dump link-server.cer     (Cert Hash(sha256) = fingerprint)\n");
         how.append("               certutil -addstore Root link-server.cer\n\n");
         how.append("Or pin it      no installation; the application compares the fingerprint itself. PowerShell check:\n");
-        how.append("  $tcp = New-Object Net.Sockets.TcpClient('").append(host).append("', ").append(c.port).append(")\n");
-        how.append("  $ssl = New-Object Net.Security.SslStream($tcp.GetStream(), $false, ({$true}))\n");
-        how.append("  $ssl.AuthenticateAsClient('").append(host).append("')\n");
-        how.append("  $c = New-Object Security.Cryptography.X509Certificates.X509Certificate2($ssl.RemoteCertificate)\n");
-        how.append("  [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($c.RawData)).Replace('-','') -eq '")
-           .append(fpNoColons).append("'\n\n");
+        for (String ln : util.Scripts.raw("link/link-pin-check.ps1", "HOST", host, "PORT", String.valueOf(c.port), "FINGERPRINT", fpNoColons).split("\n"))
+            how.append("  ").append(ln).append("\n");
+        how.append("\n");
         how.append("Other options: your own certificate (tls.keystore / tls.password), or HTTPS off (tls.enabled=false) on a private network.");
         certHow.setText(how.toString());
         certHow.setCaretPosition(0);

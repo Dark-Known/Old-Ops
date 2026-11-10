@@ -81,10 +81,10 @@ final class LinkActivityPanel extends JPanel {
                 .setContents(new StringSelection(detail.getText()), null));
         bar.add(copy);
         JButton openFolder = new JButton("Open folder");
-        openFolder.setToolTipText("The data folder with " + LinkActivityLog.FILE_NAME + " and " + GraphCallLog.FILE_NAME);
+        openFolder.setToolTipText("The logs folder with " + LinkActivityLog.FILE_NAME + " and " + GraphCallLog.FILE_NAME);
         openFolder.addActionListener(e -> {
-            try { Desktop.getDesktop().open(dataDir); } catch (Exception ex) {
-                JOptionPane.showMessageDialog(this, dataDir.getAbsolutePath());
+            try { Desktop.getDesktop().open(service.LogFiles.dir(dataDir)); } catch (Exception ex) {
+                JOptionPane.showMessageDialog(this, service.LogFiles.dir(dataDir).getAbsolutePath());
             }
         });
         bar.add(openFolder);
@@ -161,7 +161,7 @@ final class LinkActivityPanel extends JPanel {
     }
 
     private long stampOf(String name) {
-        File f = new File(dataDir, name);
+        File f = service.LogFiles.file(dataDir, name);
         return f.isFile() ? f.lastModified() * 31 + f.length() : -1;
     }
 

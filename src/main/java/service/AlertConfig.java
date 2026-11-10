@@ -29,6 +29,8 @@ import java.util.Set;
 public final class AlertConfig {
 
     public static final String FILE_NAME = "alerts.properties";
+    /** Name of the row in app.db that holds the settings (the file name above is only the pre-database location). */
+    static final String KV_NAME = "alerts";
 
     /** What a task does about alerts. */
     public enum Mode { INHERIT, OFF, CUSTOM }
@@ -160,10 +162,15 @@ public final class AlertConfig {
     // ── Files ──────────────────────────────────────────────────────────────
 
     public static AlertConfig load(File dataDir) {
-        File f = new File(dataDir, FILE_NAME);
-        if (!f.isFile()) return empty();
+        String text = AppDb.get(dataDir, KV_NAME);
+        if (text == null) {
+            // settings written by an older version were a loose file; move them into app.db once
+            text = AppDb.takeLegacyFile(new File(dataDir, FILE_NAME));
+            if (text == null) return empty();
+            try { AppDb.put(dataDir, KV_NAME, text); } catch (IOException e) { /* still usable this time */ }
+        }
         Properties p = new Properties();
-        try (InputStream in = new FileInputStream(f)) { p.load(in); } catch (IOException e) { return empty(); }
+        try { p.load(new java.io.StringReader(text)); } catch (IOException e) { return empty(); }
         return parse(p, dataDir);
     }
 
@@ -207,9 +214,9 @@ public final class AlertConfig {
             p.setProperty("task." + e.getKey() + ".mode", e.getValue().mode().name());
             if (e.getValue().mode() == Mode.CUSTOM) p.setProperty("task." + e.getKey() + ".kinds", join(e.getValue().kinds()));
         }
-        File tmp = new File(dataDir, FILE_NAME + ".tmp");
-        try (OutputStream out = new FileOutputStream(tmp)) { p.store(out, "Alert settings (the webhook address is encrypted)"); }
-        Files.move(tmp.toPath(), new File(dataDir, FILE_NAME).toPath(), StandardCopyOption.REPLACE_EXISTING);
+        java.io.StringWriter w = new java.io.StringWriter();
+        p.store(w, "Alert settings (the webhook address is encrypted)");
+        AppDb.put(dataDir, KV_NAME, w.toString());
     }
 
     static Set<EventKind> parseKinds(String s) {

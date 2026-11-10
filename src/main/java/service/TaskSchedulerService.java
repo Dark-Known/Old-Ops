@@ -265,7 +265,9 @@ public class TaskSchedulerService {
             // Long-lived session (remote watcher): belongs to the task, not to any one run, so it joins the
             // task's watcher group (armed -> session opened -> ... -> closed) instead of floating alone.
             recordWatchEvent(kind, e.taskId(), name, type, status, msg, details,
-                    e.phase() == SshSessionEvents.Phase.OPENED ? WatchStep.OPEN : WatchStep.END);
+                    e.phase() == SshSessionEvents.Phase.OPENED ? WatchStep.OPEN
+                            : e.reason() != null && e.reason().contains("reconnecting (attempt") ? WatchStep.KEEP
+                            : WatchStep.END);
         } else {
             // Opened/closed while a run executes: recordSchedulerEvent attaches the run key (the
             // calling thread's run context, else the task's in-flight run).
@@ -2099,7 +2101,8 @@ public class TaskSchedulerService {
         String taskId = task != null ? task.getId() : null;
         String taskName = task != null ? task.getName() : null;
         if (taskId != null) lastActivityMillis.put(taskId, System.currentTimeMillis());
-        log.info("[" + taskId + "] " + line);
+        // A host that installed a log callback (the daemon) writes this line itself; logging it here too printed every line twice.
+        if (logCallback == null) log.info("[" + taskId + "] " + line);
         logService.log(taskId, taskName, line);
         if (logCallback != null) {
             logCallback.accept(taskId, LocalDateTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"))
