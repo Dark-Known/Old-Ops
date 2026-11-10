@@ -1,6 +1,9 @@
 package export;
 
-import java.io.*;
+import java.io.BufferedOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.zip.ZipEntry;
@@ -19,7 +22,29 @@ import java.util.zip.ZipOutputStream;
  */
 public final class XlsxWriter {
 
-    private XlsxWriter() {}
+    private static final String CONTENT_TYPES =
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n" +
+                    "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">" +
+                    "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>" +
+                    "<Default Extension=\"xml\" ContentType=\"application/xml\"/>" +
+                    "<Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>" +
+                    "<Override PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>" +
+                    "<Override PartName=\"/xl/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml\"/>" +
+                    "</Types>";
+    private static final String RELS =
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n" +
+                    "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" +
+                    "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/>" +
+                    "</Relationships>";
+    private static final String WORKBOOK_RELS =
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n" +
+                    "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" +
+                    "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/>" +
+                    "<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>" +
+                    "</Relationships>";
+
+    private XlsxWriter() {
+    }
 
     /**
      * @param outFile      destination .xlsx path
@@ -30,7 +55,7 @@ public final class XlsxWriter {
      *                     background, or null for no fill (e.g. the header uses its own fill)
      */
     public static void write(File outFile, String[] headers, int[] columnWidths,
-            List<String[]> rows, List<String> rowFillHex) throws IOException {
+                             List<String[]> rows, List<String> rowFillHex) throws IOException {
 
         int colCount = headers.length;
 
@@ -74,11 +99,21 @@ public final class XlsxWriter {
         for (int i = 0; i < s.length(); i++) {
             char c = s.charAt(i);
             switch (c) {
-                case '&': sb.append("&amp;"); break;
-                case '<': sb.append("&lt;"); break;
-                case '>': sb.append("&gt;"); break;
-                case '"': sb.append("&quot;"); break;
-                case '\'': sb.append("&apos;"); break;
+                case '&':
+                    sb.append("&amp;");
+                    break;
+                case '<':
+                    sb.append("&lt;");
+                    break;
+                case '>':
+                    sb.append("&gt;");
+                    break;
+                case '"':
+                    sb.append("&quot;");
+                    break;
+                case '\'':
+                    sb.append("&apos;");
+                    break;
                 default:
                     // Strip control chars invalid in XML 1.0 (other than tab/lf/cr)
                     if (c < 0x20 && c != '\t' && c != '\n' && c != '\r') sb.append(' ');
@@ -140,7 +175,7 @@ public final class XlsxWriter {
     }
 
     private static String buildSheetXml(String[] headers, int[] columnWidths, List<String[]> rows,
-            List<String> rowFillHex, java.util.LinkedHashMap<String, Integer> assignedFills) {
+                                        List<String> rowFillHex, java.util.LinkedHashMap<String, Integer> assignedFills) {
         StringBuilder cols = new StringBuilder("<cols>");
         for (int i = 0; i < headers.length; i++) {
             double w = columnWidths != null && i < columnWidths.length ? columnWidths[i] : 20;
@@ -151,15 +186,15 @@ public final class XlsxWriter {
 
         StringBuilder sb = new StringBuilder();
         sb.append("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n")
-          .append("<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">")
-          .append(cols)
-          .append("<sheetData>");
+                .append("<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">")
+                .append(cols)
+                .append("<sheetData>");
 
         // Header row (row 1)
         sb.append("<row r=\"1\">");
         for (int c = 0; c < headers.length; c++) {
             sb.append("<c r=\"").append(colLetter(c)).append("1\" t=\"inlineStr\" s=\"1\"><is><t>")
-              .append(esc(headers[c])).append("</t></is></c>");
+                    .append(esc(headers[c])).append("</t></is></c>");
         }
         sb.append("</row>");
 
@@ -182,27 +217,4 @@ public final class XlsxWriter {
         sb.append("</sheetData></worksheet>");
         return sb.toString();
     }
-
-    private static final String CONTENT_TYPES =
-            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n" +
-            "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">" +
-            "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>" +
-            "<Default Extension=\"xml\" ContentType=\"application/xml\"/>" +
-            "<Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>" +
-            "<Override PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>" +
-            "<Override PartName=\"/xl/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml\"/>" +
-            "</Types>";
-
-    private static final String RELS =
-            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n" +
-            "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" +
-            "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/>" +
-            "</Relationships>";
-
-    private static final String WORKBOOK_RELS =
-            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n" +
-            "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" +
-            "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/>" +
-            "<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>" +
-            "</Relationships>";
 }

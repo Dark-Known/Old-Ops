@@ -1,15 +1,21 @@
 package service;
 
-import static org.junit.Assert.*;
-
 import org.junit.Test;
 
 import java.io.File;
 import java.nio.file.Files;
-import java.sql.*;
-import java.util.*;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.ResultSet;
+import java.sql.Statement;
+import java.util.HashSet;
+import java.util.Set;
 
-/** Needs the sqlite-jdbc driver on the classpath (it is a normal dependency of the project). */
+import static org.junit.Assert.*;
+
+/**
+ * Needs the sqlite-jdbc driver on the classpath (it is a normal dependency of the project).
+ */
 public class TaskDbMigrationTest {
 
     private static Set<String> columns(File dir) throws Exception {

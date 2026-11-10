@@ -4,12 +4,7 @@ import model.EventKind;
 import model.TaskRunRecord;
 
 import java.io.File;
-import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
-import java.sql.SQLException;
-import java.sql.Statement;
+import java.sql.*;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
@@ -30,22 +25,18 @@ import java.util.logging.Logger;
  * timeout) serialises them, and {@code synchronized} serialises threads within one process.
  */
 public class BackgroundLogService {
+    public static final String FILE_NAME = "background_log.db";
+    /**
+     * Pseudo task id shared by every row, so the monitor can tell these are not about a scheduled task.
+     */
+    public static final String TASK_ID = "BACKGROUND";
+    static final String TABLE = "background_events";
     private static final Logger log = Logger.getLogger(BackgroundLogService.class.getName());
     private static final DateTimeFormatter TS = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss");
-
-    public static final String FILE_NAME = "background_log.db";
-    static final String TABLE = "background_events";
-    /** Pseudo task id shared by every row, so the monitor can tell these are not about a scheduled task. */
-    public static final String TASK_ID = "BACKGROUND";
-
     private static volatile String processLabel = "GUI";
-    /** Names this process in the log ("GUI" or "Daemon"); set once at start-up. */
-    public static void setProcessLabel(String label) { processLabel = label; }
-
     private final File dbFile;
     private final Connection conn;
     private final List<Consumer<TaskRunRecord>> listeners = new CopyOnWriteArrayList<>();
-
     public BackgroundLogService(String dataDir) {
         this.dbFile = new File(dataDir, FILE_NAME);
         Connection c = null;
@@ -80,21 +71,66 @@ public class BackgroundLogService {
         this.conn = c;
     }
 
-    public boolean isOpen() { return conn != null; }
+    /**
+     * Names this process in the log ("GUI" or "Daemon"); set once at start-up.
+     */
+    public static void setProcessLabel(String label) {
+        processLabel = label;
+    }
 
-    public File getDbFile() { return dbFile; }
+    private static TaskRunRecord.Status parseStatus(String s) {
+        try {
+            return TaskRunRecord.Status.valueOf(s);
+        } catch (Exception e) {
+            return TaskRunRecord.Status.SUCCESS;
+        }
+    }
 
-    public void addListener(Consumer<TaskRunRecord> l) { listeners.add(l); }
+    private static TaskRunRecord toRecord(long id, String kind, String name, TaskRunRecord.Status status, String message,
+                                          String details, LocalDateTime start, LocalDateTime end, long ms, String source) {
+        TaskRunRecord r = new TaskRunRecord();
+        r.setId(id);
+        r.setTaskId(TASK_ID);
+        r.setTaskName(name);
+        r.setTaskType("BACKGROUND");
+        r.setStatus(status);
+        r.setReason(message);
+        r.setDetails(details);
+        r.setStartedAt(start);
+        r.setEndedAt(end);
+        r.setDurationMs(ms);
+        r.setEventKind(kind);
+        r.setTrigger(source);
+        return r;
+    }
 
-    public void removeListener(Consumer<TaskRunRecord> l) { listeners.remove(l); }
+    public boolean isOpen() {
+        return conn != null;
+    }
+
+    public File getDbFile() {
+        return dbFile;
+    }
 
     // ── Writing ─────────────────────────────────────────────────────────────
 
-    /** Records one background event. Returns its id, or -1 if it could not be stored. */
+    public void addListener(Consumer<TaskRunRecord> l) {
+        listeners.add(l);
+    }
+
+    public void removeListener(Consumer<TaskRunRecord> l) {
+        listeners.remove(l);
+    }
+
+    /**
+     * Records one background event. Returns its id, or -1 if it could not be stored.
+     */
     public long record(EventKind kind, String name, TaskRunRecord.Status status, String message, String details,
                        LocalDateTime start, LocalDateTime end) {
         return record(kind, name, status, message, details, start, end, processLabel);
     }
+
+    // ── Reading ─────────────────────────────────────────────────────────────
 
     synchronized long record(EventKind kind, String name, TaskRunRecord.Status status, String message, String details,
                              LocalDateTime start, LocalDateTime end, String source) {
@@ -103,7 +139,7 @@ public class BackgroundLogService {
         long ms = java.time.Duration.between(start, e).toMillis();
         long id;
         try (PreparedStatement ps = conn.prepareStatement("INSERT INTO " + TABLE
-                + " (kind, name, status, message, details, started_at, ended_at, duration_ms, source) VALUES (?,?,?,?,?,?,?,?,?)",
+                        + " (kind, name, status, message, details, started_at, ended_at, duration_ms, source) VALUES (?,?,?,?,?,?,?,?,?)",
                 Statement.RETURN_GENERATED_KEYS)) {
             ps.setString(1, kind.name());
             ps.setString(2, name);
@@ -115,7 +151,9 @@ public class BackgroundLogService {
             ps.setLong(8, ms);
             ps.setString(9, source);
             ps.executeUpdate();
-            try (ResultSet keys = ps.getGeneratedKeys()) { id = keys.next() ? keys.getLong(1) : 0; }
+            try (ResultSet keys = ps.getGeneratedKeys()) {
+                id = keys.next() ? keys.getLong(1) : 0;
+            }
         } catch (SQLException ex) {
             log.log(Level.WARNING, "Failed to record background event", ex);
             return -1;
@@ -124,13 +162,18 @@ public class BackgroundLogService {
             TaskRunRecord rec = toRecord(id, kind.name(), name, status, message, details != null ? details : message,
                     start, e, ms, source);
             for (Consumer<TaskRunRecord> l : listeners) {
-                try { l.accept(rec); } catch (Exception ignored) { }
+                try {
+                    l.accept(rec);
+                } catch (Exception ignored) {
+                }
             }
         }
         return id;
     }
 
-    /** Copies rows in from another store (used once to move older rows out of run history). Keeps their timestamps. */
+    /**
+     * Copies rows in from another store (used once to move older rows out of run history). Keeps their timestamps.
+     */
     public synchronized int importRows(List<TaskRunRecord> rows) {
         if (conn == null || rows.isEmpty()) return 0;
         int n = 0;
@@ -155,18 +198,24 @@ public class BackgroundLogService {
             }
             conn.commit();
         } catch (SQLException ex) {
-            try { conn.rollback(); } catch (SQLException ignored) { }
+            try {
+                conn.rollback();
+            } catch (SQLException ignored) {
+            }
             log.log(Level.WARNING, "Failed to import background rows", ex);
             return -1;
         } finally {
-            try { conn.setAutoCommit(true); } catch (SQLException ignored) { }
+            try {
+                conn.setAutoCommit(true);
+            } catch (SQLException ignored) {
+            }
         }
         return n;
     }
 
-    // ── Reading ─────────────────────────────────────────────────────────────
-
-    /** Newest-first rows without the {@code details} text (cheap; served from the covering index). */
+    /**
+     * Newest-first rows without the {@code details} text (cheap; served from the covering index).
+     */
     public synchronized List<TaskRunRecord> querySummaries(LocalDateTime from, int limit) {
         List<TaskRunRecord> out = new ArrayList<>();
         if (conn == null) return out;
@@ -189,7 +238,9 @@ public class BackgroundLogService {
         return out;
     }
 
-    /** One row including its full details text. */
+    /**
+     * One row including its full details text.
+     */
     public synchronized TaskRunRecord getById(long id) {
         if (conn == null) return null;
         try (PreparedStatement ps = conn.prepareStatement("SELECT id, kind, name, status, message, details, started_at, "
@@ -211,15 +262,23 @@ public class BackgroundLogService {
         if (conn == null) return 0;
         try (Statement st = conn.createStatement(); ResultSet rs = st.executeQuery("SELECT COUNT(*) FROM " + TABLE)) {
             return rs.next() ? rs.getLong(1) : 0;
-        } catch (SQLException ex) { return 0; }
+        } catch (SQLException ex) {
+            return 0;
+        }
     }
 
-    /** Changes whenever a row is added or a purge ran, so a poller can skip querying when nothing happened. */
+    // ── Small key/value store (scheduler bookkeeping such as "last purge time") ────
+
+    /**
+     * Changes whenever a row is added or a purge ran, so a poller can skip querying when nothing happened.
+     */
     public synchronized String getChangeToken() {
         if (conn == null) return "closed";
         try (Statement st = conn.createStatement()) {
             long max = 0;
-            try (ResultSet rs = st.executeQuery("SELECT COALESCE(MAX(id),0) FROM " + TABLE)) { if (rs.next()) max = rs.getLong(1); }
+            try (ResultSet rs = st.executeQuery("SELECT COALESCE(MAX(id),0) FROM " + TABLE)) {
+                if (rs.next()) max = rs.getLong(1);
+            }
             String gen = meta("purge_gen");
             return max + ":" + (gen == null ? "0" : gen);
         } catch (SQLException ex) {
@@ -227,17 +286,25 @@ public class BackgroundLogService {
         }
     }
 
-    /** On-disk size of this database (file plus write-ahead log). */
-    public long sizeBytes() { return SqlitePurge.fileBytes(dbFile); }
+    /**
+     * On-disk size of this database (file plus write-ahead log).
+     */
+    public long sizeBytes() {
+        return SqlitePurge.fileBytes(dbFile);
+    }
 
-    // ── Small key/value store (scheduler bookkeeping such as "last purge time") ────
+    // ── Purging ─────────────────────────────────────────────────────────────
 
     public synchronized String meta(String key) {
         if (conn == null) return null;
         try (PreparedStatement ps = conn.prepareStatement("SELECT value FROM meta WHERE key = ?")) {
             ps.setString(1, key);
-            try (ResultSet rs = ps.executeQuery()) { return rs.next() ? rs.getString(1) : null; }
-        } catch (SQLException ex) { return null; }
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getString(1) : null;
+            }
+        } catch (SQLException ex) {
+            return null;
+        }
     }
 
     public synchronized void setMeta(String key, String value) {
@@ -252,9 +319,11 @@ public class BackgroundLogService {
         }
     }
 
-    // ── Purging ─────────────────────────────────────────────────────────────
+    // ── Mapping ─────────────────────────────────────────────────────────────
 
-    /** Removes the oldest rows until the policy is met. Safe to call from any thread; see {@link SqlitePurge}. */
+    /**
+     * Removes the oldest rows until the policy is met. Safe to call from any thread; see {@link SqlitePurge}.
+     */
     public PurgeResult purge(PurgePolicy policy, BooleanSupplier cancelled) {
         PurgeResult r = SqlitePurge.run("Background log", this, conn, dbFile, List.of(TABLE), policy, cancelled);
         if (!r.failed() && r.deleted() > 0) {
@@ -267,30 +336,9 @@ public class BackgroundLogService {
     }
 
     public synchronized void close() {
-        try { if (conn != null) conn.close(); } catch (SQLException ignored) { }
-    }
-
-    // ── Mapping ─────────────────────────────────────────────────────────────
-
-    private static TaskRunRecord.Status parseStatus(String s) {
-        try { return TaskRunRecord.Status.valueOf(s); } catch (Exception e) { return TaskRunRecord.Status.SUCCESS; }
-    }
-
-    private static TaskRunRecord toRecord(long id, String kind, String name, TaskRunRecord.Status status, String message,
-                                          String details, LocalDateTime start, LocalDateTime end, long ms, String source) {
-        TaskRunRecord r = new TaskRunRecord();
-        r.setId(id);
-        r.setTaskId(TASK_ID);
-        r.setTaskName(name);
-        r.setTaskType("BACKGROUND");
-        r.setStatus(status);
-        r.setReason(message);
-        r.setDetails(details);
-        r.setStartedAt(start);
-        r.setEndedAt(end);
-        r.setDurationMs(ms);
-        r.setEventKind(kind);
-        r.setTrigger(source);
-        return r;
+        try {
+            if (conn != null) conn.close();
+        } catch (SQLException ignored) {
+        }
     }
 }

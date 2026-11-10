@@ -14,13 +14,13 @@ public class IconTile extends JLabel {
     public IconTile(Icon icon, Color fgColor, Color bgColor) {
         super(icon);
         this.bgColor = bgColor;
-        
+
         setHorizontalAlignment(CENTER);
         setVerticalAlignment(CENTER);
         setOpaque(true);
         setBackground(bgColor);
         setForeground(fgColor);
-        
+
         // Fixed 36x36 size
         setPreferredSize(new Dimension(36, 36));
         setMinimumSize(new Dimension(36, 36));

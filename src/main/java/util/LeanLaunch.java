@@ -15,15 +15,18 @@ import java.util.List;
 public final class LeanLaunch {
     private static final String MARK = "opstool.lean";
     private static final String[] FLAGS = {
-        "-XX:+UseSerialGC", "-Xms32m", "-Xmx512m", "-Xmn48m",
-        "-XX:MinHeapFreeRatio=10", "-XX:MaxHeapFreeRatio=30",
-        "-XX:ReservedCodeCacheSize=48m", "-XX:TieredStopAtLevel=1",
-        "-XX:MaxMetaspaceSize=96m", "-Xss512k", "-Dsun.java2d.d3d=false", "-D" + MARK + "=1"
+            "-XX:+UseSerialGC", "-Xms32m", "-Xmx512m", "-Xmn48m",
+            "-XX:MinHeapFreeRatio=10", "-XX:MaxHeapFreeRatio=30",
+            "-XX:ReservedCodeCacheSize=48m", "-XX:TieredStopAtLevel=1",
+            "-XX:MaxMetaspaceSize=96m", "-Xss512k", "-Dsun.java2d.d3d=false", "-D" + MARK + "=1"
     };
 
-    private LeanLaunch() {}
+    private LeanLaunch() {
+    }
 
-    /** Returns true if a lean copy was started and this process should exit. */
+    /**
+     * Returns true if a lean copy was started and this process should exit.
+     */
     public static boolean relaunchIfNeeded(String[] args) {
         try {
             if (System.getProperty(MARK) != null) return false;

@@ -14,12 +14,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -37,13 +32,16 @@ import java.util.logging.Logger;
  */
 public final class DaemonStatusStream {
 
-    private static final Logger log = Logger.getLogger(DaemonStatusStream.class.getName());
-
-    /** No bytes (not even a heartbeat) for this long and the connection is treated as dead and recycled. */
+    /**
+     * No bytes (not even a heartbeat) for this long and the connection is treated as dead and recycled.
+     */
     static final long STALL_MS = 15_000;
+    private static final Logger log = Logger.getLogger(DaemonStatusStream.class.getName());
     private static final long WATCHDOG_EVERY_MS = 5_000;
     private static final long BACKOFF_START_MS = 1_000, BACKOFF_MAX_MS = 10_000;
-    /** While there is no control file (Daemon not running) just look again this often: a stat is trivial. */
+    /**
+     * While there is no control file (Daemon not running) just look again this often: a stat is trivial.
+     */
     private static final long WAITING_FOR_DAEMON_MS = 2_000;
 
     private static final ConcurrentHashMap<String, DaemonStatusStream> SHARED = new ConcurrentHashMap<>();
@@ -53,13 +51,6 @@ public final class DaemonStatusStream {
         return t;
     });
     private static final HttpClient HTTP = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(1)).build();
-
-    /** The shared, already-started stream for a data directory. */
-    public static DaemonStatusStream forDataDir(File dataDir) {
-        String key = dataDir.getAbsoluteFile().toPath().normalize().toString();
-        return SHARED.computeIfAbsent(key, k -> new DaemonStatusStream(dataDir).start());
-    }
-
     private final File dataDir;
     private final CopyOnWriteArrayList<Runnable> listeners = new CopyOnWriteArrayList<>();
     private volatile SchedulerStatusSnapshot latest;
@@ -68,9 +59,20 @@ public final class DaemonStatusStream {
     private volatile boolean stopped;
     private volatile long eventsReceived, connects;
     private Thread thread;
+    /**
+     * Not started and not shared: for tests. Production code uses {@link #forDataDir}.
+     */
+    DaemonStatusStream(File dataDir) {
+        this.dataDir = dataDir;
+    }
 
-    /** Not started and not shared: for tests. Production code uses {@link #forDataDir}. */
-    DaemonStatusStream(File dataDir) { this.dataDir = dataDir; }
+    /**
+     * The shared, already-started stream for a data directory.
+     */
+    public static DaemonStatusStream forDataDir(File dataDir) {
+        String key = dataDir.getAbsoluteFile().toPath().normalize().toString();
+        return SHARED.computeIfAbsent(key, k -> new DaemonStatusStream(dataDir).start());
+    }
 
     DaemonStatusStream start() {
         if (thread != null) return this;
@@ -97,15 +99,27 @@ public final class DaemonStatusStream {
         return System.currentTimeMillis() - lastByteMs <= STALL_MS ? s : null;
     }
 
-    public boolean isConnected() { return connected; }
+    public boolean isConnected() {
+        return connected;
+    }
 
-    /** Number of status events received so far (diagnostics and tests). */
-    public long eventsReceived() { return eventsReceived; }
+    /**
+     * Number of status events received so far (diagnostics and tests).
+     */
+    public long eventsReceived() {
+        return eventsReceived;
+    }
 
-    /** Number of successful connections so far (diagnostics and tests). */
-    public long connects() { return connects; }
+    /**
+     * Number of successful connections so far (diagnostics and tests).
+     */
+    public long connects() {
+        return connects;
+    }
 
-    /** Runs {@code onChange} (on the stream thread) when a status arrives or liveness flips. Returns an unsubscribe action. */
+    /**
+     * Runs {@code onChange} (on the stream thread) when a status arrives or liveness flips. Returns an unsubscribe action.
+     */
     public Runnable addListener(Runnable onChange) {
         listeners.add(onChange);
         return () -> listeners.remove(onChange);
@@ -118,7 +132,11 @@ public final class DaemonStatusStream {
         while (!stopped) {
             DaemonControlClient.Control control = DaemonControlClient.readControl(dataDir);
             if (control == null) { // Daemon not running, or control API disabled: no backoff growth, just keep looking
-                try { Thread.sleep(WAITING_FOR_DAEMON_MS); } catch (InterruptedException e) { return; }
+                try {
+                    Thread.sleep(WAITING_FOR_DAEMON_MS);
+                } catch (InterruptedException e) {
+                    return;
+                }
                 continue;
             }
             boolean gotAnyEvent = false;
@@ -130,14 +148,23 @@ public final class DaemonStatusStream {
                 log.log(Level.FINE, "Daemon status stream unavailable: " + e);
             }
             latest = null; // never serve a previous Daemon instance's state after a drop/restart
-            if (connected) { connected = false; notifyListeners(); } // liveness flipped: let callers fall back now
+            if (connected) {
+                connected = false;
+                notifyListeners();
+            } // liveness flipped: let callers fall back now
             if (stopped) return;
             backoff = gotAnyEvent ? BACKOFF_START_MS : Math.min(backoff * 2, BACKOFF_MAX_MS);
-            try { Thread.sleep(backoff); } catch (InterruptedException e) { return; }
+            try {
+                Thread.sleep(backoff);
+            } catch (InterruptedException e) {
+                return;
+            }
         }
     }
 
-    /** One connection's lifetime. Returns whether it delivered at least one status (resets the backoff). */
+    /**
+     * One connection's lifetime. Returns whether it delivered at least one status (resets the backoff).
+     */
     private boolean connectAndRead(DaemonControlClient.Control c) throws Exception {
         HttpRequest req = HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + c.port() + "/status/stream"))
                 .header(DaemonControlServer.TOKEN_HEADER, c.token())
@@ -155,7 +182,10 @@ public final class DaemonStatusStream {
         connects++;
         ScheduledFuture<?> watchdog = WATCHDOG.scheduleWithFixedDelay(() -> {
             if (System.currentTimeMillis() - lastByteMs > STALL_MS) {
-                try { body.close(); } catch (Exception ignored) { } // unblocks readLine() below
+                try {
+                    body.close();
+                } catch (Exception ignored) {
+                } // unblocks readLine() below
             }
         }, WATCHDOG_EVERY_MS, WATCHDOG_EVERY_MS, TimeUnit.MILLISECONDS);
 
@@ -197,7 +227,11 @@ public final class DaemonStatusStream {
 
     private void notifyListeners() {
         for (Runnable r : listeners) {
-            try { r.run(); } catch (RuntimeException e) { log.log(Level.WARNING, "status listener failed", e); }
+            try {
+                r.run();
+            } catch (RuntimeException e) {
+                log.log(Level.WARNING, "status listener failed", e);
+            }
         }
     }
 }

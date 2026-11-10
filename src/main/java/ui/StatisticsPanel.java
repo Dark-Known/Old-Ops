@@ -10,11 +10,8 @@ import java.awt.geom.RoundRectangle2D;
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.temporal.ChronoUnit;
-import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.LinkedHashMap;
+import java.util.*;
 import java.util.List;
-import java.util.Map;
 import java.util.function.IntConsumer;
 
 /**
@@ -41,26 +38,26 @@ import java.util.function.IntConsumer;
 public class StatisticsPanel extends JPanel {
 
     private static final Color SUCCESS = new Color(0x5C7A45);
-    private static final Color FAILED  = new Color(0x9C4A32);
+    private static final Color FAILED = new Color(0x9C4A32);
     private static final Color SKIPPED = new Color(0xAD7C33);
     private static final Color NEUTRAL_ACCENT = new Color(0x596F6F);
     private static final Color DURATION_ACCENT = new Color(0x8A7A66);
 
-    /** Range options shown as chips, in hours. */
-    private static final int[] RANGE_HOURS = { 1, 2, 24, 24 * 7 };
-    private static final String[] RANGE_LABELS = { "1h", "2h", "24h", "7d" };
+    /**
+     * Range options shown as chips, in hours.
+     */
+    private static final int[] RANGE_HOURS = {1, 2, 24, 24 * 7};
+    private static final String[] RANGE_LABELS = {"1h", "2h", "24h", "7d"};
     private static final int DEFAULT_RANGE_INDEX = 1; // 2h, matching the old fixed window
-
+    private final JToggleButton[] rangeButtons = new JToggleButton[RANGE_HOURS.length];
     private int selectedRangeHours = RANGE_HOURS[DEFAULT_RANGE_INDEX];
     private IntConsumer rangeChangeListener;
-
     private JLabel valTotal, valSuccessRate, valMedianDuration, valFailures;
     private JLabel deltaTotal, deltaSuccessRate, deltaFailures, subP95Duration;
     private ActivityChart chart;
     private JLabel chartTitle;
     private JPanel durByTypePanel;
     private JPanel topFailingPanel;
-    private final JToggleButton[] rangeButtons = new JToggleButton[RANGE_HOURS.length];
 
     public StatisticsPanel() {
         setLayout(new BorderLayout(10, 10));
@@ -98,7 +95,45 @@ public class StatisticsPanel extends JPanel {
         updateChartTitle();
     }
 
-    /** Registers a listener fired whenever the person picks a different range chip — the caller re-queries and calls {@link #update} again. */
+    private static int indexOfRange(int hours) {
+        for (int i = 0; i < RANGE_HOURS.length; i++) if (RANGE_HOURS[i] == hours) return i;
+        return DEFAULT_RANGE_INDEX;
+    }
+
+    /**
+     * Keeps the visible chart at roughly 12-28 bars regardless of which range is selected.
+     */
+    private static int bucketMinutesFor(int rangeHours) {
+        if (rangeHours <= 1) return 5;           // 12 buckets
+        if (rangeHours <= 2) return 5;           // 24 buckets
+        if (rangeHours <= 24) return 60;         // 24 buckets
+        return 6 * 60;                            // 7d -> 28 buckets of 6h
+    }
+
+    private static Color withAlpha(Color c, int alpha) {
+        return new Color(c.getRed(), c.getGreen(), c.getBlue(), alpha);
+    }
+
+    private static long percentile(List<Long> values, double p) {
+        List<Long> sorted = new ArrayList<>(values);
+        sorted.sort(Comparator.naturalOrder());
+        int idx = (int) Math.ceil(p * sorted.size()) - 1;
+        idx = Math.max(0, Math.min(idx, sorted.size() - 1));
+        return sorted.get(idx);
+    }
+
+    private static String formatMs(long ms) {
+        if (ms < 1000) return ms + "ms";
+        Duration d = Duration.ofMillis(ms);
+        long s = d.getSeconds();
+        if (s < 60) return s + "s";
+        if (s < 3600) return (s / 60) + "m " + (s % 60) + "s";
+        return (s / 3600) + "h " + ((s % 3600) / 60) + "m";
+    }
+
+    /**
+     * Registers a listener fired whenever the person picks a different range chip — the caller re-queries and calls {@link #update} again.
+     */
     public void setRangeChangeListener(IntConsumer listener) {
         this.rangeChangeListener = listener;
     }
@@ -135,19 +170,6 @@ public class StatisticsPanel extends JPanel {
                 : bucketMinutes < 24 * 60 ? (bucketMinutes / 60) + "-hour"
                 : (bucketMinutes / (24 * 60)) + "-day";
         chartTitle.setText("Runs over the last " + rangeLabel + " (" + bucketLabel + " buckets)");
-    }
-
-    private static int indexOfRange(int hours) {
-        for (int i = 0; i < RANGE_HOURS.length; i++) if (RANGE_HOURS[i] == hours) return i;
-        return DEFAULT_RANGE_INDEX;
-    }
-
-    /** Keeps the visible chart at roughly 12-28 bars regardless of which range is selected. */
-    private static int bucketMinutesFor(int rangeHours) {
-        if (rangeHours <= 1) return 5;           // 12 buckets
-        if (rangeHours <= 2) return 5;           // 24 buckets
-        if (rangeHours <= 24) return 60;         // 24 buckets
-        return 6 * 60;                            // 7d -> 28 buckets of 6h
     }
 
     private JComponent buildCards() {
@@ -237,10 +259,6 @@ public class StatisticsPanel extends JPanel {
         return p;
     }
 
-    private static Color withAlpha(Color c, int alpha) {
-        return new Color(c.getRed(), c.getGreen(), c.getBlue(), alpha);
-    }
-
     /**
      * Recomputes every stat, the chart, and both breakdown lists.
      *
@@ -288,9 +306,14 @@ public class StatisticsPanel extends JPanel {
         updateTopFailing(runs);
     }
 
-    /** Green up-arrow is "good" for a count unless {@code higherIsBad} (e.g. failure counts), where it flips to red. */
+    /**
+     * Green up-arrow is "good" for a count unless {@code higherIsBad} (e.g. failure counts), where it flips to red.
+     */
     private void applyDelta(JLabel label, int current, int prior, boolean higherIsBad, String suffix) {
-        if (prior == 0 && current == 0) { label.setText(" "); return; }
+        if (prior == 0 && current == 0) {
+            label.setText(" ");
+            return;
+        }
         int diff = current - prior;
         String arrow = diff > 0 ? "\u2191" : diff < 0 ? "\u2193" : "\u2192";
         boolean good = diff == 0 || (higherIsBad ? diff < 0 : diff > 0);
@@ -299,23 +322,24 @@ public class StatisticsPanel extends JPanel {
     }
 
     private void applyDeltaPoints(JLabel label, double current, double prior, String suffix) {
-        if (current < 0 || prior < 0) { label.setText(" "); return; }
+        if (current < 0 || prior < 0) {
+            label.setText(" ");
+            return;
+        }
         double diff = current - prior;
-        if (Math.abs(diff) < 0.5) { label.setForeground(Color.GRAY); label.setText("\u2192 flat" + suffix); return; }
+        if (Math.abs(diff) < 0.5) {
+            label.setForeground(Color.GRAY);
+            label.setText("\u2192 flat" + suffix);
+            return;
+        }
         String arrow = diff > 0 ? "\u2191" : "\u2193";
         label.setForeground(diff > 0 ? SUCCESS : FAILED);
         label.setText(arrow + " " + Math.round(Math.abs(diff)) + "pt" + suffix);
     }
 
-    private static long percentile(List<Long> values, double p) {
-        List<Long> sorted = new ArrayList<>(values);
-        sorted.sort(Comparator.naturalOrder());
-        int idx = (int) Math.ceil(p * sorted.size()) - 1;
-        idx = Math.max(0, Math.min(idx, sorted.size() - 1));
-        return sorted.get(idx);
-    }
-
-    /** One row of median/P95 per task type — the original panel had no per-type split at all, just one mixed average across every task. */
+    /**
+     * One row of median/P95 per task type — the original panel had no per-type split at all, just one mixed average across every task.
+     */
     private void updateDurationByType(List<TaskRunRecord> runs) {
         Map<String, List<Long>> byType = new LinkedHashMap<>();
         for (TaskRunRecord r : runs) {
@@ -341,7 +365,9 @@ public class StatisticsPanel extends JPanel {
         durByTypePanel.repaint();
     }
 
-    /** Which tasks are failing, not just how many runs failed overall — the gap in the original panel. */
+    /**
+     * Which tasks are failing, not just how many runs failed overall — the gap in the original panel.
+     */
     private void updateTopFailing(List<TaskRunRecord> runs) {
         Map<String, Integer> failCounts = new LinkedHashMap<>();
         for (TaskRunRecord r : runs) {
@@ -394,12 +420,6 @@ public class StatisticsPanel extends JPanel {
         return row;
     }
 
-    /** Thin bottom hairline between breakdown rows without pulling in a full LineBorder per row. */
-    private static final class BottomHairlineBorder extends MatteBorder {
-        BottomHairlineBorder() { super(0, 0, 1, 0, new Color(0, 0, 0, 20)); }
-        @Override public Insets getBorderInsets(Component c) { return new Insets(4, 0, 4, 0); }
-    }
-
     private int[][] bucketize(List<TaskRunRecord> runs, int rangeHours) {
         int bucketMinutes = bucketMinutesFor(rangeHours);
         int bucketCount = Math.max(1, (int) Math.ceil((rangeHours * 60.0) / bucketMinutes));
@@ -423,16 +443,23 @@ public class StatisticsPanel extends JPanel {
         return buckets;
     }
 
-    private static String formatMs(long ms) {
-        if (ms < 1000) return ms + "ms";
-        Duration d = Duration.ofMillis(ms);
-        long s = d.getSeconds();
-        if (s < 60) return s + "s";
-        if (s < 3600) return (s / 60) + "m " + (s % 60) + "s";
-        return (s / 3600) + "h " + ((s % 3600) / 60) + "m";
+    /**
+     * Thin bottom hairline between breakdown rows without pulling in a full LineBorder per row.
+     */
+    private static final class BottomHairlineBorder extends MatteBorder {
+        BottomHairlineBorder() {
+            super(0, 0, 1, 0, new Color(0, 0, 0, 20));
+        }
+
+        @Override
+        public Insets getBorderInsets(Component c) {
+            return new Insets(4, 0, 4, 0);
+        }
     }
 
-    /** Small hand-painted stacked bar chart — no external charting library needed. */
+    /**
+     * Small hand-painted stacked bar chart — no external charting library needed.
+     */
     private static final class ActivityChart extends JComponent {
         private int[][] data = new int[24][3];
 
@@ -468,8 +495,8 @@ public class StatisticsPanel extends JPanel {
                     continue;
                 }
 
-                int[] counts = { b[0], b[1], b[2] };
-                Color[] colors = { SUCCESS, FAILED, SKIPPED };
+                int[] counts = {b[0], b[1], b[2]};
+                Color[] colors = {SUCCESS, FAILED, SKIPPED};
                 for (int s = 0; s < 3; s++) {
                     if (counts[s] == 0) continue;
                     double segH = usableH * ((double) counts[s] / max);

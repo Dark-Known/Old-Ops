@@ -53,45 +53,45 @@
   sees, unrelated to <id>.
 -->
 <service>
-  <id>OpsTransferToolDaemon</id>
-  <name>Monitoring tool</name>
-  <description>Monitoring tool - background daemon</description>
+    <id>OpsTransferToolDaemon</id>
+    <name>Monitoring tool</name>
+    <description>Monitoring tool - background daemon</description>
 
-  <!-- Adjust to the actual installed JRE/JDK path and jar location. -->
-  <executable>java</executable>
-  <arguments>-cp "%BASE%\OpsTransferTool.jar" Daemon "C:\OpsTools\Data"</arguments>
+    <!-- Adjust to the actual installed JRE/JDK path and jar location. -->
+    <executable>java</executable>
+    <arguments>-cp "%BASE%\OpsTransferTool.jar" Daemon "C:\OpsTools\Data"</arguments>
 
-  <!--
-    Service account: LocalSystem (the default if <serviceaccount> is
-    omitted) can read/write C:\OpsTools\Data and reach the network, which
-    covers the common case. If SFTP/SSH credentials rely on a specific
-    Windows identity (e.g. domain credentials cached for a particular
-    user), configure a dedicated service account instead:
+    <!--
+      Service account: LocalSystem (the default if <serviceaccount> is
+      omitted) can read/write C:\OpsTools\Data and reach the network, which
+      covers the common case. If SFTP/SSH credentials rely on a specific
+      Windows identity (e.g. domain credentials cached for a particular
+      user), configure a dedicated service account instead:
 
-      <serviceaccount>
-        <domain>YOURDOMAIN</domain>
-        <user>svc-opstool</user>
-        <password>...</password>
-        <allowservicelogon>true</allowservicelogon>
-      </serviceaccount>
+        <serviceaccount>
+          <domain>YOURDOMAIN</domain>
+          <user>svc-opstool</user>
+          <password>...</password>
+          <allowservicelogon>true</allowservicelogon>
+        </serviceaccount>
 
-    Whichever account runs this, it must NOT rely on
-    java.util.prefs.Preferences (per-user registry hive) for any setting —
-    see AppSettings/app.db, which this daemon now reads WinSCP path and
-    poll interval from instead, specifically so this works under any
-    service account without per-user setup.
-  -->
+      Whichever account runs this, it must NOT rely on
+      java.util.prefs.Preferences (per-user registry hive) for any setting —
+      see AppSettings/app.db, which this daemon now reads WinSCP path and
+      poll interval from instead, specifically so this works under any
+      service account without per-user setup.
+    -->
 
-  <logmode>rotate</logmode>
-  <log mode="roll-by-size">
-    <sizeThreshold>10240</sizeThreshold>
-    <keepFiles>5</keepFiles>
-  </log>
+    <logmode>rotate</logmode>
+    <log mode="roll-by-size">
+        <sizeThreshold>10240</sizeThreshold>
+        <keepFiles>5</keepFiles>
+    </log>
 
-  <onfailure action="restart" delay="10 sec"/>
-  <onfailure action="restart" delay="30 sec"/>
-  <resetfailure>1 hour</resetfailure>
+    <onfailure action="restart" delay="10 sec"/>
+    <onfailure action="restart" delay="30 sec"/>
+    <resetfailure>1 hour</resetfailure>
 
-  <startmode>Automatic</startmode>
-  <stoptimeout>15 sec</stoptimeout>
+    <startmode>Automatic</startmode>
+    <stoptimeout>15 sec</stoptimeout>
 </service>

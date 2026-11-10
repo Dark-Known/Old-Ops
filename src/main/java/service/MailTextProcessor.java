@@ -1,11 +1,13 @@
 package service;
 
-import util.MiniJson;
 import util.AppConfig;
 import util.AppSettings;
-import java.io.*;
-import java.nio.file.*;
+import util.MiniJson;
+
+import java.io.File;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.Collections;
@@ -23,35 +25,125 @@ import java.util.regex.Pattern;
  */
 final class MailTextProcessor {
 
-    private final java.util.function.Supplier<File> dataDir;
-
-    MailTextProcessor(java.util.function.Supplier<File> dataDir) { this.dataDir = dataDir; }
+    private static final DateTimeFormatter RCV_HEADER_DATE_FMT = DateTimeFormatter.ofPattern("yyyy/MM/dd HH:mm");
+    // Second line of the raw message packet: a dot, a 7-letter SITA address
+    // (3-letter station + 4-letter org code), a space, then a 6-digit
+    // date-time group. Captures the 3-letter station code.
+    private static final Pattern LDM_ORIGIN_SECOND_LINE =
+            Pattern.compile("^\\.([A-Z]{3})[A-Z]{4}\\s+\\d{6}");
 
     // ─── SITA-style header block (LDM / MVT / PTM) ─────────────────────────
+    // An isolated line of exactly 3 uppercase letters immediately followed by
+    // a baggage (B) or cargo (C) distribution line starting with a dot.
+    private static final Pattern LDM_ORIGIN_BEFORE_DISTRIBUTION =
+            Pattern.compile("^([A-Z]{3})\\s*$\\R^(?:B|C)\\s+\\.", Pattern.MULTILINE);
+    // First run of 3 capital letters right after a '-' on the same line.
+    private static final Pattern LDM_DESTINATION_AFTER_DASH =
+            Pattern.compile("-\\s*([A-Z]{3})");
 
-    private static final DateTimeFormatter RCV_HEADER_DATE_FMT = DateTimeFormatter.ofPattern("yyyy/MM/dd HH:mm");
+    // ─── LDM origin / destination extraction ───────────────────────────────
+    // Flight designator + departure date line, e.g. "SV753/06AUG HYDJED":
+    // 2-3 char airline code + 1-4 digit flight number, "/", 2-digit day +
+    // 3-letter month, then a run of 6 capital letters split into two 3-letter
+    // station codes — origin (where these passengers boarded) then the
+    // immediate/transit destination (where they disembark).
+    private static final Pattern PTM_FLIGHT_ORIGIN_DEST =
+            Pattern.compile("^[A-Z0-9]{2,3}\\d{1,4}/\\d{2}[A-Z]{3}\\s+([A-Z]{3})([A-Z]{3})", Pattern.MULTILINE);
+    private static final Pattern[] BANNER_REMOVAL_PATTERNS = new Pattern[]{
+            // Outlook's "You don't often get email from X. Learn why this is
+            // important" safety tip — X varies per message, so match the fixed
+            // wrapper text around it rather than a literal sender.
+            Pattern.compile("(?is)you don't often get email from .*?learn why this is important\\.?"),
+            // "** EXTERNAL EMAIL - Please verify the sender ... **" style banners.
+            Pattern.compile("(?is)\\*\\*\\s*external email\\s*-.*?\\*\\*"),
+            // Common Office 365 default external-sender banner text.
+            Pattern.compile("(?is)this message originated from outside your organization\\.?\\s*"
+                    + "(do not click links or open attachments unless you recognize the sender[^.\\n]*\\.)?"),
+            // "[EXTERNAL]" tag some gateways prepend to the subject/body.
+            Pattern.compile("(?i)^\\s*\\[external]\\s*", Pattern.MULTILINE),
+            Pattern.compile("(?i)^caution:\\s*this email originated from outside.*$", Pattern.MULTILINE),
+    };
+    /**
+     * Company convention for these mailboxes: the substantive message content
+     * begins at a literal "LDM" / "MVT" / "PTM" marker in the body — whichever
+     * one starts the actual message — and everything before it (banners,
+     * greetings, etc.) is boilerplate that gets discarded. The marker found
+     * also identifies the message type, which drives the =PRIORITY value and
+     * whether/how origin+destination are extracted. If none of the three
+     * markers are present, no marker is returned and the text is left as-is
+     * (not an LDM/MVT/PTM message, so no SITA header is generated for it).
+     */
+    private static final String[] MESSAGE_TYPE_MARKERS = {"LDM", "MVT", "PTM"};
+    // Lines matching any of these mark the start of a signature, footer/
+    // disclaimer, or quoted reply history — everything from the first match
+    // onward is dropped. Best-effort: real-world mail signature formats
+    // vary too much to catch every case, but this covers the common ones
+    // (Outlook/Gmail/mobile clients, RFC 3676 "-- " delimiter, disclaimers).
+    private static final Pattern[] BODY_CUTOFF_PATTERNS = new Pattern[]{
+            Pattern.compile("^-- ?$"),
+            Pattern.compile("^_{5,}$"),
+            Pattern.compile("(?i)^-{3,}\\s*original message\\s*-{3,}$"),
+            Pattern.compile("(?i)^on .{5,120} wrote:\\s*$"),
+            Pattern.compile("^from:\\s+\\S.*$", Pattern.CASE_INSENSITIVE),
+            Pattern.compile("^>.*$"),
+            Pattern.compile("(?i)^sent from my (iphone|android|mobile|samsung|ipad).*$"),
+            Pattern.compile("(?i)^get outlook for (ios|android).*$"),
+            Pattern.compile("(?i)^(confidentiality notice|disclaimer)\\b.*$"),
+            // Common sign-off lines — "Thanks & Regards", "Best Regards,", etc.
+            // Anchored to a line containing (at most) a short trailing name/
+            // title so it doesn't accidentally match the phrase mid-sentence.
+            Pattern.compile("(?i)^thanks\\s*(&|and)\\s*regards\\s*,?\\s*$"),
+            Pattern.compile("(?i)^(best|warm|kind|many)\\s+regards\\s*,?\\s*$"),
+            Pattern.compile("(?i)^regards\\s*,?\\s*$"),
+            Pattern.compile("(?i)^(thank\\s*you|thanks)\\s*,?\\s*$"),
+            Pattern.compile("(?i)^(best|sincerely|cheers|respectfully)\\s*,?\\s*$"),
+            Pattern.compile("(?i)^this (e-?mail|message)( and any (attachments|files))?"
+                    + " (is|are|contains|may contain).*confidential.*$"),
+    };
+    private final java.util.function.Supplier<File> dataDir;
+
+    // ─── PTM origin / destination extraction ───────────────────────────────
+    private final Object msgIdLock = new Object();
+    private Map<String, Object> stationCodeCache;
+
+    // ─── Station code → full SITA address lookup (app-config.xml / JSON) ──
+    private long stationCodeCacheFileMtime = -1;
+    MailTextProcessor(java.util.function.Supplier<File> dataDir) {
+        this.dataDir = dataDir;
+    }
+    // (defaultStationAddress is no longer cached here — AppSettings.getDefaultStationAddress()
+    // already does its own cheap mtime-checked caching and stays live-editable.)
+
+    /**
+     * Removes only leading spaces/tabs from a single line, leaving the rest of the line untouched.
+     */
+    static String stripLeadingWhitespace(String line) {
+        int i = 0;
+        while (i < line.length() && (line.charAt(i) == ' ' || line.charAt(i) == '\t')) i++;
+        return line.substring(i);
+    }
 
     /**
      * Builds the fixed-format routing header prepended to LDM/MVT/PTM
      * message content:
-     *   =HEADER
-     *   RCV,<yyyy/MM/dd HH:mm>
-     *   =PRIORITY
-     *   QU (LDM/MVT) or QN (PTM)
-     *   =DESTINATION TYPE B
-     *   STX,<destination SITA address>
-     *   =ORIGIN
-     *   <origin SITA address>
-     *   =MSGID
-     *   <5-digit sequential id>
-     *   =SMI
+     * =HEADER
+     * RCV,<yyyy/MM/dd HH:mm>
+     * =PRIORITY
+     * QU (LDM/MVT) or QN (PTM)
+     * =DESTINATION TYPE B
+     * STX,<destination SITA address>
+     * =ORIGIN
+     * <origin SITA address>
+     * =MSGID
+     * <5-digit sequential id>
+     * =SMI
      * The template is identical across all three message types — only the
      * field values differ. Missing origin/destination addresses (extraction
      * or lookup failure) are left blank rather than guessed; a WARN is
      * already logged by the caller in that case.
      */
     String buildSitaHeaderBlock(String messageType, String originAddress,
-                                         String destinationAddress, String msgId) {
+                                String destinationAddress, String msgId) {
         StringBuilder sb = new StringBuilder();
         sb.append("=HEADER\n");
         sb.append("RCV,").append(LocalDateTime.now().format(RCV_HEADER_DATE_FMT)).append("\n");
@@ -66,21 +158,6 @@ final class MailTextProcessor {
         sb.append("=SMI\n");
         return sb.toString();
     }
-
-    // ─── LDM origin / destination extraction ───────────────────────────────
-
-    // Second line of the raw message packet: a dot, a 7-letter SITA address
-    // (3-letter station + 4-letter org code), a space, then a 6-digit
-    // date-time group. Captures the 3-letter station code.
-    private static final Pattern LDM_ORIGIN_SECOND_LINE =
-            Pattern.compile("^\\.([A-Z]{3})[A-Z]{4}\\s+\\d{6}");
-    // An isolated line of exactly 3 uppercase letters immediately followed by
-    // a baggage (B) or cargo (C) distribution line starting with a dot.
-    private static final Pattern LDM_ORIGIN_BEFORE_DISTRIBUTION =
-            Pattern.compile("^([A-Z]{3})\\s*$\\R^(?:B|C)\\s+\\.", Pattern.MULTILINE);
-    // First run of 3 capital letters right after a '-' on the same line.
-    private static final Pattern LDM_DESTINATION_AFTER_DASH =
-            Pattern.compile("-\\s*([A-Z]{3})");
 
     /**
      * Origin station code for an LDM message. Tries the "second line of the
@@ -121,17 +198,11 @@ final class MailTextProcessor {
         return null;
     }
 
-    // ─── PTM origin / destination extraction ───────────────────────────────
+    // ─── Sequential 5-digit message id ──────────────────────────────────────
 
-    // Flight designator + departure date line, e.g. "SV753/06AUG HYDJED":
-    // 2-3 char airline code + 1-4 digit flight number, "/", 2-digit day +
-    // 3-letter month, then a run of 6 capital letters split into two 3-letter
-    // station codes — origin (where these passengers boarded) then the
-    // immediate/transit destination (where they disembark).
-    private static final Pattern PTM_FLIGHT_ORIGIN_DEST =
-            Pattern.compile("^[A-Z0-9]{2,3}\\d{1,4}/\\d{2}[A-Z]{3}\\s+([A-Z]{3})([A-Z]{3})", Pattern.MULTILINE);
-
-    /** Returns {origin, destination} station codes for a PTM message, or {null, null} if not found. */
+    /**
+     * Returns {origin, destination} station codes for a PTM message, or {null, null} if not found.
+     */
     String[] extractPtmOriginDestination(String ptmBody) {
         if (ptmBody != null) {
             Matcher m = PTM_FLIGHT_ORIGIN_DEST.matcher(ptmBody);
@@ -139,13 +210,6 @@ final class MailTextProcessor {
         }
         return new String[]{null, null};
     }
-
-    // ─── Station code → full SITA address lookup (app-config.xml / JSON) ──
-
-    private Map<String, Object> stationCodeCache;
-    private long stationCodeCacheFileMtime = -1;
-    // (defaultStationAddress is no longer cached here — AppSettings.getDefaultStationAddress()
-    // already does its own cheap mtime-checked caching and stays live-editable.)
 
     /**
      * Loads and caches the station-code → 7-character SITA address map from
@@ -180,7 +244,9 @@ final class MailTextProcessor {
         return stationCodeCache;
     }
 
-    /** Reads a single top-level-named element's text from app-config.xml. */
+    /**
+     * Reads a single top-level-named element's text from app-config.xml.
+     */
     String readAppConfigValue(String tagName) {
         // Delegates to util.AppConfig, which resolves the file next to the
         // running JAR as a fallback when it's not found relative to the
@@ -217,10 +283,6 @@ final class MailTextProcessor {
         }
         return null;
     }
-
-    // ─── Sequential 5-digit message id ──────────────────────────────────────
-
-    private final Object msgIdLock = new Object();
 
     /**
      * Persistent, sequential 5-digit =MSGID, shared across all LDM/MVT/PTM
@@ -278,13 +340,6 @@ final class MailTextProcessor {
         return sb.toString();
     }
 
-    /** Removes only leading spaces/tabs from a single line, leaving the rest of the line untouched. */
-    static String stripLeadingWhitespace(String line) {
-        int i = 0;
-        while (i < line.length() && (line.charAt(i) == ' ' || line.charAt(i) == '\t')) i++;
-        return line.substring(i);
-    }
-
     /**
      * Converts a Graph message body to plain text. Graph returns bodyType
      * "html" for the vast majority of real-world mail — writing that raw
@@ -331,39 +386,6 @@ final class MailTextProcessor {
         return result.replaceAll("\\n{3,}", "\n\n").trim();
     }
 
-    private static final Pattern[] BANNER_REMOVAL_PATTERNS = new Pattern[] {
-            // Outlook's "You don't often get email from X. Learn why this is
-            // important" safety tip — X varies per message, so match the fixed
-            // wrapper text around it rather than a literal sender.
-            Pattern.compile("(?is)you don't often get email from .*?learn why this is important\\.?"),
-            // "** EXTERNAL EMAIL - Please verify the sender ... **" style banners.
-            Pattern.compile("(?is)\\*\\*\\s*external email\\s*-.*?\\*\\*"),
-            // Common Office 365 default external-sender banner text.
-            Pattern.compile("(?is)this message originated from outside your organization\\.?\\s*"
-                    + "(do not click links or open attachments unless you recognize the sender[^.\\n]*\\.)?"),
-            // "[EXTERNAL]" tag some gateways prepend to the subject/body.
-            Pattern.compile("(?i)^\\s*\\[external]\\s*", Pattern.MULTILINE),
-            Pattern.compile("(?i)^caution:\\s*this email originated from outside.*$", Pattern.MULTILINE),
-    };
-
-    /**
-     * Company convention for these mailboxes: the substantive message content
-     * begins at a literal "LDM" / "MVT" / "PTM" marker in the body — whichever
-     * one starts the actual message — and everything before it (banners,
-     * greetings, etc.) is boilerplate that gets discarded. The marker found
-     * also identifies the message type, which drives the =PRIORITY value and
-     * whether/how origin+destination are extracted. If none of the three
-     * markers are present, no marker is returned and the text is left as-is
-     * (not an LDM/MVT/PTM message, so no SITA header is generated for it).
-     */
-    private static final String[] MESSAGE_TYPE_MARKERS = {"LDM", "MVT", "PTM"};
-
-    static class MarkerMatch {
-        final String type;
-        final int index;
-        MarkerMatch(String type, int index) { this.type = type; this.index = index; }
-    }
-
     MarkerMatch findMessageTypeMarker(String text) {
         if (text == null) return null;
         MarkerMatch best = null;
@@ -384,7 +406,7 @@ final class MailTextProcessor {
      * than one key, whichever rule is listed first wins. The "Others"
      * fallback rule's key is never matched against (it's the catch-all, not
      * a marker to search for).
-     *
+     * <p>
      * Deliberately separate from findMessageTypeMarker (used for the SITA
      * header): that one is a strict, single-source, case-sensitive match
      * against the structured message content, because getting the header
@@ -395,8 +417,8 @@ final class MailTextProcessor {
      * in the subject is the actual reported problem.
      *
      * @return the matching rule's key (e.g. "LDM", "PTM", or any custom key
-     *         configured in Settings), or {@code null} if nothing matched
-     *         (routes to the "Others" folder).
+     * configured in Settings), or {@code null} if nothing matched
+     * (routes to the "Others" folder).
      */
     String classifyForFolderRouting(GraphMailService.MailMessage m) {
         String subject = m.subject != null ? m.subject : "";
@@ -426,33 +448,6 @@ final class MailTextProcessor {
     String resolveMoveFolderName(String messageType) {
         return AppSettings.resolveRoutingFolder(messageType);
     }
-
-    // Lines matching any of these mark the start of a signature, footer/
-    // disclaimer, or quoted reply history — everything from the first match
-    // onward is dropped. Best-effort: real-world mail signature formats
-    // vary too much to catch every case, but this covers the common ones
-    // (Outlook/Gmail/mobile clients, RFC 3676 "-- " delimiter, disclaimers).
-    private static final Pattern[] BODY_CUTOFF_PATTERNS = new Pattern[] {
-            Pattern.compile("^-- ?$"),
-            Pattern.compile("^_{5,}$"),
-            Pattern.compile("(?i)^-{3,}\\s*original message\\s*-{3,}$"),
-            Pattern.compile("(?i)^on .{5,120} wrote:\\s*$"),
-            Pattern.compile("^from:\\s+\\S.*$", Pattern.CASE_INSENSITIVE),
-            Pattern.compile("^>.*$"),
-            Pattern.compile("(?i)^sent from my (iphone|android|mobile|samsung|ipad).*$"),
-            Pattern.compile("(?i)^get outlook for (ios|android).*$"),
-            Pattern.compile("(?i)^(confidentiality notice|disclaimer)\\b.*$"),
-            // Common sign-off lines — "Thanks & Regards", "Best Regards,", etc.
-            // Anchored to a line containing (at most) a short trailing name/
-            // title so it doesn't accidentally match the phrase mid-sentence.
-            Pattern.compile("(?i)^thanks\\s*(&|and)\\s*regards\\s*,?\\s*$"),
-            Pattern.compile("(?i)^(best|warm|kind|many)\\s+regards\\s*,?\\s*$"),
-            Pattern.compile("(?i)^regards\\s*,?\\s*$"),
-            Pattern.compile("(?i)^(thank\\s*you|thanks)\\s*,?\\s*$"),
-            Pattern.compile("(?i)^(best|sincerely|cheers|respectfully)\\s*,?\\s*$"),
-            Pattern.compile("(?i)^this (e-?mail|message)( and any (attachments|files))?"
-                    + " (is|are|contains|may contain).*confidential.*$"),
-    };
 
     String stripSignatureAndQuotedContent(String text) {
         if (text == null || text.isEmpty()) return "";
@@ -491,6 +486,16 @@ final class MailTextProcessor {
             if (i < cutoff - 1) sb.append("\n");
         }
         return sb.toString().trim();
+    }
+
+    static class MarkerMatch {
+        final String type;
+        final int index;
+
+        MarkerMatch(String type, int index) {
+            this.type = type;
+            this.index = index;
+        }
     }
 
 }

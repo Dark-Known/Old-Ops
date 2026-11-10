@@ -8,7 +8,9 @@ import java.awt.*;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
-/** Settings card: how long background work / a frozen window must last before it shows up in the Event Monitor. */
+/**
+ * Settings card: how long background work / a frozen window must last before it shows up in the Event Monitor.
+ */
 final class VisibilityPanel extends JPanel {
     private final JSpinner slowJob = spinner(ActivityVisibility.DEFAULT_SLOW_JOB_MS);
     private final JSpinner uiStall = spinner(ActivityVisibility.DEFAULT_UI_STALL_MS);
@@ -31,7 +33,8 @@ final class VisibilityPanel extends JPanel {
     }
 
     private void row(int y, GridBagConstraints c, String title, String hint, JSpinner sp) {
-        c.gridy = y; c.gridx = 0;
+        c.gridy = y;
+        c.gridx = 0;
         JPanel left = new JPanel();
         left.setLayout(new BoxLayout(left, BoxLayout.Y_AXIS));
         left.setOpaque(false);
@@ -40,10 +43,13 @@ final class VisibilityPanel extends JPanel {
         JLabel h = new JLabel("<html><div style='width:360px'>" + hint + "</div></html>");
         h.setFont(h.getFont().deriveFont(Font.PLAIN, 11f));
         h.setForeground(new Color(0x888888));
-        left.add(t); left.add(h);
+        left.add(t);
+        left.add(h);
         add(left, c);
-        c.gridx = 1; add(sp, c);
-        c.gridx = 2; add(new JLabel("ms"), c);
+        c.gridx = 1;
+        add(sp, c);
+        c.gridx = 2;
+        add(new JLabel("ms"), c);
     }
 
     void load() {

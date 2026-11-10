@@ -14,9 +14,12 @@ import java.util.Base64;
  */
 final class ListenerScripts {
 
-    private ListenerScripts() {}
+    private ListenerScripts() {
+    }
 
-    /** Windows: {@code powershell -EncodedCommand ...}; {@code dir} is the already normalised folder. */
+    /**
+     * Windows: {@code powershell -EncodedCommand ...}; {@code dir} is the already normalised folder.
+     */
     static String windows(String dir, String heartbeat, String endPrefix, String unavailableMarker) {
         String script = expand(load("windows/listener.ps1"))
                 .replace("{{PATH}}", dir.replace("'", "''"))
@@ -29,7 +32,9 @@ final class ListenerScripts {
         return "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " + encoded;
     }
 
-    /** Linux: {@code sh -c '...'}; {@code dir} is the already normalised folder. */
+    /**
+     * Linux: {@code sh -c '...'}; {@code dir} is the already normalised folder.
+     */
     static String linux(String dir, String heartbeat, String unavailableMarker) {
         String inner = load("linux/listener.sh").replace('\n', ' ').trim()
                 .replace("{{DIR}}", quote(dir))
@@ -38,9 +43,13 @@ final class ListenerScripts {
         return "sh -c " + quote(inner);
     }
 
-    static String quote(String s) { return "'" + s.replace("'", "'\\''") + "'"; }
+    static String quote(String s) {
+        return "'" + s.replace("'", "'\\''") + "'";
+    }
 
-    /** Replaces every {@code {{include:name}}} line with the content of that file from the same folder. */
+    /**
+     * Replaces every {@code {{include:name}}} line with the content of that file from the same folder.
+     */
     private static String expand(String skeleton) {
         StringBuilder out = new StringBuilder();
         for (String line : skeleton.split("\n")) {
@@ -53,7 +62,9 @@ final class ListenerScripts {
         return out.toString();
     }
 
-    /** The resource without comment lines, blank lines and leading/trailing spaces. */
+    /**
+     * The resource without comment lines, blank lines and leading/trailing spaces.
+     */
     private static String load(String name) {
         try (InputStream in = ListenerScripts.class.getResourceAsStream("/scripts/watcher/" + name)) {
             if (in == null) throw new IllegalStateException("Missing script resource watch/" + name);

@@ -1,13 +1,8 @@
 package util;
 
-import com.jcraft.jsch.HostKey;
-import com.jcraft.jsch.HostKeyRepository;
-import com.jcraft.jsch.JSch;
-import com.jcraft.jsch.Session;
-import com.jcraft.jsch.UserInfo;
+import com.jcraft.jsch.*;
 
 import java.io.File;
-import java.io.IOException;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -27,15 +22,17 @@ import java.util.logging.Logger;
  */
 public final class SshHostKeys {
 
-    private static final Logger log = Logger.getLogger(SshHostKeys.class.getName());
     public static final String FILE_NAME = "known_hosts";
-
+    private static final Logger log = Logger.getLogger(SshHostKeys.class.getName());
     private static final Object LOCK = new Object();
     private static File dir;
 
-    private SshHostKeys() {}
+    private SshHostKeys() {
+    }
 
-    /** First call wins, same convention as {@link CryptoUtil#configure}. */
+    /**
+     * First call wins, same convention as {@link CryptoUtil#configure}.
+     */
     public static void configure(File dataDir) {
         if (dataDir == null) return;
         synchronized (LOCK) {
@@ -43,7 +40,9 @@ public final class SshHostKeys {
         }
     }
 
-    /** The known_hosts file in use, or null if no directory has been configured yet. */
+    /**
+     * The known_hosts file in use, or null if no directory has been configured yet.
+     */
     public static File knownHostsFile() {
         synchronized (LOCK) {
             return dir == null ? null : new File(dir, FILE_NAME);
@@ -88,11 +87,15 @@ public final class SshHostKeys {
         }
     }
 
-    /** Accepts and records unknown hosts, delegates everything else (changed keys fail). */
+    /**
+     * Accepts and records unknown hosts, delegates everything else (changed keys fail).
+     */
     private static final class Tofu implements HostKeyRepository {
         private final HostKeyRepository delegate;
 
-        Tofu(HostKeyRepository delegate) { this.delegate = delegate; }
+        Tofu(HostKeyRepository delegate) {
+            this.delegate = delegate;
+        }
 
         @Override
         public int check(String host, byte[] key) {
@@ -116,11 +119,34 @@ public final class SshHostKeys {
             }
         }
 
-        @Override public void add(HostKey hostkey, UserInfo ui) { delegate.add(hostkey, ui); }
-        @Override public void remove(String host, String type) { delegate.remove(host, type); }
-        @Override public void remove(String host, String type, byte[] key) { delegate.remove(host, type, key); }
-        @Override public String getKnownHostsRepositoryID() { return delegate.getKnownHostsRepositoryID(); }
-        @Override public HostKey[] getHostKey() { return delegate.getHostKey(); }
-        @Override public HostKey[] getHostKey(String host, String type) { return delegate.getHostKey(host, type); }
+        @Override
+        public void add(HostKey hostkey, UserInfo ui) {
+            delegate.add(hostkey, ui);
+        }
+
+        @Override
+        public void remove(String host, String type) {
+            delegate.remove(host, type);
+        }
+
+        @Override
+        public void remove(String host, String type, byte[] key) {
+            delegate.remove(host, type, key);
+        }
+
+        @Override
+        public String getKnownHostsRepositoryID() {
+            return delegate.getKnownHostsRepositoryID();
+        }
+
+        @Override
+        public HostKey[] getHostKey() {
+            return delegate.getHostKey();
+        }
+
+        @Override
+        public HostKey[] getHostKey(String host, String type) {
+            return delegate.getHostKey(host, type);
+        }
     }
 }

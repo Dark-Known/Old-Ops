@@ -1,8 +1,5 @@
 package service.sftp;
 
-import static org.junit.Assert.*;
-import static org.junit.Assume.assumeTrue;
-
 import org.junit.BeforeClass;
 import org.junit.Test;
 
@@ -13,7 +10,12 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 
-/** Runs WinSCP-style scripts through {@link SftpScriptRunner} against a real server (-Dopstool.sftp.port). */
+import static org.junit.Assert.*;
+import static org.junit.Assume.assumeTrue;
+
+/**
+ * Runs WinSCP-style scripts through {@link SftpScriptRunner} against a real server (-Dopstool.sftp.port).
+ */
 public class SftpScriptRunnerIT {
 
     private static final String PASSWORD = "p@ss:w\"rd%";
@@ -31,10 +33,17 @@ public class SftpScriptRunnerIT {
                 (host, prt, user, pw) -> JschSftpClient.connect(host, port, user, pw, 10_000), null, null);
     }
 
-    private static String open() { return "open sftp://tester@127.0.0.1/ -hostkey=\"*\" -password=\"%X%\""; }
+    private static String open() {
+        return "open sftp://tester@127.0.0.1/ -hostkey=\"*\" -password=\"%X%\"";
+    }
 
-    private static String q(String s) { return '"' + s.replace("\\", "\\\\").replace("\"", "\\\"") + '"'; }
-    private static String qr(String s) { return '"' + s.replace("\"", "\\\"") + '"'; }
+    private static String q(String s) {
+        return '"' + s.replace("\\", "\\\\").replace("\"", "\\\"") + '"';
+    }
+
+    private static String qr(String s) {
+        return '"' + s.replace("\"", "\\\"") + '"';
+    }
 
     private static List<String> script(String... lines) {
         List<String> l = new ArrayList<>(Arrays.asList("option batch abort", "option confirm off", open()));
@@ -107,11 +116,13 @@ public class SftpScriptRunnerIT {
         base.mkdirs();
         Files.write(new File(base, "a.txt").toPath(), "A".getBytes(StandardCharsets.UTF_8));
         Files.write(new File(base, "b.txt").toPath(), "B".getBytes(StandardCharsets.UTF_8));
-        assertTrue(runner.run(script("mv " + qr("/mv/a.txt") + " " + qr("/mv/moved.txt")), PASSWORD, x -> { }).ok());
+        assertTrue(runner.run(script("mv " + qr("/mv/a.txt") + " " + qr("/mv/moved.txt")), PASSWORD, x -> {
+        }).ok());
         assertFalse(new File(base, "a.txt").exists());
         assertEquals("A", new String(Files.readAllBytes(new File(base, "moved.txt").toPath()), StandardCharsets.UTF_8));
         assertFalse("must not replace an existing file",
-                runner.run(script("mv " + qr("/mv/b.txt") + " " + qr("/mv/moved.txt")), PASSWORD, x -> { }).ok());
+                runner.run(script("mv " + qr("/mv/b.txt") + " " + qr("/mv/moved.txt")), PASSWORD, x -> {
+                }).ok());
         assertEquals("A", new String(Files.readAllBytes(new File(base, "moved.txt").toPath()), StandardCharsets.UTF_8));
         assertTrue(new File(base, "b.txt").exists());
     }
@@ -119,7 +130,8 @@ public class SftpScriptRunnerIT {
     @Test
     public void wrongPasswordFailsTheRun() {
         try {
-            SftpScriptRunner.Outcome o = runner.run(script("mkdir " + qr("/sr/nope")), "wrong", x -> { });
+            SftpScriptRunner.Outcome o = runner.run(script("mkdir " + qr("/sr/nope")), "wrong", x -> {
+            });
             fail("connect must fail, got " + o);
         } catch (java.io.IOException expected) {
             assertTrue(expected.getMessage().toLowerCase().contains("auth"));

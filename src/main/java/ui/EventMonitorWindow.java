@@ -11,19 +11,19 @@ import java.awt.event.WindowEvent;
 /**
  * A standalone window dedicated to live-monitoring the event-driven
  * scheduler's queue and worker pool (see {@link EventMonitorPanel}).
- *
+ * <p>
  * Deliberately a separate top-level window rather than another sidebar tab
  * in {@link MainWindow}: it's meant to be left open on the side — on a
  * second monitor, or just floating over the main app — while you work in
  * the Task Manager, so you can watch events actually fire in something
  * close to real time instead of switching tabs to check.
- *
+ * <p>
  * Styled to match the main application shell: the same gradient header
  * ({@link GradientPanel} + {@link AppTheme} accent colors) used in
  * {@link MainWindow}, so this reads as part of the same app rather than a
  * bolted-on debug tool. All live status (scheduler, workers, queue) lives in
  * the panel's own summary bar rather than a header chip.
- *
+ * <p>
  * Non-modal and reusable: {@link #open} keeps at most one instance alive
  * per app and just brings it to front on repeat calls, so triggering it
  * again from a button doesn't spawn duplicate windows.
@@ -59,6 +59,23 @@ public class EventMonitorWindow extends JFrame {
         });
     }
 
+    /**
+     * Opens the Event Monitor window, or brings the already-open one to
+     * front if one exists. Safe to call repeatedly (e.g. from a toolbar
+     * button) without accumulating duplicate windows.
+     */
+    public static void open(TaskSchedulerService scheduler, Component relativeTo) {
+        if (openInstance != null) {
+            openInstance.setState(Frame.NORMAL);
+            openInstance.toFront();
+            openInstance.requestFocus();
+            return;
+        }
+        openInstance = new EventMonitorWindow(scheduler);
+        openInstance.setLocationRelativeTo(relativeTo);
+        openInstance.setVisible(true);
+    }
+
     private JComponent buildHeader() {
         GradientPanel header = new GradientPanel(new BorderLayout(), AppTheme.ACCENT_DARK, AppTheme.ACCENT_SECONDARY);
         header.setBorder(new EmptyBorder(12, 20, 12, 20));
@@ -88,22 +105,5 @@ public class EventMonitorWindow extends JFrame {
         header.add(titleStack, BorderLayout.WEST);
         header.add(keys, BorderLayout.EAST);
         return header;
-    }
-
-    /**
-     * Opens the Event Monitor window, or brings the already-open one to
-     * front if one exists. Safe to call repeatedly (e.g. from a toolbar
-     * button) without accumulating duplicate windows.
-     */
-    public static void open(TaskSchedulerService scheduler, Component relativeTo) {
-        if (openInstance != null) {
-            openInstance.setState(Frame.NORMAL);
-            openInstance.toFront();
-            openInstance.requestFocus();
-            return;
-        }
-        openInstance = new EventMonitorWindow(scheduler);
-        openInstance.setLocationRelativeTo(relativeTo);
-        openInstance.setVisible(true);
     }
 }

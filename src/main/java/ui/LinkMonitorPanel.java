@@ -29,7 +29,6 @@ public class LinkMonitorPanel extends JPanel {
     private static final String[] COLUMNS = {"Name", "Status", "Last heard", "Enabled", "Heartbeat", "Silent after", "Token issued", "Previous token"};
 
     private final File dataDir;
-    private LinkMonitorConfig config = LinkMonitorConfig.empty();
     private final SourceTableModel model = new SourceTableModel();
     private final JTable table = new JTable(model);
     private final JTextArea lblEndpoint = new JTextArea();
@@ -38,6 +37,11 @@ public class LinkMonitorPanel extends JPanel {
     private final JButton btnRegen = new JButton("New token...");
     private final JButton btnDelete = new JButton("Delete");
     private final JButton btnExport = new JButton("Export certificate...");
+    private LinkMonitorConfig config = LinkMonitorConfig.empty();
+    private LinkStatusFile.Status status;
+
+    // ── Loading ───────────────────────────────────────────────────────────
+    private javax.swing.Timer refreshTimer;
 
     public LinkMonitorPanel(File dataDir) {
         this.dataDir = dataDir;
@@ -75,7 +79,10 @@ public class LinkMonitorPanel extends JPanel {
         table.setRowHeight(24);
         table.getSelectionModel().addListSelectionListener(e -> updateButtons());
         table.addMouseListener(new java.awt.event.MouseAdapter() {
-            @Override public void mouseClicked(java.awt.event.MouseEvent e) { if (e.getClickCount() == 2) editSelected(); }
+            @Override
+            public void mouseClicked(java.awt.event.MouseEvent e) {
+                if (e.getClickCount() == 2) editSelected();
+            }
         });
         table.setAutoResizeMode(JTable.AUTO_RESIZE_LAST_COLUMN);
         int[] widths = {190, 170, 80, 60, 80, 80, 120, 150};
@@ -102,14 +109,35 @@ public class LinkMonitorPanel extends JPanel {
         reload();
     }
 
-    // ── Loading ───────────────────────────────────────────────────────────
+    private static void addRow(JPanel p, String label, JComponent field, int row) {
+        GridBagConstraints l = new GridBagConstraints();
+        l.gridx = 0;
+        l.gridy = row;
+        l.anchor = GridBagConstraints.WEST;
+        l.insets = new Insets(4, 0, 4, 10);
+        GridBagConstraints f = new GridBagConstraints();
+        f.gridx = 1;
+        f.gridy = row;
+        f.fill = GridBagConstraints.HORIZONTAL;
+        f.weightx = 1;
+        f.insets = new Insets(4, 0, 4, 0);
+        p.add(new JLabel(label), l);
+        p.add(field, f);
+    }
 
-    private record Loaded(LinkMonitorConfig config, LinkTls.Material cert, LinkStatusFile.Status status) {}
+    private static String ago(long ms) {
+        long sec = Math.max(0, ms / 1000);
+        if (sec < 90) return sec + " s ago";
+        if (sec < 5400) return (sec / 60) + " min ago";
+        return (sec / 3600) + " h ago";
+    }
 
-    private LinkStatusFile.Status status;
-    private javax.swing.Timer refreshTimer;
+    private static String escape(String s) {
+        return s == null ? "" : s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
+    }
 
-    @Override public void addNotify() {
+    @Override
+    public void addNotify() {
         super.addNotify();
         if (refreshTimer == null) {
             refreshTimer = new javax.swing.Timer(5000, e -> reload());
@@ -117,12 +145,18 @@ public class LinkMonitorPanel extends JPanel {
         }
     }
 
-    @Override public void removeNotify() {
-        if (refreshTimer != null) { refreshTimer.stop(); refreshTimer = null; }
+    @Override
+    public void removeNotify() {
+        if (refreshTimer != null) {
+            refreshTimer.stop();
+            refreshTimer = null;
+        }
         super.removeNotify();
     }
 
-    /** Re-reads the settings and the certificate file (off the UI thread), then redraws. */
+    /**
+     * Re-reads the settings and the certificate file (off the UI thread), then redraws.
+     */
     public void reload() {
         Async.latest(this, () -> new Loaded(LinkMonitorConfig.load(dataDir), LinkTls.describe(dataDir), LinkStatusFile.read(dataDir)),
                 this::apply, e -> System.err.println("Socket link settings could not be read: " + e));
@@ -135,7 +169,10 @@ public class LinkMonitorPanel extends JPanel {
         model.fireTableDataChanged();
         if (selected != null) {
             for (int i = 0; i < config.sources.size(); i++) {
-                if (config.sources.get(i).id().equals(selected)) { table.setRowSelectionInterval(i, i); break; }
+                if (config.sources.get(i).id().equals(selected)) {
+                    table.setRowSelectionInterval(i, i);
+                    break;
+                }
             }
         }
         lblEndpoint.setText("Address for the sender: " + addressList()
@@ -169,7 +206,11 @@ public class LinkMonitorPanel extends JPanel {
         return row >= 0 && row < config.sources.size() ? config.sources.get(row).id() : null;
     }
 
-    /** Every name or address the sender can use, as full URLs (loopback left out: it only works on this PC). */
+    // ── Actions ───────────────────────────────────────────────────────────
+
+    /**
+     * Every name or address the sender can use, as full URLs (loopback left out: it only works on this PC).
+     */
     private String addressList() {
         String scheme = config.tlsEnabled ? "https://" : "http://";
         java.util.LinkedHashSet<String> out = new java.util.LinkedHashSet<>();
@@ -187,10 +228,12 @@ public class LinkMonitorPanel extends JPanel {
 
     private String preferredHost() {
         if (!config.tlsHostnames.isEmpty()) return config.tlsHostnames.get(0);
-        try { return InetAddress.getLocalHost().getHostName(); } catch (Exception e) { return "this-pc"; }
+        try {
+            return InetAddress.getLocalHost().getHostName();
+        } catch (Exception e) {
+            return "this-pc";
+        }
     }
-
-    // ── Actions ───────────────────────────────────────────────────────────
 
     private void addSource() {
         SourceForm form = new SourceForm(null);
@@ -207,7 +250,10 @@ public class LinkMonitorPanel extends JPanel {
         if (id == null) return;
         LinkMonitorConfig current = LinkMonitorConfig.load(dataDir);
         LinkMonitor.Source s = current.source(id);
-        if (s == null) { reload(); return; }
+        if (s == null) {
+            reload();
+            return;
+        }
         SourceForm form = new SourceForm(s);
         if (!form.show("Edit source")) return;
         save(current.updateSource(id, form.name(), form.enabled(), form.heartbeat(), form.silent(), form.remind(),
@@ -219,7 +265,10 @@ public class LinkMonitorPanel extends JPanel {
         if (id == null) return;
         LinkMonitorConfig current = LinkMonitorConfig.load(dataDir);
         LinkMonitor.Source s = current.source(id);
-        if (s == null) { reload(); return; }
+        if (s == null) {
+            reload();
+            return;
+        }
         Object[] options = {"Keep the old token for 24 hours", "Stop the old token now", "Cancel"};
         int choice = JOptionPane.showOptionDialog(this,
                 "<html><div style='width:420px'>Issue a new access token for <b>" + escape(s.label()) + "</b>?<br><br>"
@@ -239,7 +288,10 @@ public class LinkMonitorPanel extends JPanel {
         if (id == null) return;
         LinkMonitorConfig current = LinkMonitorConfig.load(dataDir);
         LinkMonitor.Source s = current.source(id);
-        if (s == null) { reload(); return; }
+        if (s == null) {
+            reload();
+            return;
+        }
         int ok = JOptionPane.showConfirmDialog(this,
                 "<html><div style='width:380px'>Delete <b>" + escape(s.label()) + "</b>? Its token stops working at once and "
                         + "the application on that server will get \"unauthorised\" until it is given a new source.</div></html>",
@@ -255,7 +307,11 @@ public class LinkMonitorPanel extends JPanel {
         addRow(p, "Port:", port, 0);
         addRow(p, "Extra names / addresses:", names, 1);
         GridBagConstraints c = new GridBagConstraints();
-        c.gridx = 0; c.gridy = 2; c.gridwidth = 2; c.anchor = GridBagConstraints.WEST; c.insets = new Insets(8, 0, 0, 0);
+        c.gridx = 0;
+        c.gridy = 2;
+        c.gridwidth = 2;
+        c.anchor = GridBagConstraints.WEST;
+        c.insets = new Insets(8, 0, 0, 0);
         p.add(new JLabel("<html><div style='width:360px'><i>The certificate is valid for this PC's name and addresses. If the "
                 + "reporting server reaches this PC by another name (for example a DNS alias), add it here. Changing the "
                 + "names creates a new certificate, which the reporting server then has to trust again. Open the port "
@@ -269,7 +325,10 @@ public class LinkMonitorPanel extends JPanel {
 
     private void exportCertificate() {
         File cer = LinkTls.certificateFile(dataDir);
-        if (!cer.isFile()) { reload(); return; }
+        if (!cer.isFile()) {
+            reload();
+            return;
+        }
         JFileChooser fc = new JFileChooser();
         fc.setDialogTitle("Save the certificate for the reporting server");
         fc.setSelectedFile(new File(cer.getName()));
@@ -283,6 +342,8 @@ public class LinkMonitorPanel extends JPanel {
         }
     }
 
+    // ── Source dialog ─────────────────────────────────────────────────────
+
     private boolean save(LinkMonitorConfig next) {
         try {
             next.save(dataDir);
@@ -294,7 +355,9 @@ public class LinkMonitorPanel extends JPanel {
         }
     }
 
-    /** Shows the token ONCE, with the ready-to-paste settings for the reporting application. */
+    /**
+     * Shows the token ONCE, with the ready-to-paste settings for the reporting application.
+     */
     private void showToken(LinkMonitor.Source s, String token, String title) {
         String url = (config.tlsEnabled ? "https://" : "http://") + preferredHost() + ":" + config.port;
         String block = "LINK_MONITOR_URL=" + url + "\n"
@@ -321,7 +384,8 @@ public class LinkMonitorPanel extends JPanel {
         JOptionPane.showMessageDialog(this, p, title, JOptionPane.INFORMATION_MESSAGE);
     }
 
-    // ── Source dialog ─────────────────────────────────────────────────────
+    private record Loaded(LinkMonitorConfig config, LinkTls.Material cert, LinkStatusFile.Status status) {
+    }
 
     private final class SourceForm {
         private final JTextField name = new JTextField(26);
@@ -346,7 +410,9 @@ public class LinkMonitorPanel extends JPanel {
             } else {
                 enabled.setSelected(true);
             }
-            heartbeat.addChangeListener(e -> { if (!editing) silent.setValue(((Integer) heartbeat.getValue()) * 3); });
+            heartbeat.addChangeListener(e -> {
+                if (!editing) silent.setValue(((Integer) heartbeat.getValue()) * 3);
+            });
         }
 
         boolean show(String title) {
@@ -367,33 +433,33 @@ public class LinkMonitorPanel extends JPanel {
             }
         }
 
-        String name() { return name.getText().trim(); }
-        boolean enabled() { return enabled.isSelected(); }
-        int heartbeat() { return (Integer) heartbeat.getValue(); }
-        int silent() { return (Integer) silent.getValue(); }
-        int remind() { return (Integer) remind.getValue(); }
-        int flapCount() { return (Integer) flapCount.getValue(); }
-        int flapWindow() { return (Integer) flapWindow.getValue(); }
-    }
+        String name() {
+            return name.getText().trim();
+        }
 
-    private static void addRow(JPanel p, String label, JComponent field, int row) {
-        GridBagConstraints l = new GridBagConstraints();
-        l.gridx = 0; l.gridy = row; l.anchor = GridBagConstraints.WEST; l.insets = new Insets(4, 0, 4, 10);
-        GridBagConstraints f = new GridBagConstraints();
-        f.gridx = 1; f.gridy = row; f.fill = GridBagConstraints.HORIZONTAL; f.weightx = 1; f.insets = new Insets(4, 0, 4, 0);
-        p.add(new JLabel(label), l);
-        p.add(field, f);
-    }
+        boolean enabled() {
+            return enabled.isSelected();
+        }
 
-    private static String ago(long ms) {
-        long sec = Math.max(0, ms / 1000);
-        if (sec < 90) return sec + " s ago";
-        if (sec < 5400) return (sec / 60) + " min ago";
-        return (sec / 3600) + " h ago";
-    }
+        int heartbeat() {
+            return (Integer) heartbeat.getValue();
+        }
 
-    private static String escape(String s) {
-        return s == null ? "" : s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
+        int silent() {
+            return (Integer) silent.getValue();
+        }
+
+        int remind() {
+            return (Integer) remind.getValue();
+        }
+
+        int flapCount() {
+            return (Integer) flapCount.getValue();
+        }
+
+        int flapWindow() {
+            return (Integer) flapWindow.getValue();
+        }
     }
 
     // ── Table ─────────────────────────────────────────────────────────────
@@ -401,9 +467,20 @@ public class LinkMonitorPanel extends JPanel {
     private final class SourceTableModel extends AbstractTableModel {
         private final SimpleDateFormat day = new SimpleDateFormat("yyyy-MM-dd HH:mm");
 
-        @Override public int getRowCount() { return config.sources.size(); }
-        @Override public int getColumnCount() { return COLUMNS.length; }
-        @Override public String getColumnName(int c) { return COLUMNS[c]; }
+        @Override
+        public int getRowCount() {
+            return config.sources.size();
+        }
+
+        @Override
+        public int getColumnCount() {
+            return COLUMNS.length;
+        }
+
+        @Override
+        public String getColumnName(int c) {
+            return COLUMNS[c];
+        }
 
         private String statusText(LinkMonitor.Source s, long now) {
             if (!s.enabled()) return "Disabled";
@@ -413,28 +490,40 @@ public class LinkMonitorPanel extends JPanel {
             if (live.silent()) return "Silent (stopped reporting)";
             if (live.state() == null) return "No report yet";
             switch (live.state()) {
-                case "CONNECTED": return "Connected";
-                case "CONNECTING": return "Reconnecting";
-                case "DISCONNECTED": return "Disconnected";
-                case "STALLED": return "Stalled";
-                default: return live.state();
+                case "CONNECTED":
+                    return "Connected";
+                case "CONNECTING":
+                    return "Reconnecting";
+                case "DISCONNECTED":
+                    return "Disconnected";
+                case "STALLED":
+                    return "Stalled";
+                default:
+                    return live.state();
             }
         }
 
-        @Override public Object getValueAt(int r, int c) {
+        @Override
+        public Object getValueAt(int r, int c) {
             LinkMonitor.Source s = config.sources.get(r);
             long now = System.currentTimeMillis();
             switch (c) {
-                case 0: return s.label();
-                case 1: return statusText(s, now);
+                case 0:
+                    return s.label();
+                case 1:
+                    return statusText(s, now);
                 case 2: {
                     LinkStatusFile.Source live = status == null ? null : status.find(s.id());
                     return live == null || live.lastHeardAt() <= 0 ? "" : ago(now - live.lastHeardAt());
                 }
-                case 3: return s.enabled() ? "Yes" : "No";
-                case 4: return s.heartbeatSeconds() + " s";
-                case 5: return s.silentAfterSeconds() + " s";
-                case 6: return s.tokenIssuedAt() > 0 ? day.format(new Date(s.tokenIssuedAt())) : "";
+                case 3:
+                    return s.enabled() ? "Yes" : "No";
+                case 4:
+                    return s.heartbeatSeconds() + " s";
+                case 5:
+                    return s.silentAfterSeconds() + " s";
+                case 6:
+                    return s.tokenIssuedAt() > 0 ? day.format(new Date(s.tokenIssuedAt())) : "";
                 default:
                     if (s.prevTokenHash().isEmpty()) return "";
                     return s.prevValidUntil() > now ? "valid until " + day.format(new Date(s.prevValidUntil())) : "expired";

@@ -1,12 +1,12 @@
 package ui;
 
+import export.HtmlReportWriter;
+import export.PdfTableWriter;
+import export.XlsxWriter;
 import model.ScheduledTask;
 import model.TaskRunRecord;
 import service.RunHistoryService;
 import service.XmlStorageService;
-import export.XlsxWriter;
-import export.PdfTableWriter;
-import export.HtmlReportWriter;
 import ui.components.PillBadge;
 import ui.components.StatCard;
 
@@ -14,8 +14,8 @@ import javax.swing.*;
 import javax.swing.border.EmptyBorder;
 import javax.swing.border.MatteBorder;
 import javax.swing.event.ChangeListener;
-import javax.swing.event.DocumentListener;
 import javax.swing.event.DocumentEvent;
+import javax.swing.event.DocumentListener;
 import javax.swing.table.DefaultTableCellRenderer;
 import javax.swing.table.DefaultTableModel;
 import javax.swing.table.TableCellRenderer;
@@ -24,10 +24,10 @@ import java.io.File;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
-import java.time.format.DateTimeFormatter;
 import java.time.ZoneId;
-import java.util.Date;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.List;
 
 /**
@@ -46,14 +46,16 @@ import java.util.List;
  */
 public class RunHistoryPanel extends JPanel {
 
-    private static final String HEX_FAILED  = "FFEBEE";
+    private static final String HEX_FAILED = "FFEBEE";
     private static final String HEX_SUCCESS = "E8F5E9";
     private static final String HEX_SKIPPED = "FFF8E1";
     private static final DateTimeFormatter DT_FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
-
+    /**
+     * Common headers/values for both export formats — one row per currently-displayed record, in the same order shown on screen.
+     */
+    private static final String[] EXPORT_HEADERS = {"Task", "Type", "Status", "Started", "Ended", "Duration", "Reason", "Details"};
     private final XmlStorageService storage;
     private final RunHistoryService runHistoryService;
-
     private JComboBox<String> cbTaskFilter;
     private JComboBox<String> cbStatusFilter;
     private JCheckBox cbUseDateFilter;
@@ -67,21 +69,18 @@ public class RunHistoryPanel extends JPanel {
     // been applied on top of the DB-level task/status/date filters — this is
     // what row indices in `table` map to, and what gets exported.
     private List<TaskRunRecord> currentRows;
-
     // Summary strip above the table — counts reflect currentRows (i.e. the
     // filtered set actually shown), not the whole table.
     private StatCard cardTotal;
     private StatCard cardSuccess;
     private StatCard cardFailed;
     private StatCard cardSkipped;
-
     // Docked detail panel (replaces the old blocking JOptionPane on
     // double-click) — sits below the table, hidden until a row is opened.
     private JPanel detailPanel;
     private JLabel lblDetailTitle;
     private JLabel lblDetailMeta;
     private JTextArea detailArea;
-
     // Guards against the filter-repopulation in refresh() (removeAllItems /
     // addItem on the task combo) re-triggering itself via the very
     // ActionListener that's supposed to auto-apply filters on user changes.
@@ -106,11 +105,56 @@ public class RunHistoryPanel extends JPanel {
         refresh();
     }
 
-    /** Total / success / failed / skipped counts for whatever's currently filtered into view. */
+    private static Date toDateTime(LocalDate d, LocalTime t) {
+        return Date.from(LocalDateTime.of(d, t).atZone(ZoneId.systemDefault()).toInstant());
+    }
+
+    /**
+     * Reads both the date AND time of day the user set on the spinner —
+     * previously this only had a date picker, so "From 09:00 to 17:00"
+     * type ranges weren't expressible; a "From" filter always meant
+     * midnight and "To" always meant end-of-day regardless of what the
+     * user actually wanted. Now the spinner's own time-of-day is used
+     * as-is; {@code endOfDay} still pads seconds up to :59 so a "To" value
+     * of e.g. 17:30 is inclusive of that whole minute.
+     */
+    private static LocalDateTime dateSpinnerToLocalDateTime(JSpinner spinner, boolean endOfDay) {
+        Date d = (Date) spinner.getValue();
+        LocalDateTime ldt = d.toInstant().atZone(ZoneId.systemDefault()).toLocalDateTime();
+        return endOfDay ? ldt.withSecond(59) : ldt.withSecond(0);
+    }
+
+    private static String formatDuration(long ms) {
+        if (ms < 1000) return ms + "ms";
+        long totalSeconds = ms / 1000;
+        long h = totalSeconds / 3600;
+        long m = (totalSeconds % 3600) / 60;
+        long s = totalSeconds % 60;
+        if (h > 0) return String.format("%dh %dm %ds", h, m, s);
+        if (m > 0) return String.format("%dm %ds", m, s);
+        return s + "s";
+    }
+
+    private static String hexForStatus(TaskRunRecord.Status status) {
+        switch (status) {
+            case SUCCESS:
+                return HEX_SUCCESS;
+            case FAILED:
+                return HEX_FAILED;
+            case SKIPPED:
+                return HEX_SKIPPED;
+            default:
+                return null;
+        }
+    }
+
+    /**
+     * Total / success / failed / skipped counts for whatever's currently filtered into view.
+     */
     private JComponent buildStatsStrip() {
-        cardTotal   = new StatCard("Runs shown", "0", null);
+        cardTotal = new StatCard("Runs shown", "0", null);
         cardSuccess = new StatCard("Success", "0", AppTheme.SUCCESS_FG);
-        cardFailed  = new StatCard("Failed", "0", AppTheme.FAILED_FG);
+        cardFailed = new StatCard("Failed", "0", AppTheme.FAILED_FG);
         cardSkipped = new StatCard("Skipped", "0", AppTheme.SKIPPED_FG);
 
         JPanel strip = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
@@ -186,18 +230,24 @@ public class RunHistoryPanel extends JPanel {
         row1.add(new JLabel("Task:"));
         cbTaskFilter = new JComboBox<>();
         cbTaskFilter.addItem("All tasks");
-        cbTaskFilter.addActionListener(e -> { if (!suppressFilterEvents) refresh(); });
+        cbTaskFilter.addActionListener(e -> {
+            if (!suppressFilterEvents) refresh();
+        });
         row1.add(cbTaskFilter);
 
         row1.add(new JLabel("Status:"));
         cbStatusFilter = new JComboBox<>(new String[]{"All", "SUCCESS", "FAILED", "SKIPPED"});
-        cbStatusFilter.addActionListener(e -> { if (!suppressFilterEvents) refresh(); });
+        cbStatusFilter.addActionListener(e -> {
+            if (!suppressFilterEvents) refresh();
+        });
         row1.add(cbStatusFilter);
 
         row1.add(new JLabel("Show last:"));
         spLimit = new JSpinner(new SpinnerNumberModel(200, 10, 5000, 50));
         ((JSpinner.DefaultEditor) spLimit.getEditor()).getTextField().setColumns(5);
-        spLimit.addChangeListener(e -> { if (!suppressFilterEvents) refresh(); });
+        spLimit.addChangeListener(e -> {
+            if (!suppressFilterEvents) refresh();
+        });
         row1.add(spLimit);
 
         JButton btnRefresh = new JButton("Refresh");
@@ -230,9 +280,20 @@ public class RunHistoryPanel extends JPanel {
         txtSearch = new JTextField(16);
         txtSearch.setToolTipText("Filter shown rows by task name or reason text");
         txtSearch.getDocument().addDocumentListener(new DocumentListener() {
-            @Override public void insertUpdate(DocumentEvent e)  { refresh(); }
-            @Override public void removeUpdate(DocumentEvent e)  { refresh(); }
-            @Override public void changedUpdate(DocumentEvent e) { refresh(); }
+            @Override
+            public void insertUpdate(DocumentEvent e) {
+                refresh();
+            }
+
+            @Override
+            public void removeUpdate(DocumentEvent e) {
+                refresh();
+            }
+
+            @Override
+            public void changedUpdate(DocumentEvent e) {
+                refresh();
+            }
         });
         row1.add(txtSearch);
 
@@ -251,7 +312,9 @@ public class RunHistoryPanel extends JPanel {
         spFromDate.setEditor(new JSpinner.DateEditor(spFromDate, "yyyy-MM-dd HH:mm"));
         spFromDate.setValue(toDateTime(LocalDate.now().minusDays(7), LocalTime.MIDNIGHT));
         spFromDate.setEnabled(false);
-        ChangeListener dateChangeListener = e -> { if (!suppressFilterEvents && cbUseDateFilter.isSelected()) refresh(); };
+        ChangeListener dateChangeListener = e -> {
+            if (!suppressFilterEvents && cbUseDateFilter.isSelected()) refresh();
+        };
         spFromDate.addChangeListener(dateChangeListener);
         row2.add(spFromDate);
 
@@ -277,29 +340,13 @@ public class RunHistoryPanel extends JPanel {
         return bar;
     }
 
-    private static Date toDateTime(LocalDate d, LocalTime t) {
-        return Date.from(LocalDateTime.of(d, t).atZone(ZoneId.systemDefault()).toInstant());
-    }
-
-    /**
-     * Reads both the date AND time of day the user set on the spinner —
-     * previously this only had a date picker, so "From 09:00 to 17:00"
-     * type ranges weren't expressible; a "From" filter always meant
-     * midnight and "To" always meant end-of-day regardless of what the
-     * user actually wanted. Now the spinner's own time-of-day is used
-     * as-is; {@code endOfDay} still pads seconds up to :59 so a "To" value
-     * of e.g. 17:30 is inclusive of that whole minute.
-     */
-    private static LocalDateTime dateSpinnerToLocalDateTime(JSpinner spinner, boolean endOfDay) {
-        Date d = (Date) spinner.getValue();
-        LocalDateTime ldt = d.toInstant().atZone(ZoneId.systemDefault()).toLocalDateTime();
-        return endOfDay ? ldt.withSecond(59) : ldt.withSecond(0);
-    }
-
     private JComponent buildTable() {
         String[] columns = {"Task", "Type", "Status", "Started", "Duration", "Reason"};
         tableModel = new DefaultTableModel(columns, 0) {
-            @Override public boolean isCellEditable(int row, int col) { return false; }
+            @Override
+            public boolean isCellEditable(int row, int col) {
+                return false;
+            }
         };
         table = new JTable(tableModel);
         table.setRowHeight(24);
@@ -321,16 +368,22 @@ public class RunHistoryPanel extends JPanel {
         DefaultTableCellRenderer plainRenderer = new DefaultTableCellRenderer() {
             @Override
             public Component getTableCellRendererComponent(JTable t, Object value, boolean isSelected,
-                    boolean hasFocus, int row, int column) {
+                                                           boolean hasFocus, int row, int column) {
                 Component c = super.getTableCellRendererComponent(t, value, isSelected, hasFocus, row, column);
                 if (!isSelected) {
                     int modelRow = table.convertRowIndexToModel(row);
                     Color bg = table.getBackground();
                     if (modelRow >= 0 && modelRow < currentRows.size()) {
                         switch (currentRows.get(modelRow).getStatus()) {
-                            case SUCCESS: bg = AppTheme.SUCCESS_BG; break;
-                            case FAILED:  bg = AppTheme.FAILED_BG;  break;
-                            case SKIPPED: bg = AppTheme.SKIPPED_BG; break;
+                            case SUCCESS:
+                                bg = AppTheme.SUCCESS_BG;
+                                break;
+                            case FAILED:
+                                bg = AppTheme.FAILED_BG;
+                                break;
+                            case SKIPPED:
+                                bg = AppTheme.SKIPPED_BG;
+                                break;
                         }
                     }
                     c.setBackground(bg);
@@ -359,48 +412,6 @@ public class RunHistoryPanel extends JPanel {
         return new JScrollPane(table);
     }
 
-    /** Renders the Status column as a small colored {@link PillBadge} chip instead of plain text. */
-    private class StatusPillRenderer implements TableCellRenderer {
-        private final PillBadge badge = new PillBadge("", AppTheme.NEUTRAL_FG, null);
-        private final JPanel wrapper = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
-        { wrapper.add(badge); }
-
-        @Override
-        public Component getTableCellRendererComponent(JTable t, Object value, boolean isSelected,
-                boolean hasFocus, int row, int column) {
-            String status = String.valueOf(value);
-            Color fg, bg;
-            bg = switch (status) {
-                case "SUCCESS" -> {
-                    fg = AppTheme.SUCCESS_FG;
-                    yield AppTheme.SUCCESS_BG;
-                }
-                case "FAILED" -> {
-                    fg = AppTheme.FAILED_FG;
-                    yield AppTheme.FAILED_BG;
-                }
-                case "SKIPPED" -> {
-                    fg = AppTheme.SKIPPED_FG;
-                    yield AppTheme.SKIPPED_BG;
-                }
-                default -> {
-                    fg = AppTheme.NEUTRAL_FG;
-                    yield AppTheme.surface2();
-                }
-            };
-            badge.setText(status);
-            badge.setColors(fg, bg);
-            // Match column 2's own cell background to the same status tint
-            // the other columns in this row get from plainRenderer — this
-            // renderer replaces plainRenderer for this one column entirely,
-            // so without this the badge would sit in a plain white/table-
-            // colored gap while every other cell in the row is tinted.
-            wrapper.setBackground(isSelected ? t.getSelectionBackground() : bg);
-            wrapper.setOpaque(true);
-            return wrapper;
-        }
-    }
-
     /**
      * Repopulates the task filter dropdown and reloads the table from the
      * database using the current filter values. Safe to call from
@@ -424,37 +435,35 @@ public class RunHistoryPanel extends JPanel {
                 ? TaskRunRecord.Status.valueOf(statusFilterStr) : null;
 
         Async.latest(this, () -> {
-            List<ScheduledTask> tasks = storage.loadTasks();
-            String taskId = null;
-            if (previouslySelectedTask != null && !"All tasks".equals(previouslySelectedTask)) {
-                taskId = tasks.stream()
-                        .filter(t -> t.getName().equals(previouslySelectedTask))
-                        .map(ScheduledTask::getId)
-                        .findFirst().orElse(null);
-            }
-            List<TaskRunRecord> dbRows = runHistoryService.queryRuns(taskId, status, from, to, limit);
-            // Free-text search isn't a DB-level filter (queryRuns has no text
-            // param) — applied on top of the task/status/date results, over
-            // task name and reason.
-            List<TaskRunRecord> rows;
-            if (searchText.isEmpty()) {
-                rows = dbRows;
-            } else {
-                rows = new ArrayList<>();
-                for (TaskRunRecord r : dbRows) {
-                    String haystack = (r.getTaskName() + " " + (r.getReason() != null ? r.getReason() : ""))
-                            .toLowerCase();
-                    if (haystack.contains(searchText)) rows.add(r);
-                }
-            }
-            List<String> names = new ArrayList<>();
-            for (ScheduledTask t : tasks) names.add(t.getName());
-            return new Loaded(names, rows);
-        }, loaded -> applyLoaded(loaded, previouslySelectedTask),
-           e -> System.err.println("Run history refresh failed: " + e));
+                    List<ScheduledTask> tasks = storage.loadTasks();
+                    String taskId = null;
+                    if (previouslySelectedTask != null && !"All tasks".equals(previouslySelectedTask)) {
+                        taskId = tasks.stream()
+                                .filter(t -> t.getName().equals(previouslySelectedTask))
+                                .map(ScheduledTask::getId)
+                                .findFirst().orElse(null);
+                    }
+                    List<TaskRunRecord> dbRows = runHistoryService.queryRuns(taskId, status, from, to, limit);
+                    // Free-text search isn't a DB-level filter (queryRuns has no text
+                    // param) — applied on top of the task/status/date results, over
+                    // task name and reason.
+                    List<TaskRunRecord> rows;
+                    if (searchText.isEmpty()) {
+                        rows = dbRows;
+                    } else {
+                        rows = new ArrayList<>();
+                        for (TaskRunRecord r : dbRows) {
+                            String haystack = (r.getTaskName() + " " + (r.getReason() != null ? r.getReason() : ""))
+                                    .toLowerCase();
+                            if (haystack.contains(searchText)) rows.add(r);
+                        }
+                    }
+                    List<String> names = new ArrayList<>();
+                    for (ScheduledTask t : tasks) names.add(t.getName());
+                    return new Loaded(names, rows);
+                }, loaded -> applyLoaded(loaded, previouslySelectedTask),
+                e -> System.err.println("Run history refresh failed: " + e));
     }
-
-    private record Loaded(List<String> taskNames, List<TaskRunRecord> rows) {}
 
     private void applyLoaded(Loaded loaded, String previouslySelectedTask) {
         // Repopulating the task combo is guarded so it doesn't re-trigger refresh().
@@ -496,9 +505,15 @@ public class RunHistoryPanel extends JPanel {
         int success = 0, failed = 0, skipped = 0;
         for (TaskRunRecord r : currentRows) {
             switch (r.getStatus()) {
-                case SUCCESS: success++; break;
-                case FAILED:  failed++;  break;
-                case SKIPPED: skipped++; break;
+                case SUCCESS:
+                    success++;
+                    break;
+                case FAILED:
+                    failed++;
+                    break;
+                case SKIPPED:
+                    skipped++;
+                    break;
             }
         }
         cardTotal.setValue(String.valueOf(currentRows.size()));
@@ -537,29 +552,6 @@ public class RunHistoryPanel extends JPanel {
         detailPanel.setVisible(true);
     }
 
-    private static String formatDuration(long ms) {
-        if (ms < 1000) return ms + "ms";
-        long totalSeconds = ms / 1000;
-        long h = totalSeconds / 3600;
-        long m = (totalSeconds % 3600) / 60;
-        long s = totalSeconds % 60;
-        if (h > 0) return String.format("%dh %dm %ds", h, m, s);
-        if (m > 0) return String.format("%dm %ds", m, s);
-        return s + "s";
-    }
-
-    private static String hexForStatus(TaskRunRecord.Status status) {
-        switch (status) {
-            case SUCCESS: return HEX_SUCCESS;
-            case FAILED:  return HEX_FAILED;
-            case SKIPPED: return HEX_SKIPPED;
-            default:      return null;
-        }
-    }
-
-    /** Common headers/values for both export formats — one row per currently-displayed record, in the same order shown on screen. */
-    private static final String[] EXPORT_HEADERS = {"Task", "Type", "Status", "Started", "Ended", "Duration", "Reason", "Details"};
-
     private List<String[]> buildExportRows() {
         List<String[]> out = new ArrayList<>();
         for (TaskRunRecord r : currentRows) {
@@ -590,7 +582,7 @@ public class RunHistoryPanel extends JPanel {
      * Excel and PDF export buttons.
      */
     private void runExport(String suggestedFileName, String description, String extension,
-            ExportTask exportTask) {
+                           ExportTask exportTask) {
         if (currentRows == null || currentRows.isEmpty()) {
             JOptionPane.showMessageDialog(this, "No rows to export — adjust the filters above first.",
                     "Nothing to export", JOptionPane.INFORMATION_MESSAGE);
@@ -614,7 +606,9 @@ public class RunHistoryPanel extends JPanel {
 
         Async.execute("Export run history", true, false, new SwingWorker<Void, Void>() {
             Exception failure;
-            @Override protected Void doInBackground() {
+
+            @Override
+            protected Void doInBackground() {
                 try {
                     exportTask.run(finalTarget, rows, fills);
                 } catch (Exception ex) {
@@ -622,7 +616,9 @@ public class RunHistoryPanel extends JPanel {
                 }
                 return null;
             }
-            @Override protected void done() {
+
+            @Override
+            protected void done() {
                 if (failure != null) {
                     JOptionPane.showMessageDialog(RunHistoryPanel.this,
                             "Export failed: " + failure.getMessage(),
@@ -655,19 +651,69 @@ public class RunHistoryPanel extends JPanel {
         float[] widths = {95f, 65f, 55f, 85f, 85f, 55f, 150f, 142f};
         runExport("task_logs.pdf", "PDF Document (*.pdf)", "pdf",
                 (file, rows, fills) -> PdfTableWriter.write(file, "Task Run Logs — exported " +
-                        LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")),
+                                LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")),
                         EXPORT_HEADERS, widths, rows, fills));
     }
 
     private void exportHtml() {
         runExport("task_logs.html", "HTML Report (*.html)", "html",
                 (file, rows, fills) -> HtmlReportWriter.write(file, "Task Run Logs — exported " +
-                        LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")),
+                                LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")),
                         EXPORT_HEADERS, rows));
     }
 
     @FunctionalInterface
     private interface ExportTask {
         void run(File file, List<String[]> rows, List<String> rowFillHex) throws Exception;
+    }
+
+    private record Loaded(List<String> taskNames, List<TaskRunRecord> rows) {
+    }
+
+    /**
+     * Renders the Status column as a small colored {@link PillBadge} chip instead of plain text.
+     */
+    private class StatusPillRenderer implements TableCellRenderer {
+        private final PillBadge badge = new PillBadge("", AppTheme.NEUTRAL_FG, null);
+        private final JPanel wrapper = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
+
+        {
+            wrapper.add(badge);
+        }
+
+        @Override
+        public Component getTableCellRendererComponent(JTable t, Object value, boolean isSelected,
+                                                       boolean hasFocus, int row, int column) {
+            String status = String.valueOf(value);
+            Color fg, bg;
+            bg = switch (status) {
+                case "SUCCESS" -> {
+                    fg = AppTheme.SUCCESS_FG;
+                    yield AppTheme.SUCCESS_BG;
+                }
+                case "FAILED" -> {
+                    fg = AppTheme.FAILED_FG;
+                    yield AppTheme.FAILED_BG;
+                }
+                case "SKIPPED" -> {
+                    fg = AppTheme.SKIPPED_FG;
+                    yield AppTheme.SKIPPED_BG;
+                }
+                default -> {
+                    fg = AppTheme.NEUTRAL_FG;
+                    yield AppTheme.surface2();
+                }
+            };
+            badge.setText(status);
+            badge.setColors(fg, bg);
+            // Match column 2's own cell background to the same status tint
+            // the other columns in this row get from plainRenderer — this
+            // renderer replaces plainRenderer for this one column entirely,
+            // so without this the badge would sit in a plain white/table-
+            // colored gap while every other cell in the row is tinted.
+            wrapper.setBackground(isSelected ? t.getSelectionBackground() : bg);
+            wrapper.setOpaque(true);
+            return wrapper;
+        }
     }
 }

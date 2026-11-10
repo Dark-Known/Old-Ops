@@ -28,19 +28,6 @@ public class TaskListModel extends AbstractListModel<ScheduledTask> {
         return tasks.get(index);
     }
 
-    public void setTasks(List<ScheduledTask> newTasks) {
-        int oldSize = tasks.size();
-        tasks.clear();
-        tasks.addAll(newTasks);
-        
-        if (oldSize > 0) {
-            fireIntervalRemoved(this, 0, oldSize - 1);
-        }
-        if (tasks.size() > 0) {
-            fireIntervalAdded(this, 0, tasks.size() - 1);
-        }
-    }
-
     public void addTask(ScheduledTask task) {
         int index = tasks.size();
         tasks.add(task);
@@ -73,5 +60,18 @@ public class TaskListModel extends AbstractListModel<ScheduledTask> {
 
     public List<ScheduledTask> getTasks() {
         return new ArrayList<>(tasks);
+    }
+
+    public void setTasks(List<ScheduledTask> newTasks) {
+        int oldSize = tasks.size();
+        tasks.clear();
+        tasks.addAll(newTasks);
+
+        if (oldSize > 0) {
+            fireIntervalRemoved(this, 0, oldSize - 1);
+        }
+        if (tasks.size() > 0) {
+            fireIntervalAdded(this, 0, tasks.size() - 1);
+        }
     }
 }

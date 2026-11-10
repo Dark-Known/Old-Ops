@@ -5,7 +5,10 @@ import model.ScheduledTask;
 import java.io.IOException;
 import java.nio.file.*;
 import java.util.*;
-import java.util.concurrent.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.function.BiConsumer;
 import java.util.logging.Logger;
 
@@ -39,22 +42,19 @@ public class LocalWatchManager {
 
     private static final Logger log = Logger.getLogger(LocalWatchManager.class.getName());
 
-    /** Default quiet period after the last observed change before treating a
+    /**
+     * Default quiet period after the last observed change before treating a
      * file as "settled" and safe to transfer — avoids racing an in-progress
      * write. Kept short (1.5s, down from an earlier 3s) since most local
      * filesystem writes complete well within that window and this delay sits
-     * directly on the "change detected" → "transfer starts" critical path. */
+     * directly on the "change detected" → "transfer starts" critical path.
+     */
     private static final long DEFAULT_SETTLE_MILLIS = 1500L;
 
     private final long settleMillis;
     // taskId, changedFileNames -> caller wakes the task up and (when non-empty)
     // transfers exactly those named files instead of re-scanning the directory.
     private final BiConsumer<String, Set<String>> onSettled;
-
-    private WatchService watchService;
-    private Thread watchThread;
-    private ScheduledExecutorService debounceExecutor;
-
     // taskId -> its registered WatchKey (so we can cancel on unregister)
     private final Map<String, WatchKey> keysByTaskId = new ConcurrentHashMap<>();
     // WatchKey -> taskId (reverse lookup when an event arrives)
@@ -74,7 +74,9 @@ public class LocalWatchManager {
     // that arrives before the debounce settles — e.g. three files dropped within
     // the same settle window all end up in one fire, all three named.
     private final Map<String, Set<String>> pendingNamesByTaskId = new ConcurrentHashMap<>();
-
+    private WatchService watchService;
+    private Thread watchThread;
+    private ScheduledExecutorService debounceExecutor;
     private volatile boolean running = false;
 
     public LocalWatchManager(BiConsumer<String, Set<String>> onSettled) {
@@ -107,7 +109,10 @@ public class LocalWatchManager {
         if (watchThread != null) watchThread.interrupt();
         if (debounceExecutor != null) debounceExecutor.shutdownNow();
         if (watchService != null) {
-            try { watchService.close(); } catch (IOException ignored) {}
+            try {
+                watchService.close();
+            } catch (IOException ignored) {
+            }
         }
         keysByTaskId.clear();
         taskIdByKey.clear();
@@ -145,16 +150,20 @@ public class LocalWatchManager {
         }
     }
 
-    /** True if this task currently has a live native directory watch registered
-     *  (i.e. it's getting instant OS-level notifications, not just polling). */
+    /**
+     * True if this task currently has a live native directory watch registered
+     * (i.e. it's getting instant OS-level notifications, not just polling).
+     */
     public boolean isWatching(String taskId) {
         return registeredPathByTaskId.containsKey(taskId);
     }
 
-    /** Short human-readable reason for this task's current state — e.g. "native
-     *  watch registered", "source path is not a directory", or an IOException
-     *  message from a failed registration attempt. {@code null} if this task
-     *  has never been evaluated (not eligible, or sync() hasn't run yet). */
+    /**
+     * Short human-readable reason for this task's current state — e.g. "native
+     * watch registered", "source path is not a directory", or an IOException
+     * message from a failed registration attempt. {@code null} if this task
+     * has never been evaluated (not eligible, or sync() hasn't run yet).
+     */
     public String getReason(String taskId) {
         return reasonByTaskId.get(taskId);
     }

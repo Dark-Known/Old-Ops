@@ -14,16 +14,21 @@ import util.AppSettings;
  * </ul>
  */
 public final class ActivityVisibility {
-    private ActivityVisibility() {}
-
     public static final String KEY_SLOW_JOB_MS = "bgSlowJobMs";
     public static final String KEY_UI_STALL_MS = "uiStallMs";
     public static final int DEFAULT_SLOW_JOB_MS = 2000;
     public static final int DEFAULT_UI_STALL_MS = 150;
     public static final int MIN_MS = 50, MAX_MS = 600_000;
+    private ActivityVisibility() {
+    }
 
-    public static long slowJobMs() { return read(KEY_SLOW_JOB_MS, DEFAULT_SLOW_JOB_MS); }
-    public static long uiStallMs() { return read(KEY_UI_STALL_MS, DEFAULT_UI_STALL_MS); }
+    public static long slowJobMs() {
+        return read(KEY_SLOW_JOB_MS, DEFAULT_SLOW_JOB_MS);
+    }
+
+    public static long uiStallMs() {
+        return read(KEY_UI_STALL_MS, DEFAULT_UI_STALL_MS);
+    }
 
     private static long read(String key, int fallback) {
         try {

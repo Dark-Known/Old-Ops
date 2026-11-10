@@ -26,10 +26,16 @@ public class SummaryBar extends JPanel {
         setOpaque(false);
     }
 
-    /** Creates or updates a chip. {@code accent} colours the leading dot; null for none. */
+    /**
+     * Creates or updates a chip. {@code accent} colours the leading dot; null for none.
+     */
     public void set(String id, String label, String value, Color accent, String tooltip) {
         Chip c = chips.get(id);
-        if (c == null) { c = new Chip(); chips.put(id, c); add(c); }
+        if (c == null) {
+            c = new Chip();
+            chips.put(id, c);
+            add(c);
+        }
         c.update(label, value, accent, tooltip);
     }
 
@@ -43,7 +49,9 @@ public class SummaryBar extends JPanel {
         if (c != null) c.setLiveTooltip(supplier);
     }
 
-    /** Makes a chip clickable (hand cursor + callback). */
+    /**
+     * Makes a chip clickable (hand cursor + callback).
+     */
     public void onClick(String id, Runnable r) {
         Chip c = chips.get(id);
         if (c != null) c.setClick(r);
@@ -54,7 +62,8 @@ public class SummaryBar extends JPanel {
         private final JLabel value = new JLabel();
         private Color accent;
         private Runnable click;
-
+        private java.util.function.Supplier<String> live;
+        private javax.swing.Timer hover;
         Chip() {
             setLayout(new FlowLayout(FlowLayout.LEFT, 5, 0));
             setOpaque(false);
@@ -65,12 +74,12 @@ public class SummaryBar extends JPanel {
             add(label);
             add(value);
             addMouseListener(new MouseAdapter() {
-                @Override public void mouseClicked(MouseEvent e) { if (click != null) click.run(); }
+                @Override
+                public void mouseClicked(MouseEvent e) {
+                    if (click != null) click.run();
+                }
             });
         }
-
-        private java.util.function.Supplier<String> live;
-        private javax.swing.Timer hover;
 
         void setLiveTooltip(java.util.function.Supplier<String> supplier) {
             live = supplier;
@@ -82,14 +91,24 @@ public class SummaryBar extends JPanel {
                         new MouseEvent(this, MouseEvent.MOUSE_MOVED, System.currentTimeMillis(), 0, pt.x, pt.y, 0, false));
             });
             addMouseListener(new MouseAdapter() {
-                @Override public void mouseEntered(MouseEvent e) { hover.start(); }
-                @Override public void mouseExited(MouseEvent e) { hover.stop(); }
+                @Override
+                public void mouseEntered(MouseEvent e) {
+                    hover.start();
+                }
+
+                @Override
+                public void mouseExited(MouseEvent e) {
+                    hover.stop();
+                }
             });
         }
 
-        @Override public String getToolTipText(MouseEvent e) {
+        @Override
+        public String getToolTipText(MouseEvent e) {
             if (live != null) {
-                try { return live.get(); } catch (RuntimeException ex) { /* fall back to the fixed text */ }
+                try {
+                    return live.get();
+                } catch (RuntimeException ex) { /* fall back to the fixed text */ }
             }
             return super.getToolTipText(e);
         }
@@ -109,7 +128,8 @@ public class SummaryBar extends JPanel {
             setCursor(Cursor.getPredefinedCursor(r != null ? Cursor.HAND_CURSOR : Cursor.DEFAULT_CURSOR));
         }
 
-        @Override protected void paintComponent(Graphics g) {
+        @Override
+        protected void paintComponent(Graphics g) {
             Graphics2D g2 = (Graphics2D) g.create();
             g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
             boolean dark = AppTheme.isDark();

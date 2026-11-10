@@ -9,33 +9,38 @@ import java.util.concurrent.DelayQueue;
 
 /**
  * The in-process "broker" for scheduled task events.
- *
+ * <p>
  * A {@link DelayQueue} is the actual delivery mechanism (it will not release
  * an event to a consumer until its delay has expired), and a side index
  * tracks the most recently published pending event per task so it can be
  * cancelled or transparently replaced — e.g. when a task's schedule is
  * edited, or it's disabled/deleted, the stale future occurrence must never
  * fire.
- *
+ * <p>
  * Thread-safe: publish()/take()/cancel() may all be called concurrently from
  * the reconcile thread and worker threads.
  */
 public class TaskEventQueue {
 
+    private final DelayQueue<TaskDueEvent> queue = new DelayQueue<>();
+    // Most recent pending event per task ID, keyed for cancellation/replacement.
+    private final ConcurrentMap<String, TaskDueEvent> pendingByTaskId = new ConcurrentHashMap<>();
     // Tells interested code (the status exporter) that the pending set changed, so it can push an
     // update at once instead of waiting for its next safety tick. Must be cheap and non-blocking.
     private volatile Runnable changeListener;
 
-    public void setChangeListener(Runnable r) { this.changeListener = r; }
+    public void setChangeListener(Runnable r) {
+        this.changeListener = r;
+    }
 
     private void changed() {
         Runnable r = changeListener;
-        if (r != null) { try { r.run(); } catch (RuntimeException ignored) { /* a listener must never break scheduling */ } }
+        if (r != null) {
+            try {
+                r.run();
+            } catch (RuntimeException ignored) { /* a listener must never break scheduling */ }
+        }
     }
-
-    private final DelayQueue<TaskDueEvent> queue = new DelayQueue<>();
-    // Most recent pending event per task ID, keyed for cancellation/replacement.
-    private final ConcurrentMap<String, TaskDueEvent> pendingByTaskId = new ConcurrentHashMap<>();
 
     /**
      * Publish an event. If this task already has a pending event, it is
@@ -89,7 +94,9 @@ public class TaskEventQueue {
         return event;
     }
 
-    /** Cancel a task's pending event, if any (task disabled or deleted). */
+    /**
+     * Cancel a task's pending event, if any (task disabled or deleted).
+     */
     public boolean cancel(String taskId) {
         TaskDueEvent existing = pendingByTaskId.remove(taskId);
         boolean removed = existing != null && queue.remove(existing);
@@ -97,12 +104,16 @@ public class TaskEventQueue {
         return removed;
     }
 
-    /** Whether this task currently has a pending (not-yet-due) event. */
+    /**
+     * Whether this task currently has a pending (not-yet-due) event.
+     */
     public boolean hasPending(String taskId) {
         return pendingByTaskId.containsKey(taskId);
     }
 
-    /** Number of events currently waiting in the queue. */
+    /**
+     * Number of events currently waiting in the queue.
+     */
     public int size() {
         return queue.size();
     }

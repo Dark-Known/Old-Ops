@@ -15,7 +15,7 @@ import java.util.logging.Logger;
 /**
  * A fixed pool of worker threads, each independently running a
  * take-execute-repeat loop against a {@link TaskEventQueue}.
- *
+ * <p>
  * This is the actual "pool of worker threads consuming from a queue
  * independently" — no shared poll tick, no central dispatcher deciding
  * which worker gets which task. Each thread blocks in
@@ -23,7 +23,7 @@ import java.util.logging.Logger;
  * synchronously (so pool size directly controls execution concurrency —
  * the same role {@code AppSettings.getMaxConcurrentTaskThreads()} played
  * before), then loops back to take() for the next one.
- *
+ * <p>
  * Also tracks lightweight, non-persistent monitoring state (how many
  * workers are currently busy, and a bounded feed of recently handled
  * events) purely for UI/dashboard consumption — none of this affects
@@ -33,59 +33,8 @@ public class TaskWorkerPool {
 
     private static final Logger log = Logger.getLogger(TaskWorkerPool.class.getName());
     private static final int MAX_ACTIVITY_ENTRIES = 200;
-
-    /**
-     * What the handler wants to tell the pool about the event it just
-     * finished handling, beyond "did it throw" — set via a {@code Supplier}
-     * the handler-owning code (e.g. {@code TaskSchedulerService}) hands in,
-     * since the handler itself is a plain {@code Consumer} with no return
-     * value. {@code suppress=true} means "this wasn't actually an attempted
-     * run — pure scheduling bookkeeping (task disabled, deleted, already
-     * running elsewhere, a watcher fire that arrived mid-run, etc.) — don't
-     * add a row to the Events feed for it at all"; {@code errored} lets a
-     * handler report a real failure it handled internally (returned false
-     * rather than throwing) so it's badged the same as a thrown exception
-     * instead of quietly looking like a success; {@code note} is a short
-     * human-readable reason shown in place of a bare "OK"/"ERROR" for
-     * anything worth explaining (a skip reason, a failure reason, etc.).
-     */
-    public record HandlerOutcome(boolean suppress, boolean errored, String note) {
-        public static final HandlerOutcome DEFAULT = new HandlerOutcome(false, false, null);
-    }
-
-    /** One row of the recent-activity feed, for UI display only. */
-    public static final class ActivityEntry {
-        private final String taskId;
-        private final int attempt;
-        private final LocalDateTime startedAt;
-        private final LocalDateTime finishedAt;
-        private final boolean errored;
-        private final String errorMessage; // error text if errored, otherwise an optional informational note (e.g. a skip reason) or null
-
-        ActivityEntry(String taskId, int attempt, LocalDateTime startedAt, LocalDateTime finishedAt,
-                      boolean errored, String errorMessage) {
-            this.taskId = taskId;
-            this.attempt = attempt;
-            this.startedAt = startedAt;
-            this.finishedAt = finishedAt;
-            this.errored = errored;
-            this.errorMessage = errorMessage;
-        }
-
-        public String getTaskId() { return taskId; }
-        public int getAttempt() { return attempt; }
-        public LocalDateTime getStartedAt() { return startedAt; }
-        public LocalDateTime getFinishedAt() { return finishedAt; }
-        public boolean isErrored() { return errored; }
-        public String getErrorMessage() { return errorMessage; }
-    }
-
-    /** One worker thread's currently-executing task, for the live activity widget — see {@link #getInFlightSnapshot()}. */
-    public record InFlightTask(String taskId, LocalDateTime startedAt, String thread) {}
-
     private final java.util.concurrent.ConcurrentHashMap<Long, InFlightTask> inFlightByThread =
             new java.util.concurrent.ConcurrentHashMap<>();
-
     private final TaskEventQueue queue;
     private final Consumer<TaskDueEvent> handler;
     private final Supplier<HandlerOutcome> outcomeSupplier;
@@ -99,20 +48,11 @@ public class TaskWorkerPool {
     private volatile boolean running = false;
     // See TaskEventQueue#setChangeListener: fired when a worker starts or finishes a task.
     private volatile Runnable changeListener;
-
-    public void setChangeListener(Runnable r) { this.changeListener = r; }
-
-    private void changed() {
-        Runnable r = changeListener;
-        if (r != null) { try { r.run(); } catch (RuntimeException ignored) { /* never break a worker */ } }
-    }
-
     public TaskWorkerPool(TaskEventQueue queue, int workerCount, Consumer<TaskDueEvent> handler) {
         this(queue, workerCount, handler, () -> HandlerOutcome.DEFAULT);
     }
-
     public TaskWorkerPool(TaskEventQueue queue, int workerCount, Consumer<TaskDueEvent> handler,
-                           Supplier<HandlerOutcome> outcomeSupplier) {
+                          Supplier<HandlerOutcome> outcomeSupplier) {
         this.queue = queue;
         this.handler = handler;
         this.outcomeSupplier = outcomeSupplier != null ? outcomeSupplier : () -> HandlerOutcome.DEFAULT;
@@ -125,7 +65,22 @@ public class TaskWorkerPool {
         });
     }
 
-    /** Starts the configured number of worker threads. Safe to call once per pool instance. */
+    public void setChangeListener(Runnable r) {
+        this.changeListener = r;
+    }
+
+    private void changed() {
+        Runnable r = changeListener;
+        if (r != null) {
+            try {
+                r.run();
+            } catch (RuntimeException ignored) { /* never break a worker */ }
+        }
+    }
+
+    /**
+     * Starts the configured number of worker threads. Safe to call once per pool instance.
+     */
     public void start() {
         running = true;
         for (int i = 0; i < workerCount; i++) {
@@ -170,7 +125,10 @@ public class TaskWorkerPool {
                     changed();
                 }
             } catch (InterruptedException ie) {
-                if (!running) { Thread.currentThread().interrupt(); return; } // pool shutting down
+                if (!running) {
+                    Thread.currentThread().interrupt();
+                    return;
+                } // pool shutting down
                 // otherwise a task-cancel interrupt landed while idle: keep serving events
             }
         }
@@ -180,7 +138,10 @@ public class TaskWorkerPool {
         recentActivity.addFirst(entry);
         while (recentActivity.size() > MAX_ACTIVITY_ENTRIES) {
             Iterator<ActivityEntry> it = recentActivity.descendingIterator();
-            if (it.hasNext()) { it.next(); it.remove(); } else break;
+            if (it.hasNext()) {
+                it.next();
+                it.remove();
+            } else break;
         }
     }
 
@@ -189,11 +150,19 @@ public class TaskWorkerPool {
         workers.shutdownNow();
     }
 
-    /** Total configured worker threads (the execution-concurrency ceiling). */
-    public int getWorkerCount() { return workerCount; }
+    /**
+     * Total configured worker threads (the execution-concurrency ceiling).
+     */
+    public int getWorkerCount() {
+        return workerCount;
+    }
 
-    /** Workers currently blocked inside handler.accept(), i.e. actively executing a task right now. */
-    public int getActiveWorkerCount() { return activeWorkers.get(); }
+    /**
+     * Workers currently blocked inside handler.accept(), i.e. actively executing a task right now.
+     */
+    public int getActiveWorkerCount() {
+        return activeWorkers.get();
+    }
 
     /**
      * Snapshot of what every currently-busy worker thread is executing right
@@ -207,7 +176,9 @@ public class TaskWorkerPool {
         return new ArrayList<>(inFlightByThread.values());
     }
 
-    /** Newest-first snapshot of the last {@code limit} handled events. UI-consumption only. */
+    /**
+     * Newest-first snapshot of the last {@code limit} handled events. UI-consumption only.
+     */
     public List<ActivityEntry> getRecentActivity(int limit) {
         List<ActivityEntry> snapshot = new ArrayList<>(Math.min(limit, MAX_ACTIVITY_ENTRIES));
         for (ActivityEntry e : recentActivity) {
@@ -215,5 +186,76 @@ public class TaskWorkerPool {
             snapshot.add(e);
         }
         return snapshot;
+    }
+
+    /**
+     * What the handler wants to tell the pool about the event it just
+     * finished handling, beyond "did it throw" — set via a {@code Supplier}
+     * the handler-owning code (e.g. {@code TaskSchedulerService}) hands in,
+     * since the handler itself is a plain {@code Consumer} with no return
+     * value. {@code suppress=true} means "this wasn't actually an attempted
+     * run — pure scheduling bookkeeping (task disabled, deleted, already
+     * running elsewhere, a watcher fire that arrived mid-run, etc.) — don't
+     * add a row to the Events feed for it at all"; {@code errored} lets a
+     * handler report a real failure it handled internally (returned false
+     * rather than throwing) so it's badged the same as a thrown exception
+     * instead of quietly looking like a success; {@code note} is a short
+     * human-readable reason shown in place of a bare "OK"/"ERROR" for
+     * anything worth explaining (a skip reason, a failure reason, etc.).
+     */
+    public record HandlerOutcome(boolean suppress, boolean errored, String note) {
+        public static final HandlerOutcome DEFAULT = new HandlerOutcome(false, false, null);
+    }
+
+    /**
+     * One row of the recent-activity feed, for UI display only.
+     */
+    public static final class ActivityEntry {
+        private final String taskId;
+        private final int attempt;
+        private final LocalDateTime startedAt;
+        private final LocalDateTime finishedAt;
+        private final boolean errored;
+        private final String errorMessage; // error text if errored, otherwise an optional informational note (e.g. a skip reason) or null
+
+        ActivityEntry(String taskId, int attempt, LocalDateTime startedAt, LocalDateTime finishedAt,
+                      boolean errored, String errorMessage) {
+            this.taskId = taskId;
+            this.attempt = attempt;
+            this.startedAt = startedAt;
+            this.finishedAt = finishedAt;
+            this.errored = errored;
+            this.errorMessage = errorMessage;
+        }
+
+        public String getTaskId() {
+            return taskId;
+        }
+
+        public int getAttempt() {
+            return attempt;
+        }
+
+        public LocalDateTime getStartedAt() {
+            return startedAt;
+        }
+
+        public LocalDateTime getFinishedAt() {
+            return finishedAt;
+        }
+
+        public boolean isErrored() {
+            return errored;
+        }
+
+        public String getErrorMessage() {
+            return errorMessage;
+        }
+    }
+
+    /**
+     * One worker thread's currently-executing task, for the live activity widget — see {@link #getInFlightSnapshot()}.
+     */
+    public record InFlightTask(String taskId, LocalDateTime startedAt, String thread) {
     }
 }

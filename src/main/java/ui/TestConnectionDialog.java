@@ -17,14 +17,15 @@ import java.awt.*;
  */
 public final class TestConnectionDialog {
 
-    private TestConnectionDialog() {}
+    private TestConnectionDialog() {
+    }
 
     /**
      * Shows the dialog and blocks (it's modal) until the user closes it.
      *
      * @return the test result, or {@code null} if the dialog was closed
-     *         before the background test finished (shouldn't normally
-     *         happen since Close is disabled until then).
+     * before the background test finished (shouldn't normally
+     * happen since Close is disabled until then).
      */
     public static ConnectionTestService.Result show(Component parent, String host, String username, String password) {
         Window ownerWindow = SwingUtilities.getWindowAncestor(parent);
@@ -79,10 +80,13 @@ public final class TestConnectionDialog {
         final ConnectionTestService.Result[] holder = new ConnectionTestService.Result[1];
 
         Async.execute("Test SFTP connection", true, false, new SwingWorker<ConnectionTestService.Result, Void>() {
-            @Override protected ConnectionTestService.Result doInBackground() {
+            @Override
+            protected ConnectionTestService.Result doInBackground() {
                 return ConnectionTestService.testSftp(host, username, password);
             }
-            @Override protected void done() {
+
+            @Override
+            protected void done() {
                 ConnectionTestService.Result r;
                 try {
                     r = get();

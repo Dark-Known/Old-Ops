@@ -21,21 +21,18 @@ import java.util.List;
  */
 final class LinkConnectPanel {
 
+    final JComponent connectTab;
+    final JComponent certTab;
     private final File dataDir;
-    private ApiPanel.View view;
-
     private final JTextArea connectText = mono();
     private final JTextArea testOut = mono();
     private final JComboBox<String> hostBox = new JComboBox<>();
-
     private final JTextArea certInfo = mono();
     private final JTextArea certHow = mono();
     private final JTextArea certTestOut = mono();
     private final JButton btnCopyFp = new JButton("Copy fingerprint");
     private final JButton btnExport = new JButton("Export certificate...");
-
-    final JComponent connectTab;
-    final JComponent certTab;
+    private ApiPanel.View view;
 
     LinkConnectPanel(File dataDir) {
         this.dataDir = dataDir;
@@ -51,6 +48,10 @@ final class LinkConnectPanel {
         t.setWrapStyleWord(true);
         t.setBorder(new EmptyBorder(6, 8, 6, 8));
         return t;
+    }
+
+    private static void clip(String s) {
+        Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(s), null);
     }
 
     private JComponent buildConnect() {
@@ -90,7 +91,9 @@ final class LinkConnectPanel {
         JPanel top = new JPanel(new BorderLayout(6, 6));
         top.add(certInfo, BorderLayout.CENTER);
         JPanel buttons = new JPanel(new GridLayout(0, 1, 0, 4));
-        btnCopyFp.addActionListener(e -> { if (view != null && view.cert() != null) clip(view.cert().sha256Fingerprint()); });
+        btnCopyFp.addActionListener(e -> {
+            if (view != null && view.cert() != null) clip(view.cert().sha256Fingerprint());
+        });
         btnExport.addActionListener(e -> export());
         JButton verify = new JButton("Verify endpoint now");
         verify.setToolTipText("Connects to the live endpoint and compares the certificate it presents with link-server.cer");
@@ -131,7 +134,8 @@ final class LinkConnectPanel {
         sb.append("Body       {\"type\":\"heartbeat\",\"state\":\"connected\",\"seq\":1,\"instance\":\"app-start-time\"}\n");
         if (v.addresses().size() > 1) {
             sb.append("\nOther addresses that work:\n");
-            for (int i = 1; i < v.addresses().size(); i++) sb.append("  ").append(v.addresses().get(i)).append("/socketLink/events\n");
+            for (int i = 1; i < v.addresses().size(); i++)
+                sb.append("  ").append(v.addresses().get(i)).append("/socketLink/events\n");
         }
         sb.append("\nTest from server A\n");
         sb.append("  PowerShell  ").append(util.Scripts.raw("link/link-health-check.ps1", "URL", url)).append("\n");
@@ -211,9 +215,5 @@ final class LinkConnectPanel {
         } catch (Exception ex) {
             JOptionPane.showMessageDialog(connectTab, "Could not save: " + ex.getMessage(), "Export", JOptionPane.ERROR_MESSAGE);
         }
-    }
-
-    private static void clip(String s) {
-        Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(s), null);
     }
 }

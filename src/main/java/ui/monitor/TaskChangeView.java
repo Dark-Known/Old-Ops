@@ -13,10 +13,12 @@ import java.util.*;
  */
 public final class TaskChangeView {
 
-    private TaskChangeView() {}
-
-    /** Field key -> label used in the audit text. The task list screen writes the text with these. */
+    /**
+     * Field key -> label used in the audit text. The task list screen writes the text with these.
+     */
     public static final Map<String, String> LABELS = new LinkedHashMap<>();
+    private static final String[] PREFIXES = {"Created task \"", "Edited task \"", "Deleted task \""};
+
     static {
         LABELS.put("taskType", "Type");
         LABELS.put("transferDirection", "Direction");
@@ -57,12 +59,8 @@ public final class TaskChangeView {
         LABELS.put("retryCount", "Retry count");
     }
 
-    public enum Change { CREATED, EDITED, DELETED }
-
-    /** HTML for the details pane plus a plain-text twin for "Copy". */
-    public record View(String html, String text) {}
-
-    private static final String[] PREFIXES = {"Created task \"", "Edited task \"", "Deleted task \""};
+    private TaskChangeView() {
+    }
 
     public static boolean applies(String message) {
         if (message == null) return false;
@@ -70,9 +68,9 @@ public final class TaskChangeView {
         return false;
     }
 
-    private record Row(String label, String oldValue, String value) {}
-
-    /** @param muted CSS class for secondary text, @param bad CSS class for removed values. */
+    /**
+     * @param muted CSS class for secondary text, @param bad CSS class for removed values.
+     */
     public static View render(String message, String muted) {
         Change kind = message.startsWith(PREFIXES[0]) ? Change.CREATED
                 : message.startsWith(PREFIXES[1]) ? Change.EDITED : Change.DELETED;
@@ -139,12 +137,13 @@ public final class TaskChangeView {
         return new View(h.toString(), t.toString());
     }
 
-    // ── parsing ────────────────────────────────────────────────────
-
-    /** "Label: value; Label: value" with known labels only, so a ';' inside a value does not split it. */
+    /**
+     * "Label: value; Label: value" with known labels only, so a ';' inside a value does not split it.
+     */
     static List<Row> parse(String s, boolean edit) {
         List<Row> rows = new ArrayList<>();
-        if (s == null || s.isBlank() || s.startsWith("no fields") || s.startsWith("no fields actually changed")) return rows;
+        if (s == null || s.isBlank() || s.startsWith("no fields") || s.startsWith("no fields actually changed"))
+            return rows;
         Set<String> labels = new HashSet<>(LABELS.values());
         String label = null;
         StringBuilder value = new StringBuilder();
@@ -171,8 +170,6 @@ public final class TaskChangeView {
         if (arrow < 0) return new Row(label, "", value);
         return new Row(label, value.substring(0, arrow), value.substring(arrow + 3));
     }
-
-    // ── wording ────────────────────────────────────────────────────
 
     private static String friendly(String label, String value) {
         if (value == null) return "";
@@ -227,7 +224,7 @@ public final class TaskChangeView {
         };
     }
 
-    private record Section(String title, List<String[]> rows) {}
+    // ── parsing ────────────────────────────────────────────────────
 
     private static void add(List<String[]> rows, Map<String, String> v, String label, String shownLabel) {
         String val = v.get(label);
@@ -306,7 +303,11 @@ public final class TaskChangeView {
         return out;
     }
 
-    /** One plain sentence describing the task, or null when there is not enough information. */
+    // ── wording ────────────────────────────────────────────────────
+
+    /**
+     * One plain sentence describing the task, or null when there is not enough information.
+     */
     static String sentence(Map<String, String> v) {
         String type = v.getOrDefault("Type", "");
         String when = whenPhrase(v);
@@ -326,11 +327,12 @@ public final class TaskChangeView {
                 String local = v.get("Source path");
                 s = inbound
                         ? "Downloads " + which + " from " + server + (remote != null ? " (" + remote + ")" : "")
-                                + (local != null ? " to " + local : "")
+                        + (local != null ? " to " + local : "")
                         : "Uploads " + which + (local != null ? " from " + local : "") + " to " + server
-                                + (remote != null ? " (" + remote + ")" : "");
+                        + (remote != null ? " (" + remote + ")" : "");
             }
-            case "FOLDER_WATCH" -> s = "Watches " + v.getOrDefault("Backup source path", "a folder") + " for new and changed files (nothing is transferred)";
+            case "FOLDER_WATCH" ->
+                    s = "Watches " + v.getOrDefault("Backup source path", "a folder") + " for new and changed files (nothing is transferred)";
             case "BACKUP" -> s = "Backs up " + v.getOrDefault("Backup source path", "files")
                     + (v.get("Backup destination path") != null ? " to " + v.get("Backup destination path") : "");
             case "OUTLOOK_MAIL" -> s = "Reads mail from " + v.getOrDefault("Mailbox address", "a mailbox")
@@ -349,14 +351,33 @@ public final class TaskChangeView {
         if (type == null) return null;
         return switch (type) {
             case "RUN_NOW" -> "once, right away";
-            case "ONCE" -> v.get("Scheduled at") != null ? "once at " + friendly("Scheduled at", v.get("Scheduled at")) : "once";
+            case "ONCE" ->
+                    v.get("Scheduled at") != null ? "once at " + friendly("Scheduled at", v.get("Scheduled at")) : "once";
             case "DAILY" -> "every day";
             case "WEEKLY" -> "every week";
-            case "INTERVAL_MINUTES" -> v.get("Interval (minutes)") != null ? "every " + friendly("Interval (minutes)", v.get("Interval (minutes)")) : null;
-            case "INTERVAL_SECONDS" -> v.get("Interval (seconds)") != null ? "every " + friendly("Interval (seconds)", v.get("Interval (seconds)")) : null;
+            case "INTERVAL_MINUTES" ->
+                    v.get("Interval (minutes)") != null ? "every " + friendly("Interval (minutes)", v.get("Interval (minutes)")) : null;
+            case "INTERVAL_SECONDS" ->
+                    v.get("Interval (seconds)") != null ? "every " + friendly("Interval (seconds)", v.get("Interval (seconds)")) : null;
             default -> null;
         };
     }
 
-    private static String esc(String s) { return MonitorStyle.htmlEscape(s); }
+    private static String esc(String s) {
+        return MonitorStyle.htmlEscape(s);
+    }
+
+    public enum Change {CREATED, EDITED, DELETED}
+
+    /**
+     * HTML for the details pane plus a plain-text twin for "Copy".
+     */
+    public record View(String html, String text) {
+    }
+
+    private record Row(String label, String oldValue, String value) {
+    }
+
+    private record Section(String title, List<String[]> rows) {
+    }
 }

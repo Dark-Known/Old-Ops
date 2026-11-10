@@ -20,6 +20,23 @@ public class GradientToggleButton extends JToggleButton {
         setBorderPainted(false);
     }
 
+    private static int arcFor() {
+        Object v = UIManager.get("Component.arc");
+        if (v instanceof Integer) return (Integer) v;
+        return 8;
+    }
+
+    private static Color shade(Color c, float amount) {
+        int r = clamp(c.getRed() + Math.round(255 * amount));
+        int g = clamp(c.getGreen() + Math.round(255 * amount));
+        int b = clamp(c.getBlue() + Math.round(255 * amount));
+        return new Color(r, g, b, c.getAlpha());
+    }
+
+    private static int clamp(int v) {
+        return Math.max(0, Math.min(255, v));
+    }
+
     @Override
     protected void paintComponent(Graphics g) {
         if (isSelected()) {
@@ -36,22 +53,5 @@ public class GradientToggleButton extends JToggleButton {
             }
         }
         super.paintComponent(g);
-    }
-
-    private static int arcFor() {
-        Object v = UIManager.get("Component.arc");
-        if (v instanceof Integer) return (Integer) v;
-        return 8;
-    }
-
-    private static Color shade(Color c, float amount) {
-        int r = clamp(c.getRed()   + Math.round(255 * amount));
-        int g = clamp(c.getGreen() + Math.round(255 * amount));
-        int b = clamp(c.getBlue()  + Math.round(255 * amount));
-        return new Color(r, g, b, c.getAlpha());
-    }
-
-    private static int clamp(int v) {
-        return Math.max(0, Math.min(255, v));
     }
 }

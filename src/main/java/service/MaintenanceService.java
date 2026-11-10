@@ -15,7 +15,9 @@ import java.util.function.BooleanSupplier;
  * other work, and shows up in the workers badge, the live queue and the Event Monitor.
  */
 public final class MaintenanceService {
-    /** Id of the purge job as it travels through the event queue and the worker pool. */
+    /**
+     * Id of the purge job as it travels through the event queue and the worker pool.
+     */
     public static final String JOB_PURGE = "system:purge";
     private static final String META_LAST_PURGE = "last_purge_at";
     private static final String META_LAST_SUMMARY = "last_purge_summary";
@@ -28,12 +30,43 @@ public final class MaintenanceService {
         this.backgroundLog = backgroundLog;
     }
 
-    /** True for ids of internal jobs (as opposed to ids of user-defined tasks). */
-    public static boolean isSystemJob(String id) { return id != null && id.startsWith("system:"); }
+    /**
+     * True for ids of internal jobs (as opposed to ids of user-defined tasks).
+     */
+    public static boolean isSystemJob(String id) {
+        return id != null && id.startsWith("system:");
+    }
 
-    /** Name shown for a system job wherever tasks are listed (queue, workers badge). */
+    /**
+     * Name shown for a system job wherever tasks are listed (queue, workers badge).
+     */
     public static String displayName(String id) {
         return JOB_PURGE.equals(id) ? "Purge old logs & history" : id;
+    }
+
+    private static PurgeResult safe(String label, Purge p) {
+        try {
+            return p.run();
+        } catch (RuntimeException e) {
+            return PurgeResult.failure(label, 0, 0, e.toString());
+        }
+    }
+
+    /**
+     * Moves background events that older builds stored in run history into their own database.
+     */
+    public static int migrateLegacyBackgroundRows(RunHistoryService history, BackgroundLogService bg) {
+        if (!bg.isOpen() || "1".equals(bg.meta("legacy_migrated"))) return 0;
+        List<TaskRunRecord> rows = history.listLegacyBackgroundRows();
+        int moved = 0;
+        if (!rows.isEmpty()) {
+            long maxId = rows.stream().mapToLong(TaskRunRecord::getId).max().orElse(0);
+            moved = bg.importRows(rows);
+            if (moved != rows.size()) return 0; // import failed: leave the rows where they are, retry next start
+            history.deleteLegacyBackgroundRows(maxId);
+        }
+        bg.setMeta("legacy_migrated", "1");
+        return moved;
     }
 
     /**
@@ -59,22 +92,25 @@ public final class MaintenanceService {
         return results;
     }
 
-    private interface Purge { PurgeResult run(); }
-
-    private static PurgeResult safe(String label, Purge p) {
-        try { return p.run(); }
-        catch (RuntimeException e) { return PurgeResult.failure(label, 0, 0, e.toString()); }
-    }
-
-    /** When the last purge finished, or null if none has run yet. */
+    /**
+     * When the last purge finished, or null if none has run yet.
+     */
     public LocalDateTime lastPurgeAt() {
         String v = backgroundLog.meta(META_LAST_PURGE);
-        try { return v == null ? null : LocalDateTime.parse(v); } catch (Exception e) { return null; }
+        try {
+            return v == null ? null : LocalDateTime.parse(v);
+        } catch (Exception e) {
+            return null;
+        }
     }
 
-    public String lastPurgeSummary() { return backgroundLog.meta(META_LAST_SUMMARY); }
+    public String lastPurgeSummary() {
+        return backgroundLog.meta(META_LAST_SUMMARY);
+    }
 
-    /** True when scheduled purging is on and the configured interval has elapsed since the last one. */
+    /**
+     * True when scheduled purging is on and the configured interval has elapsed since the last one.
+     */
     public boolean purgeDue() {
         if (!PurgePolicy.scheduledEnabled()) return false;
         LocalDateTime last = lastPurgeAt();
@@ -82,21 +118,15 @@ public final class MaintenanceService {
                 || LocalDateTime.now().isBefore(last); // clock moved backwards: don't wait indefinitely
     }
 
-    public BackgroundLogService backgroundLog() { return backgroundLog; }
-    public RunHistoryService history() { return history; }
+    public BackgroundLogService backgroundLog() {
+        return backgroundLog;
+    }
 
-    /** Moves background events that older builds stored in run history into their own database. */
-    public static int migrateLegacyBackgroundRows(RunHistoryService history, BackgroundLogService bg) {
-        if (!bg.isOpen() || "1".equals(bg.meta("legacy_migrated"))) return 0;
-        List<TaskRunRecord> rows = history.listLegacyBackgroundRows();
-        int moved = 0;
-        if (!rows.isEmpty()) {
-            long maxId = rows.stream().mapToLong(TaskRunRecord::getId).max().orElse(0);
-            moved = bg.importRows(rows);
-            if (moved != rows.size()) return 0; // import failed: leave the rows where they are, retry next start
-            history.deleteLegacyBackgroundRows(maxId);
-        }
-        bg.setMeta("legacy_migrated", "1");
-        return moved;
+    public RunHistoryService history() {
+        return history;
+    }
+
+    private interface Purge {
+        PurgeResult run();
     }
 }

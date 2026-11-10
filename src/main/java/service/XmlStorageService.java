@@ -32,9 +32,15 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 public class XmlStorageService {
 
+    // Snapshot cache for read-only consumers (status bar, watcher monitor, event monitor, feeds).
+    // Valid while neither this process (localEpoch) nor any other (monitor TASKS generation) has
+    // touched the tasks table; the age cap is a safety net should the change signal ever stall.
+    private static final long SNAPSHOT_MAX_AGE_MS = 30_000;
     private final File dataDir;
     private final TaskDbService taskDb;
     private final CredentialDbService credentialDb;
+    private final AtomicLong localEpoch = new AtomicLong();
+    private volatile TaskSnapshot snapshot;
 
     public XmlStorageService(String dataDirPath) {
         this.dataDir = new File(dataDirPath);
@@ -43,9 +49,28 @@ public class XmlStorageService {
         this.credentialDb = new CredentialDbService(this.dataDir);
     }
 
+    /**
+     * Same count over an already-loaded task list — lets callers that count many
+     * credentials load the task table once instead of once per credential.
+     */
+    public static int countTasksUsingCredential(List<ScheduledTask> tasks, String name) {
+        if (name == null || name.isEmpty()) return 0;
+        int count = 0;
+        for (ScheduledTask t : tasks) {
+            if (name.equals(t.getTargetUsername())
+                    || name.equals(t.getBackupSourceUsername())
+                    || name.equals(t.getBackupDestinationUsername())) {
+                count++;
+            }
+        }
+        return count;
+    }
+
     public File getDataDir() {
         return dataDir;
     }
+
+    // ─── Credentials (SQLite-backed — see CredentialDbService) ──────────────
 
     /**
      * True only if BOTH the tasks and credentials tables in app.db opened
@@ -86,21 +111,25 @@ public class XmlStorageService {
         return taskDb.getLastSaveError();
     }
 
-    /** Same as {@link #getLastTaskSaveError()}, for {@link #saveCredential}. */
+    /**
+     * Same as {@link #getLastTaskSaveError()}, for {@link #saveCredential}.
+     */
     public String getLastCredentialSaveError() {
         return credentialDb.getLastSaveError();
     }
 
-    // ─── Credentials (SQLite-backed — see CredentialDbService) ──────────────
-
-    /** Returns the legacy creds_<username>.xml path. Retained only so old migration/cleanup tooling can find it; credentials themselves now live in app.db. */
+    /**
+     * Returns the legacy creds_<username>.xml path. Retained only so old migration/cleanup tooling can find it; credentials themselves now live in app.db.
+     */
     public File credFileForUser(String username) {
         // Sanitise username so it is safe as a filename
         String safe = username.replaceAll("[^a-zA-Z0-9_\\-.]", "_");
         return new File(dataDir, "creds_" + safe + ".xml");
     }
 
-    /** Look up a credential by its (unique) name — what tasks store to say which credential they use. */
+    /**
+     * Look up a credential by its (unique) name — what tasks store to say which credential they use.
+     */
     public Credential loadCredentialByName(String name) {
         return credentialDb.loadByName(name);
     }
@@ -109,7 +138,9 @@ public class XmlStorageService {
         return credentialDb.loadById(id);
     }
 
-    /** True when another credential already has this name (ignoring case). */
+    /**
+     * True when another credential already has this name (ignoring case).
+     */
     public boolean isCredentialNameTaken(String name, String exceptId) {
         return credentialDb.isNameTaken(name, exceptId);
     }
@@ -136,13 +167,19 @@ public class XmlStorageService {
         return true;
     }
 
-    /** Delete the credential with the given name. Returns whether it was actually removed — false means app.db isn't
-     *  connected or the delete failed; see {@link #isConnected()} / {@link #getLastCredentialSaveError()}. */
+    // ─── Tasks (SQLite-backed — see TaskDbService) ──────────────────────────
+
+    /**
+     * Delete the credential with the given name. Returns whether it was actually removed — false means app.db isn't
+     * connected or the delete failed; see {@link #isConnected()} / {@link #getLastCredentialSaveError()}.
+     */
     public boolean deleteCredential(String name) {
         return credentialDb.delete(name);
     }
 
-    /** List every credential stored. */
+    /**
+     * List every credential stored.
+     */
     public List<Credential> loadAllCredentials() {
         return credentialDb.loadAll();
     }
@@ -160,38 +197,14 @@ public class XmlStorageService {
         return countTasksUsingCredential(loadTasks(), name);
     }
 
-    /** Same count over an already-loaded task list — lets callers that count many
-     *  credentials load the task table once instead of once per credential. */
-    public static int countTasksUsingCredential(List<ScheduledTask> tasks, String name) {
-        if (name == null || name.isEmpty()) return 0;
-        int count = 0;
-        for (ScheduledTask t : tasks) {
-            if (name.equals(t.getTargetUsername())
-                    || name.equals(t.getBackupSourceUsername())
-                    || name.equals(t.getBackupDestinationUsername())) {
-                count++;
-            }
-        }
-        return count;
-    }
-
-    // ─── Tasks (SQLite-backed — see TaskDbService) ──────────────────────────
-
-    /** All stored tasks, freshly read. Callers get their own mutable objects - use this when you
-     *  intend to edit and {@link #saveTask} the result. Display-only code should prefer
-     *  {@link #loadTasksSnapshot()}. */
+    /**
+     * All stored tasks, freshly read. Callers get their own mutable objects - use this when you
+     * intend to edit and {@link #saveTask} the result. Display-only code should prefer
+     * {@link #loadTasksSnapshot()}.
+     */
     public List<ScheduledTask> loadTasks() {
         return taskDb.loadAll();
     }
-
-    // Snapshot cache for read-only consumers (status bar, watcher monitor, event monitor, feeds).
-    // Valid while neither this process (localEpoch) nor any other (monitor TASKS generation) has
-    // touched the tasks table; the age cap is a safety net should the change signal ever stall.
-    private static final long SNAPSHOT_MAX_AGE_MS = 30_000;
-    private final AtomicLong localEpoch = new AtomicLong();
-    private volatile TaskSnapshot snapshot;
-
-    private record TaskSnapshot(List<ScheduledTask> tasks, long monitorGen, long epoch, long loadedAtMs) {}
 
     /**
      * Read-only view of all tasks, shared by every caller until the table actually changes.
@@ -214,12 +227,18 @@ public class XmlStorageService {
         return fresh;
     }
 
-    /** Inserts or replaces (by id) a task. Assigns an id if missing. Returns
-     *  whether it was actually persisted — false means app.db isn't
-     *  connected; see {@link #getConnectionError()}. */
+    /**
+     * Inserts or replaces (by id) a task. Assigns an id if missing. Returns
+     * whether it was actually persisted — false means app.db isn't
+     * connected; see {@link #getConnectionError()}.
+     */
     public boolean saveTask(ScheduledTask task) {
         localEpoch.incrementAndGet();
-        try { return taskDb.save(task); } finally { localEpoch.incrementAndGet(); }
+        try {
+            return taskDb.save(task);
+        } finally {
+            localEpoch.incrementAndGet();
+        }
     }
 
     /**
@@ -229,14 +248,27 @@ public class XmlStorageService {
      */
     public boolean saveTaskRunState(ScheduledTask task) {
         localEpoch.incrementAndGet();
-        try { return taskDb.saveRunState(task); } finally { localEpoch.incrementAndGet(); }
+        try {
+            return taskDb.saveRunState(task);
+        } finally {
+            localEpoch.incrementAndGet();
+        }
     }
 
-    /** Deletes the task with the given id, if any. Returns whether it was
-     *  actually removed — false means app.db isn't connected or the delete
-     *  failed; see {@link #isConnected()} / {@link #getLastTaskSaveError()}. */
+    /**
+     * Deletes the task with the given id, if any. Returns whether it was
+     * actually removed — false means app.db isn't connected or the delete
+     * failed; see {@link #isConnected()} / {@link #getLastTaskSaveError()}.
+     */
     public boolean deleteTask(String id) {
         localEpoch.incrementAndGet();
-        try { return taskDb.delete(id); } finally { localEpoch.incrementAndGet(); }
+        try {
+            return taskDb.delete(id);
+        } finally {
+            localEpoch.incrementAndGet();
+        }
+    }
+
+    private record TaskSnapshot(List<ScheduledTask> tasks, long monitorGen, long epoch, long loadedAtMs) {
     }
 }

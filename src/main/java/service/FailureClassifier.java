@@ -27,7 +27,8 @@ import java.util.Locale;
  */
 public final class FailureClassifier {
 
-    private FailureClassifier() {}
+    private FailureClassifier() {
+    }
 
     /**
      * Classifies directly from the exception object where one is still in

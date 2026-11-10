@@ -10,21 +10,21 @@ import java.util.function.Consumer;
  */
 public final class SshSessionEvents {
 
-    public enum Phase { OPENED, CLOSED, FAILED }
-
-    /** {@code detached}: the session outlives any single run (e.g. the remote watcher), so the event
-     *  must not be attached to whatever run of the task happens to be in flight. */
-    public record Event(Phase phase, String taskId, String purpose, String host, String user,
-                        String reason, long openMs, boolean detached, String log, String runKey) {}
-
     private static volatile Consumer<Event> sink;
 
-    private SshSessionEvents() {}
+    private SshSessionEvents() {
+    }
 
-    public static void setSink(Consumer<Event> s) { sink = s; }
+    public static void setSink(Consumer<Event> s) {
+        sink = s;
+    }
 
-    /** Removes {@code s} only if it is still the installed sink (a newer scheduler may own it now). */
-    public static void clearSink(Consumer<Event> s) { if (sink == s) sink = null; }
+    /**
+     * Removes {@code s} only if it is still the installed sink (a newer scheduler may own it now).
+     */
+    public static void clearSink(Consumer<Event> s) {
+        if (sink == s) sink = null;
+    }
 
     public static void opened(String taskId, String purpose, String host, String user) {
         service.sftp.SessionLog.begin().add("Opening " + purpose + " to " + who(host, user));
@@ -40,7 +40,9 @@ public final class SshSessionEvents {
         emit(new Event(Phase.FAILED, taskId, purpose, host, user, reason, 0, false, service.sftp.SessionLog.take(), null));
     }
 
-    /** Same as the task variants, for sessions that live longer than one run. */
+    /**
+     * Same as the task variants, for sessions that live longer than one run.
+     */
     public static void openedDetached(String taskId, String purpose, String host, String user) {
         openedDetached(taskId, purpose, host, user, null);
     }
@@ -50,7 +52,9 @@ public final class SshSessionEvents {
     }
 
     public static void closedDetached(String taskId, String purpose, String host, String user,
-                                      String reason, long openMs) { closedDetached(taskId, purpose, host, user, reason, openMs, null); }
+                                      String reason, long openMs) {
+        closedDetached(taskId, purpose, host, user, reason, openMs, null);
+    }
 
     public static void closedDetached(String taskId, String purpose, String host, String user,
                                       String reason, long openMs, String log) {
@@ -65,8 +69,6 @@ public final class SshSessionEvents {
         emit(new Event(Phase.FAILED, taskId, purpose, host, user, reason, 0, true, log, null));
     }
 
-    // ── Sessions that belong to a specific run but outlive the call that opened them (the kept-warm connection) ──
-
     public static void openedInRun(String taskId, String purpose, String host, String user, String runKey, String log) {
         emit(new Event(Phase.OPENED, taskId, purpose, host, user, null, 0, false, log, runKey));
     }
@@ -76,19 +78,23 @@ public final class SshSessionEvents {
         emit(new Event(Phase.CLOSED, taskId, purpose, host, user, reason, openMs, false, log, runKey));
     }
 
+    // ── Sessions that belong to a specific run but outlive the call that opened them (the kept-warm connection) ──
+
     public static void failedInRun(String taskId, String purpose, String host, String user, String reason,
                                    String runKey, String log) {
         emit(new Event(Phase.FAILED, taskId, purpose, host, user, reason, 0, false, log, runKey));
     }
-
-    // ── Sessions opened from the UI (folder browser, Test connection): not tied to a task ──
 
     public static void uiOpened(String purpose, String host, String user) {
         BackgroundJobs.note(model.EventKind.SSH_OPENED, model.TaskRunRecord.Status.SUCCESS, purpose,
                 "SSH session opened to " + who(host, user) + " (" + purpose + ")", null);
     }
 
-    public static void uiClosed(String purpose, String host, String user, long openMs) { uiClosed(purpose, host, user, openMs, null); }
+    public static void uiClosed(String purpose, String host, String user, long openMs) {
+        uiClosed(purpose, host, user, openMs, null);
+    }
+
+    // ── Sessions opened from the UI (folder browser, Test connection): not tied to a task ──
 
     public static void uiClosed(String purpose, String host, String user, long openMs, String log) {
         String msg = "SSH session closed to " + who(host, user) + " (" + purpose + ")"
@@ -96,7 +102,9 @@ public final class SshSessionEvents {
         BackgroundJobs.note(model.EventKind.SSH_CLOSED, model.TaskRunRecord.Status.SUCCESS, purpose, msg, withLog(msg, log));
     }
 
-    public static void uiFailed(String purpose, String host, String user, String reason) { uiFailed(purpose, host, user, reason, null); }
+    public static void uiFailed(String purpose, String host, String user, String reason) {
+        uiFailed(purpose, host, user, reason, null);
+    }
 
     public static void uiFailed(String purpose, String host, String user, String reason, String log) {
         String msg = "SSH connect to " + who(host, user) + " failed (" + purpose + ")"
@@ -108,7 +116,9 @@ public final class SshSessionEvents {
         return log == null || log.isBlank() ? null : msg + "\n\nSession log (what was said on this connection):\n" + log;
     }
 
-    /** [user, host] from the {@code open sftp://user:pass@host/} line of a WinSCP script (never the password). */
+    /**
+     * [user, host] from the {@code open sftp://user:pass@host/} line of a WinSCP script (never the password).
+     */
     public static String[] targetOfWinScpScript(java.io.File script) {
         try (java.io.BufferedReader br = new java.io.BufferedReader(new java.io.FileReader(script))) {
             String line;
@@ -123,10 +133,14 @@ public final class SshSessionEvents {
                 String cred = at >= 0 ? rest.substring(0, at) : "";
                 int colon = cred.indexOf(':');
                 String user = colon >= 0 ? cred.substring(0, colon) : cred;
-                try { user = java.net.URLDecoder.decode(user, "UTF-8"); } catch (Exception ignored) { }
+                try {
+                    user = java.net.URLDecoder.decode(user, "UTF-8");
+                } catch (Exception ignored) {
+                }
                 return new String[]{user, host};
             }
-        } catch (Exception ignored) { }
+        } catch (Exception ignored) {
+        }
         return new String[]{null, null};
     }
 
@@ -144,6 +158,19 @@ public final class SshSessionEvents {
     private static void emit(Event e) {
         Consumer<Event> s = sink;
         if (s == null) return;
-        try { s.accept(e); } catch (Throwable ignored) {}
+        try {
+            s.accept(e);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    public enum Phase {OPENED, CLOSED, FAILED}
+
+    /**
+     * {@code detached}: the session outlives any single run (e.g. the remote watcher), so the event
+     * must not be attached to whatever run of the task happens to be in flight.
+     */
+    public record Event(Phase phase, String taskId, String purpose, String host, String user,
+                        String reason, long openMs, boolean detached, String log, String runKey) {
     }
 }

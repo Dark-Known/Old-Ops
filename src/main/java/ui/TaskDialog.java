@@ -2,123 +2,117 @@ package ui;
 
 import model.Credential;
 import model.ScheduledTask;
+import model.ScheduledTask.*;
 import service.TransferService;
 import service.XmlStorageService;
 import util.MailFetchMode;
-import util.*;
-import model.ScheduledTask.*;
+
 import javax.swing.*;
-import javax.swing.SpinnerNumberModel;
 import javax.swing.border.EmptyBorder;
 import javax.swing.border.TitledBorder;
 import java.awt.*;
-import java.io.File;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.UUID;
 
 /**
  * Unified task dialog — used for both New Task and Edit Task.
- *
+ * <p>
  * Watcher + service integration changes:
- *
- *  FILE TRANSFER — REMOTE ONLY
- *  ────────────────────────────
- *  Local→local file transfers are not supported. Every FILE_TRANSFER task
- *  requires a resolved target credential (Target Credentials tab: host,
- *  username, password) and moves data over SFTP in both directions.
- *
- *  BACKUP — LOCAL OR REMOTE, EITHER SIDE
- *  ──────────────────────────────────────
- *  A Backup task's source and/or destination may each independently be a
- *  local folder or a REMOTE path reached over SFTP (checkbox + username,
- *  reusing the same creds_<username>.xml credential store as Target
- *  Credentials). Source and destination cannot both be remote at once.
- *
- *  WATCHER BASELINE ROW
- *  ────────────────────
- *  The baseline status row is now also tied to cbTransferMode: it is only shown
- *  when TransferMode == LATEST_ONLY (in addition to the watcher checkbox being
- *  checked), because the service is only used in that mode.
- *
- *  RESET BASELINE
- *  ──────────────
- *  Resets BOTH epoch and size (–1) on Save so the composite fingerprint is
- *  fully cleared.  Auto-resets also fire when:
- *    • The target folder path is changed.
- *    • The transfer direction is switched away from INBOUND.
- *    • TransferMode is changed away from LATEST_ONLY while the watcher is on.
+ * <p>
+ * FILE TRANSFER — REMOTE ONLY
+ * ────────────────────────────
+ * Local→local file transfers are not supported. Every FILE_TRANSFER task
+ * requires a resolved target credential (Target Credentials tab: host,
+ * username, password) and moves data over SFTP in both directions.
+ * <p>
+ * BACKUP — LOCAL OR REMOTE, EITHER SIDE
+ * ──────────────────────────────────────
+ * A Backup task's source and/or destination may each independently be a
+ * local folder or a REMOTE path reached over SFTP (checkbox + username,
+ * reusing the same creds_<username>.xml credential store as Target
+ * Credentials). Source and destination cannot both be remote at once.
+ * <p>
+ * WATCHER BASELINE ROW
+ * ────────────────────
+ * The baseline status row is now also tied to cbTransferMode: it is only shown
+ * when TransferMode == LATEST_ONLY (in addition to the watcher checkbox being
+ * checked), because the service is only used in that mode.
+ * <p>
+ * RESET BASELINE
+ * ──────────────
+ * Resets BOTH epoch and size (–1) on Save so the composite fingerprint is
+ * fully cleared.  Auto-resets also fire when:
+ * • The target folder path is changed.
+ * • The transfer direction is switched away from INBOUND.
+ * • TransferMode is changed away from LATEST_ONLY while the watcher is on.
  */
 public class TaskDialog extends JDialog {
 
     private final XmlStorageService storage;
     private final service.RunHistoryService auditLog; // nullable — see 4-arg constructor
+    private final java.util.List<JTextField> additionalDestFields = new java.util.ArrayList<>();
     private ScheduledTask result;
-
     // ── General ───────────────────────────────────────────────────────────────
-    private JPanel    general;
-    private JTextField  tfName;
+    private JPanel general;
+    private JTextField tfName;
     private JComboBox<String> cbTaskType;
-
     // ── Source system (auto-detected, editable) ───────────────────────────────
-    private JPanel    sourcePanel;
-    private JTextField  tfSourceHost;
-    private JTextField  tfSourceUser;
-    private JTextField  tfSourcePath;
-
+    private JPanel sourcePanel;
+    private JTextField tfSourceHost;
+    private JTextField tfSourceUser;
+    private JTextField tfSourcePath;
     // ── Target system credentials ─────────────────────────────────────────────
-    private JPanel    targetPanel;
+    private JPanel targetPanel;
     private JComboBox<String> cbTargetCredential;   // editable: pick a saved credential by name, or type a new name
-    private JTextField  tfTargetHost;
-    private JTextField  tfTargetUser;
+    private JTextField tfTargetHost;
+    private JTextField tfTargetUser;
     private JPasswordField pfTargetPass;
     private JComboBox<String> cbTargetOs;
-    private JSpinner  spinnerRetryCount;
-
+    private JSpinner spinnerRetryCount;
     // ── File transfer extras ──────────────────────────────────────────────────
     private JComboBox<String> cbTransferDirection;
     private JComboBox<String> cbTransferMode;
-    private JLabel      lblSourcePath;
-    private JLabel      lblTargetFolder;
-    private JTextField  tfTargetFolder;
-    private JPanel       additionalDestRowsContainer;
-    private final java.util.List<JTextField> additionalDestFields = new java.util.ArrayList<>();
-    private JLabel      lblAdditionalTargetFolders;
-    private JCheckBox   cbWatcherEnabled;
-    private JLabel      lblWatcherStatus;
-    private JButton     btnResetBaseline;
-    private JPanel      transferTab;
+    private JLabel lblSourcePath;
+    private JLabel lblTargetFolder;
+    private JTextField tfTargetFolder;
+    private JPanel additionalDestRowsContainer;
+    private JLabel lblAdditionalTargetFolders;
+    private JCheckBox cbWatcherEnabled;
+    private JLabel lblWatcherStatus;
+    private JButton btnResetBaseline;
+    private JPanel transferTab;
     // Watcher status row panel (made a field so visibility can be toggled reliably)
-    private JPanel      watcherStatusRow;
+    private JPanel watcherStatusRow;
 
     // ── Backup panel ──────────────────────────────────────────────────────────
-    private JTextField  tfBackupSourcePath;
-    private JTextField  tfBackupDestinationPath;
-    private JSpinner    spBackupRetentionDays;
-    private JCheckBox   cbBackupSourceRemote;
-    private JTextField  tfBackupSourceUsername;
-    private JCheckBox   cbBackupDestinationRemote;
-    private JTextField  tfBackupDestinationUsername;
+    private JTextField tfBackupSourcePath;
+    private JTextField tfBackupDestinationPath;
+    private JSpinner spBackupRetentionDays;
+    private JCheckBox cbBackupSourceRemote;
+    private JTextField tfBackupSourceUsername;
+    private JCheckBox cbBackupDestinationRemote;
+    private JTextField tfBackupDestinationUsername;
 
     // ── Outlook mail (Microsoft Graph) ─────────────────────────────────────────
-    private JPanel      mailPanel;
-    private JTextField  tfMailMailboxAddress;
-    private JTextField  tfMailTenantId;
-    private JTextField  tfMailClientId;
-    private JButton      btnAuthorizeMailbox;
-    private JLabel        lblMailAuthStatus;
-    private JTextField  tfImapFolder;
+    private JPanel mailPanel;
+    private JTextField tfMailMailboxAddress;
+    private JTextField tfMailTenantId;
+    private JTextField tfMailClientId;
+    private JButton btnAuthorizeMailbox;
+    private JLabel lblMailAuthStatus;
+    private JTextField tfImapFolder;
     private SearchCriteriaPanel pnlMailSearchCriteria;
     private JComboBox<String> cbMailFetchMode;
     private JComboBox<String> cbMailFetchScope;
     private JTextField tfMailMaxResults;
-    private JLabel   lblMailMaxResults;
+    private JLabel lblMailMaxResults;
 
     // ── Mail watcher (baseline = newest processed message's receivedDateTime) ──
     private JCheckBox cbMailWatcherEnabled;
-    private JLabel     lblMailWatcherStatus;
-    private JButton    btnResetMailBaseline;
-    private JPanel     mailWatcherStatusRow;
+    private JLabel lblMailWatcherStatus;
+    private JButton btnResetMailBaseline;
+    private JPanel mailWatcherStatusRow;
     private boolean mailWatcherEpochShouldReset = false;
 
     // ── Post-processing: mark as read / move to another folder ─────────────────
@@ -127,10 +121,10 @@ public class TaskDialog extends JDialog {
 
     // ── Schedule ──────────────────────────────────────────────────────────────
     private JComboBox<String> cbScheduleType;
-    private JTextField  tfScheduledAt;
-    private JTextField  tfInterval;
+    private JTextField tfScheduledAt;
+    private JTextField tfInterval;
     private JComboBox<String> cbDayOfWeek;
-    private JTextField  tfTime;
+    private JTextField tfTime;
 
     private JPanel fileTransferPanel;
     private FileSelectionPanel fileSelectionPanel;
@@ -144,17 +138,17 @@ public class TaskDialog extends JDialog {
     // Watcher checkbox lives in the dialog header (above the tabs) so it is the
     // first thing seen for a file-transfer task; the Schedule tab turns into
     // "Fallback Settings" while it is ticked.
-    private JPanel      watcherTopRow;
-    private JPanel      schedulePanel;
-    private JLabel      lblScheduleType;
-    private JLabel      lblScheduleFallbackNote;
+    private JPanel watcherTopRow;
+    private JPanel schedulePanel;
+    private JLabel lblScheduleType;
+    private JLabel lblScheduleFallbackNote;
 
     // ── Watcher epoch reset tracking ──────────────────────────────────────────
-    private boolean uiFullyLoaded            = false;
-    private boolean watcherEpochShouldReset  = false;
-    private String  originalTargetFolder     = "";
-    private String  originalTransferDirection = "OUTBOUND";
-    private String  originalTransferMode      = "ENTIRE_FOLDER";
+    private boolean uiFullyLoaded = false;
+    private boolean watcherEpochShouldReset = false;
+    private String originalTargetFolder = "";
+    private String originalTransferDirection = "OUTBOUND";
+    private String originalTransferMode = "ENTIRE_FOLDER";
 
     public TaskDialog(Frame parent, XmlStorageService storage, ScheduledTask existing) {
         this(parent, storage, existing, null);
@@ -169,7 +163,7 @@ public class TaskDialog extends JDialog {
      *                 event feed to log into.
      */
     public TaskDialog(Frame parent, XmlStorageService storage, ScheduledTask existing,
-            service.RunHistoryService auditLog) {
+                      service.RunHistoryService auditLog) {
         super(parent, existing == null ? "New Task" : "Edit Task", true);
         this.storage = storage;
         this.auditLog = auditLog;
@@ -186,12 +180,35 @@ public class TaskDialog extends JDialog {
         setLocationRelativeTo(parent);
     }
 
+    private static boolean sameFolder(String a, String b) {
+        if (a == null || b == null) return false;
+        String x = a.trim().replace('\\', '/').replaceAll("/+$", "");
+        String y = b.trim().replace('\\', '/').replaceAll("/+$", "");
+        return !x.isEmpty() && x.equalsIgnoreCase(y);
+    }
+
+    // ── Watcher baseline status label ─────────────────────────────────────────
+
+    /**
+     * "WINDOWS" or "LINUX" for whatever machine this app is currently running on.
+     */
+    private static String localOsType() {
+        String os = System.getProperty("os.name", "").toLowerCase();
+        return os.contains("win") ? "WINDOWS" : "LINUX";
+    }
+
+    // ── Visibility helpers ────────────────────────────────────────────────────
+
+    private static String nz(String s) {
+        return s == null ? "" : s;
+    }
+
     private void buildUI(ScheduledTask existing) {
-        originalTargetFolder      = existing != null && existing.getTargetPath() != null
+        originalTargetFolder = existing != null && existing.getTargetPath() != null
                 ? existing.getTargetPath() : "";
         originalTransferDirection = existing != null
                 ? existing.getTransferDirection().name() : "OUTBOUND";
-        originalTransferMode      = existing != null && existing.getTransferMode() != null
+        originalTransferMode = existing != null && existing.getTransferMode() != null
                 ? existing.getTransferMode().name() : "ENTIRE_FOLDER";
 
         JPanel main = new JPanel(new BorderLayout(0, 12));
@@ -229,17 +246,17 @@ public class TaskDialog extends JDialog {
         main.add(header, BorderLayout.NORTH);
 
         // ── General tab ───────────────────────────────────────────────────────
-        general    = titledPanel("General");
-        tfName     = makeField(new JTextField(existing != null ? existing.getName() : "", 28));
+        general = titledPanel("General");
+        tfName = makeField(new JTextField(existing != null ? existing.getName() : "", 28));
         cbTaskType = makeCombo(new JComboBox<>(new String[]{
                 "FILE_TRANSFER", "OUTLOOK_MAIL", "BACKUP", "FOLDER_WATCH"}));
         if (existing != null) cbTaskType.setSelectedItem(existing.getTaskType().name());
 
-        addRow(general, "Task Name *", tfName,     0);
+        addRow(general, "Task Name *", tfName, 0);
         addRow(general, "Task Type *", cbTaskType, 1);
 
         // ── Source system ─────────────────────────────────────────────────────
-        sourcePanel  = titledPanel("Source System  (auto-detected — editable if needed)");
+        sourcePanel = titledPanel("Source System  (auto-detected — editable if needed)");
         tfSourceHost = makeField(new JTextField(TransferService.getLocalHostname(), 28));
         tfSourceUser = makeField(new JTextField(TransferService.getLocalUsername(), 28));
         tfSourcePath = makeField(new JTextField(
@@ -248,8 +265,8 @@ public class TaskDialog extends JDialog {
         tfSourceHost.setForeground(UIManager.getColor("Label.disabledForeground"));
         tfSourceUser.setForeground(UIManager.getColor("Label.disabledForeground"));
 
-        addRow(sourcePanel, "Hostname / IP",             tfSourceHost, 0);
-        addRow(sourcePanel, "Username",                  tfSourceUser, 1);
+        addRow(sourcePanel, "Hostname / IP", tfSourceHost, 0);
+        addRow(sourcePanel, "Username", tfSourceUser, 1);
         addRow(sourcePanel, lblSourcePath = new JLabel(), withBrowseButton(tfSourcePath,
                 () -> browseLocal(tfSourcePath, "This Computer")), 2);
 
@@ -328,13 +345,13 @@ public class TaskDialog extends JDialog {
 
         lblTargetFolder = new JLabel();
 
-        addRow(fileTransferPanel, "Transfer Direction *",    cbTransferDirection,    0);
-        addRow(fileTransferPanel, "Transfer Mode *",         cbTransferMode,         1);
-        addRow(fileTransferPanel, lblTargetFolder,           withBrowseButton(tfTargetFolder, () ->
+        addRow(fileTransferPanel, "Transfer Direction *", cbTransferDirection, 0);
+        addRow(fileTransferPanel, "Transfer Mode *", cbTransferMode, 1);
+        addRow(fileTransferPanel, lblTargetFolder, withBrowseButton(tfTargetFolder, () ->
                 browseRemote(tfTargetFolder, tfTargetHost.getText().trim(), tfTargetUser.getText().trim(),
-                        new String(pfTargetPass.getPassword()), (String) cbTargetOs.getSelectedItem())),   2);
+                        new String(pfTargetPass.getPassword()), (String) cbTargetOs.getSelectedItem())), 2);
         addRow(fileTransferPanel, lblAdditionalTargetFolders, additionalDestinationsField, 4);
-        addRow(fileTransferPanel, "Watcher baseline",        watcherStatusRow,       7);
+        addRow(fileTransferPanel, "Watcher baseline", watcherStatusRow, 7);
 
         transferTab = new JPanel(new GridBagLayout());
         transferTab.setOpaque(false);
@@ -378,7 +395,7 @@ public class TaskDialog extends JDialog {
                 ? existing.getBackupRetentionDays() : 3;
         spBackupRetentionDays = new JSpinner(new SpinnerNumberModel(existingRetention, 1, 365, 1));
 
-        String existingSrcUser  = existing != null && existing.getBackupSourceUsername() != null
+        String existingSrcUser = existing != null && existing.getBackupSourceUsername() != null
                 ? existing.getBackupSourceUsername() : "";
         String existingDestUser = existing != null && existing.getBackupDestinationUsername() != null
                 ? existing.getBackupDestinationUsername() : "";
@@ -393,13 +410,13 @@ public class TaskDialog extends JDialog {
         tfBackupDestinationUsername.setEnabled(cbBackupDestinationRemote.isSelected());
         cbBackupDestinationRemote.addActionListener(e -> tfBackupDestinationUsername.setEnabled(cbBackupDestinationRemote.isSelected()));
 
-        addRow(backupPanel, "Source Folder *",      withBrowseButton(tfBackupSourcePath, () ->
+        addRow(backupPanel, "Source Folder *", withBrowseButton(tfBackupSourcePath, () ->
                 browseBackupSide(tfBackupSourcePath, cbBackupSourceRemote, tfBackupSourceUsername)), 0);
-        addRow(backupPanel, "",                     cbBackupSourceRemote, 1);
-        addRow(backupPanel, "Source Credential",    tfBackupSourceUsername, 2);
-        addRow(backupPanel, "Backup Folder *",      withBrowseButton(tfBackupDestinationPath, () ->
+        addRow(backupPanel, "", cbBackupSourceRemote, 1);
+        addRow(backupPanel, "Source Credential", tfBackupSourceUsername, 2);
+        addRow(backupPanel, "Backup Folder *", withBrowseButton(tfBackupDestinationPath, () ->
                 browseBackupSide(tfBackupDestinationPath, cbBackupDestinationRemote, tfBackupDestinationUsername)), 4);
-        addRow(backupPanel, "",                     cbBackupDestinationRemote, 5);
+        addRow(backupPanel, "", cbBackupDestinationRemote, 5);
         addRow(backupPanel, "Destination Credential", tfBackupDestinationUsername, 6);
         addRow(backupPanel, "Days to keep (D..) *", spBackupRetentionDays, 8);
 
@@ -420,15 +437,18 @@ public class TaskDialog extends JDialog {
         cbWatchChanged = new JCheckBox("Report changed files (size or modified time changed)", watchOpts.onChanged());
         addRow(watchPanel, "Folder to watch *", withBrowseButton(tfWatchPath, () ->
                 browseBackupSide(tfWatchPath, cbWatchRemote, tfWatchCredential)), 0);
-        addRow(watchPanel, "",                  cbWatchRemote, 1);
-        addRow(watchPanel, "Credential",        tfWatchCredential, 2);
-        addRow(watchPanel, "",                  cbWatchNew, 4);
-        addRow(watchPanel, "",                  cbWatchChanged, 5);
+        addRow(watchPanel, "", cbWatchRemote, 1);
+        addRow(watchPanel, "Credential", tfWatchCredential, 2);
+        addRow(watchPanel, "", cbWatchNew, 4);
+        addRow(watchPanel, "", cbWatchChanged, 5);
         JTextArea watchNote = new JTextArea("The first look only remembers the files already there. After that, every time the Schedule tab runs this task "
                 + "(try every 30\u201360 seconds) new and changed files are listed in the Event Monitor and can be sent to Teams "
                 + "(API \u2192 Teams alerts \u2192 Per task: choose \"Files detected\" / \"Files changed\"). "
                 + "Use the File Selection tab to watch only some names, wait until a file has stopped changing, and to be alerted when nothing new arrives for N minutes.");
-        watchNote.setEditable(false); watchNote.setOpaque(false); watchNote.setLineWrap(true); watchNote.setWrapStyleWord(true);
+        watchNote.setEditable(false);
+        watchNote.setOpaque(false);
+        watchNote.setLineWrap(true);
+        watchNote.setWrapStyleWord(true);
         watchNote.setForeground(UIManager.getColor("Label.disabledForeground"));
         addRow(watchPanel, "", watchNote, 7);
 
@@ -466,9 +486,17 @@ public class TaskDialog extends JDialog {
 
         btnAuthorizeMailbox.addActionListener(e -> onAuthorizeMailboxClicked());
         tfMailMailboxAddress.getDocument().addDocumentListener(new javax.swing.event.DocumentListener() {
-            public void insertUpdate (javax.swing.event.DocumentEvent e) { updateMailAuthStatus(); }
-            public void removeUpdate (javax.swing.event.DocumentEvent e) { updateMailAuthStatus(); }
-            public void changedUpdate(javax.swing.event.DocumentEvent e) { updateMailAuthStatus(); }
+            public void insertUpdate(javax.swing.event.DocumentEvent e) {
+                updateMailAuthStatus();
+            }
+
+            public void removeUpdate(javax.swing.event.DocumentEvent e) {
+                updateMailAuthStatus();
+            }
+
+            public void changedUpdate(javax.swing.event.DocumentEvent e) {
+                updateMailAuthStatus();
+            }
         });
 
         tfImapFolder = makeField(new JTextField(
@@ -481,9 +509,12 @@ public class TaskDialog extends JDialog {
             pnlMailSearchCriteria.setCriteria(existing.getMailSearchCriteria());
 
         GridBagConstraints gcCriteria = new GridBagConstraints();
-        gcCriteria.gridx = 0; gcCriteria.gridy = 8; gcCriteria.gridwidth = 2;
+        gcCriteria.gridx = 0;
+        gcCriteria.gridy = 8;
+        gcCriteria.gridwidth = 2;
         gcCriteria.fill = GridBagConstraints.BOTH;
-        gcCriteria.weightx = 1; gcCriteria.weighty = 1;
+        gcCriteria.weightx = 1;
+        gcCriteria.weighty = 1;
         gcCriteria.insets = new Insets(4, 4, 4, 4);
         mailPanel.add(pnlMailSearchCriteria, gcCriteria);
 
@@ -582,7 +613,7 @@ public class TaskDialog extends JDialog {
                 existingCred != null ? nz(existingCred.getUsername())
                         : (existingCredName != null ? existingCredName : ""), 28));
         pfTargetPass = makePasswordField(new JPasswordField(28));
-        cbTargetOs   = makeCombo(new JComboBox<>(new String[]{"WINDOWS", "LINUX"}));
+        cbTargetOs = makeCombo(new JComboBox<>(new String[]{"WINDOWS", "LINUX"}));
 
         if (existingCred != null) {
             pfTargetPass.setText(existingCred.getPassword() != null ? existingCred.getPassword() : "");
@@ -604,14 +635,17 @@ public class TaskDialog extends JDialog {
         };
         cbTargetCredential.addActionListener(e -> fillFromSaved.run());
         cbTargetCredential.getEditor().getEditorComponent().addFocusListener(new java.awt.event.FocusAdapter() {
-            @Override public void focusLost(java.awt.event.FocusEvent e) { fillFromSaved.run(); }
+            @Override
+            public void focusLost(java.awt.event.FocusEvent e) {
+                fillFromSaved.run();
+            }
         });
 
         addRow(targetPanel, "Credential name", cbTargetCredential, 0);
-        addRow(targetPanel, "Hostname / IP",   tfTargetHost, 1);
-        addRow(targetPanel, "Username",        tfTargetUser, 2);
-        addRow(targetPanel, "Password",        pfTargetPass, 3);
-        addRow(targetPanel, "OS Type",         cbTargetOs,   4);
+        addRow(targetPanel, "Hostname / IP", tfTargetHost, 1);
+        addRow(targetPanel, "Username", tfTargetUser, 2);
+        addRow(targetPanel, "Password", pfTargetPass, 3);
+        addRow(targetPanel, "OS Type", cbTargetOs, 4);
 
         JButton btnTestConnection = new JButton("Test Connection");
         btnTestConnection.setToolTipText("Opens a real SFTP session with the fields above to verify they work");
@@ -705,10 +739,10 @@ public class TaskDialog extends JDialog {
         scheduleDetailsPanel = new JPanel(new GridBagLayout());
         tfScheduledAt = makeField(new JTextField(LocalDateTime.now().plusMinutes(5)
                 .format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")), 18));
-        tfInterval    = makeField(new JTextField("30", 6));
-        cbDayOfWeek   = makeCombo(new JComboBox<>(new String[]{
-                "MONDAY","TUESDAY","WEDNESDAY","THURSDAY","FRIDAY","SATURDAY","SUNDAY"}));
-        tfTime        = makeField(new JTextField("09:00", 8));
+        tfInterval = makeField(new JTextField("30", 6));
+        cbDayOfWeek = makeCombo(new JComboBox<>(new String[]{
+                "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY"}));
+        tfTime = makeField(new JTextField("09:00", 8));
 
         if (existing != null) {
             if (existing.getScheduledAt() != null)
@@ -740,8 +774,11 @@ public class TaskDialog extends JDialog {
         lblScheduleFallbackNote.setFont(lblScheduleFallbackNote.getFont().deriveFont(Font.PLAIN, 11f));
         lblScheduleFallbackNote.setForeground(UIManager.getColor("Label.disabledForeground"));
         GridBagConstraints ngc = new GridBagConstraints();
-        ngc.gridx = 0; ngc.gridy = 0; ngc.gridwidth = 2;
-        ngc.fill = GridBagConstraints.HORIZONTAL; ngc.weightx = 1;
+        ngc.gridx = 0;
+        ngc.gridy = 0;
+        ngc.gridwidth = 2;
+        ngc.fill = GridBagConstraints.HORIZONTAL;
+        ngc.weightx = 1;
         ngc.anchor = GridBagConstraints.NORTHWEST;
         ngc.insets = new Insets(0, 4, 8, 4);
         sched.add(lblScheduleFallbackNote, ngc);
@@ -750,8 +787,11 @@ public class TaskDialog extends JDialog {
         lblScheduleType = new JLabel("Schedule Type *");
         addRow(sched, lblScheduleType, cbScheduleType, 1);
         GridBagConstraints gc = new GridBagConstraints();
-        gc.gridx = 0; gc.gridy = 2; gc.gridwidth = 2;
-        gc.fill = GridBagConstraints.HORIZONTAL; gc.weightx = 1;
+        gc.gridx = 0;
+        gc.gridy = 2;
+        gc.gridwidth = 2;
+        gc.fill = GridBagConstraints.HORIZONTAL;
+        gc.weightx = 1;
         gc.insets = new Insets(4, 4, 4, 4);
         sched.add(scheduleDetailsPanel, gc);
 
@@ -759,25 +799,25 @@ public class TaskDialog extends JDialog {
         // Anchor every GridBagLayout tab's content to the top — see anchorTop()'s
         // javadoc for why this matters (short tabs like General otherwise render
         // with their fields vertically centered out of the visible viewport).
-        anchorTop(general,     2);
+        anchorTop(general, 2);
         anchorTop(backupPanel, 11);
-        anchorTop(watchPanel,  9);
+        anchorTop(watchPanel, 9);
         anchorTop(targetPanel, 6);
-        anchorTop(mailPanel,   23);
-        anchorTop(sched,       3);
-        anchorTop(retryPanel,  2);
+        anchorTop(mailPanel, 23);
+        anchorTop(sched, 3);
+        anchorTop(retryPanel, 2);
 
         tabbedPane = new JTabbedPane(JTabbedPane.TOP);
         tabbedPane.setFont(tabbedPane.getFont().deriveFont(Font.PLAIN, 12f));
-        tabbedPane.addTab("General",        general);
-        tabbedPane.addTab("Target",         targetPanel);
-        tabbedPane.addTab("Transfer",       transferTab);
+        tabbedPane.addTab("General", general);
+        tabbedPane.addTab("Target", targetPanel);
+        tabbedPane.addTab("Transfer", transferTab);
         tabbedPane.addTab("File Selection", selectionTab);
-        tabbedPane.addTab("Backup",         backupPanel);
-        tabbedPane.addTab("Watch folder",   watchPanel);
-        tabbedPane.addTab("Mail/IMAP",      mailPanel);
-        tabbedPane.addTab("Schedule",  sched);
-        tabbedPane.addTab("Retry",     retryPanel);
+        tabbedPane.addTab("Backup", backupPanel);
+        tabbedPane.addTab("Watch folder", watchPanel);
+        tabbedPane.addTab("Mail/IMAP", mailPanel);
+        tabbedPane.addTab("Schedule", sched);
+        tabbedPane.addTab("Retry", retryPanel);
 
         main.add(tabbedPane, BorderLayout.CENTER);
 
@@ -818,9 +858,17 @@ public class TaskDialog extends JDialog {
         cbScheduleType.addActionListener(e -> updateScheduleDetails());
 
         tfTargetFolder.getDocument().addDocumentListener(new javax.swing.event.DocumentListener() {
-            public void insertUpdate (javax.swing.event.DocumentEvent e) { checkTargetFolderChanged(existing); }
-            public void removeUpdate (javax.swing.event.DocumentEvent e) { checkTargetFolderChanged(existing); }
-            public void changedUpdate(javax.swing.event.DocumentEvent e) { checkTargetFolderChanged(existing); }
+            public void insertUpdate(javax.swing.event.DocumentEvent e) {
+                checkTargetFolderChanged(existing);
+            }
+
+            public void removeUpdate(javax.swing.event.DocumentEvent e) {
+                checkTargetFolderChanged(existing);
+            }
+
+            public void changedUpdate(javax.swing.event.DocumentEvent e) {
+                checkTargetFolderChanged(existing);
+            }
         });
 
         updateTransferDirectionLabels();
@@ -847,7 +895,7 @@ public class TaskDialog extends JDialog {
         add(scroll, BorderLayout.CENTER);
 
         // ── Buttons ───────────────────────────────────────────────────────────
-        JButton btnSave   = new GradientButton(existing == null ? "Create Task" : "Save Changes");
+        JButton btnSave = new GradientButton(existing == null ? "Create Task" : "Save Changes");
         JButton btnCancel = new JButton("Cancel");
         styleBtn(btnSave, AppTheme.EARTH_SIENNA);
         btnCancel.addActionListener(e -> dispose());
@@ -860,25 +908,23 @@ public class TaskDialog extends JDialog {
         add(btnRow, BorderLayout.SOUTH);
     }
 
-    // ── Watcher baseline status label ─────────────────────────────────────────
-
     /**
      * Populates lblWatcherStatus and btnResetBaseline visibility based on the
      * task's stored fingerprint (epoch + size).
-     *
+     * <p>
      * States
      * ──────
      * No existing task / first run (epoch == 0):
-     *   Grey italic — "No baseline stored — first run will always transfer."
-     *   Reset button hidden.
-     *
+     * Grey italic — "No baseline stored — first run will always transfer."
+     * Reset button hidden.
+     * <p>
      * Baseline present, size tracked (size >= 0):
-     *   Green italic — "Last seen: YYYY-MM-DD HH:mm:ss | size: N bytes"
-     *   Reset button visible.
-     *
+     * Green italic — "Last seen: YYYY-MM-DD HH:mm:ss | size: N bytes"
+     * Reset button visible.
+     * <p>
      * Baseline present, size not tracked (size == -1, legacy):
-     *   Amber italic — warns the operator that the size signal is missing.
-     *   Reset button visible.
+     * Amber italic — warns the operator that the size signal is missing.
+     * Reset button visible.
      */
     private void refreshWatcherStatusLabel(ScheduledTask existing) {
         if (existing == null || existing.getLastKnownRemoteFileEpoch() <= 0) {
@@ -889,7 +935,7 @@ public class TaskDialog extends JDialog {
         }
 
         long epoch = existing.getLastKnownRemoteFileEpoch();
-        long size  = existing.getLastKnownRemoteFileSize();
+        long size = existing.getLastKnownRemoteFileSize();
 
         String dateStr = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
                 .format(new java.util.Date(epoch));
@@ -898,10 +944,10 @@ public class TaskDialog extends JDialog {
         String color;
         if (size < 0) {
             sizeStr = "not tracked — size check always passes (legacy; reset baseline to fix)";
-            color   = "#E65100";
+            color = "#E65100";
         } else {
             sizeStr = String.format("%,d bytes", size);
-            color   = "#2E7D32";
+            color = "#2E7D32";
         }
 
         lblWatcherStatus.setText(String.format(
@@ -911,24 +957,25 @@ public class TaskDialog extends JDialog {
         if (btnResetBaseline != null) btnResetBaseline.setVisible(true);
     }
 
-    // ── Visibility helpers ────────────────────────────────────────────────────
-
     private void updateVisibility() {
-        String type        = (String) cbTaskType.getSelectedItem();
+        String type = (String) cbTaskType.getSelectedItem();
         boolean isTransfer = "FILE_TRANSFER".equals(type);
-        boolean isMail     = "OUTLOOK_MAIL".equals(type);
-        boolean isBackup   = "BACKUP".equals(type);
-        boolean isWatch    = "FOLDER_WATCH".equals(type);
+        boolean isMail = "OUTLOOK_MAIL".equals(type);
+        boolean isBackup = "BACKUP".equals(type);
+        boolean isWatch = "FOLDER_WATCH".equals(type);
 
-        enableTabIfPresent(transferTab,   isTransfer);
-        enableTabIfPresent(selectionTab,  isTransfer || isWatch);
-        enableTabIfPresent(backupPanel,   isBackup);
-        enableTabIfPresent(watchPanel,    isWatch);
+        enableTabIfPresent(transferTab, isTransfer);
+        enableTabIfPresent(selectionTab, isTransfer || isWatch);
+        enableTabIfPresent(backupPanel, isBackup);
+        enableTabIfPresent(watchPanel, isWatch);
         if (fileSelectionPanel != null) {
             fileSelectionPanel.setWatchMode(isWatch);
-            if (isWatch) { fileSelectionPanel.setTransferMode("ENTIRE_FOLDER"); fileSelectionPanel.setWatcherActive(false); }
+            if (isWatch) {
+                fileSelectionPanel.setTransferMode("ENTIRE_FOLDER");
+                fileSelectionPanel.setWatcherActive(false);
+            }
         }
-        enableTabIfPresent(mailPanel,     isMail);
+        enableTabIfPresent(mailPanel, isMail);
 
         // Watcher checkbox (header) only applies to file transfers; mail has its
         // own incremental-fetch checkbox and backup has none.
@@ -946,20 +993,16 @@ public class TaskDialog extends JDialog {
             tabbedPane.repaint();
         }
         updateTransferTabVisibility();
-        revalidate(); repaint();
+        revalidate();
+        repaint();
     }
 
-    /** The watcher only works in LATEST_ONLY; then it replaces the pick and the sent-files memory. */
+    /**
+     * The watcher only works in LATEST_ONLY; then it replaces the pick and the sent-files memory.
+     */
     private void updateSelectionForWatcher() {
         fileSelectionPanel.setWatcherActive(cbWatcherEnabled.isSelected()
                 && "LATEST_ONLY".equals(cbTransferMode.getSelectedItem()));
-    }
-
-    private static boolean sameFolder(String a, String b) {
-        if (a == null || b == null) return false;
-        String x = a.trim().replace('\\', '/').replaceAll("/+$", "");
-        String y = b.trim().replace('\\', '/').replaceAll("/+$", "");
-        return !x.isEmpty() && x.equalsIgnoreCase(y);
     }
 
     private void updateTransferDirectionLabels() {
@@ -978,26 +1021,30 @@ public class TaskDialog extends JDialog {
         // copies the downloaded file to additional local folders.
         lblAdditionalTargetFolders.setText(inbound ? "Additional local destinations" : "Additional destinations");
 
-        transferTab.revalidate(); transferTab.repaint();
-        revalidate(); repaint();
+        transferTab.revalidate();
+        transferTab.repaint();
+        revalidate();
+        repaint();
     }
 
     /**
      * Shows/hides watcher-related fields based on:
-     *   • Whether the watcher checkbox is checked (spinners, info text).
-     *   • Whether TransferMode is LATEST_ONLY (baseline row — service only runs in this mode).
+     * • Whether the watcher checkbox is checked (spinners, info text).
+     * • Whether TransferMode is LATEST_ONLY (baseline row — service only runs in this mode).
      */
     private void updateWatcherFieldsVisibility() {
-        boolean watcherOn  = cbWatcherEnabled.isSelected();
+        boolean watcherOn = cbWatcherEnabled.isSelected();
         boolean latestOnly = "LATEST_ONLY".equals(cbTransferMode.getSelectedItem());
 
         boolean showBaseline = watcherOn && latestOnly;
         if (watcherStatusRow != null) watcherStatusRow.setVisible(showBaseline);
-        if (lblWatcherStatus  != null) lblWatcherStatus.setVisible(showBaseline);
-        if (btnResetBaseline  != null) btnResetBaseline.setVisible(showBaseline && !watcherEpochShouldReset);
+        if (lblWatcherStatus != null) lblWatcherStatus.setVisible(showBaseline);
+        if (btnResetBaseline != null) btnResetBaseline.setVisible(showBaseline && !watcherEpochShouldReset);
 
-        transferTab.revalidate(); transferTab.repaint();
-        revalidate(); repaint();
+        transferTab.revalidate();
+        transferTab.repaint();
+        revalidate();
+        repaint();
     }
 
     /**
@@ -1035,7 +1082,10 @@ public class TaskDialog extends JDialog {
         if (!uiFullyLoaded || !cbWatcherEnabled.isSelected()) return;
         if (!"RUN_NOW".equals(cbScheduleType.getSelectedItem())) return;
         int current = 0;
-        try { current = Integer.parseInt(tfInterval.getText().trim()); } catch (NumberFormatException ignored) {}
+        try {
+            current = Integer.parseInt(tfInterval.getText().trim());
+        } catch (NumberFormatException ignored) {
+        }
         if (current <= 0) tfInterval.setText("5");
         cbScheduleType.setSelectedItem("INTERVAL_MINUTES");   // fires updateScheduleDetails()
     }
@@ -1053,8 +1103,8 @@ public class TaskDialog extends JDialog {
                 addRowTo(scheduleDetailsPanel, "Time (HH:mm) *", tfTime, 0);
                 break;
             case "WEEKLY":
-                addRowTo(scheduleDetailsPanel, "Day *",          cbDayOfWeek, 0);
-                addRowTo(scheduleDetailsPanel, "Time (HH:mm) *", tfTime,      1);
+                addRowTo(scheduleDetailsPanel, "Day *", cbDayOfWeek, 0);
+                addRowTo(scheduleDetailsPanel, "Time (HH:mm) *", tfTime, 1);
                 break;
             case "INTERVAL_MINUTES":
                 addRowTo(scheduleDetailsPanel, "Every N minutes *", tfInterval, 0);
@@ -1077,7 +1127,7 @@ public class TaskDialog extends JDialog {
     private void updateTransferTabVisibility() {
         if (tabbedPane == null) return;
         boolean isBackup = "BACKUP".equals(cbTaskType.getSelectedItem());
-        boolean isWatch  = "FOLDER_WATCH".equals(cbTaskType.getSelectedItem());
+        boolean isWatch = "FOLDER_WATCH".equals(cbTaskType.getSelectedItem());
         enableTabIfPresent(targetPanel, !isBackup && !isWatch);
         if ((isBackup || isWatch) && tabbedPane.getSelectedComponent() == targetPanel) {
             tabbedPane.setSelectedComponent(isWatch ? watchPanel : backupPanel);
@@ -1093,12 +1143,21 @@ public class TaskDialog extends JDialog {
         boolean isMail = "OUTLOOK_MAIL".equals(cbTaskType.getSelectedItem());
         if (targetPanel != null && tabbedPane != null)
             enableTabIfPresent(targetPanel, !isMail && !"FOLDER_WATCH".equals(cbTaskType.getSelectedItem()));
-        if (tabbedPane != null) { tabbedPane.revalidate(); tabbedPane.repaint(); }
-        if (targetPanel != null) { targetPanel.revalidate(); targetPanel.repaint(); }
-        revalidate(); repaint();
+        if (tabbedPane != null) {
+            tabbedPane.revalidate();
+            tabbedPane.repaint();
+        }
+        if (targetPanel != null) {
+            targetPanel.revalidate();
+            targetPanel.repaint();
+        }
+        revalidate();
+        repaint();
     }
 
-    /** Max Messages only matters when fetching everything that matches, or when the watcher is on. */
+    /**
+     * Max Messages only matters when fetching everything that matches, or when the watcher is on.
+     */
     private void updateMailFetchScopeVisibility() {
         boolean watcherOn = cbMailWatcherEnabled != null && cbMailWatcherEnabled.isSelected();
         boolean isAll = "ALL_MATCHING".equals(cbMailFetchScope.getSelectedItem());
@@ -1108,7 +1167,6 @@ public class TaskDialog extends JDialog {
         mailPanel.revalidate();
         mailPanel.repaint();
     }
-
 
     /**
      * Populates lblMailWatcherStatus / btnResetMailBaseline based on the task's
@@ -1128,7 +1186,11 @@ public class TaskDialog extends JDialog {
         if (btnResetMailBaseline != null) btnResetMailBaseline.setVisible(true);
     }
 
-    /** Reflects whether the entered mailbox is already authorized (cached refresh token present). */
+    // ── Watcher epoch reset helpers ───────────────────────────────────────────
+
+    /**
+     * Reflects whether the entered mailbox is already authorized (cached refresh token present).
+     */
     private void updateMailAuthStatus() {
         if (lblMailAuthStatus == null) return;
         String mailbox = tfMailMailboxAddress.getText().trim();
@@ -1142,22 +1204,31 @@ public class TaskDialog extends JDialog {
                 : "<html><span style='color:#E65100'>Not authorized yet</span></html>");
     }
 
-    /** Runs the OAuth2 device-code enrollment in the background and shows the sign-in prompt. */
+    /**
+     * Runs the OAuth2 device-code enrollment in the background and shows the sign-in prompt.
+     */
     private void onAuthorizeMailboxClicked() {
-        String mailbox  = tfMailMailboxAddress.getText().trim();
+        String mailbox = tfMailMailboxAddress.getText().trim();
         String tenantId = tfMailTenantId.getText().trim();
         String clientId = tfMailClientId.getText().trim();
 
-        if (mailbox.isEmpty())  { msg("Enter the mailbox address first.");        return; }
-        if (tenantId.isEmpty()) { msg("Enter the Azure AD Tenant ID first (or \"common\")."); return; }
-        if (clientId.isEmpty()) { msg("Enter the Azure AD Client ID first — see README \u201cOutlook Mail setup\u201d."); return; }
+        if (mailbox.isEmpty()) {
+            msg("Enter the mailbox address first.");
+            return;
+        }
+        if (tenantId.isEmpty()) {
+            msg("Enter the Azure AD Tenant ID first (or \"common\").");
+            return;
+        }
+        if (clientId.isEmpty()) {
+            msg("Enter the Azure AD Client ID first — see README \u201cOutlook Mail setup\u201d.");
+            return;
+        }
 
         new OAuthAuthorizeDialog((Frame) getOwner(), mailbox, tenantId, clientId,
                 storage.getDataDir(), success -> updateMailAuthStatus())
                 .setVisible(true);
     }
-
-    // ── Watcher epoch reset helpers ───────────────────────────────────────────
 
     private void checkTargetFolderChanged(ScheduledTask existing) {
         if (!uiFullyLoaded) return;
@@ -1175,6 +1246,8 @@ public class TaskDialog extends JDialog {
         if (!uiFullyLoaded || existing == null) return;
     }
 
+    // ── Save ──────────────────────────────────────────────────────────────────
+
     /**
      * Resets the baseline when the operator changes transfer mode away from
      * LATEST_ONLY while the watcher is enabled, because the service will not
@@ -1189,7 +1262,9 @@ public class TaskDialog extends JDialog {
         }
     }
 
-    /** Marks the baseline for reset and optionally updates the status label. */
+    /**
+     * Marks the baseline for reset and optionally updates the status label.
+     */
     private void triggerBaselineReset(String uiMessage) {
         watcherEpochShouldReset = true;
         if (uiMessage != null && lblWatcherStatus != null) {
@@ -1199,18 +1274,21 @@ public class TaskDialog extends JDialog {
         if (btnResetBaseline != null) btnResetBaseline.setEnabled(false);
     }
 
-    // ── Save ──────────────────────────────────────────────────────────────────
+    // ── Directory browsing ──────────────────────────────────────────────────
 
     private void save(ScheduledTask existing) {
         // ── Validate ──────────────────────────────────────────────────────────
         String name = tfName.getText().trim();
-        if (name.isEmpty()) { msg("Task name is required."); return; }
+        if (name.isEmpty()) {
+            msg("Task name is required.");
+            return;
+        }
 
-        boolean isTransfer  = "FILE_TRANSFER".equals(cbTaskType.getSelectedItem());
-        boolean isMail      = "OUTLOOK_MAIL".equals(cbTaskType.getSelectedItem());
+        boolean isTransfer = "FILE_TRANSFER".equals(cbTaskType.getSelectedItem());
+        boolean isMail = "OUTLOOK_MAIL".equals(cbTaskType.getSelectedItem());
 
-        boolean isBackup    = "BACKUP".equals(cbTaskType.getSelectedItem());
-        boolean isWatch     = "FOLDER_WATCH".equals(cbTaskType.getSelectedItem());
+        boolean isBackup = "BACKUP".equals(cbTaskType.getSelectedItem());
+        boolean isWatch = "FOLDER_WATCH".equals(cbTaskType.getSelectedItem());
 
         String targetHost = tfTargetHost.getText().trim();
         String targetUser = tfTargetUser.getText().trim();
@@ -1219,9 +1297,18 @@ public class TaskDialog extends JDialog {
         // Mail and Backup tasks don't use the SFTP-style target credential.
         // Every FILE_TRANSFER task requires one — local→local is not supported.
         if (!isMail && !isBackup && !isWatch) {
-            if (targetHost.isEmpty()) { msg("Target hostname / IP is required."); return; }
-            if (targetUser.isEmpty()) { msg("Target username is required.");       return; }
-            if (targetPass.isEmpty()) { msg("Target password is required.");       return; }
+            if (targetHost.isEmpty()) {
+                msg("Target hostname / IP is required.");
+                return;
+            }
+            if (targetUser.isEmpty()) {
+                msg("Target username is required.");
+                return;
+            }
+            if (targetPass.isEmpty()) {
+                msg("Target password is required.");
+                return;
+            }
         }
 
         if (isTransfer) {
@@ -1287,28 +1374,43 @@ public class TaskDialog extends JDialog {
             }
 
         } else if (isMail) {
-            String mailbox  = tfMailMailboxAddress.getText().trim();
+            String mailbox = tfMailMailboxAddress.getText().trim();
             String tenantId = tfMailTenantId.getText().trim();
             String clientId = tfMailClientId.getText().trim();
-            if (mailbox.isEmpty())  { msg("Mailbox address is required.");        return; }
-            if (tenantId.isEmpty()) { msg("Azure AD Tenant ID is required (or \"common\")."); return; }
-            if (clientId.isEmpty()) { msg("Azure AD Client ID is required — see README \u201cOutlook Mail setup\u201d."); return; }
-            if (tfImapFolder.getText().trim().isEmpty()) { msg("Mail folder is required."); return; }
+            if (mailbox.isEmpty()) {
+                msg("Mailbox address is required.");
+                return;
+            }
+            if (tenantId.isEmpty()) {
+                msg("Azure AD Tenant ID is required (or \"common\").");
+                return;
+            }
+            if (clientId.isEmpty()) {
+                msg("Azure AD Client ID is required — see README \u201cOutlook Mail setup\u201d.");
+                return;
+            }
+            if (tfImapFolder.getText().trim().isEmpty()) {
+                msg("Mail folder is required.");
+                return;
+            }
             if (tfMailOutputFolder.getText().trim().isEmpty()) {
                 msg("Output Folder is required — each fetched message is written there as a .RCV file.");
                 return;
             }
             if (pnlMailSearchCriteria.getCriteria().trim().isEmpty()) {
-                msg("Search criteria is required."); return;
+                msg("Search criteria is required.");
+                return;
             }
             int mailMaxResults;
             try {
                 mailMaxResults = Integer.parseInt(tfMailMaxResults.getText().trim());
             } catch (NumberFormatException nfe) {
-                msg("Max Messages must be a whole number."); return;
+                msg("Max Messages must be a whole number.");
+                return;
             }
             if (mailMaxResults < 1 || mailMaxResults > 5000) {
-                msg("Max Messages must be between 1 and 5000."); return;
+                msg("Max Messages must be between 1 and 5000.");
+                return;
             }
             if (!new service.OAuth2TokenService().isEnrolled(mailbox)) {
                 int choice = JOptionPane.showConfirmDialog(this,
@@ -1319,12 +1421,17 @@ public class TaskDialog extends JDialog {
                 if (choice != JOptionPane.YES_OPTION) return;
             }
         } else if (isWatch) {
-            if (tfWatchPath.getText().trim().isEmpty()) { msg("The folder to watch is required."); return; }
+            if (tfWatchPath.getText().trim().isEmpty()) {
+                msg("The folder to watch is required.");
+                return;
+            }
             if (cbWatchRemote.isSelected() && tfWatchCredential.getText().trim().isEmpty()) {
-                msg("Credential (the name of a saved credential) is required when the folder is on a server."); return;
+                msg("Credential (the name of a saved credential) is required when the folder is on a server.");
+                return;
             }
             if (!cbWatchNew.isSelected() && !cbWatchChanged.isSelected()) {
-                msg("Choose what to report: new files, changed files, or both."); return;
+                msg("Choose what to report: new files, changed files, or both.");
+                return;
             }
             java.util.List<String> watchProblems = fileSelectionPanel.validateInput();
             if (!watchProblems.isEmpty()) {
@@ -1332,19 +1439,27 @@ public class TaskDialog extends JDialog {
                 return;
             }
         } else if (isBackup) {
-            if (tfBackupSourcePath.getText().trim().isEmpty()) { msg("Backup source folder is required."); return; }
-            if (tfBackupDestinationPath.getText().trim().isEmpty()) { msg("Backup destination folder is required."); return; }
-            boolean srcRemote  = cbBackupSourceRemote.isSelected();
+            if (tfBackupSourcePath.getText().trim().isEmpty()) {
+                msg("Backup source folder is required.");
+                return;
+            }
+            if (tfBackupDestinationPath.getText().trim().isEmpty()) {
+                msg("Backup destination folder is required.");
+                return;
+            }
+            boolean srcRemote = cbBackupSourceRemote.isSelected();
             boolean destRemote = cbBackupDestinationRemote.isSelected();
             if (srcRemote && destRemote) {
                 msg("Backup source and destination cannot both be remote — make one side local.");
                 return;
             }
             if (srcRemote && tfBackupSourceUsername.getText().trim().isEmpty()) {
-                msg("Source Credential (the name of a saved credential) is required when 'Source is remote' is checked."); return;
+                msg("Source Credential (the name of a saved credential) is required when 'Source is remote' is checked.");
+                return;
             }
             if (destRemote && tfBackupDestinationUsername.getText().trim().isEmpty()) {
-                msg("Destination Credential (the name of a saved credential) is required when 'Destination is remote' is checked."); return;
+                msg("Destination Credential (the name of a saved credential) is required when 'Destination is remote' is checked.");
+                return;
             }
         }
 
@@ -1551,11 +1666,13 @@ public class TaskDialog extends JDialog {
         dispose();
     }
 
-    public ScheduledTask getResult() { return result; }
+    public ScheduledTask getResult() {
+        return result;
+    }
 
-    // ── Directory browsing ──────────────────────────────────────────────────
-
-    /** Wraps a path field with a small "..." button that opens the folder browser. */
+    /**
+     * Wraps a path field with a small "..." button that opens the folder browser.
+     */
     private JPanel withBrowseButton(JTextField field, Runnable onBrowse) {
         JPanel row = new JPanel(new BorderLayout(6, 0));
         row.setOpaque(false);
@@ -1568,13 +1685,9 @@ public class TaskDialog extends JDialog {
         return row;
     }
 
-    /** "WINDOWS" or "LINUX" for whatever machine this app is currently running on. */
-    private static String localOsType() {
-        String os = System.getProperty("os.name", "").toLowerCase();
-        return os.contains("win") ? "WINDOWS" : "LINUX";
-    }
-
-    /** Opens the browser against the local filesystem this app is running on. */
+    /**
+     * Opens the browser against the local filesystem this app is running on.
+     */
     private void browseLocal(JTextField field, String label) {
         String selected = DirectoryBrowserDialog.show(this, label, localOsType(),
                 new DirectoryBrowserDialog.LocalProvider(field.getText().trim()));
@@ -1610,7 +1723,8 @@ public class TaskDialog extends JDialog {
         final Exception[] failure = new Exception[1];
 
         SwingWorker<Void, Void> connector = new SwingWorker<Void, Void>() {
-            @Override protected Void doInBackground() {
+            @Override
+            protected Void doInBackground() {
                 try {
                     connection[0] = service.SftpBrowseService.connect(host, username, password);
                 } catch (Exception ex) {
@@ -1618,7 +1732,9 @@ public class TaskDialog extends JDialog {
                 }
                 return null;
             }
-            @Override protected void done() {
+
+            @Override
+            protected void done() {
                 wait.dispose();
             }
         };
@@ -1638,7 +1754,11 @@ public class TaskDialog extends JDialog {
         if (selected != null) field.setText(selected);
     }
 
-    /** Backup source/destination fields are local or remote depending on their checkbox; resolves the right one. */
+    // ── Layout helpers ────────────────────────────────────────────────────────
+
+    /**
+     * Backup source/destination fields are local or remote depending on their checkbox; resolves the right one.
+     */
     private void browseBackupSide(JTextField field, JCheckBox remoteCheckbox, JTextField usernameField) {
         if (!remoteCheckbox.isSelected()) {
             browseLocal(field, "This Computer");
@@ -1662,8 +1782,6 @@ public class TaskDialog extends JDialog {
         }
         browseRemote(field, cred.getHost(), cred.getUsername(), cred.getPassword(), cred.getOsType());
     }
-
-    // ── Layout helpers ────────────────────────────────────────────────────────
 
     private JPanel titledPanel(String title) {
         JPanel p = new JPanel(new GridBagLayout()) {
@@ -1745,7 +1863,9 @@ public class TaskDialog extends JDialog {
         return wrapper;
     }
 
-    /** Appends one destination row (text field + "−" remove button) to additionalDestRowsContainer. */
+    /**
+     * Appends one destination row (text field + "−" remove button) to additionalDestRowsContainer.
+     */
     private void addAdditionalDestinationRow(String initialValue) {
         JPanel row = new JPanel(new BorderLayout(6, 0));
         row.setOpaque(false);
@@ -1774,7 +1894,7 @@ public class TaskDialog extends JDialog {
 
     /**
      * Re-lays-out the destination rows after one is added or removed.
-     *
+     * <p>
      * This intentionally does NOT call pack() on the dialog. The dialog's
      * content sits inside a JScrollPane with a fixed preferred size (see
      * buildUI), so extra rows scroll into view instead of resizing the
@@ -1794,8 +1914,6 @@ public class TaskDialog extends JDialog {
         return field;
     }
 
-    private static String nz(String s) { return s == null ? "" : s; }
-
     /**
      * A saved credential is shared by name: changing its server or login changes it for every task that uses it.
      * When that would affect other tasks, asks first. Returns false if the operator chose to go back.
@@ -1813,7 +1931,9 @@ public class TaskDialog extends JDialog {
         return answer == JOptionPane.YES_OPTION;
     }
 
-    /** The credential name the operator chose or typed; empty becomes {@code username@host}. */
+    /**
+     * The credential name the operator chose or typed; empty becomes {@code username@host}.
+     */
     private String targetCredentialName() {
         Object item = cbTargetCredential.getEditor().getItem();
         String typed = item == null ? "" : item.toString().trim();
@@ -1832,7 +1952,8 @@ public class TaskDialog extends JDialog {
 
     private GridBagConstraints labelGbc(int row) {
         GridBagConstraints c = new GridBagConstraints();
-        c.gridx = 0; c.gridy = row;
+        c.gridx = 0;
+        c.gridy = row;
         c.anchor = GridBagConstraints.WEST;
         c.insets = new Insets(4, 4, 4, 8);
         return c;
@@ -1840,7 +1961,8 @@ public class TaskDialog extends JDialog {
 
     private GridBagConstraints fieldGbc(int row) {
         GridBagConstraints c = new GridBagConstraints();
-        c.gridx = 1; c.gridy = row;
+        c.gridx = 1;
+        c.gridy = row;
         c.fill = GridBagConstraints.HORIZONTAL;
         c.weightx = 1;
         c.insets = new Insets(4, 0, 4, 4);
@@ -1862,15 +1984,19 @@ public class TaskDialog extends JDialog {
      */
     private void anchorTop(JPanel panel, int afterRow) {
         GridBagConstraints gc = new GridBagConstraints();
-        gc.gridx = 0; gc.gridy = afterRow; gc.gridwidth = 2;
+        gc.gridx = 0;
+        gc.gridy = afterRow;
+        gc.gridwidth = 2;
         gc.weighty = 1.0;
         gc.fill = GridBagConstraints.BOTH;
         panel.add(Box.createGlue(), gc);
     }
 
     private void styleBtn(JButton b, Color bg) {
-        b.setBackground(bg); b.setForeground(Color.WHITE);
-        b.setFocusPainted(false); b.setBorderPainted(false);
+        b.setBackground(bg);
+        b.setForeground(Color.WHITE);
+        b.setFocusPainted(false);
+        b.setBorderPainted(false);
     }
 
     /**
@@ -1896,11 +2022,13 @@ public class TaskDialog extends JDialog {
         });
     }
 
-    /** Same as {@link #logActivity} but marks the event FAILED, so it renders
-     *  as a failure (red, "Failed: ...") in the feed instead of a neutral note —
-     *  see {@link service.RunHistoryService#recordActivityEvent(String, String,
-     *  String, model.TaskRunRecord.Status, String, String, java.time.LocalDateTime,
-     *  java.time.LocalDateTime)}. */
+    /**
+     * Same as {@link #logActivity} but marks the event FAILED, so it renders
+     * as a failure (red, "Failed: ...") in the feed instead of a neutral note —
+     * see {@link service.RunHistoryService#recordActivityEvent(String, String,
+     * String, model.TaskRunRecord.Status, String, String, java.time.LocalDateTime,
+     * java.time.LocalDateTime)}.
+     */
     private void logActivityFailed(boolean aboutCredential, String title, String detail) {
         if (auditLog == null) return;
         java.time.LocalDateTime now = java.time.LocalDateTime.now();

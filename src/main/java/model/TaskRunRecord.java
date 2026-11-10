@@ -17,20 +17,6 @@ import java.time.LocalDateTime;
  */
 public class TaskRunRecord {
 
-    public enum Status { SUCCESS, FAILED, SKIPPED }
-
-    /**
-     * Coarse root-cause bucket for a FAILED row, assigned by
-     * {@link service.FailureClassifier} at the moment the failure is
-     * recorded — not re-derived from the log text on every view. Lets the
-     * UI render a consistent badge + suggested action instead of everyone
-     * reading the raw reason string and guessing, and lets the health
-     * aggregator group failures by cause (e.g. "3 failures, all AUTH,
-     * likely the same broken credential") instead of listing them as
-     * unrelated rows.
-     */
-    public enum FailureCategory { NETWORK, AUTH, PERMISSION, DISK_SPACE, CONFIG, TIMEOUT, ORPHANED, UNKNOWN }
-
     private long id;
     private String taskId;
     private String taskName;
@@ -47,54 +33,132 @@ public class TaskRunRecord {
     private String eventKind;
     private String runKey;
     private String trigger;
+    public TaskRunRecord() {
+    }
 
-    public TaskRunRecord() {}
+    public long getId() {
+        return id;
+    }
 
-    public long getId()                          { return id; }
-    public void setId(long id)                   { this.id = id; }
+    public void setId(long id) {
+        this.id = id;
+    }
 
-    public String getTaskId()                    { return taskId; }
-    public void setTaskId(String taskId)         { this.taskId = taskId; }
+    public String getTaskId() {
+        return taskId;
+    }
 
-    public String getTaskName()                  { return taskName; }
-    public void setTaskName(String taskName)     { this.taskName = taskName; }
+    public void setTaskId(String taskId) {
+        this.taskId = taskId;
+    }
 
-    public String getTaskType()                  { return taskType; }
-    public void setTaskType(String taskType)     { this.taskType = taskType; }
+    public String getTaskName() {
+        return taskName;
+    }
 
-    public Status getStatus()                    { return status; }
-    public void setStatus(Status status)         { this.status = status; }
+    public void setTaskName(String taskName) {
+        this.taskName = taskName;
+    }
 
-    public String getReason()                    { return reason; }
-    public void setReason(String reason)         { this.reason = reason; }
+    public String getTaskType() {
+        return taskType;
+    }
 
-    public String getDetails()                   { return details; }
-    public void setDetails(String details)       { this.details = details; }
+    public void setTaskType(String taskType) {
+        this.taskType = taskType;
+    }
 
-    public LocalDateTime getStartedAt()           { return startedAt; }
-    public void setStartedAt(LocalDateTime t)     { this.startedAt = t; }
+    public Status getStatus() {
+        return status;
+    }
 
-    public LocalDateTime getEndedAt()             { return endedAt; }
-    public void setEndedAt(LocalDateTime t)       { this.endedAt = t; }
+    public void setStatus(Status status) {
+        this.status = status;
+    }
 
-    public long getDurationMs()                   { return durationMs; }
-    public void setDurationMs(long durationMs)    { this.durationMs = durationMs; }
+    public String getReason() {
+        return reason;
+    }
 
-    /** Null for SUCCESS/SKIPPED rows, and for FAILED rows recorded before this field existed. */
-    public FailureCategory getFailureCategory()          { return failureCategory; }
-    public void setFailureCategory(FailureCategory c)    { this.failureCategory = c; }
+    public void setReason(String reason) {
+        this.reason = reason;
+    }
 
-    /** Whether simply running the task again is likely to succeed (a transient network blip) vs. needs a config/credential fix first. Meaningless outside a FAILED row. */
-    public boolean isRetryable()                          { return retryable; }
-    public void setRetryable(boolean retryable)           { this.retryable = retryable; }
+    public String getDetails() {
+        return details;
+    }
 
-    /** One short, human-actionable next step ("Check the credential's password"), or null if none was classified. */
-    public String getSuggestedAction()                    { return suggestedAction; }
-    public void setSuggestedAction(String suggestedAction) { this.suggestedAction = suggestedAction; }
+    public void setDetails(String details) {
+        this.details = details;
+    }
 
-    /** {@link EventKind} name, or null for rows written before event kinds were stored. */
-    public String getEventKind()                          { return eventKind; }
-    public void setEventKind(String eventKind)            { this.eventKind = eventKind; }
+    public LocalDateTime getStartedAt() {
+        return startedAt;
+    }
+
+    public void setStartedAt(LocalDateTime t) {
+        this.startedAt = t;
+    }
+
+    public LocalDateTime getEndedAt() {
+        return endedAt;
+    }
+
+    public void setEndedAt(LocalDateTime t) {
+        this.endedAt = t;
+    }
+
+    public long getDurationMs() {
+        return durationMs;
+    }
+
+    public void setDurationMs(long durationMs) {
+        this.durationMs = durationMs;
+    }
+
+    /**
+     * Null for SUCCESS/SKIPPED rows, and for FAILED rows recorded before this field existed.
+     */
+    public FailureCategory getFailureCategory() {
+        return failureCategory;
+    }
+
+    public void setFailureCategory(FailureCategory c) {
+        this.failureCategory = c;
+    }
+
+    /**
+     * Whether simply running the task again is likely to succeed (a transient network blip) vs. needs a config/credential fix first. Meaningless outside a FAILED row.
+     */
+    public boolean isRetryable() {
+        return retryable;
+    }
+
+    public void setRetryable(boolean retryable) {
+        this.retryable = retryable;
+    }
+
+    /**
+     * One short, human-actionable next step ("Check the credential's password"), or null if none was classified.
+     */
+    public String getSuggestedAction() {
+        return suggestedAction;
+    }
+
+    public void setSuggestedAction(String suggestedAction) {
+        this.suggestedAction = suggestedAction;
+    }
+
+    /**
+     * {@link EventKind} name, or null for rows written before event kinds were stored.
+     */
+    public String getEventKind() {
+        return eventKind;
+    }
+
+    public void setEventKind(String eventKind) {
+        this.eventKind = eventKind;
+    }
 
     /**
      * Correlation id shared by every row produced by one execution of a task
@@ -103,10 +167,36 @@ public class TaskRunRecord {
      * Null for rows not tied to a run (config changes, watcher state) and for
      * rows written before this field existed.
      */
-    public String getRunKey()                             { return runKey; }
-    public void setRunKey(String runKey)                  { this.runKey = runKey; }
+    public String getRunKey() {
+        return runKey;
+    }
 
-    /** What caused the run: SCHEDULE, WATCHER, MANUAL or RETRY. Null when unknown / not applicable. */
-    public String getTrigger()                            { return trigger; }
-    public void setTrigger(String trigger)                { this.trigger = trigger; }
+    public void setRunKey(String runKey) {
+        this.runKey = runKey;
+    }
+
+    /**
+     * What caused the run: SCHEDULE, WATCHER, MANUAL or RETRY. Null when unknown / not applicable.
+     */
+    public String getTrigger() {
+        return trigger;
+    }
+
+    public void setTrigger(String trigger) {
+        this.trigger = trigger;
+    }
+
+    public enum Status {SUCCESS, FAILED, SKIPPED}
+
+    /**
+     * Coarse root-cause bucket for a FAILED row, assigned by
+     * {@link service.FailureClassifier} at the moment the failure is
+     * recorded — not re-derived from the log text on every view. Lets the
+     * UI render a consistent badge + suggested action instead of everyone
+     * reading the raw reason string and guessing, and lets the health
+     * aggregator group failures by cause (e.g. "3 failures, all AUTH,
+     * likely the same broken credential") instead of listing them as
+     * unrelated rows.
+     */
+    public enum FailureCategory {NETWORK, AUTH, PERMISSION, DISK_SPACE, CONFIG, TIMEOUT, ORPHANED, UNKNOWN}
 }

@@ -1,7 +1,5 @@
 package ui;
 
-import static org.junit.Assert.*;
-
 import org.junit.Test;
 import service.DaemonControlServer;
 import service.StatusBroadcaster;
@@ -15,7 +13,11 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 
-/** v3: GUI-side source selection. Stream when live, the status file otherwise, "offline" when neither. */
+import static org.junit.Assert.*;
+
+/**
+ * v3: GUI-side source selection. Stream when live, the status file otherwise, "offline" when neither.
+ */
 public class DaemonNowTest {
 
     private static void export(SchedulerStatusExporter e, int pool, int active) {
@@ -39,10 +41,14 @@ public class DaemonNowTest {
         assertTrue("fresh file is accepted when there is no stream", viaFile.alive());
         assertEquals(4, viaFile.snapshot().getPoolSize());
 
-        try (DaemonControlServer s = DaemonControlServer.start(dir, (a, id, w) -> { }, bus)) {
+        try (DaemonControlServer s = DaemonControlServer.start(dir, (a, id, w) -> {
+        }, bus)) {
             long end = System.currentTimeMillis() + 6000;
             AppFeeds.Daemon d;
-            do { Thread.sleep(50); d = AppFeeds.daemonNow(file); }
+            do {
+                Thread.sleep(50);
+                d = AppFeeds.daemonNow(file);
+            }
             while (System.currentTimeMillis() < end && !(d.alive() && d.snapshot() != null
                     && service.DaemonStatusStream.forDataDir(dir).isConnected()));
             assertTrue("stream connected", service.DaemonStatusStream.forDataDir(dir).isConnected());
@@ -57,13 +63,15 @@ public class DaemonNowTest {
             // ...and a state change reaches the GUI through the stream.
             export(e, 4, 5);
             long until = System.currentTimeMillis() + 1500;
-            while (System.currentTimeMillis() < until && AppFeeds.daemonNow(file).snapshot().getActiveWorkers() != 5) Thread.sleep(25);
+            while (System.currentTimeMillis() < until && AppFeeds.daemonNow(file).snapshot().getActiveWorkers() != 5)
+                Thread.sleep(25);
             assertEquals(5, AppFeeds.daemonNow(file).snapshot().getActiveWorkers());
         }
 
         // daemon gone: stream drops; with the file deleted too, the answer is offline
         long end = System.currentTimeMillis() + 6000;
-        while (System.currentTimeMillis() < end && service.DaemonStatusStream.forDataDir(dir).isConnected()) Thread.sleep(50);
+        while (System.currentTimeMillis() < end && service.DaemonStatusStream.forDataDir(dir).isConnected())
+            Thread.sleep(50);
         Files.deleteIfExists(file);
         assertFalse(AppFeeds.daemonNow(file).alive());
     }

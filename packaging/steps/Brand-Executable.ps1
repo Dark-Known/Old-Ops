@@ -83,25 +83,36 @@ param(
     [Parameter(Mandatory = $true)][string]$IconPath,
     [Parameter(Mandatory = $true)][string]$Description,
     [string]$ProductName = $null,
-    [string]$RceditPath  = $null,
-    [string]$SearchDir   = $null,
-    [string]$LogFile     = $null
+    [string]$RceditPath = $null,
+    [string]$SearchDir = $null,
+    [string]$LogFile = $null
 )
 
 $ErrorActionPreference = "Stop"
 
-function Log([string]$msg) {
+function Log([string]$msg)
+{
     $line = "[brand-executable] $msg"
     Write-Host "  $line"
-    if ($LogFile) { Add-Content -Path $LogFile -Value "$(Get-Date -Format 'HH:mm:ss')  $line" }
+    if ($LogFile)
+    {
+        Add-Content -Path $LogFile -Value "$( Get-Date -Format 'HH:mm:ss' )  $line"
+    }
 }
-function OK([string]$msg) { Write-Host "  v  $msg" -ForegroundColor Green; Log $msg }
+function OK([string]$msg)
+{
+    Write-Host "  v  $msg" -ForegroundColor Green; Log $msg
+}
 
-if (-not $ProductName) { $ProductName = $Description }
+if (-not $ProductName)
+{
+    $ProductName = $Description
+}
 
 $fallback = [pscustomobject]@{ Branded = $false; ExePath = $SourceExe }
 
-if (-not (Test-Path $SourceExe)) {
+if (-not (Test-Path $SourceExe))
+{
     Log "NOTE: Source executable not found at $SourceExe - nothing to brand."
     return $fallback
 }
@@ -110,27 +121,33 @@ if (-not (Test-Path $SourceExe)) {
 # this (rather than trusting a caller-supplied directory) is deliberate:
 # a wrong directory here doesn't fail loudly, it produces an exe that
 # won't launch, which is a much worse failure to debug later.
-$sourceDir  = Split-Path $SourceExe -Parent
+$sourceDir = Split-Path $SourceExe -Parent
 $destExeName = Split-Path $DestExe -Leaf
-$DestExe    = Join-Path $sourceDir $destExeName
+$DestExe = Join-Path $sourceDir $destExeName
 
 $rcEdit = @(
     $RceditPath,
-    $(if ($SearchDir) { Join-Path $SearchDir "rcedit.exe" }),
+    $( if ($SearchDir)
+    {
+        Join-Path $SearchDir "rcedit.exe"
+    } ),
     (Get-Command "rcedit.exe" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue)
 ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
 
-if (-not $rcEdit) {
-    Log "NOTE: rcedit.exe not found - '$(Split-Path $SourceExe -Leaf)' will keep its own identity in Task Manager."
+if (-not $rcEdit)
+{
+    Log "NOTE: rcedit.exe not found - '$( Split-Path $SourceExe -Leaf )' will keep its own identity in Task Manager."
     Log "Download rcedit.exe from https://github.com/electron/rcedit/releases and place it in $SearchDir (or pass -RceditPath) to brand it."
     return $fallback
 }
-if (-not (Test-Path $IconPath)) {
+if (-not (Test-Path $IconPath))
+{
     Log "NOTE: No icon at $IconPath - skipping rebrand (rcedit needs an icon to bake in)."
     return $fallback
 }
 
-try {
+try
+{
     Copy-Item -Path $SourceExe -Destination $DestExe -Force
     $internalName = [System.IO.Path]::GetFileNameWithoutExtension($DestExe)
 
@@ -163,22 +180,27 @@ try {
         @("--set-product-version", "1.0.0.0")
     )
     $allOk = $true
-    foreach ($edit in $edits) {
+    foreach ($edit in $edits)
+    {
         & $rcEdit $DestExe @edit
-        if ($LASTEXITCODE -ne 0) {
-            Log "WARNING: rcedit $($edit -join ' ') exited with code $LASTEXITCODE"
+        if ($LASTEXITCODE -ne 0)
+        {
+            Log "WARNING: rcedit $( $edit -join ' ' ) exited with code $LASTEXITCODE"
             $allOk = $false
             break
         }
     }
-    if (-not $allOk) {
+    if (-not $allOk)
+    {
         Log "Falling back to unbranded $SourceExe."
         Remove-Item $DestExe -ErrorAction SilentlyContinue
         return $fallback
     }
     OK "Branded: $DestExe ($Description)"
     return [pscustomobject]@{ Branded = $true; ExePath = $DestExe }
-} catch {
+}
+catch
+{
     Log "WARNING: Could not brand executable: $_ - falling back to unbranded $SourceExe."
     Remove-Item $DestExe -ErrorAction SilentlyContinue
     return $fallback

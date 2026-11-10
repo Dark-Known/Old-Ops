@@ -47,7 +47,96 @@ public class TaskDbService {
 
     private static final Logger log = Logger.getLogger(TaskDbService.class.getName());
     private static final DateTimeFormatter DT_FMT = DateTimeFormatter.ISO_LOCAL_DATE_TIME;
-
+    // Extracted so migrateLegacyXmlColumnIfPresent() can re-run the exact same
+    // DDL when it has to rebuild the table under a pre-existing legacy schema.
+    private static final String CREATE_TASKS_TABLE_SQL =
+            "CREATE TABLE IF NOT EXISTS tasks (" +
+                    "id TEXT PRIMARY KEY," +
+                    "name TEXT," +
+                    "task_type TEXT," +
+                    "status TEXT," +
+                    "source_credential_id TEXT," +
+                    "target_credential_id TEXT," +
+                    "target_username TEXT," +
+                    "transfer_direction TEXT," +
+                    "transfer_mode TEXT," +
+                    "source_path TEXT," +
+                    "target_path TEXT," +
+                    "additional_target_paths TEXT," +
+                    "file_selection TEXT," +
+                    "backup_source_path TEXT," +
+                    "backup_destination_path TEXT," +
+                    "backup_retention_days INTEGER," +
+                    "backup_source_username TEXT," +
+                    "backup_destination_username TEXT," +
+                    "imap_folder TEXT," +
+                    "mail_search_criteria TEXT," +
+                    "mail_fetch_mode TEXT," +
+                    "mail_mailbox_address TEXT," +
+                    "mail_tenant_id TEXT," +
+                    "mail_client_id TEXT," +
+                    "mail_fetch_scope TEXT," +
+                    "mail_max_results INTEGER," +
+                    "mail_last_known_epoch INTEGER," +
+                    "mail_mark_as_read INTEGER," +
+                    "mail_move_to_folder_enabled INTEGER," +
+                    "mail_move_to_folder_name TEXT," +
+                    "mail_output_folder TEXT," +
+                    "schedule_type TEXT," +
+                    "scheduled_at TEXT," +
+                    "interval_minutes INTEGER," +
+                    "interval_seconds INTEGER," +
+                    "cron_expression TEXT," +
+                    "watcher_enabled INTEGER," +
+                    "inbound_watcher_poll_interval_minutes INTEGER," +
+                    "inbound_watcher_max_age_minutes INTEGER," +
+                    "last_known_remote_file_epoch INTEGER," +
+                    "last_known_remote_file_size INTEGER," +
+                    "last_run_at TEXT," +
+                    "last_started_at TEXT," +
+                    "last_run_result TEXT," +
+                    "created_at TEXT," +
+                    "retry_count INTEGER," +
+                    "watch_options TEXT" +
+                    ")";
+    private static final String UPSERT_SQL = "INSERT INTO tasks (" +
+            "id, name, task_type, status, source_credential_id, target_credential_id, target_username, " +
+            "transfer_direction, transfer_mode, source_path, target_path, additional_target_paths, " +
+            "file_selection, " +
+            "backup_source_path, backup_destination_path, backup_retention_days, backup_source_username, " +
+            "backup_destination_username, imap_folder, mail_search_criteria, mail_fetch_mode, " +
+            "mail_mailbox_address, mail_tenant_id, mail_client_id, mail_fetch_scope, mail_max_results, " +
+            "mail_last_known_epoch, mail_mark_as_read, mail_move_to_folder_enabled, mail_move_to_folder_name, " +
+            "mail_output_folder, schedule_type, scheduled_at, interval_minutes, interval_seconds, " +
+            "cron_expression, watcher_enabled, inbound_watcher_poll_interval_minutes, " +
+            "inbound_watcher_max_age_minutes, last_known_remote_file_epoch, last_known_remote_file_size, " +
+            "last_run_at, last_started_at, last_run_result, created_at, retry_count, watch_options" +
+            ") VALUES (" + "?,".repeat(47).replaceAll(",$", "") + ") " +
+            "ON CONFLICT(id) DO UPDATE SET " +
+            "name=excluded.name, task_type=excluded.task_type, status=excluded.status, " +
+            "source_credential_id=excluded.source_credential_id, target_credential_id=excluded.target_credential_id, " +
+            "target_username=excluded.target_username, transfer_direction=excluded.transfer_direction, " +
+            "transfer_mode=excluded.transfer_mode, source_path=excluded.source_path, target_path=excluded.target_path, " +
+            "additional_target_paths=excluded.additional_target_paths, file_selection=excluded.file_selection, " +
+            "backup_source_path=excluded.backup_source_path, " +
+            "backup_destination_path=excluded.backup_destination_path, backup_retention_days=excluded.backup_retention_days, " +
+            "backup_source_username=excluded.backup_source_username, backup_destination_username=excluded.backup_destination_username, " +
+            "imap_folder=excluded.imap_folder, mail_search_criteria=excluded.mail_search_criteria, " +
+            "mail_fetch_mode=excluded.mail_fetch_mode, mail_mailbox_address=excluded.mail_mailbox_address, " +
+            "mail_tenant_id=excluded.mail_tenant_id, mail_client_id=excluded.mail_client_id, " +
+            "mail_fetch_scope=excluded.mail_fetch_scope, mail_max_results=excluded.mail_max_results, " +
+            "mail_last_known_epoch=excluded.mail_last_known_epoch, mail_mark_as_read=excluded.mail_mark_as_read, " +
+            "mail_move_to_folder_enabled=excluded.mail_move_to_folder_enabled, " +
+            "mail_move_to_folder_name=excluded.mail_move_to_folder_name, mail_output_folder=excluded.mail_output_folder, " +
+            "schedule_type=excluded.schedule_type, scheduled_at=excluded.scheduled_at, " +
+            "interval_minutes=excluded.interval_minutes, interval_seconds=excluded.interval_seconds, " +
+            "cron_expression=excluded.cron_expression, watcher_enabled=excluded.watcher_enabled, " +
+            "inbound_watcher_poll_interval_minutes=excluded.inbound_watcher_poll_interval_minutes, " +
+            "inbound_watcher_max_age_minutes=excluded.inbound_watcher_max_age_minutes, " +
+            "last_known_remote_file_epoch=excluded.last_known_remote_file_epoch, " +
+            "last_known_remote_file_size=excluded.last_known_remote_file_size, " +
+            "last_run_at=excluded.last_run_at, last_started_at=excluded.last_started_at, " +
+            "last_run_result=excluded.last_run_result, created_at=excluded.created_at, retry_count=excluded.retry_count, watch_options=excluded.watch_options";
     private final Connection conn;
     private final File dataDir;
     // Set once, in the constructor, if the connection/table-init below fails.
@@ -56,6 +145,14 @@ public class TaskDbService {
     // yet" apart from "empty because the database never actually opened" —
     // previously indistinguishable from loadAll()'s point of view.
     private final String connectionError;
+    // Set by save() whenever a write on an otherwise-live connection fails
+    // (e.g. SQLITE_BUSY because the Daemon is writing at the same instant, a
+    // constraint violation, disk full) — distinct from connectionError, which
+    // only covers "never connected at all". Conflating the two used to make
+    // every save failure say "the database is not connected" even when the
+    // connection was fine and only this one write failed, contradicting a
+    // status badge that (correctly) showed connected.
+    private volatile String lastSaveError;
 
     public TaskDbService(File dataDir) {
         this.dataDir = dataDir;
@@ -144,59 +241,6 @@ public class TaskDbService {
         }
     }
 
-    // Extracted so migrateLegacyXmlColumnIfPresent() can re-run the exact same
-    // DDL when it has to rebuild the table under a pre-existing legacy schema.
-    private static final String CREATE_TASKS_TABLE_SQL =
-                "CREATE TABLE IF NOT EXISTS tasks (" +
-                        "id TEXT PRIMARY KEY," +
-                        "name TEXT," +
-                        "task_type TEXT," +
-                        "status TEXT," +
-                        "source_credential_id TEXT," +
-                        "target_credential_id TEXT," +
-                        "target_username TEXT," +
-                        "transfer_direction TEXT," +
-                        "transfer_mode TEXT," +
-                        "source_path TEXT," +
-                        "target_path TEXT," +
-                        "additional_target_paths TEXT," +
-                        "file_selection TEXT," +
-                        "backup_source_path TEXT," +
-                        "backup_destination_path TEXT," +
-                        "backup_retention_days INTEGER," +
-                        "backup_source_username TEXT," +
-                        "backup_destination_username TEXT," +
-                        "imap_folder TEXT," +
-                        "mail_search_criteria TEXT," +
-                        "mail_fetch_mode TEXT," +
-                        "mail_mailbox_address TEXT," +
-                        "mail_tenant_id TEXT," +
-                        "mail_client_id TEXT," +
-                        "mail_fetch_scope TEXT," +
-                        "mail_max_results INTEGER," +
-                        "mail_last_known_epoch INTEGER," +
-                        "mail_mark_as_read INTEGER," +
-                        "mail_move_to_folder_enabled INTEGER," +
-                        "mail_move_to_folder_name TEXT," +
-                        "mail_output_folder TEXT," +
-                        "schedule_type TEXT," +
-                        "scheduled_at TEXT," +
-                        "interval_minutes INTEGER," +
-                        "interval_seconds INTEGER," +
-                        "cron_expression TEXT," +
-                        "watcher_enabled INTEGER," +
-                        "inbound_watcher_poll_interval_minutes INTEGER," +
-                        "inbound_watcher_max_age_minutes INTEGER," +
-                        "last_known_remote_file_epoch INTEGER," +
-                        "last_known_remote_file_size INTEGER," +
-                        "last_run_at TEXT," +
-                        "last_started_at TEXT," +
-                        "last_run_result TEXT," +
-                        "created_at TEXT," +
-                        "retry_count INTEGER," +
-                        "watch_options TEXT" +
-                        ")";
-
     /**
      * Brings an existing {@code tasks} table up to the columns declared in
      * {@link #CREATE_TASKS_TABLE_SQL}. {@code CREATE TABLE IF NOT EXISTS} does nothing for a table
@@ -222,6 +266,20 @@ public class TaskDbService {
             }
             log.info("Added missing column to tasks table: " + name);
         }
+    }
+
+    private static String safeGetString(ResultSet rs, String col) {
+        try {
+            return rs.getString(col);
+        } catch (SQLException e) {
+            return "?";
+        }
+    }
+
+    private static String text(org.w3c.dom.Element parent, String tag) {
+        org.w3c.dom.NodeList nl = parent.getElementsByTagName(tag);
+        if (nl.getLength() == 0) return "";
+        return nl.item(0).getTextContent();
     }
 
     /**
@@ -280,15 +338,6 @@ public class TaskDbService {
         }
     }
 
-    // Set by save() whenever a write on an otherwise-live connection fails
-    // (e.g. SQLITE_BUSY because the Daemon is writing at the same instant, a
-    // constraint violation, disk full) — distinct from connectionError, which
-    // only covers "never connected at all". Conflating the two used to make
-    // every save failure say "the database is not connected" even when the
-    // connection was fine and only this one write failed, contradicting a
-    // status badge that (correctly) showed connected.
-    private volatile String lastSaveError;
-
     /**
      * True if app.db's tasks table opened successfully AND the connection is
      * still alive right now — checked live via {@link Connection#isValid},
@@ -306,7 +355,9 @@ public class TaskDbService {
         }
     }
 
-    /** Short exception summary from the failed connection attempt, or null if connected fine. */
+    /**
+     * Short exception summary from the failed connection attempt, or null if connected fine.
+     */
     public String getConnectionError() {
         return connectionError;
     }
@@ -322,45 +373,6 @@ public class TaskDbService {
     public String getLastSaveError() {
         return lastSaveError;
     }
-
-    private static final String UPSERT_SQL = "INSERT INTO tasks (" +
-            "id, name, task_type, status, source_credential_id, target_credential_id, target_username, " +
-            "transfer_direction, transfer_mode, source_path, target_path, additional_target_paths, " +
-            "file_selection, " +
-            "backup_source_path, backup_destination_path, backup_retention_days, backup_source_username, " +
-            "backup_destination_username, imap_folder, mail_search_criteria, mail_fetch_mode, " +
-            "mail_mailbox_address, mail_tenant_id, mail_client_id, mail_fetch_scope, mail_max_results, " +
-            "mail_last_known_epoch, mail_mark_as_read, mail_move_to_folder_enabled, mail_move_to_folder_name, " +
-            "mail_output_folder, schedule_type, scheduled_at, interval_minutes, interval_seconds, " +
-            "cron_expression, watcher_enabled, inbound_watcher_poll_interval_minutes, " +
-            "inbound_watcher_max_age_minutes, last_known_remote_file_epoch, last_known_remote_file_size, " +
-            "last_run_at, last_started_at, last_run_result, created_at, retry_count, watch_options" +
-            ") VALUES (" + "?,".repeat(47).replaceAll(",$", "") + ") " +
-            "ON CONFLICT(id) DO UPDATE SET " +
-            "name=excluded.name, task_type=excluded.task_type, status=excluded.status, " +
-            "source_credential_id=excluded.source_credential_id, target_credential_id=excluded.target_credential_id, " +
-            "target_username=excluded.target_username, transfer_direction=excluded.transfer_direction, " +
-            "transfer_mode=excluded.transfer_mode, source_path=excluded.source_path, target_path=excluded.target_path, " +
-            "additional_target_paths=excluded.additional_target_paths, file_selection=excluded.file_selection, " +
-            "backup_source_path=excluded.backup_source_path, " +
-            "backup_destination_path=excluded.backup_destination_path, backup_retention_days=excluded.backup_retention_days, " +
-            "backup_source_username=excluded.backup_source_username, backup_destination_username=excluded.backup_destination_username, " +
-            "imap_folder=excluded.imap_folder, mail_search_criteria=excluded.mail_search_criteria, " +
-            "mail_fetch_mode=excluded.mail_fetch_mode, mail_mailbox_address=excluded.mail_mailbox_address, " +
-            "mail_tenant_id=excluded.mail_tenant_id, mail_client_id=excluded.mail_client_id, " +
-            "mail_fetch_scope=excluded.mail_fetch_scope, mail_max_results=excluded.mail_max_results, " +
-            "mail_last_known_epoch=excluded.mail_last_known_epoch, mail_mark_as_read=excluded.mail_mark_as_read, " +
-            "mail_move_to_folder_enabled=excluded.mail_move_to_folder_enabled, " +
-            "mail_move_to_folder_name=excluded.mail_move_to_folder_name, mail_output_folder=excluded.mail_output_folder, " +
-            "schedule_type=excluded.schedule_type, scheduled_at=excluded.scheduled_at, " +
-            "interval_minutes=excluded.interval_minutes, interval_seconds=excluded.interval_seconds, " +
-            "cron_expression=excluded.cron_expression, watcher_enabled=excluded.watcher_enabled, " +
-            "inbound_watcher_poll_interval_minutes=excluded.inbound_watcher_poll_interval_minutes, " +
-            "inbound_watcher_max_age_minutes=excluded.inbound_watcher_max_age_minutes, " +
-            "last_known_remote_file_epoch=excluded.last_known_remote_file_epoch, " +
-            "last_known_remote_file_size=excluded.last_known_remote_file_size, " +
-            "last_run_at=excluded.last_run_at, last_started_at=excluded.last_started_at, " +
-            "last_run_result=excluded.last_run_result, created_at=excluded.created_at, retry_count=excluded.retry_count, watch_options=excluded.watch_options";
 
     /**
      * Inserts or replaces (by id) a task. Assigns an id if missing, same as the
@@ -485,7 +497,10 @@ public class TaskDbService {
                             + "backup_destination_username = CASE WHEN backup_destination_username = ? THEN ? ELSE backup_destination_username END "
                             + "WHERE target_username = ? OR backup_source_username = ? OR backup_destination_username = ?")) {
                 int i = 1;
-                for (int k = 0; k < 3; k++) { ps.setString(i++, oldName); ps.setString(i++, newName); }
+                for (int k = 0; k < 3; k++) {
+                    ps.setString(i++, oldName);
+                    ps.setString(i++, newName);
+                }
                 for (int k = 0; k < 3; k++) ps.setString(i++, oldName);
                 changed = ps.executeUpdate();
                 conn.commit();
@@ -504,9 +519,11 @@ public class TaskDbService {
         }
     }
 
-    /** Deletes the task with the given id, if any. Returns whether a row was
-     *  actually removed — see {@link #save}'s javadoc for why callers should
-     *  check this instead of assuming a delete silently succeeded. */
+    /**
+     * Deletes the task with the given id, if any. Returns whether a row was
+     * actually removed — see {@link #save}'s javadoc for why callers should
+     * check this instead of assuming a delete silently succeeded.
+     */
     public synchronized boolean delete(String id) {
         if (conn == null || id == null || id.isEmpty()) return false;
         try (PreparedStatement ps = conn.prepareStatement("DELETE FROM tasks WHERE id = ?")) {
@@ -521,7 +538,9 @@ public class TaskDbService {
         }
     }
 
-    /** All stored tasks. One bad row (e.g. an enum value no longer supported) is skipped rather than failing the whole load. */
+    /**
+     * All stored tasks. One bad row (e.g. an enum value no longer supported) is skipped rather than failing the whole load.
+     */
     public synchronized List<ScheduledTask> loadAll() {
         List<ScheduledTask> list = new ArrayList<>();
         if (conn == null) return list;
@@ -544,10 +563,6 @@ public class TaskDbService {
             log.log(Level.WARNING, "Failed to load tasks", e);
         }
         return list;
-    }
-
-    private static String safeGetString(ResultSet rs, String col) {
-        try { return rs.getString(col); } catch (SQLException e) { return "?"; }
     }
 
     private ScheduledTask mapRow(ResultSet rs) throws SQLException {
@@ -604,7 +619,8 @@ public class TaskDbService {
         String lastRunAt = rs.getString("last_run_at");
         if (lastRunAt != null && !lastRunAt.isEmpty()) t.setLastRunAt(LocalDateTime.parse(lastRunAt, DT_FMT));
         String lastStartedAt = rs.getString("last_started_at");
-        if (lastStartedAt != null && !lastStartedAt.isEmpty()) t.setLastStartedAt(LocalDateTime.parse(lastStartedAt, DT_FMT));
+        if (lastStartedAt != null && !lastStartedAt.isEmpty())
+            t.setLastStartedAt(LocalDateTime.parse(lastStartedAt, DT_FMT));
         t.setLastRunResult(rs.getString("last_run_result"));
         String createdAt = rs.getString("created_at");
         if (createdAt != null && !createdAt.isEmpty()) t.setCreatedAt(LocalDateTime.parse(createdAt, DT_FMT));
@@ -734,7 +750,8 @@ public class TaskDbService {
                     String lastRun = text(e, "lastRunAt");
                     if (lastRun != null && !lastRun.isEmpty()) t.setLastRunAt(LocalDateTime.parse(lastRun, DT_FMT));
                     String lastStarted = text(e, "lastStartedAt");
-                    if (lastStarted != null && !lastStarted.isEmpty()) t.setLastStartedAt(LocalDateTime.parse(lastStarted, DT_FMT));
+                    if (lastStarted != null && !lastStarted.isEmpty())
+                        t.setLastStartedAt(LocalDateTime.parse(lastStarted, DT_FMT));
                     t.setLastRunResult(text(e, "lastRunResult"));
                     String created = text(e, "createdAt");
                     if (created != null && !created.isEmpty()) t.setCreatedAt(LocalDateTime.parse(created, DT_FMT));
@@ -796,15 +813,12 @@ public class TaskDbService {
         }
     }
 
-    private static String text(org.w3c.dom.Element parent, String tag) {
-        org.w3c.dom.NodeList nl = parent.getElementsByTagName(tag);
-        if (nl.getLength() == 0) return "";
-        return nl.item(0).getTextContent();
-    }
-
     public synchronized void close() {
         if (conn != null) {
-            try { conn.close(); } catch (SQLException ignored) {}
+            try {
+                conn.close();
+            } catch (SQLException ignored) {
+            }
         }
     }
 }

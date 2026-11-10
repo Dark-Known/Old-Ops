@@ -1,7 +1,6 @@
 package util;
 
 import java.io.File;
-import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.sql.*;
@@ -64,23 +63,16 @@ import java.util.logging.Logger;
  */
 public final class AppSettings {
 
-    private static final Logger log = Logger.getLogger(AppSettings.class.getName());
-    private static final String DB_FILE_NAME = "app.db";
-    private static final String LEGACY_STANDALONE_DB_FILE_NAME = "app-settings.db";
-    private static final String LEGACY_JSON_FILE_NAME = "app-settings.json";
-    private static final long CACHE_TTL_MILLIS = 2000; // live-reload granularity
-
     // Keys
-    public static final String KEY_LDM_FOLDER            = "ldmFolder";
-    public static final String KEY_PTM_FOLDER             = "ptmFolder";
-    public static final String KEY_OTHERS_FOLDER          = "othersFolder";
-    public static final String KEY_MAIL_ROUTING_RULES     = "mailRoutingRulesJson";
-    public static final String KEY_DEFAULT_STATION_ADDR   = "defaultStationAddress";
+    public static final String KEY_LDM_FOLDER = "ldmFolder";
+    public static final String KEY_PTM_FOLDER = "ptmFolder";
+    public static final String KEY_OTHERS_FOLDER = "othersFolder";
+    public static final String KEY_MAIL_ROUTING_RULES = "mailRoutingRulesJson";
+    public static final String KEY_DEFAULT_STATION_ADDR = "defaultStationAddress";
     public static final String KEY_ATTACHMENT_DOWNLOAD_DIR = "attachmentDownloadLocation";
-    public static final String KEY_LOG_LEVEL              = "logLevel";
-    public static final String KEY_JVM_MIN_HEAP           = "jvmMinHeap";
-    public static final String KEY_JVM_MAX_HEAP           = "jvmMaxHeap";
-
+    public static final String KEY_LOG_LEVEL = "logLevel";
+    public static final String KEY_JVM_MIN_HEAP = "jvmMinHeap";
+    public static final String KEY_JVM_MAX_HEAP = "jvmMaxHeap";
     // ── Size-based transfer batching (replaces the old file-count based
     //    "transferBatchSize") ──────────────────────────────────────────────
     // A batch is capped by total bytes rather than file count, because a
@@ -92,11 +84,10 @@ public final class AppSettings {
     // An explicit KEY_TRANSFER_BATCH_MAX_BYTES override is honored if set
     // (> 0) so an admin who knows their real throughput can just set bytes
     // directly instead of the two derived inputs.
-    public static final String KEY_TRANSFER_BATCH_TARGET_SECONDS   = "transferBatchTargetSeconds";
+    public static final String KEY_TRANSFER_BATCH_TARGET_SECONDS = "transferBatchTargetSeconds";
     public static final String KEY_TRANSFER_ASSUMED_THROUGHPUT_MBPS = "transferAssumedThroughputMBps";
-    public static final String KEY_TRANSFER_BATCH_MAX_BYTES        = "transferBatchMaxBytes";
+    public static final String KEY_TRANSFER_BATCH_MAX_BYTES = "transferBatchMaxBytes";
     public static final String KEY_TRANSFER_BATCH_INTERVAL_SECONDS = "transferBatchIntervalSeconds";
-
     // How many batches run at once (separate WinSCP/SFTP sessions in
     // parallel) instead of one strictly sequential session at a time. Big
     // win for backlogs with many small files, where per-file protocol
@@ -105,14 +96,12 @@ public final class AppSettings {
     // thousands of files. 1 = old sequential behavior (default, safest).
     public static final String KEY_TRANSFER_BATCH_CONCURRENCY = "transferBatchConcurrency";
     public static final String KEY_WATCHER_FILES_PER_WORKER_THREAD = "watcherFilesPerWorkerThread";
-
     // How long a task may sit in RUNNING before the scheduler assumes it
     // crashed/hung and force-cancels it. For long-running transfers/backups
     // (e.g. large backlogs of many small files) this may need to be raised
     // well above the 30-minute default so a legitimately slow — but still
     // progressing — run isn't killed and reported as FAILED partway through.
     public static final String KEY_STALE_RUNNING_THRESHOLD_MINUTES = "staleRunningThresholdMinutes";
-
     // How many minutes a RUNNING task may go without emitting ANY new log
     // line before the scheduler treats it as network-stalled and
     // force-cancels it — independent of, and much shorter than, the overall
@@ -126,7 +115,6 @@ public final class AppSettings {
     // still letting a genuinely slow-but-progressing transfer run as long
     // as it needs to, since every WinSCP output line resets the clock.
     public static final String KEY_STALE_INACTIVITY_THRESHOLD_MINUTES = "staleInactivityThresholdMinutes";
-
     // Ceiling on how many task-execution worker threads the scheduler will
     // ever have alive at once (see TaskSchedulerService's fixed thread
     // pool). Read once at scheduler startup, not hot-reloaded — restart
@@ -135,7 +123,6 @@ public final class AppSettings {
     // number of truly-parallel threads rarely helps throughput but does
     // cost memory (each thread reserves its own stack).
     public static final String KEY_MAX_CONCURRENT_TASK_THREADS = "maxConcurrentTaskThreads";
-
     // Moved here from per-user java.util.prefs.Preferences so the Daemon —
     // and, once it's wrapped as a Windows Service running under a service
     // account, a process with no access to the interactive user's registry
@@ -143,13 +130,29 @@ public final class AppSettings {
     // saved, instead of silently falling back to a default. See class
     // javadoc: this store already propagates to any reader (GUI or daemon)
     // within CACHE_TTL_MILLIS with no extra wiring needed.
-    public static final String KEY_WINSCP_PATH            = "winScpPath";
-    public static final String KEY_POLL_INTERVAL_SECONDS  = "pollIntervalSeconds";
-
+    public static final String KEY_WINSCP_PATH = "winScpPath";
+    public static final String KEY_POLL_INTERVAL_SECONDS = "pollIntervalSeconds";
+    private static final Logger log = Logger.getLogger(AppSettings.class.getName());
+    private static final String DB_FILE_NAME = "app.db";
+    private static final String LEGACY_STANDALONE_DB_FILE_NAME = "app-settings.db";
+    private static final String LEGACY_JSON_FILE_NAME = "app-settings.json";
+    private static final long CACHE_TTL_MILLIS = 2000; // live-reload granularity
     // Built-in fallbacks, used only if neither app-settings.json nor
     // app-config.xml has a value (keeps behavior identical to before this
     // file existed, for anyone upgrading in place).
     private static final Map<String, String> HARD_DEFAULTS = new LinkedHashMap<>();
+    // app-config.xml tag each key is seeded from on first run.
+    private static final Map<String, String> XML_SEED_TAG = new LinkedHashMap<>();
+    private static final Object LOCK = new Object();
+    private static volatile Map<String, String> cache;
+    private static volatile long cacheLoadedAtMillis = -1;
+    private static volatile File resolvedDataDir;
+    private static volatile Connection conn;
+    // Set once, in connection()'s catch block, if the connection attempt
+    // fails. Mirrors TaskDbService/CredentialDbService's connectionError —
+    // see their javadoc for why this is surfaced rather than only logged.
+    private static volatile String lastConnectionError;
+
     static {
         HARD_DEFAULTS.put(KEY_LDM_FOLDER, "LDM");
         HARD_DEFAULTS.put(KEY_PTM_FOLDER, "PTM");
@@ -184,8 +187,6 @@ public final class AppSettings {
         HARD_DEFAULTS.put(KEY_POLL_INTERVAL_SECONDS, "60");
     }
 
-    // app-config.xml tag each key is seeded from on first run.
-    private static final Map<String, String> XML_SEED_TAG = new LinkedHashMap<>();
     static {
         XML_SEED_TAG.put(KEY_LDM_FOLDER, "ldmFolder");
         XML_SEED_TAG.put(KEY_PTM_FOLDER, "ptmFolder");
@@ -205,17 +206,8 @@ public final class AppSettings {
         XML_SEED_TAG.put(KEY_STALE_INACTIVITY_THRESHOLD_MINUTES, "staleInactivityThresholdMinutes");
     }
 
-    private static final Object LOCK = new Object();
-    private static volatile Map<String, String> cache;
-    private static volatile long cacheLoadedAtMillis = -1;
-    private static volatile File resolvedDataDir;
-    private static volatile Connection conn;
-    // Set once, in connection()'s catch block, if the connection attempt
-    // fails. Mirrors TaskDbService/CredentialDbService's connectionError —
-    // see their javadoc for why this is surfaced rather than only logged.
-    private static volatile String lastConnectionError;
-
-    private AppSettings() {}
+    private AppSettings() {
+    }
 
     // ─── Data directory / connection resolution ─────────────────────────────
 
@@ -343,7 +335,7 @@ public final class AppSettings {
             if (!parsed.isEmpty()) {
                 try (PreparedStatement ps = c.prepareStatement(
                         "INSERT INTO settings (key, value) VALUES (?, ?) " +
-                        "ON CONFLICT(key) DO UPDATE SET value = excluded.value")) {
+                                "ON CONFLICT(key) DO UPDATE SET value = excluded.value")) {
                     for (Map.Entry<String, Object> e : parsed.entrySet()) {
                         if (e.getValue() == null) continue;
                         ps.setString(1, e.getKey());
@@ -414,9 +406,17 @@ public final class AppSettings {
         return HARD_DEFAULTS.get(key);
     }
 
-    public static String getLdmFolder()             { return get(KEY_LDM_FOLDER); }
-    public static String getPtmFolder()              { return get(KEY_PTM_FOLDER); }
-    public static String getOthersFolder()           { return get(KEY_OTHERS_FOLDER); }
+    public static String getLdmFolder() {
+        return get(KEY_LDM_FOLDER);
+    }
+
+    public static String getPtmFolder() {
+        return get(KEY_PTM_FOLDER);
+    }
+
+    public static String getOthersFolder() {
+        return get(KEY_OTHERS_FOLDER);
+    }
 
     /**
      * The full, user-editable list of mail-routing rules (classification key
@@ -483,9 +483,11 @@ public final class AppSettings {
         return rules;
     }
 
-    /** Persists the full mail-routing rule list. Takes effect on the very next
-     *  message processed — no restart needed. Returns whether it was actually
-     *  persisted — see {@link #set}. */
+    /**
+     * Persists the full mail-routing rule list. Takes effect on the very next
+     * message processed — no restart needed. Returns whether it was actually
+     * persisted — see {@link #set}.
+     */
     public static boolean setMailRoutingRules(List<MailRoutingRule> rules) {
         List<Map<String, String>> rows = new ArrayList<>();
         for (MailRoutingRule r : rules) {
@@ -518,16 +520,45 @@ public final class AppSettings {
         }
         return "Others"; // unreachable in practice — getMailRoutingRules() always guarantees an Others row
     }
-    public static String getDefaultStationAddress()  { String v = get(KEY_DEFAULT_STATION_ADDR); return v == null || v.isEmpty() ? null : v; }
-    /** Base folder attachments are downloaded under (each task's Attachments/&lt;LDM|PTM|Others&gt; subtree is created inside it). Empty/unset = fall back to the task's own output directory. */
-    public static String getAttachmentDownloadLocation() { String v = get(KEY_ATTACHMENT_DOWNLOAD_DIR); return v == null || v.isEmpty() ? null : v; }
-    public static String getLogLevel()               { return get(KEY_LOG_LEVEL); }
-    public static String getWinScpPath()             { return get(KEY_WINSCP_PATH); }
-    public static int getPollIntervalSeconds()       { return intOrDefault(KEY_POLL_INTERVAL_SECONDS); }
-    /** Applies only on the JVM's NEXT start — see class javadoc. */
-    public static String getJvmMinHeap()             { return get(KEY_JVM_MIN_HEAP); }
-    /** Applies only on the JVM's NEXT start — see class javadoc. */
-    public static String getJvmMaxHeap()             { return get(KEY_JVM_MAX_HEAP); }
+
+    public static String getDefaultStationAddress() {
+        String v = get(KEY_DEFAULT_STATION_ADDR);
+        return v == null || v.isEmpty() ? null : v;
+    }
+
+    /**
+     * Base folder attachments are downloaded under (each task's Attachments/&lt;LDM|PTM|Others&gt; subtree is created inside it). Empty/unset = fall back to the task's own output directory.
+     */
+    public static String getAttachmentDownloadLocation() {
+        String v = get(KEY_ATTACHMENT_DOWNLOAD_DIR);
+        return v == null || v.isEmpty() ? null : v;
+    }
+
+    public static String getLogLevel() {
+        return get(KEY_LOG_LEVEL);
+    }
+
+    public static String getWinScpPath() {
+        return get(KEY_WINSCP_PATH);
+    }
+
+    public static int getPollIntervalSeconds() {
+        return intOrDefault(KEY_POLL_INTERVAL_SECONDS);
+    }
+
+    /**
+     * Applies only on the JVM's NEXT start — see class javadoc.
+     */
+    public static String getJvmMinHeap() {
+        return get(KEY_JVM_MIN_HEAP);
+    }
+
+    /**
+     * Applies only on the JVM's NEXT start — see class javadoc.
+     */
+    public static String getJvmMaxHeap() {
+        return get(KEY_JVM_MAX_HEAP);
+    }
 
     private static int intOrDefault(String key) {
         try {
@@ -654,7 +685,8 @@ public final class AppSettings {
     public static boolean set(String key, String value) {
         synchronized (LOCK) {
             Map<String, String> base = new LinkedHashMap<>(current());
-            if (value == null || value.isEmpty()) base.remove(key); else base.put(key, value);
+            if (value == null || value.isEmpty()) base.remove(key);
+            else base.put(key, value);
             Connection c = connection();
             if (c == null) return false;
             writeThroughLocked(c, base);
@@ -664,9 +696,11 @@ public final class AppSettings {
         }
     }
 
-    /** Sets and immediately persists several values in one transaction
-     *  (preferred for a Settings-panel "Save"). See {@link #set} for exactly
-     *  what the return value means and why the cache isn't touched on failure. */
+    /**
+     * Sets and immediately persists several values in one transaction
+     * (preferred for a Settings-panel "Save"). See {@link #set} for exactly
+     * what the return value means and why the cache isn't touched on failure.
+     */
     public static boolean setAll(Map<String, String> values) {
         synchronized (LOCK) {
             Map<String, String> base = new LinkedHashMap<>(current());
@@ -704,13 +738,17 @@ public final class AppSettings {
         }
     }
 
-    /** Short exception summary from the failed connection attempt, or null if connected fine. */
+    /**
+     * Short exception summary from the failed connection attempt, or null if connected fine.
+     */
     public static String getConnectionError() {
         if (isConnected()) return null;
         return lastConnectionError != null ? lastConnectionError : "unknown error";
     }
 
-    /** Caller must hold LOCK. Replaces the entire settings table contents with {@code values}. */
+    /**
+     * Caller must hold LOCK. Replaces the entire settings table contents with {@code values}.
+     */
     private static void writeThroughLocked(Connection c, Map<String, String> values) {
         try {
             boolean priorAutoCommit = c.getAutoCommit();
@@ -733,7 +771,9 @@ public final class AppSettings {
         }
     }
 
-    /** Absolute path of the backing SQLite database, for display in the Settings panel. */
+    /**
+     * Absolute path of the backing SQLite database, for display in the Settings panel.
+     */
     public static String filePath() {
         return new File(dataDir(), DB_FILE_NAME).getAbsolutePath();
     }

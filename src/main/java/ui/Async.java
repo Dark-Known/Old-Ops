@@ -3,8 +3,9 @@ package ui;
 import service.BackgroundJobs;
 import service.Workers;
 
-import javax.swing.SwingUtilities;
-import java.util.concurrent.*;
+import javax.swing.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
@@ -14,17 +15,25 @@ import java.util.function.Supplier;
  * Swing Event Dispatch Thread. Results are always delivered back on the EDT.
  */
 public final class Async {
-    private Async() {}
-
     private static final ExecutorService POOL = Workers.pool(Workers.Lane.UI);
-    /** Single thread: preserves submission order (used for audit-log writes). */
+    /**
+     * Single thread: preserves submission order (used for audit-log writes).
+     */
     private static final ExecutorService SERIAL = Workers.newPool(Workers.Lane.ORDERED, 1);
-    /** For user dialogs that legitimately block for minutes (device-code sign-in): never ties up the shared UI lane. */
+    /**
+     * For user dialogs that legitimately block for minutes (device-code sign-in): never ties up the shared UI lane.
+     */
     private static final ExecutorService LONG = Workers.newCachedPool(Workers.Lane.UI);
     private static final ConcurrentHashMap<Object, AtomicLong> LATEST = new ConcurrentHashMap<>();
+    private Async() {
+    }
 
-    /** Fire-and-forget background work. */
-    public static void run(Runnable work) { run("Background task", false, work); }
+    /**
+     * Fire-and-forget background work.
+     */
+    public static void run(Runnable work) {
+        run("Background task", false, work);
+    }
 
     /**
      * Named background work. {@code audited} jobs (user-triggered actions) always record a
@@ -38,7 +47,12 @@ public final class Async {
     public static void runJob(String name, boolean audited, java.util.function.Consumer<BackgroundJobs.Job> work) {
         POOL.execute(() -> {
             try (BackgroundJobs.Job j = BackgroundJobs.begin(name, audited)) {
-                try { work.accept(j); } catch (Throwable t) { j.fail(t); report(t); }
+                try {
+                    work.accept(j);
+                } catch (Throwable t) {
+                    j.fail(t);
+                    report(t);
+                }
             }
         });
     }
@@ -49,18 +63,28 @@ public final class Async {
      */
     public static void execute(String name, boolean audited, boolean longRunning, javax.swing.SwingWorker<?, ?> w) {
         (longRunning ? LONG : POOL).execute(() -> {
-            try (BackgroundJobs.Job j = BackgroundJobs.begin(name, audited)) { w.run(); }
+            try (BackgroundJobs.Job j = BackgroundJobs.begin(name, audited)) {
+                w.run();
+            }
         });
     }
 
-    /** Background work that must run in submission order. */
+    /**
+     * Background work that must run in submission order.
+     */
     public static void inOrder(Runnable work) {
         SERIAL.execute(() -> {
-            try { BackgroundJobs.track("Audit log write", false, work); } catch (Throwable t) { report(t); }
+            try {
+                BackgroundJobs.track("Audit log write", false, work);
+            } catch (Throwable t) {
+                report(t);
+            }
         });
     }
 
-    /** Run {@code work} in the background and hand the result to {@code onEdt} on the EDT. */
+    /**
+     * Run {@code work} in the background and hand the result to {@code onEdt} on the EDT.
+     */
     public static <T> void call(Supplier<T> work, Consumer<T> onEdt, Consumer<Throwable> onError) {
         call("Background load", work, onEdt, onError);
     }
@@ -89,11 +113,17 @@ public final class Async {
     public static <T> void latest(Object key, Supplier<T> work, Consumer<T> onEdt, Consumer<Throwable> onError) {
         AtomicLong gen = LATEST.computeIfAbsent(key, k -> new AtomicLong());
         long mine = gen.incrementAndGet();
-        call(nameFor(key), work, r -> { if (gen.get() == mine) onEdt.accept(r); },
-                t -> { if (gen.get() == mine && onError != null) onError.accept(t); });
+        call(nameFor(key), work, r -> {
+                    if (gen.get() == mine) onEdt.accept(r);
+                },
+                t -> {
+                    if (gen.get() == mine && onError != null) onError.accept(t);
+                });
     }
 
-    /** Readable job name for the Event Monitor: a String key is used as-is, an object becomes "<Class> refresh". */
+    /**
+     * Readable job name for the Event Monitor: a String key is used as-is, an object becomes "<Class> refresh".
+     */
     private static String nameFor(Object key) {
         if (key instanceof String s) return s;
         return key.getClass().getSimpleName() + " refresh";

@@ -1,10 +1,6 @@
 package service.sftp;
 
-import com.jcraft.jsch.ChannelSftp;
-import com.jcraft.jsch.JSch;
-import com.jcraft.jsch.Session;
-import com.jcraft.jsch.SftpATTRS;
-import com.jcraft.jsch.SftpException;
+import com.jcraft.jsch.*;
 
 import java.io.File;
 import java.io.IOException;
@@ -14,7 +10,9 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Vector;
 
-/** {@link SftpClient} on JSch, with trust-on-first-use host-key checking ({@link util.SshHostKeys}). */
+/**
+ * {@link SftpClient} on JSch, with trust-on-first-use host-key checking ({@link util.SshHostKeys}).
+ */
 public final class JschSftpClient implements SftpClient {
 
     private static final int SERVER_ALIVE_MS = 15_000;
@@ -83,7 +81,10 @@ public final class JschSftpClient implements SftpClient {
             String n = remotePath.substring(remotePath.lastIndexOf('/') + 1);
             return new RemoteEntry(n, a.getSize(), a.getMTime(), a.isDir());
         } catch (SftpException e) {
-            if (e.id == ChannelSftp.SSH_FX_NO_SUCH_FILE) { log.add("stat " + remotePath + " \u2192 not found"); return null; }
+            if (e.id == ChannelSftp.SSH_FX_NO_SUCH_FILE) {
+                log.add("stat " + remotePath + " \u2192 not found");
+                return null;
+            }
             throw wrap("stat " + remotePath, e);
         }
     }
@@ -121,7 +122,10 @@ public final class JschSftpClient implements SftpClient {
                 log.add("rename " + part + " \u2192 " + remotePath);
             } catch (SftpException renameFailed) {
                 // Some servers refuse to rename over an existing file: remove it and retry once.
-                try { channel.rm(remotePath); } catch (SftpException ignored) { }
+                try {
+                    channel.rm(remotePath);
+                } catch (SftpException ignored) {
+                }
                 channel.rename(part, remotePath);
             }
             try {
@@ -130,7 +134,10 @@ public final class JschSftpClient implements SftpClient {
                 // server does not allow setting times - the upload itself succeeded
             }
         } catch (SftpException e) {
-            try { channel.rm(part); } catch (Exception ignored) { }
+            try {
+                channel.rm(part);
+            } catch (Exception ignored) {
+            }
             throw wrap("upload " + remotePath, e);
         }
     }
@@ -164,7 +171,10 @@ public final class JschSftpClient implements SftpClient {
             log.add("rm " + remotePath);
             return true;
         } catch (SftpException e) {
-            if (e.id == ChannelSftp.SSH_FX_NO_SUCH_FILE) { log.add("rm " + remotePath + " \u2192 not found"); return false; }
+            if (e.id == ChannelSftp.SSH_FX_NO_SUCH_FILE) {
+                log.add("rm " + remotePath + " \u2192 not found");
+                return false;
+            }
             throw wrap("delete " + remotePath, e);
         }
     }
@@ -178,14 +188,21 @@ public final class JschSftpClient implements SftpClient {
     @Override
     public void close() {
         log.add("Closing session");
-        try { channel.disconnect(); } catch (Exception ignored) { }
-        try { session.disconnect(); } catch (Exception ignored) { }
+        try {
+            channel.disconnect();
+        } catch (Exception ignored) {
+        }
+        try {
+            session.disconnect();
+        } catch (Exception ignored) {
+        }
     }
 
     @Override
     public void rename(String from, String to) throws IOException {
         try {
-            if (channel.stat(to) != null) throw new IOException("rename " + from + " failed: " + to + " already exists");
+            if (channel.stat(to) != null)
+                throw new IOException("rename " + from + " failed: " + to + " already exists");
         } catch (SftpException e) {
             if (e.id != ChannelSftp.SSH_FX_NO_SUCH_FILE) throw wrap("rename " + from, e);
         }

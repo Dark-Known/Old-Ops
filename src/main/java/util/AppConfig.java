@@ -1,17 +1,17 @@
 package util;
 
-import javax.xml.parsers.DocumentBuilder;
-import javax.xml.parsers.DocumentBuilderFactory;
 import org.w3c.dom.Document;
 import org.w3c.dom.NodeList;
 
+import javax.xml.parsers.DocumentBuilder;
+import javax.xml.parsers.DocumentBuilderFactory;
 import java.io.File;
 import java.net.URISyntaxException;
 
 /**
  * Locates and reads app-config.xml reliably regardless of the process's
  * current working directory at launch.
- *
+ * <p>
  * A plain {@code new File("app-config.xml")} only works when the process's
  * working directory happens to be the install directory. That's true for the
  * GUI when launched via its shortcut (whose "Start in" defaults to the
@@ -20,7 +20,7 @@ import java.net.URISyntaxException;
  * no indication anything went wrong (e.g. SITA header generation resolving
  * neither the station-codes JSON path nor the configured default address,
  * even though both are set in app-config.xml).
- *
+ * <p>
  * This resolves the file two ways: first relative to the working directory
  * (cheap, covers the common case), then — if that fails — next to the
  * running JAR itself, which is correct regardless of how/where the process
@@ -28,10 +28,17 @@ import java.net.URISyntaxException;
  */
 public final class AppConfig {
     private static final String FILE_NAME = "app-config.xml";
+    /**
+     * Reads a single top-level-named element's text from app-config.xml, or null if absent/unreadable.
+     */
+    // The XML was re-parsed (a DocumentBuilder plus a full DOM) on every call. Parse once per file change instead.
+    private static final java.util.Map<String, String> CACHE = new java.util.concurrent.ConcurrentHashMap<>();
     private static volatile File resolved;
     private static volatile boolean attempted = false;
-
-    private AppConfig() {}
+    private static volatile String cachedPath;
+    private static volatile long cachedStamp = -1;
+    private AppConfig() {
+    }
 
     public static synchronized File locate() {
         if (attempted) return resolved;
@@ -59,12 +66,6 @@ public final class AppConfig {
         resolved = null;
         return null;
     }
-
-    /** Reads a single top-level-named element's text from app-config.xml, or null if absent/unreadable. */
-    // The XML was re-parsed (a DocumentBuilder plus a full DOM) on every call. Parse once per file change instead.
-    private static final java.util.Map<String, String> CACHE = new java.util.concurrent.ConcurrentHashMap<>();
-    private static volatile String cachedPath;
-    private static volatile long cachedStamp = -1;
 
     public static String readValue(String tagName) {
         try {

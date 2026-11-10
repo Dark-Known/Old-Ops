@@ -41,18 +41,15 @@ import java.util.logging.Logger;
  */
 public final class CommandQueueService {
 
+    /**
+     * A PENDING command older than this is not run: the user asked minutes ago and has moved on.
+     */
+    static final long PENDING_TTL_MINUTES = 10;
     private static final Logger log = Logger.getLogger(CommandQueueService.class.getName());
     private static final DateTimeFormatter TS = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS");
 
-    public enum Action { RUN_NOW, CANCEL, RESTART, RECONNECT_WATCH, REFRESH, PURGE_NOW }
-    public enum Status { PENDING, DONE, FAILED }
-
-    /** One row, as read back by the daemon's poller. */
-    public record Command(long id, String taskId, Action action, String requestedBy, LocalDateTime requestedAt) {}
-
-    private CommandQueueService() {}
-
-    // ── GUI side: enqueue ──────────────────────────────────────────────────
+    private CommandQueueService() {
+    }
 
     /**
      * Enqueues a command for the daemon to pick up on its next poll
@@ -70,7 +67,7 @@ public final class CommandQueueService {
         try (Connection c = connection(dataDir)) {
             try (PreparedStatement ps = c.prepareStatement(
                     "INSERT INTO gui_commands (task_id, action, requested_by, requested_at, status) " +
-                    "VALUES (?, ?, ?, ?, 'PENDING')")) {
+                            "VALUES (?, ?, ?, ?, 'PENDING')")) {
                 ps.setString(1, taskId);
                 ps.setString(2, action.name());
                 ps.setString(3, requestedBy);
@@ -87,16 +84,16 @@ public final class CommandQueueService {
         }
     }
 
-    // ── Daemon side: drain and resolve ───────────────────────────────────
-
-    /** Fetches every command still waiting to be handled, oldest first. */
+    /**
+     * Fetches every command still waiting to be handled, oldest first.
+     */
     public static List<Command> pollPending(File dataDir) {
         expireStalePending(dataDir);
         List<Command> out = new ArrayList<>();
         try (Connection c = connection(dataDir);
              PreparedStatement ps = c.prepareStatement(
                      "SELECT id, task_id, action, requested_by, requested_at FROM gui_commands " +
-                     "WHERE status = 'PENDING' ORDER BY id ASC");
+                             "WHERE status = 'PENDING' ORDER BY id ASC");
              ResultSet rs = ps.executeQuery()) {
             while (rs.next()) {
                 try {
@@ -118,8 +115,7 @@ public final class CommandQueueService {
         return out;
     }
 
-    /** A PENDING command older than this is not run: the user asked minutes ago and has moved on. */
-    static final long PENDING_TTL_MINUTES = 10;
+    // ── GUI side: enqueue ──────────────────────────────────────────────────
 
     /**
      * Marks PENDING commands older than {@link #PENDING_TTL_MINUTES} as FAILED ("Expired"),
@@ -137,6 +133,8 @@ public final class CommandQueueService {
             log.log(Level.WARNING, "Failed to expire stale commands", e);
         }
     }
+
+    // ── Daemon side: drain and resolve ───────────────────────────────────
 
     public static void markDone(File dataDir, long commandId) {
         updateStatus(dataDir, commandId, Status.DONE, null);
@@ -176,8 +174,6 @@ public final class CommandQueueService {
         }
     }
 
-    // ── Connection helper ────────────────────────────────────────────────
-
     private static Connection connection(File dataDir) throws SQLException {
         Connection c = open(dataDir);
         ensureSchema(c);
@@ -193,7 +189,9 @@ public final class CommandQueueService {
             throw new SQLException("SQLite JDBC driver not on classpath", e);
         }
         Connection c = DriverManager.getConnection("jdbc:sqlite:" + dbFile.getAbsolutePath());
-        try (Statement st = c.createStatement()) { st.execute("PRAGMA busy_timeout=5000"); }
+        try (Statement st = c.createStatement()) {
+            st.execute("PRAGMA busy_timeout=5000");
+        }
         return c;
     }
 
@@ -209,6 +207,18 @@ public final class CommandQueueService {
                     "detail TEXT)");
             st.execute("CREATE INDEX IF NOT EXISTS idx_gui_commands_status ON gui_commands (status)");
         }
+    }
+
+    // ── Connection helper ────────────────────────────────────────────────
+
+    public enum Action {RUN_NOW, CANCEL, RESTART, RECONNECT_WATCH, REFRESH, PURGE_NOW}
+
+    public enum Status {PENDING, DONE, FAILED}
+
+    /**
+     * One row, as read back by the daemon's poller.
+     */
+    public record Command(long id, String taskId, Action action, String requestedBy, LocalDateTime requestedAt) {
     }
 
     // ── Daemon side: long-lived poller ───────────────────────────────────
@@ -231,7 +241,26 @@ public final class CommandQueueService {
         private Connection conn;
         private long lastExpire, lastPrune;
 
-        public Poller(File dataDir) { this.dataDir = dataDir; }
+        public Poller(File dataDir) {
+            this.dataDir = dataDir;
+        }
+
+        private static void expire(Connection c) throws SQLException {
+            try (PreparedStatement ps = c.prepareStatement(
+                    "UPDATE gui_commands SET status = 'FAILED', detail = ? WHERE status = 'PENDING' AND requested_at < ?")) {
+                ps.setString(1, "Expired: not picked up within " + PENDING_TTL_MINUTES + " minutes (daemon not running?)");
+                ps.setString(2, LocalDateTime.now().minusMinutes(PENDING_TTL_MINUTES).format(TS));
+                ps.executeUpdate();
+            }
+        }
+
+        private static void prune(Connection c) throws SQLException {
+            try (PreparedStatement ps = c.prepareStatement(
+                    "DELETE FROM gui_commands WHERE status != 'PENDING' AND requested_at < ?")) {
+                ps.setString(1, LocalDateTime.now().minusDays(1).format(TS));
+                ps.executeUpdate();
+            }
+        }
 
         private Connection conn() throws SQLException {
             if (conn == null || conn.isClosed()) {
@@ -242,21 +271,32 @@ public final class CommandQueueService {
         }
 
         private void reset() {
-            try { if (conn != null) conn.close(); } catch (SQLException ignored) { }
+            try {
+                if (conn != null) conn.close();
+            } catch (SQLException ignored) {
+            }
             conn = null;
         }
 
-        /** Pending commands, oldest first; housekeeping runs only when due. */
+        /**
+         * Pending commands, oldest first; housekeeping runs only when due.
+         */
         public List<Command> pollPending() {
             List<Command> out = new ArrayList<>();
             try {
                 Connection c = conn();
                 long now = System.currentTimeMillis();
-                if (now - lastExpire >= EXPIRE_EVERY_MS) { lastExpire = now; expire(c); }
-                if (now - lastPrune >= PRUNE_EVERY_MS) { lastPrune = now; prune(c); }
+                if (now - lastExpire >= EXPIRE_EVERY_MS) {
+                    lastExpire = now;
+                    expire(c);
+                }
+                if (now - lastPrune >= PRUNE_EVERY_MS) {
+                    lastPrune = now;
+                    prune(c);
+                }
                 try (PreparedStatement ps = c.prepareStatement(
                         "SELECT id, task_id, action, requested_by, requested_at FROM gui_commands " +
-                        "WHERE status = 'PENDING' ORDER BY id ASC");
+                                "WHERE status = 'PENDING' ORDER BY id ASC");
                      ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
                         long id = rs.getLong("id");
@@ -283,8 +323,13 @@ public final class CommandQueueService {
             markOn(id, Status.FAILED, detail);
         }
 
-        public void markDone(long id) { markOn(id, Status.DONE, null); }
-        public void markFailed(long id, String detail) { markOn(id, Status.FAILED, detail); }
+        public void markDone(long id) {
+            markOn(id, Status.DONE, null);
+        }
+
+        public void markFailed(long id, String detail) {
+            markOn(id, Status.FAILED, detail);
+        }
 
         private void markOn(long id, Status status, String detail) {
             try (PreparedStatement ps = conn().prepareStatement(
@@ -299,23 +344,9 @@ public final class CommandQueueService {
             }
         }
 
-        private static void expire(Connection c) throws SQLException {
-            try (PreparedStatement ps = c.prepareStatement(
-                    "UPDATE gui_commands SET status = 'FAILED', detail = ? WHERE status = 'PENDING' AND requested_at < ?")) {
-                ps.setString(1, "Expired: not picked up within " + PENDING_TTL_MINUTES + " minutes (daemon not running?)");
-                ps.setString(2, LocalDateTime.now().minusMinutes(PENDING_TTL_MINUTES).format(TS));
-                ps.executeUpdate();
-            }
+        @Override
+        public void close() {
+            reset();
         }
-
-        private static void prune(Connection c) throws SQLException {
-            try (PreparedStatement ps = c.prepareStatement(
-                    "DELETE FROM gui_commands WHERE status != 'PENDING' AND requested_at < ?")) {
-                ps.setString(1, LocalDateTime.now().minusDays(1).format(TS));
-                ps.executeUpdate();
-            }
-        }
-
-        @Override public void close() { reset(); }
     }
 }

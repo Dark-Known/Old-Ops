@@ -39,20 +39,11 @@ public class WorkerActivityStrip extends JPanel {
     // ones actually worth flagging as long-running.
     private static final long LONG_RUNNING_THRESHOLD_MS = 5_000;
     private static final int PULSE_TICK_MS = 400;
-
+    private final javax.swing.Timer pulseTimer;
     private List<Row> rows = List.of();
     private int idleCount = 0;
     private String modeLabel = null;
-
-    private final javax.swing.Timer pulseTimer;
     private int pulsePhase = 0;
-
-    private record Row(String taskName, ScheduledTask.TransferDirection direction, java.time.LocalDateTime startedAt) {
-        boolean isLongRunning() {
-            return startedAt != null
-                    && java.time.Duration.between(startedAt, java.time.LocalDateTime.now()).toMillis() > LONG_RUNNING_THRESHOLD_MS;
-        }
-    }
 
     public WorkerActivityStrip() {
         setOpaque(false);
@@ -65,7 +56,14 @@ public class WorkerActivityStrip extends JPanel {
         });
     }
 
-    /** Stops the pulse timer — call before discarding an instance so it doesn't keep ticking. */
+    private static String clip(String s, int maxChars) {
+        if (s == null) return "";
+        return s.length() <= maxChars ? s : s.substring(0, maxChars - 1) + "\u2026";
+    }
+
+    /**
+     * Stops the pulse timer — call before discarding an instance so it doesn't keep ticking.
+     */
     public void dispose() {
         pulseTimer.stop();
     }
@@ -197,8 +195,10 @@ public class WorkerActivityStrip extends JPanel {
         g2.dispose();
     }
 
-    private static String clip(String s, int maxChars) {
-        if (s == null) return "";
-        return s.length() <= maxChars ? s : s.substring(0, maxChars - 1) + "\u2026";
+    private record Row(String taskName, ScheduledTask.TransferDirection direction, java.time.LocalDateTime startedAt) {
+        boolean isLongRunning() {
+            return startedAt != null
+                    && java.time.Duration.between(startedAt, java.time.LocalDateTime.now()).toMillis() > LONG_RUNNING_THRESHOLD_MS;
+        }
     }
 }

@@ -37,10 +37,9 @@ public record MonitorEvent(
         boolean retryable,
         String suggestedAction) {
 
-    /** Which history table a row lives in — their id sequences are independent. */
-    public enum Table { RUN, ACTIVITY, BACKGROUND }
-
-    /** Globally unique key for this event (table + row id). */
+    /**
+     * Globally unique key for this event (table + row id).
+     */
     public String key() {
         return table.name().charAt(0) + ":" + id;
     }
@@ -57,7 +56,9 @@ public record MonitorEvent(
         return (isOutcome() || kind == EventKind.FILES_DETECTED) && end != null ? end : start;
     }
 
-    /** True for the terminal row of a run: succeeded, failed or skipped. */
+    /**
+     * True for the terminal row of a run: succeeded, failed or skipped.
+     */
     public boolean isOutcome() {
         return kind == EventKind.RUN_SUCCEEDED || kind == EventKind.RUN_FAILED || kind == EventKind.RUN_SKIPPED;
     }
@@ -66,8 +67,15 @@ public record MonitorEvent(
         return severity.compareTo(EventKind.Severity.WARN) >= 0;
     }
 
-    /** Task id values used for application-level notes that are not about any one task. */
+    /**
+     * Task id values used for application-level notes that are not about any one task.
+     */
     public boolean isSystemNote() {
         return kind.category().taskless();
     }
+
+    /**
+     * Which history table a row lives in — their id sequences are independent.
+     */
+    public enum Table {RUN, ACTIVITY, BACKGROUND}
 }

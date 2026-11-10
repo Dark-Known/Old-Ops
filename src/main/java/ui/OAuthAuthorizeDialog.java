@@ -11,7 +11,7 @@ import java.util.function.Consumer;
 
 /**
  * One-time interactive OAuth2 "device code" sign-in for a mailbox.
- *
+ * <p>
  * Runs {@link OAuth2TokenService#enroll} on a background thread (it blocks
  * while polling Microsoft's token endpoint until the person finishes signing
  * in elsewhere), and shows the "open this URL, enter this code" instructions
@@ -152,7 +152,9 @@ public class OAuthAuthorizeDialog extends JDialog {
         Async.execute("Authorize mailbox (device code)", true, true, worker);
     }
 
-    /** Pulls the short alphanumeric sign-in code out of Microsoft's device-code prompt text. */
+    /**
+     * Pulls the short alphanumeric sign-in code out of Microsoft's device-code prompt text.
+     */
     private String extractCode(String message) {
         java.util.regex.Matcher m =
                 java.util.regex.Pattern.compile("\\b([A-Z0-9]{4,}-?[A-Z0-9]{4,})\\b").matcher(message);

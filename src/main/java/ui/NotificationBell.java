@@ -19,11 +19,6 @@ import java.util.List;
  */
 public class NotificationBell extends JButton {
 
-    private final XmlStorageService storage;
-    private final TaskSchedulerService scheduler;
-    private final WatchStatusMonitor watchStatusMonitor; // nullable-safe; may be null in contexts without one
-    private int failedCount = 0;
-
     // Facebook's header bell: a plain outline icon sitting directly on the
     // bar (no permanent background), with a soft circular highlight that
     // only appears on hover, and a solid red count badge overlapping the
@@ -32,6 +27,10 @@ public class NotificationBell extends JButton {
     // is the equivalent on this app's dark navy header) instead of an
     // always-on colored chip.
     private static final Color HOVER_HIGHLIGHT = new Color(255, 255, 255, 38);
+    private final XmlStorageService storage;
+    private final TaskSchedulerService scheduler;
+    private final WatchStatusMonitor watchStatusMonitor; // nullable-safe; may be null in contexts without one
+    private int failedCount = 0;
     private boolean hovering = false;
 
     public NotificationBell(XmlStorageService storage, TaskSchedulerService scheduler) {
@@ -53,14 +52,29 @@ public class NotificationBell extends JButton {
         setMargin(new Insets(4, 4, 4, 4));
         addActionListener(e -> showDropdown());
         addMouseListener(new java.awt.event.MouseAdapter() {
-            @Override public void mouseEntered(java.awt.event.MouseEvent e) { hovering = true; repaint(); }
-            @Override public void mouseExited(java.awt.event.MouseEvent e) { hovering = false; repaint(); }
+            @Override
+            public void mouseEntered(java.awt.event.MouseEvent e) {
+                hovering = true;
+                repaint();
+            }
+
+            @Override
+            public void mouseExited(java.awt.event.MouseEvent e) {
+                hovering = false;
+                repaint();
+            }
         });
         refreshCount();
     }
 
-    /** Re-reads the current failed/retrying task count from storage, plus any
-     *  recent watch-fallback events, and repaints the badge. Cheap — call freely. */
+    private static String escape(String s) {
+        return s == null ? "" : s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
+    }
+
+    /**
+     * Re-reads the current failed/retrying task count from storage, plus any
+     * recent watch-fallback events, and repaints the badge. Cheap — call freely.
+     */
     public void refreshCount() {
         int count = 0;
         for (ScheduledTask t : storage.loadTasks()) {
@@ -185,12 +199,11 @@ public class NotificationBell extends JButton {
         dialog.setSize(900, 600);
         dialog.setLocationRelativeTo(ownerWindow);
         dialog.addWindowListener(new java.awt.event.WindowAdapter() {
-            @Override public void windowClosed(java.awt.event.WindowEvent e) { refreshCount(); }
+            @Override
+            public void windowClosed(java.awt.event.WindowEvent e) {
+                refreshCount();
+            }
         });
         dialog.setVisible(true);
-    }
-
-    private static String escape(String s) {
-        return s == null ? "" : s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
     }
 }

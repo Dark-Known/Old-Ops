@@ -3,4 +3,4 @@
 Add-Type -AssemblyName System.Security
 $in = [Console]::In.ReadLine()
 $b = [Convert]::FromBase64String($in)
-[Console]::Out.Write([Convert]::ToBase64String([System.Security.Cryptography.ProtectedData]::{{OPERATION}}($b, $null, [System.Security.Cryptography.DataProtectionScope]::LocalMachine)))
+[Console]::Out.Write([Convert]::ToBase64String([System.Security.Cryptography.ProtectedData]::{ { OPERATION } }($b, $null, [System.Security.Cryptography.DataProtectionScope]::LocalMachine)))

@@ -15,21 +15,10 @@ import java.util.List;
  */
 public final class TeamsCard {
 
-    /** Everything one alert says. */
-    public record Alert(EventKind kind, boolean recovery, String taskId, String taskName, String taskType, String status,
-                        String message, String details, String suggestedAction, LocalDateTime startedAt, LocalDateTime endedAt,
-                        long durationMs, String trigger, String runKey, String host, String reportUrl, String reportPath,
-                        int suppressed, LocalDateTime raisedAt) {
-
-        public String title() {
-            String what = kind == null ? "Alert" : kind.label();
-            return (recovery ? "Recovered: " : "") + what + (taskName == null || taskName.isBlank() ? "" : " - " + taskName);
-        }
-    }
-
     private static final DateTimeFormatter TS = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
-    private TeamsCard() { }
+    private TeamsCard() {
+    }
 
     public static String build(Alert a) {
         String style = a.recovery() ? "good" : a.kind() != null && a.kind().defaultSeverity() == EventKind.Severity.ERROR ? "attention"
@@ -56,9 +45,11 @@ public final class TeamsCard {
         if (a.startedAt() != null) facts.add(fact("Started", TS.format(a.startedAt())));
         if (a.durationMs() > 0) facts.add(fact("Duration", duration(a.durationMs())));
         if (!nz(a.trigger()).isEmpty()) facts.add(fact("Triggered by", a.trigger()));
-        if (a.suppressed() > 0) facts.add(fact("Repeats held back", a.suppressed() + " similar alert" + (a.suppressed() == 1 ? "" : "s")
-                + " in the last interval"));
-        if (!facts.isEmpty()) body.add("{\"type\":\"FactSet\",\"facts\":[" + String.join(",", facts) + "],\"spacing\":\"Medium\"}");
+        if (a.suppressed() > 0)
+            facts.add(fact("Repeats held back", a.suppressed() + " similar alert" + (a.suppressed() == 1 ? "" : "s")
+                    + " in the last interval"));
+        if (!facts.isEmpty())
+            body.add("{\"type\":\"FactSet\",\"facts\":[" + String.join(",", facts) + "],\"spacing\":\"Medium\"}");
 
         String det = nz(a.details()).trim();
         if (!det.isEmpty() && !det.equals(nz(a.message()).trim())) {
@@ -86,9 +77,17 @@ public final class TeamsCard {
         return "{\"title\":" + q(title) + ",\"value\":" + q(value) + "}";
     }
 
-    private static String q(String s) { return "\"" + MiniJson.escapeString(s == null ? "" : s) + "\""; }
-    private static String nz(String s) { return s == null ? "" : s; }
-    private static String clip(String s, int n) { return s.length() <= n ? s : s.substring(0, n) + "..."; }
+    private static String q(String s) {
+        return "\"" + MiniJson.escapeString(s == null ? "" : s) + "\"";
+    }
+
+    private static String nz(String s) {
+        return s == null ? "" : s;
+    }
+
+    private static String clip(String s, int n) {
+        return s.length() <= n ? s : s.substring(0, n) + "...";
+    }
 
     static String duration(long ms) {
         if (ms < 1000) return ms + " ms";
@@ -97,5 +96,22 @@ public final class TeamsCard {
         long m = s / 60;
         if (m < 120) return m + " min " + (s % 60) + " s";
         return (m / 60) + " h " + (m % 60) + " min";
+    }
+
+    /**
+     * Everything one alert says.
+     */
+    public record Alert(EventKind kind, boolean recovery, String taskId, String taskName, String taskType,
+                        String status,
+                        String message, String details, String suggestedAction, LocalDateTime startedAt,
+                        LocalDateTime endedAt,
+                        long durationMs, String trigger, String runKey, String host, String reportUrl,
+                        String reportPath,
+                        int suppressed, LocalDateTime raisedAt) {
+
+        public String title() {
+            String what = kind == null ? "Alert" : kind.label();
+            return (recovery ? "Recovered: " : "") + what + (taskName == null || taskName.isBlank() ? "" : " - " + taskName);
+        }
     }
 }

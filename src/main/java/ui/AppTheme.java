@@ -26,52 +26,66 @@ import java.util.prefs.Preferences;
  */
 public final class AppTheme {
 
-    private static final String PREF_KEY_DARK = "dark_mode";
-    private static final Preferences PREFS = Preferences.userNodeForPackage(SettingsPanel.class);
-
-    /** The app's accent color — warm terracotta, used for the header gradient, focus rings,
-     *  selected nav item, and FlatLaf's own accent-driven components (selected tabs, progress
-     *  bars, checked checkboxes...) so native Swing chrome matches the custom UI. */
+    /**
+     * The app's accent color — warm terracotta, used for the header gradient, focus rings,
+     * selected nav item, and FlatLaf's own accent-driven components (selected tabs, progress
+     * bars, checked checkboxes...) so native Swing chrome matches the custom UI.
+     */
     public static final Color ACCENT = new Color(0xC1652F);          // terracotta
     public static final Color ACCENT_DARK = new Color(0x6B4226);     // umber — header gradient start
     public static final Color ACCENT_SECONDARY = new Color(0x8A9A5B); // olive/moss — header gradient end
-    private static final String ACCENT_HEX = "#C1652F";
-
-    /** Earthy semantic button colors — used in place of the old primary-color palette
-     *  (bright green/blue/red/orange) across TaskManagerPanel, CredentialManagerPanel, etc. */
-    public static final Color EARTH_MOSS   = new Color(0x5B7B4F); // creation / positive actions (New Task, Add Credential)
+    /**
+     * Earthy semantic button colors — used in place of the old primary-color palette
+     * (bright green/blue/red/orange) across TaskManagerPanel, CredentialManagerPanel, etc.
+     */
+    public static final Color EARTH_MOSS = new Color(0x5B7B4F); // creation / positive actions (New Task, Add Credential)
     public static final Color EARTH_SIENNA = new Color(0xA0522D); // primary actions (Run Now, Save)
-    public static final Color EARTH_RUST   = new Color(0xA54A3F); // destructive actions (Delete)
-    public static final Color EARTH_OCHRE  = new Color(0xC68642); // secondary emphasis (Restart)
-    public static final Color EARTH_CLAY   = new Color(0xBF6952); // tertiary emphasis (View Logs)
-    public static final Color EARTH_TEAL   = new Color(0x4A6D5C); // alt action (Latest Logs, deep sage-teal)
-
-    /** Status pill tokens — paired (fg, bg) used by {@link PillBadge} for
-     *  Running/Failed/Success/Skipped everywhere a status needs to read as a
-     *  small colored chip rather than a full-row tint. Bg values are always
-     *  pale regardless of light/dark mode (a deliberate "highlighter"
-     *  look), so fg is always a dark, readable-on-pale color — never the
-     *  theme's normal (light-in-dark-mode) foreground. */
+    public static final Color EARTH_RUST = new Color(0xA54A3F); // destructive actions (Delete)
+    public static final Color EARTH_OCHRE = new Color(0xC68642); // secondary emphasis (Restart)
+    public static final Color EARTH_CLAY = new Color(0xBF6952); // tertiary emphasis (View Logs)
+    public static final Color EARTH_TEAL = new Color(0x4A6D5C); // alt action (Latest Logs, deep sage-teal)
+    /**
+     * Status pill tokens — paired (fg, bg) used by {@link PillBadge} for
+     * Running/Failed/Success/Skipped everywhere a status needs to read as a
+     * small colored chip rather than a full-row tint. Bg values are always
+     * pale regardless of light/dark mode (a deliberate "highlighter"
+     * look), so fg is always a dark, readable-on-pale color — never the
+     * theme's normal (light-in-dark-mode) foreground.
+     */
     public static final Color RUNNING_FG = new Color(0x854F0B);
     public static final Color RUNNING_BG = new Color(0xFAEEDA);
-    public static final Color FAILED_FG  = new Color(0xA32D2D);
-    public static final Color FAILED_BG  = new Color(0xFCEBEB);
+    public static final Color FAILED_FG = new Color(0xA32D2D);
+    public static final Color FAILED_BG = new Color(0xFCEBEB);
     public static final Color SUCCESS_FG = new Color(0x3B6D11);
     public static final Color SUCCESS_BG = new Color(0xEAF3DE);
     public static final Color SKIPPED_FG = new Color(0x8A6415);
     public static final Color SKIPPED_BG = new Color(0xFBF3E3);
     public static final Color NEUTRAL_FG = new Color(0x8A8378); // disabled / no-status text
+    private static final String PREF_KEY_DARK = "dark_mode";
+    private static final Preferences PREFS = Preferences.userNodeForPackage(SettingsPanel.class);
+    private static final String ACCENT_HEX = "#C1652F";
 
-    /** Base panel background — same as before, just named for symmetry with {@link #surface2()}. */
-    public static Color surface1() { return UIManager.getColor("Panel.background"); }
+    private AppTheme() {
+    }
 
-    /** A step darker/lighter than {@link #surface1()} (depending on light/dark mode) — used for
-     *  hovered/selected row backgrounds and section dividers in the list-card panels. */
-    public static Color surface2() { return isDark() ? new Color(0x2A2A2A) : new Color(0xF6F4F0); }
+    /**
+     * Base panel background — same as before, just named for symmetry with {@link #surface2()}.
+     */
+    public static Color surface1() {
+        return UIManager.getColor("Panel.background");
+    }
 
-    private AppTheme() {}
+    /**
+     * A step darker/lighter than {@link #surface1()} (depending on light/dark mode) — used for
+     * hovered/selected row backgrounds and section dividers in the list-card panels.
+     */
+    public static Color surface2() {
+        return isDark() ? new Color(0x2A2A2A) : new Color(0xF6F4F0);
+    }
 
-    /** Installs the theme according to the saved light/dark preference (light by default). */
+    /**
+     * Installs the theme according to the saved light/dark preference (light by default).
+     */
     public static void install() {
         // Must happen BEFORE setLookAndFeel — this is how FlatLaf itself is customized at the
         // properties-file level (its "@variable" system), as opposed to the plain UIManager.put()
@@ -83,7 +97,10 @@ public final class AppTheme {
         } catch (Exception ex) {
             // Should never happen (both classes are always available once vendored), but if it
             // somehow does, fall back to the plain OS-default LaF rather than crashing the app.
-            try { UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName()); } catch (Exception ignored) {}
+            try {
+                UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
+            } catch (Exception ignored) {
+            }
         }
 
         applyStyleOverrides();
@@ -93,7 +110,9 @@ public final class AppTheme {
         return PREFS.getBoolean(PREF_KEY_DARK, false);
     }
 
-    /** Flips light/dark and live-refreshes every currently open window — no restart required. */
+    /**
+     * Flips light/dark and live-refreshes every currently open window — no restart required.
+     */
     public static void toggle() {
         PREFS.putBoolean(PREF_KEY_DARK, !isDark());
         try {

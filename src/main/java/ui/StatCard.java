@@ -42,7 +42,9 @@ public class StatCard extends JPanel {
         valueLabel.setText(value);
     }
 
-    /** Rounded background to match {@link PillBadge}'s soft-card look elsewhere. */
+    /**
+     * Rounded background to match {@link PillBadge}'s soft-card look elsewhere.
+     */
     @Override
     protected void paintComponent(Graphics g) {
         Graphics2D g2 = (Graphics2D) g.create();

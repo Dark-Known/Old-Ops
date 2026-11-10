@@ -1,1 +1,1 @@
-Invoke-RestMethod {{URL}}/socketLink/health
+Invoke-RestMethod { { URL } }/socketLink/health

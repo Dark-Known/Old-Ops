@@ -6,4 +6,5 @@ public record RemoteFileMetadata(
         String fileName,
         Instant lastModified,
         long size
-) {}
+) {
+}

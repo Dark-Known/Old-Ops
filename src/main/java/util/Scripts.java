@@ -11,19 +11,26 @@ import java.nio.charset.StandardCharsets;
  */
 public final class Scripts {
 
-    private Scripts() {}
+    private Scripts() {
+    }
 
-    /** Comment lines and blank lines removed, remaining lines joined with a newline. For scripts passed as -EncodedCommand. */
+    /**
+     * Comment lines and blank lines removed, remaining lines joined with a newline. For scripts passed as -EncodedCommand.
+     */
     public static String compact(String name, String... kv) {
         return fill(strip(read(name), "\n"), kv);
     }
 
-    /** Comment lines and blank lines removed, remaining lines joined with "; ". For a short script given to {@code -Command}. */
+    /**
+     * Comment lines and blank lines removed, remaining lines joined with "; ". For a short script given to {@code -Command}.
+     */
     public static String oneLine(String name, String... kv) {
         return fill(strip(read(name), "; "), kv);
     }
 
-    /** The file as written (text shown to the user, such as a command to copy). Trailing newline removed. */
+    /**
+     * The file as written (text shown to the user, such as a command to copy). Trailing newline removed.
+     */
     public static String raw(String name, String... kv) {
         String s = read(name).replace("\r\n", "\n");
         return fill(s.endsWith("\n") ? s.substring(0, s.length() - 1) : s, kv);

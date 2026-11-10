@@ -1,10 +1,10 @@
 package ui.monitor;
 
-import ui.Async;
 import model.EventKind;
 import model.TaskRunRecord;
 import service.RunHistoryService;
 import ui.AppTheme;
+import ui.Async;
 import ui.RunLogSummarizer;
 
 import javax.swing.*;
@@ -47,15 +47,17 @@ public class DetailPane extends JPanel {
     private final JToggleButton logToggle = new JToggleButton("Show raw log");
     private final JButton copyBtn = new JButton("Copy");
     private final JButton onlyBtn = new JButton("Only this task");
-
+    private final Map<String, TaskRunRecord> recordCache = new LinkedHashMap<>(32, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, TaskRunRecord> e) {
+            return size() > 60;
+        }
+    };
     private String activeTaskFilter;
     private FeedRow current;
     private String currentText = "";
     private String currentLog = "";
     private int seq;
-    private final Map<String, TaskRunRecord> recordCache = new LinkedHashMap<>(32, 0.75f, true) {
-        @Override protected boolean removeEldestEntry(Map.Entry<String, TaskRunRecord> e) { return size() > 60; }
-    };
 
     public DetailPane(RunHistoryService history, service.BackgroundLogService backgroundLog, Consumer<String> onlyTask) {
         this.history = history;
@@ -70,6 +72,98 @@ public class DetailPane extends JPanel {
         add(hint, "empty");
         add(buildContent(), "content");
         cards.show(this, "empty");
+    }
+
+    private static String headline(FeedRow row) {
+        return switch (row.type) {
+            case BUCKET -> row.count + " identical runs";
+            case RUN -> (row.head.runKey() != null && row.head.runKey().startsWith("watch:") ? "Watcher" : "Run")
+                    + " \u00b7 " + row.count + " events";
+            case EVENT -> row.head.kind().category().label() + " \u00b7 " + row.head.kind().label();
+        };
+    }
+
+    private static void fact(StringBuilder h, StringBuilder t, String k, String v) {
+        h.append("<tr><td class='m'>").append(k).append("</td><td>").append(MonitorStyle.htmlEscape(v)).append("</td></tr>");
+        t.append(k).append(": ").append(v).append('\n');
+    }
+
+    private static String triggerExplain(String trig) {
+        return switch (trig) {
+            case "SCHEDULE" -> "its schedule";
+            case "WATCHER" -> "the watcher (a file changed)";
+            case "MANUAL" -> "a manual run (Run Now)";
+            case "RETRY" -> "an automatic retry";
+            default -> trig;
+        };
+    }
+
+    private static MonitorEvent failedEvent(FeedRow row) {
+        for (MonitorEvent e : row.events) if (e.kind() == EventKind.RUN_FAILED) return e;
+        return row.head.kind() == EventKind.RUN_FAILED ? row.head : null;
+    }
+
+    /**
+     * The untruncated message of the row's headline event, when the record has been loaded.
+     */
+    private static String fullMessage(FeedRow row, Map<String, TaskRunRecord> records) {
+        TaskRunRecord r = records.get(row.head.key());
+        String s = r != null && r.getReason() != null && !r.getReason().isBlank() ? r.getReason() : row.summary;
+        return s == null ? "" : s.strip();
+    }
+
+    private static boolean hasDetectedList(FeedRow row) {
+        for (MonitorEvent e : row.events) if (e.kind() == EventKind.FILES_DETECTED) return true;
+        return false;
+    }
+
+    // ── Rendering ───────────────────────────────────────────────────
+
+    private static void listFiles(StringBuilder h, StringBuilder t, List<String> files) {
+        int shown = Math.min(files.size(), MAX_FILES);
+        for (int i = 0; i < shown; i++) {
+            h.append("\u2022 ").append(MonitorStyle.htmlEscape(files.get(i))).append("<br>");
+            t.append("  - ").append(files.get(i)).append('\n');
+        }
+        if (files.size() > shown) {
+            h.append("<span class='m'>\u2026 and ").append(files.size() - shown).append(" more</span>");
+            t.append("  ... and ").append(files.size() - shown).append(" more\n");
+        }
+    }
+
+    /**
+     * Lines like "[INFO]   name | lastModified=... | size=123" written by the detection event.
+     */
+    private static List<String> parseDetected(String details) {
+        List<String> out = new ArrayList<>();
+        if (details == null) return out;
+        for (String line : details.split("\\R")) {
+            String l = line.trim();
+            if (!l.startsWith("[INFO]") || !l.contains("| size=")) continue;
+            String rest = l.substring("[INFO]".length()).trim();
+            int bar = rest.indexOf('|');
+            String name = bar > 0 ? rest.substring(0, bar).trim() : rest;
+            String sizePart = rest.substring(rest.indexOf("size=") + 5).trim();
+            try {
+                out.add(name + "  \u2014  " + RunLogSummarizer.formatBytes(Long.parseLong(sizePart)));
+            } catch (NumberFormatException nfe) {
+                out.add(name);
+            }
+        }
+        return out;
+    }
+
+    private static String categoryLabel(TaskRunRecord.FailureCategory c) {
+        return switch (c) {
+            case NETWORK -> "Network";
+            case AUTH -> "Authentication";
+            case PERMISSION -> "Permission";
+            case DISK_SPACE -> "Disk space";
+            case CONFIG -> "Configuration";
+            case TIMEOUT -> "Timeout";
+            case ORPHANED -> "Orphaned (process stopped mid-run)";
+            case UNKNOWN -> "Unclassified";
+        };
     }
 
     private JComponent buildContent() {
@@ -137,7 +231,9 @@ public class DetailPane extends JPanel {
         return p;
     }
 
-    /** Tells the pane which task the feed is currently restricted to (null = none), so its button can read "Show all tasks". */
+    /**
+     * Tells the pane which task the feed is currently restricted to (null = none), so its button can read "Show all tasks".
+     */
     public void setActiveTaskFilter(String taskId) {
         this.activeTaskFilter = taskId;
         refreshOnlyButton();
@@ -149,11 +245,16 @@ public class DetailPane extends JPanel {
         onlyBtn.setToolTipText(on ? "Remove the task filter" : "Show only events of this task in the feed");
     }
 
-    /** Shows {@code row}, or the empty hint for null. Safe to call with the same row repeatedly. */
+    /**
+     * Shows {@code row}, or the empty hint for null. Safe to call with the same row repeatedly.
+     */
     public void setRow(FeedRow row) {
         current = row;
         final int mySeq = ++seq;
-        if (row == null) { cards.show(this, "empty"); return; }
+        if (row == null) {
+            cards.show(this, "empty");
+            return;
+        }
         cards.show(this, "content");
 
         title.setText(row.taskName);
@@ -170,18 +271,26 @@ public class DetailPane extends JPanel {
         for (MonitorEvent e : row.events) {
             if (e.isOutcome() || e.kind() == EventKind.FILES_DETECTED || row.type == FeedRow.Type.EVENT) need.add(e);
         }
-        if (row.type == FeedRow.Type.BUCKET || need.isEmpty()) { applyLog(row, Map.of()); return; }
+        if (row.type == FeedRow.Type.BUCKET || need.isEmpty()) {
+            applyLog(row, Map.of());
+            return;
+        }
 
         Map<String, TaskRunRecord> have = new HashMap<>();
         List<MonitorEvent> missing = new ArrayList<>();
         for (MonitorEvent e : need) {
             TaskRunRecord r = recordCache.get(e.key());
-            if (r != null) have.put(e.key(), r); else missing.add(e);
+            if (r != null) have.put(e.key(), r);
+            else missing.add(e);
         }
-        if (missing.isEmpty()) { applyLog(row, have); return; }
+        if (missing.isEmpty()) {
+            applyLog(row, have);
+            return;
+        }
 
         Async.execute("Load event details", false, false, new SwingWorker<Map<String, TaskRunRecord>, Void>() {
-            @Override protected Map<String, TaskRunRecord> doInBackground() {
+            @Override
+            protected Map<String, TaskRunRecord> doInBackground() {
                 Map<String, TaskRunRecord> out = new HashMap<>();
                 for (MonitorEvent e : missing) {
                     TaskRunRecord r = switch (e.table()) {
@@ -193,7 +302,9 @@ public class DetailPane extends JPanel {
                 }
                 return out;
             }
-            @Override protected void done() {
+
+            @Override
+            protected void done() {
                 if (mySeq != seq) return;     // the selection moved on while this was loading
                 try {
                     Map<String, TaskRunRecord> got = get();
@@ -214,9 +325,11 @@ public class DetailPane extends JPanel {
         for (MonitorEvent e : row.events) {
             TaskRunRecord r = records.get(e.key());
             if (r == null || r.getDetails() == null || r.getDetails().isBlank()) continue;
-            if (r.getDetails().strip().equals(r.getReason() != null ? r.getReason().strip() : "")) continue; // nothing beyond the summary
+            if (r.getDetails().strip().equals(r.getReason() != null ? r.getReason().strip() : ""))
+                continue; // nothing beyond the summary
             if (log.length() > 0) log.append("\n\n");
-            if (row.events.size() > 1) log.append("\u2500\u2500 ").append(e.kind().label()).append("  ").append(MonitorStyle.time(e.time())).append(" \u2500\u2500\n");
+            if (row.events.size() > 1)
+                log.append("\u2500\u2500 ").append(e.kind().label()).append("  ").append(MonitorStyle.time(e.time())).append(" \u2500\u2500\n");
             log.append(r.getDetails().strip());
         }
         currentLog = log.length() > MAX_LOG_CHARS ? log.substring(0, MAX_LOG_CHARS) + "\n\u2026 (truncated)" : log.toString();
@@ -225,25 +338,22 @@ public class DetailPane extends JPanel {
         logToggle.setVisible(!currentLog.isEmpty());
         // An SSH session's log IS the point of its event, so show it straight away instead of behind the toggle.
         boolean ssh = false;
-        for (MonitorEvent e : row.events) if (e.kind().category() == EventKind.Category.SSH) { ssh = true; break; }
+        for (MonitorEvent e : row.events)
+            if (e.kind().category() == EventKind.Category.SSH) {
+                ssh = true;
+                break;
+            }
         if (ssh && !currentLog.isEmpty()) {
             logToggle.setSelected(true);
             logToggle.setText("Hide raw log");
             logScroll.setVisible(true);
         }
-        if (currentLog.isEmpty()) { logToggle.setSelected(false); logToggle.setText("Show raw log"); logScroll.setVisible(false); }
+        if (currentLog.isEmpty()) {
+            logToggle.setSelected(false);
+            logToggle.setText("Show raw log");
+            logScroll.setVisible(false);
+        }
     }
-
-    private static String headline(FeedRow row) {
-        return switch (row.type) {
-            case BUCKET -> row.count + " identical runs";
-            case RUN -> (row.head.runKey() != null && row.head.runKey().startsWith("watch:") ? "Watcher" : "Run")
-                    + " \u00b7 " + row.count + " events";
-            case EVENT -> row.head.kind().category().label() + " \u00b7 " + row.head.kind().label();
-        };
-    }
-
-    // ── Rendering ───────────────────────────────────────────────────
 
     private void render(FeedRow row, Map<String, TaskRunRecord> records) {
         String fg = MonitorStyle.hex(MonitorStyle.fg());
@@ -317,33 +427,6 @@ public class DetailPane extends JPanel {
         body.setCaretPosition(0);
     }
 
-    private static void fact(StringBuilder h, StringBuilder t, String k, String v) {
-        h.append("<tr><td class='m'>").append(k).append("</td><td>").append(MonitorStyle.htmlEscape(v)).append("</td></tr>");
-        t.append(k).append(": ").append(v).append('\n');
-    }
-
-    private static String triggerExplain(String trig) {
-        return switch (trig) {
-            case "SCHEDULE" -> "its schedule";
-            case "WATCHER" -> "the watcher (a file changed)";
-            case "MANUAL" -> "a manual run (Run Now)";
-            case "RETRY" -> "an automatic retry";
-            default -> trig;
-        };
-    }
-
-    private static MonitorEvent failedEvent(FeedRow row) {
-        for (MonitorEvent e : row.events) if (e.kind() == EventKind.RUN_FAILED) return e;
-        return row.head.kind() == EventKind.RUN_FAILED ? row.head : null;
-    }
-
-    /** The untruncated message of the row's headline event, when the record has been loaded. */
-    private static String fullMessage(FeedRow row, Map<String, TaskRunRecord> records) {
-        TaskRunRecord r = records.get(row.head.key());
-        String s = r != null && r.getReason() != null && !r.getReason().isBlank() ? r.getReason() : row.summary;
-        return s == null ? "" : s.strip();
-    }
-
     private void transferSection(StringBuilder h, StringBuilder t, FeedRow row, Map<String, TaskRunRecord> records) {
         // Detection: the files a scan found.
         for (MonitorEvent e : row.events) {
@@ -367,7 +450,8 @@ public class DetailPane extends JPanel {
 
         h.append("<h4>TRANSFER</h4><table cellspacing='0'>");
         t.append("\nTransfer:\n");
-        if (s.direction() != null) fact(h, t, "Direction", s.direction().equals("INBOUND") ? "Inbound (remote \u2192 local)" : s.direction().equals("OUTBOUND") ? "Outbound (local \u2192 remote)" : s.direction());
+        if (s.direction() != null)
+            fact(h, t, "Direction", s.direction().equals("INBOUND") ? "Inbound (remote \u2192 local)" : s.direction().equals("OUTBOUND") ? "Outbound (local \u2192 remote)" : s.direction());
         if (s.sourcePath() != null) fact(h, t, "From", s.sourcePath());
         if (s.destPath() != null) fact(h, t, "To", s.destPath());
         fact(h, t, "Files", String.valueOf(s.fileCount()));
@@ -379,43 +463,10 @@ public class DetailPane extends JPanel {
         if (!s.files().isEmpty() && !hasDetectedList(row)) {
             h.append("<h4>FILES</h4>");
             List<String> names = new ArrayList<>();
-            for (RunLogSummarizer.FileEntry f : s.files()) names.add(f.name() + (f.sizeFormatted() != null ? "  \u2014  " + f.sizeFormatted() : ""));
+            for (RunLogSummarizer.FileEntry f : s.files())
+                names.add(f.name() + (f.sizeFormatted() != null ? "  \u2014  " + f.sizeFormatted() : ""));
             listFiles(h, t, names);
         }
-    }
-
-    private static boolean hasDetectedList(FeedRow row) {
-        for (MonitorEvent e : row.events) if (e.kind() == EventKind.FILES_DETECTED) return true;
-        return false;
-    }
-
-    private static void listFiles(StringBuilder h, StringBuilder t, List<String> files) {
-        int shown = Math.min(files.size(), MAX_FILES);
-        for (int i = 0; i < shown; i++) {
-            h.append("\u2022 ").append(MonitorStyle.htmlEscape(files.get(i))).append("<br>");
-            t.append("  - ").append(files.get(i)).append('\n');
-        }
-        if (files.size() > shown) {
-            h.append("<span class='m'>\u2026 and ").append(files.size() - shown).append(" more</span>");
-            t.append("  ... and ").append(files.size() - shown).append(" more\n");
-        }
-    }
-
-    /** Lines like "[INFO]   name | lastModified=... | size=123" written by the detection event. */
-    private static List<String> parseDetected(String details) {
-        List<String> out = new ArrayList<>();
-        if (details == null) return out;
-        for (String line : details.split("\\R")) {
-            String l = line.trim();
-            if (!l.startsWith("[INFO]") || !l.contains("| size=")) continue;
-            String rest = l.substring("[INFO]".length()).trim();
-            int bar = rest.indexOf('|');
-            String name = bar > 0 ? rest.substring(0, bar).trim() : rest;
-            String sizePart = rest.substring(rest.indexOf("size=") + 5).trim();
-            try { out.add(name + "  \u2014  " + RunLogSummarizer.formatBytes(Long.parseLong(sizePart))); }
-            catch (NumberFormatException nfe) { out.add(name); }
-        }
-        return out;
     }
 
     private void timeline(StringBuilder h, StringBuilder t, FeedRow row) {
@@ -447,21 +498,9 @@ public class DetailPane extends JPanel {
                     .append(m.trigger != null ? "  \u00b7  " + MonitorStyle.triggerLabel(m.trigger) : "").append("<br>");
             t.append("  ").append(MonitorStyle.time(m.time)).append('\n');
         }
-        if (row.members.size() > shown) h.append("<span class='m'>\u2026 and ").append(row.members.size() - shown).append(" more \u2014 expand the row to see each one</span>");
+        if (row.members.size() > shown)
+            h.append("<span class='m'>\u2026 and ").append(row.members.size() - shown).append(" more \u2014 expand the row to see each one</span>");
         h.append("<br><br><span class='m'>Repeated runs with nothing to do are grouped to keep the feed readable. "
                 + "Turn this off in Options \u2192 Collapse identical repeated runs.</span>");
-    }
-
-    private static String categoryLabel(TaskRunRecord.FailureCategory c) {
-        return switch (c) {
-            case NETWORK -> "Network";
-            case AUTH -> "Authentication";
-            case PERMISSION -> "Permission";
-            case DISK_SPACE -> "Disk space";
-            case CONFIG -> "Configuration";
-            case TIMEOUT -> "Timeout";
-            case ORPHANED -> "Orphaned (process stopped mid-run)";
-            case UNKNOWN -> "Unclassified";
-        };
     }
 }

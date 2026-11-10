@@ -2,6 +2,7 @@ package service;
 
 import model.RemoteFileException;
 import model.RemoteFileMetadata;
+
 import java.time.Instant;
 import java.util.List;
 
@@ -10,7 +11,7 @@ public interface RemoteFileMetadataService {
     /**
      * Returns all regular files whose last modified timestamp
      * is greater than the supplied timestamp.
-     *
+     * <p>
      * The returned list is ordered by last modified time
      * (oldest -> newest).
      */

@@ -19,7 +19,9 @@ public final class MonitorEvents {
     private boolean graphFailing;
     private String lastGraphError = "";
 
-    public MonitorEvents(RunHistoryService history) { this.history = history; }
+    public MonitorEvents(RunHistoryService history) {
+        this.history = history;
+    }
 
     public void start() {
         GraphCallLog.setListener(this::onGraph);
@@ -51,7 +53,7 @@ public final class MonitorEvents {
             graphFailing = true;
             history.recordEvent(EventKind.GRAPH_FAILING, AlertConfig.OUTLOOK, "Outlook mail", "OUTLOOK", TaskRunRecord.Status.FAILED,
                     "Outlook mail API failed " + graphFailures + " calls in a row", "Latest: " + lastGraphError
-                    + (e.mailbox().isEmpty() ? "" : "\nMailbox: " + e.mailbox()), now, now, null, null);
+                            + (e.mailbox().isEmpty() ? "" : "\nMailbox: " + e.mailbox()), now, now, null, null);
         }
     }
 

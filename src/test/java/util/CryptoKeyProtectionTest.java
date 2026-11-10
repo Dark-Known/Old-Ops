@@ -1,7 +1,5 @@
 package util;
 
-import static org.junit.Assert.*;
-
 import org.junit.Test;
 
 import java.io.File;
@@ -10,13 +8,17 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.Base64;
 
+import static org.junit.Assert.*;
+
 /**
  * Key-wrapping logic with a FAKE protector. This does not exercise real Windows DPAPI
  * (KeyProtector.WindowsDpapi), which can only be tested on Windows.
  */
 public class CryptoKeyProtectionTest {
 
-    /** Reversible, machine-independent stand-in: marker + XOR. */
+    /**
+     * Reversible, machine-independent stand-in: marker + XOR.
+     */
     static final KeyProtector FAKE = new KeyProtector() {
         public byte[] protect(byte[] p) {
             byte[] o = new byte[p.length + 4];
@@ -24,6 +26,7 @@ public class CryptoKeyProtectionTest {
             for (int i = 0; i < p.length; i++) o[i + 4] = (byte) (p[i] ^ 0x5a);
             return o;
         }
+
         public byte[] unprotect(byte[] b) throws IOException {
             if (b.length < 4 || b[0] != 'F' || b[1] != 'A') throw new IOException("not FAKE-protected");
             byte[] o = new byte[b.length - 4];
@@ -33,8 +36,13 @@ public class CryptoKeyProtectionTest {
     };
 
     static final KeyProtector BROKEN = new KeyProtector() {
-        public byte[] protect(byte[] p) throws IOException { throw new IOException("powershell missing"); }
-        public byte[] unprotect(byte[] b) throws IOException { throw new IOException("powershell missing"); }
+        public byte[] protect(byte[] p) throws IOException {
+            throw new IOException("powershell missing");
+        }
+
+        public byte[] unprotect(byte[] b) throws IOException {
+            throw new IOException("powershell missing");
+        }
     };
 
     private static String keyFile(File dir) throws Exception {

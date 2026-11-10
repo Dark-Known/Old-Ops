@@ -53,10 +53,17 @@ public class RunHistoryService {
 
     private static final String RUN_TABLE = "run_history";
     private static final String ACTIVITY_TABLE = "event_monitor_history";
-
+    // ── Run correlation context ──────────────────────────────────────────
+    // A task execution happens start-to-finish on one worker thread, and
+    // everything it records (Started, Detected, retry notes, the final
+    // outcome) should carry the same run key and trigger so the Event Monitor
+    // can fold them into one expandable run. Threading these through every
+    // recordRun/recordActivityEvent call site would mean changing signatures
+    // across the scheduler; a thread-local set once at the start of a run and
+    // cleared at the end gets the same result with no call-site changes.
+    private static final ThreadLocal<String[]> RUN_CONTEXT = new ThreadLocal<>();
     private final Connection conn;
     private final File dbFile;
-
     // Dedicated read-only connection for every query. Writes (recordRun, purge...) keep using {@code conn}
     // under {@code this}; reads take {@code readLock} on {@code rconn}. In WAL mode a reader never blocks the
     // writer and vice versa, so UI polls no longer queue behind run recording (and vice versa) inside
@@ -64,7 +71,6 @@ public class RunHistoryService {
     // old behaviour (everything serialized on {@code this} over {@code conn}).
     private final Connection rconn;
     private final Object readLock = new Object();
-
     // Notified (on whatever thread recordRun() was called from — usually a
     // scheduler worker thread, never the EDT) after every real outcome is
     // recorded, so the UI can show a toast and refresh live views without
@@ -73,7 +79,6 @@ public class RunHistoryService {
     // (EventMonitorPanel's refresh timer already covers that).
     private final List<java.util.function.Consumer<TaskRunRecord>> runListeners =
             new java.util.concurrent.CopyOnWriteArrayList<>();
-
     // Same idea as runListeners, but for recordActivityEvent — added because
     // it previously fired nothing at all, so a credential deleted, task
     // edited, or setting saved in one tab only ever reached the Event
@@ -119,12 +124,6 @@ public class RunHistoryService {
             return null;
         }
     }
-
-    /** Lock to hold while reading: the independent read lock when we have a read connection, else the write lock. */
-    private Object readGuard() { return rconn != null ? readLock : this; }
-
-    /** Connection to read from (see {@link #readGuard()}). */
-    private Connection rc() { return rconn != null ? rconn : conn; }
 
     private static void createTable(Statement st, String table) throws SQLException {
         st.execute("CREATE TABLE IF NOT EXISTS " + table + " (" +
@@ -175,7 +174,10 @@ public class RunHistoryService {
         boolean exists = false;
         try (ResultSet rs = st.executeQuery("PRAGMA table_info(" + table + ")")) {
             while (rs.next()) {
-                if (column.equalsIgnoreCase(rs.getString("name"))) { exists = true; break; }
+                if (column.equalsIgnoreCase(rs.getString("name"))) {
+                    exists = true;
+                    break;
+                }
             }
         }
         if (!exists) {
@@ -219,49 +221,67 @@ public class RunHistoryService {
                 " WHERE reason LIKE 'Started \u2014%' OR reason LIKE 'Detected %'");
     }
 
-    // ── Run correlation context ──────────────────────────────────────────
-    // A task execution happens start-to-finish on one worker thread, and
-    // everything it records (Started, Detected, retry notes, the final
-    // outcome) should carry the same run key and trigger so the Event Monitor
-    // can fold them into one expandable run. Threading these through every
-    // recordRun/recordActivityEvent call site would mean changing signatures
-    // across the scheduler; a thread-local set once at the start of a run and
-    // cleared at the end gets the same result with no call-site changes.
-    private static final ThreadLocal<String[]> RUN_CONTEXT = new ThreadLocal<>();
-
-    /** Short, unique-enough id for one task execution. */
+    /**
+     * Short, unique-enough id for one task execution.
+     */
     public static String newRunKey() {
         return java.util.UUID.randomUUID().toString().substring(0, 8);
     }
 
-    /** Marks the current thread as executing the run {@code runKey}, caused by {@code trigger} (SCHEDULE/WATCHER/MANUAL/RETRY). */
+    /**
+     * Marks the current thread as executing the run {@code runKey}, caused by {@code trigger} (SCHEDULE/WATCHER/MANUAL/RETRY).
+     */
     public static void beginRunContext(String runKey, String trigger) {
         RUN_CONTEXT.set(new String[]{runKey, trigger});
     }
 
-    /** Clears the current thread's run context. Always call from a finally block. */
+    /**
+     * Clears the current thread's run context. Always call from a finally block.
+     */
     public static void endRunContext() {
         RUN_CONTEXT.remove();
     }
 
-    /** Run key of the run executing on this thread, or null if none. */
+    /**
+     * Run key of the run executing on this thread, or null if none.
+     */
     public static String currentRunKey() {
         String[] c = RUN_CONTEXT.get();
         return c != null ? c[0] : null;
     }
 
-    /** Trigger of the run executing on this thread, or null if none. */
+    /**
+     * Trigger of the run executing on this thread, or null if none.
+     */
     public static String currentTrigger() {
         String[] c = RUN_CONTEXT.get();
         return c != null ? c[1] : null;
     }
 
-    /** Registers a listener invoked after every recorded real outcome (success, failure, or skip). Not called on the EDT — marshal accordingly. */
+    /**
+     * Lock to hold while reading: the independent read lock when we have a read connection, else the write lock.
+     */
+    private Object readGuard() {
+        return rconn != null ? readLock : this;
+    }
+
+    /**
+     * Connection to read from (see {@link #readGuard()}).
+     */
+    private Connection rc() {
+        return rconn != null ? rconn : conn;
+    }
+
+    /**
+     * Registers a listener invoked after every recorded real outcome (success, failure, or skip). Not called on the EDT — marshal accordingly.
+     */
     public void addRunListener(java.util.function.Consumer<TaskRunRecord> listener) {
         runListeners.add(listener);
     }
 
-    /** Unregisters a listener previously passed to {@link #addRunListener}. No-op if it isn't registered. */
+    /**
+     * Unregisters a listener previously passed to {@link #addRunListener}. No-op if it isn't registered.
+     */
     public void removeRunListener(java.util.function.Consumer<TaskRunRecord> listener) {
         runListeners.remove(listener);
     }
@@ -282,15 +302,19 @@ public class RunHistoryService {
         activityListeners.add(listener);
     }
 
-    /** Unregisters a listener previously passed to {@link #addActivityListener}. No-op if it isn't registered. */
+    /**
+     * Unregisters a listener previously passed to {@link #addActivityListener}. No-op if it isn't registered.
+     */
     public void removeActivityListener(java.util.function.Consumer<TaskRunRecord> listener) {
         activityListeners.remove(listener);
     }
 
-    /** Records one completed real task outcome (SUCCESS/FAILED/SKIPPED) into {@code run_history}. Safe no-op if the database failed to initialize. */
+    /**
+     * Records one completed real task outcome (SUCCESS/FAILED/SKIPPED) into {@code run_history}. Safe no-op if the database failed to initialize.
+     */
     public synchronized void recordRun(String taskId, String taskName, String taskType,
-            TaskRunRecord.Status status, String reason, String details,
-            LocalDateTime startedAt, LocalDateTime endedAt) {
+                                       TaskRunRecord.Status status, String reason, String details,
+                                       LocalDateTime startedAt, LocalDateTime endedAt) {
         recordRun(taskId, taskName, taskType, status, reason, details, startedAt, endedAt, null);
     }
 
@@ -309,8 +333,8 @@ public class RunHistoryService {
      * outer catch blocks do so far.
      */
     public synchronized void recordRun(String taskId, String taskName, String taskType,
-            TaskRunRecord.Status status, String reason, String details,
-            LocalDateTime startedAt, LocalDateTime endedAt, TaskRunRecord preclassified) {
+                                       TaskRunRecord.Status status, String reason, String details,
+                                       LocalDateTime startedAt, LocalDateTime endedAt, TaskRunRecord preclassified) {
         TaskRunRecord.FailureCategory category = null;
         boolean retryable = false;
         String suggestedAction = null;
@@ -347,7 +371,10 @@ public class RunHistoryService {
             rec.setRunKey(runKey);
             rec.setTrigger(trigger);
             for (java.util.function.Consumer<TaskRunRecord> listener : runListeners) {
-                try { listener.accept(rec); } catch (Exception ignored) {}
+                try {
+                    listener.accept(rec);
+                } catch (Exception ignored) {
+                }
             }
         }
     }
@@ -372,7 +399,7 @@ public class RunHistoryService {
      *                 {@code details} is null) the click-through detail
      */
     public synchronized void recordActivityEvent(String taskId, String taskName, String taskType,
-            String message, String details, LocalDateTime startedAt, LocalDateTime endedAt) {
+                                                 String message, String details, LocalDateTime startedAt, LocalDateTime endedAt) {
         recordActivityEvent(taskId, taskName, taskType, TaskRunRecord.Status.SUCCESS,
                 message, details, startedAt, endedAt);
     }
@@ -389,8 +416,8 @@ public class RunHistoryService {
      * may have already dismissed.
      */
     public synchronized void recordActivityEvent(String taskId, String taskName, String taskType,
-            TaskRunRecord.Status status, String message, String details,
-            LocalDateTime startedAt, LocalDateTime endedAt) {
+                                                 TaskRunRecord.Status status, String message, String details,
+                                                 LocalDateTime startedAt, LocalDateTime endedAt) {
         recordEvent(null, taskId, taskName, taskType, status, message, details, startedAt, endedAt,
                 currentRunKey(), currentTrigger());
     }
@@ -402,14 +429,14 @@ public class RunHistoryService {
      * cancellation, a deferred fire. Prefer this over the free-text
      * {@link #recordActivityEvent} overloads for anything new.
      *
-     * @param kind   what happened; null lets the monitor infer it from the row
-     * @param runKey the run this belongs to, or null for events not tied to one
-     *               (use {@link #currentRunKey()} when recording from a worker thread)
+     * @param kind    what happened; null lets the monitor infer it from the row
+     * @param runKey  the run this belongs to, or null for events not tied to one
+     *                (use {@link #currentRunKey()} when recording from a worker thread)
      * @param trigger what caused the run (SCHEDULE/WATCHER/MANUAL/RETRY), or null
      */
     public synchronized void recordEvent(EventKind kind, String taskId, String taskName, String taskType,
-            TaskRunRecord.Status status, String message, String details,
-            LocalDateTime startedAt, LocalDateTime endedAt, String runKey, String trigger) {
+                                         TaskRunRecord.Status status, String message, String details,
+                                         LocalDateTime startedAt, LocalDateTime endedAt, String runKey, String trigger) {
         long durationMs = insertInto(ACTIVITY_TABLE, taskId, taskName, taskType, status,
                 message, details != null ? details : message, startedAt, endedAt, null, false, null,
                 kind, runKey, trigger);
@@ -429,16 +456,21 @@ public class RunHistoryService {
         rec.setRunKey(runKey);
         rec.setTrigger(trigger);
         for (java.util.function.Consumer<TaskRunRecord> listener : activityListeners) {
-            try { listener.accept(rec); } catch (Exception ignored) {}
+            try {
+                listener.accept(rec);
+            } catch (Exception ignored) {
+            }
         }
     }
 
-    /** @return duration in ms on success, or -1 if the insert failed (already logged). */
+    /**
+     * @return duration in ms on success, or -1 if the insert failed (already logged).
+     */
     private long insertInto(String table, String taskId, String taskName, String taskType,
-            TaskRunRecord.Status status, String reason, String details,
-            LocalDateTime startedAt, LocalDateTime endedAt,
-            TaskRunRecord.FailureCategory category, boolean retryable, String suggestedAction,
-            EventKind kind, String runKey, String trigger) {
+                            TaskRunRecord.Status status, String reason, String details,
+                            LocalDateTime startedAt, LocalDateTime endedAt,
+                            TaskRunRecord.FailureCategory category, boolean retryable, String suggestedAction,
+                            EventKind kind, String runKey, String trigger) {
         if (conn == null) return -1;
         String sql = "INSERT INTO " + table +
                 " (task_id, task_name, task_type, status, reason, details, started_at, ended_at, duration_ms,"
@@ -469,12 +501,16 @@ public class RunHistoryService {
         }
     }
 
-    /** Most recent real outcomes across all tasks, newest first. */
+    /**
+     * Most recent real outcomes across all tasks, newest first.
+     */
     public List<TaskRunRecord> getRecentRuns(int limit) {
         return queryRuns(null, null, limit);
     }
 
-    /** Most recent real outcomes for one task, newest first. */
+    /**
+     * Most recent real outcomes for one task, newest first.
+     */
     public List<TaskRunRecord> getRunsForTask(String taskId, int limit) {
         return queryRuns(taskId, null, limit);
     }
@@ -491,7 +527,9 @@ public class RunHistoryService {
         return getByIdFrom(RUN_TABLE, id);
     }
 
-    /** {@code event_monitor_history} counterpart of {@link #getRunById}. */
+    /**
+     * {@code event_monitor_history} counterpart of {@link #getRunById}.
+     */
     public TaskRunRecord getActivityEventById(long id) {
         return getByIdFrom(ACTIVITY_TABLE, id);
     }
@@ -511,7 +549,9 @@ public class RunHistoryService {
         }
     }
 
-    /** Queries real outcomes, newest first, optionally filtered by task id and/or status. Either filter may be null to mean "any". */
+    /**
+     * Queries real outcomes, newest first, optionally filtered by task id and/or status. Either filter may be null to mean "any".
+     */
     public List<TaskRunRecord> queryRuns(String taskId, TaskRunRecord.Status status, int limit) {
         return queryRuns(taskId, status, null, null, limit);
     }
@@ -523,7 +563,7 @@ public class RunHistoryService {
      * (inclusive on both ends).
      */
     public List<TaskRunRecord> queryRuns(String taskId, TaskRunRecord.Status status,
-            LocalDateTime from, LocalDateTime to, int limit) {
+                                         LocalDateTime from, LocalDateTime to, int limit) {
         return query(RUN_TABLE, taskId, status, from, to, limit);
     }
 
@@ -538,7 +578,7 @@ public class RunHistoryService {
     }
 
     private List<TaskRunRecord> query(String table, String taskId, TaskRunRecord.Status status,
-            LocalDateTime from, LocalDateTime to, int limit) {
+                                      LocalDateTime from, LocalDateTime to, int limit) {
         synchronized (readGuard()) {
             List<TaskRunRecord> results = new ArrayList<>();
             if (rc() == null) return results;
@@ -614,12 +654,16 @@ public class RunHistoryService {
         return querySummaries(RUN_TABLE, from, limit);
     }
 
-    /** Like {@link #queryRunSummaries(LocalDateTime, int)} but restricted to one status (e.g. FAILED). */
+    /**
+     * Like {@link #queryRunSummaries(LocalDateTime, int)} but restricted to one status (e.g. FAILED).
+     */
     public List<TaskRunRecord> queryRunSummaries(TaskRunRecord.Status status, LocalDateTime from, int limit) {
         return querySummaries(RUN_TABLE, status, from, limit);
     }
 
-    /** Activity-table counterpart of {@link #queryRunSummaries}. */
+    /**
+     * Activity-table counterpart of {@link #queryRunSummaries}.
+     */
     public List<TaskRunRecord> queryActivitySummaries(LocalDateTime from, int limit) {
         return querySummaries(ACTIVITY_TABLE, from, limit);
     }
@@ -685,8 +729,12 @@ public class RunHistoryService {
         return SqlitePurge.run("Run history", this, conn, dbFile, List.of(RUN_TABLE, ACTIVITY_TABLE), policy, cancelled);
     }
 
-    /** On-disk size of the run-history database (file plus write-ahead log). */
-    public long sizeBytes() { return SqlitePurge.fileBytes(dbFile); }
+    /**
+     * On-disk size of the run-history database (file plus write-ahead log).
+     */
+    public long sizeBytes() {
+        return SqlitePurge.fileBytes(dbFile);
+    }
 
     /**
      * Background-thread events used to be stored in this database. They now live in their own
@@ -698,14 +746,18 @@ public class RunHistoryService {
         try (PreparedStatement ps = conn.prepareStatement("SELECT * FROM " + ACTIVITY_TABLE
                 + " WHERE task_id = ? ORDER BY id")) {
             ps.setString(1, BackgroundLogService.TASK_ID);
-            try (ResultSet rs = ps.executeQuery()) { while (rs.next()) out.add(mapRow(rs)); }
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) out.add(mapRow(rs));
+            }
         } catch (SQLException e) {
             log.log(Level.WARNING, "Failed to list legacy background rows", e);
         }
         return out;
     }
 
-    /** Deletes the legacy background rows with id up to and including {@code maxId}. */
+    /**
+     * Deletes the legacy background rows with id up to and including {@code maxId}.
+     */
     public synchronized int deleteLegacyBackgroundRows(long maxId) {
         if (conn == null) return 0;
         try (PreparedStatement ps = conn.prepareStatement("DELETE FROM " + ACTIVITY_TABLE
@@ -737,8 +789,10 @@ public class RunHistoryService {
         r.setDurationMs(rs.getLong("duration_ms"));
         String category = rs.getString("failure_category");
         if (category != null) {
-            try { r.setFailureCategory(TaskRunRecord.FailureCategory.valueOf(category)); }
-            catch (IllegalArgumentException ignored) { /* unknown category value from a future version — leave null */ }
+            try {
+                r.setFailureCategory(TaskRunRecord.FailureCategory.valueOf(category));
+            } catch (
+                    IllegalArgumentException ignored) { /* unknown category value from a future version — leave null */ }
         }
         r.setRetryable(rs.getInt("retryable") != 0);
         r.setSuggestedAction(rs.getString("suggested_action"));
@@ -750,10 +804,18 @@ public class RunHistoryService {
 
     public synchronized void close() {
         synchronized (readLock) {
-            if (rconn != null) { try { rconn.close(); } catch (SQLException ignored) {} }
+            if (rconn != null) {
+                try {
+                    rconn.close();
+                } catch (SQLException ignored) {
+                }
+            }
         }
         if (conn != null) {
-            try { conn.close(); } catch (SQLException ignored) {}
+            try {
+                conn.close();
+            } catch (SQLException ignored) {
+            }
         }
     }
 }

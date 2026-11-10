@@ -1,12 +1,7 @@
 package ui;
 
-import javax.swing.Icon;
-import java.awt.BasicStroke;
-import java.awt.Color;
-import java.awt.Component;
-import java.awt.Graphics;
-import java.awt.Graphics2D;
-import java.awt.RenderingHints;
+import javax.swing.*;
+import java.awt.*;
 
 /**
  * Small vector-drawn icons used in place of emoji/dingbat characters (✅ ❌
@@ -18,14 +13,26 @@ import java.awt.RenderingHints;
  */
 final class VectorIcons {
 
-    private VectorIcons() {}
+    private VectorIcons() {
+    }
 
-    /** A circular green checkmark. */
+    /**
+     * A circular green checkmark.
+     */
     static Icon check(Color color, int size) {
         return new Icon() {
-            @Override public int getIconWidth() { return size; }
-            @Override public int getIconHeight() { return size; }
-            @Override public void paintIcon(Component c, Graphics g, int x, int y) {
+            @Override
+            public int getIconWidth() {
+                return size;
+            }
+
+            @Override
+            public int getIconHeight() {
+                return size;
+            }
+
+            @Override
+            public void paintIcon(Component c, Graphics g, int x, int y) {
                 Graphics2D g2 = begin(g);
                 g2.setColor(color);
                 g2.fillOval(x, y, size, size);
@@ -39,12 +46,23 @@ final class VectorIcons {
         };
     }
 
-    /** A circular red cross. */
+    /**
+     * A circular red cross.
+     */
     static Icon cross(Color color, int size) {
         return new Icon() {
-            @Override public int getIconWidth() { return size; }
-            @Override public int getIconHeight() { return size; }
-            @Override public void paintIcon(Component c, Graphics g, int x, int y) {
+            @Override
+            public int getIconWidth() {
+                return size;
+            }
+
+            @Override
+            public int getIconHeight() {
+                return size;
+            }
+
+            @Override
+            public void paintIcon(Component c, Graphics g, int x, int y) {
                 Graphics2D g2 = begin(g);
                 g2.setColor(color);
                 g2.fillOval(x, y, size, size);
@@ -58,12 +76,23 @@ final class VectorIcons {
         };
     }
 
-    /** A simple hourglass, used while a check is in progress. */
+    /**
+     * A simple hourglass, used while a check is in progress.
+     */
     static Icon hourglass(Color color, int size) {
         return new Icon() {
-            @Override public int getIconWidth() { return size; }
-            @Override public int getIconHeight() { return size; }
-            @Override public void paintIcon(Component c, Graphics g, int x, int y) {
+            @Override
+            public int getIconWidth() {
+                return size;
+            }
+
+            @Override
+            public int getIconHeight() {
+                return size;
+            }
+
+            @Override
+            public void paintIcon(Component c, Graphics g, int x, int y) {
                 Graphics2D g2 = begin(g);
                 g2.setColor(color);
                 g2.setStroke(new BasicStroke(size * 0.09f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
@@ -81,12 +110,23 @@ final class VectorIcons {
         };
     }
 
-    /** A sun (rays + circle) — used for the "switch to light mode" toggle state. */
+    /**
+     * A sun (rays + circle) — used for the "switch to light mode" toggle state.
+     */
     static Icon sun(Color color, int size) {
         return new Icon() {
-            @Override public int getIconWidth() { return size; }
-            @Override public int getIconHeight() { return size; }
-            @Override public void paintIcon(Component c, Graphics g, int x, int y) {
+            @Override
+            public int getIconWidth() {
+                return size;
+            }
+
+            @Override
+            public int getIconHeight() {
+                return size;
+            }
+
+            @Override
+            public void paintIcon(Component c, Graphics g, int x, int y) {
                 Graphics2D g2 = begin(g);
                 g2.setColor(color);
                 int cx = x + size / 2, cy = y + size / 2;
@@ -107,12 +147,23 @@ final class VectorIcons {
         };
     }
 
-    /** A crescent moon — used for the "switch to dark mode" toggle state. */
+    /**
+     * A crescent moon — used for the "switch to dark mode" toggle state.
+     */
     static Icon moon(Color color, int size) {
         return new Icon() {
-            @Override public int getIconWidth() { return size; }
-            @Override public int getIconHeight() { return size; }
-            @Override public void paintIcon(Component c, Graphics g, int x, int y) {
+            @Override
+            public int getIconWidth() {
+                return size;
+            }
+
+            @Override
+            public int getIconHeight() {
+                return size;
+            }
+
+            @Override
+            public void paintIcon(Component c, Graphics g, int x, int y) {
                 Graphics2D g2 = begin(g);
                 g2.setColor(color);
                 float d = size * 0.72f;
@@ -129,12 +180,23 @@ final class VectorIcons {
         };
     }
 
-    /** A checklist — Tasks nav icon: a rounded rectangle outline with two checkmark rows. */
+    /**
+     * A checklist — Tasks nav icon: a rounded rectangle outline with two checkmark rows.
+     */
     static Icon checklist(Color color, int size) {
         return new Icon() {
-            @Override public int getIconWidth() { return size; }
-            @Override public int getIconHeight() { return size; }
-            @Override public void paintIcon(Component c, Graphics g, int x, int y) {
+            @Override
+            public int getIconWidth() {
+                return size;
+            }
+
+            @Override
+            public int getIconHeight() {
+                return size;
+            }
+
+            @Override
+            public void paintIcon(Component c, Graphics g, int x, int y) {
                 Graphics2D g2 = begin(g);
                 g2.setColor(color);
                 g2.setStroke(new BasicStroke(size * 0.11f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
@@ -147,6 +209,7 @@ final class VectorIcons {
                 drawCheckRow(g2, boxX, rowY2, size);
                 g2.dispose();
             }
+
             private void drawCheckRow(Graphics2D g2, float boxX, float rowY, int size) {
                 g2.drawLine((int) boxX, (int) rowY, (int) (boxX + size * 0.09f), (int) (rowY + size * 0.09f));
                 g2.drawLine((int) (boxX + size * 0.09f), (int) (rowY + size * 0.09f),
@@ -155,12 +218,23 @@ final class VectorIcons {
         };
     }
 
-    /** A key — Credentials nav icon: a ring with a small notched shaft. */
+    /**
+     * A key — Credentials nav icon: a ring with a small notched shaft.
+     */
     static Icon key(Color color, int size) {
         return new Icon() {
-            @Override public int getIconWidth() { return size; }
-            @Override public int getIconHeight() { return size; }
-            @Override public void paintIcon(Component c, Graphics g, int x, int y) {
+            @Override
+            public int getIconWidth() {
+                return size;
+            }
+
+            @Override
+            public int getIconHeight() {
+                return size;
+            }
+
+            @Override
+            public void paintIcon(Component c, Graphics g, int x, int y) {
                 Graphics2D g2 = begin(g);
                 g2.setColor(color);
                 g2.setStroke(new BasicStroke(size * 0.13f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
@@ -177,12 +251,23 @@ final class VectorIcons {
         };
     }
 
-    /** A document with lines — Logs nav icon. */
+    /**
+     * A document with lines — Logs nav icon.
+     */
     static Icon document(Color color, int size) {
         return new Icon() {
-            @Override public int getIconWidth() { return size; }
-            @Override public int getIconHeight() { return size; }
-            @Override public void paintIcon(Component c, Graphics g, int x, int y) {
+            @Override
+            public int getIconWidth() {
+                return size;
+            }
+
+            @Override
+            public int getIconHeight() {
+                return size;
+            }
+
+            @Override
+            public void paintIcon(Component c, Graphics g, int x, int y) {
                 Graphics2D g2 = begin(g);
                 g2.setColor(color);
                 g2.setStroke(new BasicStroke(size * 0.1f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
@@ -198,16 +283,27 @@ final class VectorIcons {
         };
     }
 
-    /** Three sliders with knobs — Settings nav icon. */
+    /**
+     * Three sliders with knobs — Settings nav icon.
+     */
     static Icon sliders(Color color, int size) {
         return new Icon() {
-            @Override public int getIconWidth() { return size; }
-            @Override public int getIconHeight() { return size; }
-            @Override public void paintIcon(Component c, Graphics g, int x, int y) {
+            @Override
+            public int getIconWidth() {
+                return size;
+            }
+
+            @Override
+            public int getIconHeight() {
+                return size;
+            }
+
+            @Override
+            public void paintIcon(Component c, Graphics g, int x, int y) {
                 Graphics2D g2 = begin(g);
                 g2.setColor(color);
                 g2.setStroke(new BasicStroke(size * 0.1f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
-                float[] knobFrac = { 0.65f, 0.35f, 0.55f };
+                float[] knobFrac = {0.65f, 0.35f, 0.55f};
                 for (int i = 0; i < 3; i++) {
                     float lineY = y + size * (0.22f + i * 0.3f);
                     g2.draw(new java.awt.geom.Line2D.Float(x + size * 0.1f, lineY, x + size * 0.9f, lineY));
@@ -220,12 +316,23 @@ final class VectorIcons {
         };
     }
 
-    /** An ECG-style pulse/activity line — used for the Event Monitor launcher. */
+    /**
+     * An ECG-style pulse/activity line — used for the Event Monitor launcher.
+     */
     static Icon pulse(Color color, int size) {
         return new Icon() {
-            @Override public int getIconWidth() { return size; }
-            @Override public int getIconHeight() { return size; }
-            @Override public void paintIcon(Component c, Graphics g, int x, int y) {
+            @Override
+            public int getIconWidth() {
+                return size;
+            }
+
+            @Override
+            public int getIconHeight() {
+                return size;
+            }
+
+            @Override
+            public void paintIcon(Component c, Graphics g, int x, int y) {
                 Graphics2D g2 = begin(g);
                 g2.setColor(color);
                 g2.setStroke(new BasicStroke(size * 0.11f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));

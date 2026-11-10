@@ -9,11 +9,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
-import java.util.ArrayDeque;
-import java.util.ArrayList;
-import java.util.Deque;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
 /**
  * The internal conversation between the window and the background service: commands sent over the local control
@@ -26,25 +22,24 @@ public final class DaemonCallLog {
     public static final String FILE_NAME = "daemon-activity.log";
     static final long MAX_BYTES = 2L * 1024 * 1024;
     private static final long STATUS_EVERY_MS = 30_000;
-
-    /** {@code channel}: "control" (local HTTP endpoint) or "queue" (database fallback). */
-    public record Entry(long time, String channel, String method, String path, int status, long millis,
-                        String action, String taskId, String requestedBy, String response) {
-        public boolean ok() { return status >= 200 && status < 300; }
-    }
-
     private static volatile File dir;
     private static long lastStatusAt;
     private static int statusPolls;
-
-    private DaemonCallLog() { }
-
-    public static void configure(File dataDir) { dir = dataDir; }
-
     private static volatile java.util.function.Consumer<Entry> listener;
 
-    /** Told about every recorded call (used to raise "Service command failed"); null to stop. */
-    public static void setListener(java.util.function.Consumer<Entry> l) { listener = l; }
+    private DaemonCallLog() {
+    }
+
+    public static void configure(File dataDir) {
+        dir = dataDir;
+    }
+
+    /**
+     * Told about every recorded call (used to raise "Service command failed"); null to stop.
+     */
+    public static void setListener(java.util.function.Consumer<Entry> l) {
+        listener = l;
+    }
 
     public static void record(String channel, String method, String path, int status, long millis,
                               String action, String taskId, String requestedBy, String response) {
@@ -55,10 +50,15 @@ public final class DaemonCallLog {
                 clip(response, 500));
         write(d, entry);
         java.util.function.Consumer<Entry> l = listener;
-        try { if (l != null) l.accept(entry); } catch (RuntimeException ignored) { }
+        try {
+            if (l != null) l.accept(entry);
+        } catch (RuntimeException ignored) {
+        }
     }
 
-    /** Status polls are frequent: only one line per half minute, saying how many there were. */
+    /**
+     * Status polls are frequent: only one line per half minute, saying how many there were.
+     */
     public static void recordStatusPoll(int status) {
         long now = System.currentTimeMillis();
         synchronized (DaemonCallLog.class) {
@@ -89,7 +89,7 @@ public final class DaemonCallLog {
 
     public static List<Entry> readRecent(File dataDir, int limit) {
         Deque<Entry> out = new ArrayDeque<>();
-        for (String name : new String[] { FILE_NAME + ".1", FILE_NAME }) {
+        for (String name : new String[]{FILE_NAME + ".1", FILE_NAME}) {
             File f = LogFiles.file(dataDir, name);
             if (!f.isFile()) continue;
             try (BufferedReader r = Files.newBufferedReader(f.toPath(), StandardCharsets.UTF_8)) {
@@ -121,18 +121,33 @@ public final class DaemonCallLog {
         }
     }
 
-    /** "Run now for task 3f2a...", "Status stream", ... */
+    /**
+     * "Run now for task 3f2a...", "Status stream", ...
+     */
     public static String describe(Entry e) {
         if (!e.action().isEmpty()) {
             String verb;
             switch (e.action()) {
-                case "RUN_NOW": verb = "Run now"; break;
-                case "CANCEL": verb = "Cancel"; break;
-                case "RESTART": verb = "Restart"; break;
-                case "RECONNECT_WATCH": verb = "Reconnect watch"; break;
-                case "REFRESH": verb = "Refresh schedules"; break;
-                case "PURGE_NOW": verb = "Purge now"; break;
-                default: verb = e.action();
+                case "RUN_NOW":
+                    verb = "Run now";
+                    break;
+                case "CANCEL":
+                    verb = "Cancel";
+                    break;
+                case "RESTART":
+                    verb = "Restart";
+                    break;
+                case "RECONNECT_WATCH":
+                    verb = "Reconnect watch";
+                    break;
+                case "REFRESH":
+                    verb = "Refresh schedules";
+                    break;
+                case "PURGE_NOW":
+                    verb = "Purge now";
+                    break;
+                default:
+                    verb = e.action();
             }
             String task = e.taskId().isEmpty() || e.taskId().equals("null") ? "" : " (task " + shortId(e.taskId()) + ")";
             return verb + task;
@@ -144,17 +159,42 @@ public final class DaemonCallLog {
 
     public static String explain(Entry e) {
         switch (e.status()) {
-            case 403: return "The control token was wrong. The window re-reads daemon-control.json after the service restarts.";
-            case 400: return "The command name was not recognised.";
-            case 405: return "Wrong HTTP method for this path.";
-            case 500: return "The service accepted the command but it failed while running; see the response and daemon.log.";
-            case 503: return "Too many status streams are open.";
-            case 0: return "The command could not be delivered.";
-            default: return "";
+            case 403:
+                return "The control token was wrong. The window re-reads daemon-control.json after the service restarts.";
+            case 400:
+                return "The command name was not recognised.";
+            case 405:
+                return "Wrong HTTP method for this path.";
+            case 500:
+                return "The service accepted the command but it failed while running; see the response and daemon.log.";
+            case 503:
+                return "Too many status streams are open.";
+            case 0:
+                return "The command could not be delivered.";
+            default:
+                return "";
         }
     }
 
-    private static String shortId(String id) { return id.length() > 8 ? id.substring(0, 8) : id; }
-    private static String clip(String s, int n) { return s == null ? "" : s.length() <= n ? s : s.substring(0, n) + "..."; }
-    private static String esc(String s) { return MiniJson.escapeString(s == null ? "" : s); }
+    private static String shortId(String id) {
+        return id.length() > 8 ? id.substring(0, 8) : id;
+    }
+
+    private static String clip(String s, int n) {
+        return s == null ? "" : s.length() <= n ? s : s.substring(0, n) + "...";
+    }
+
+    private static String esc(String s) {
+        return MiniJson.escapeString(s == null ? "" : s);
+    }
+
+    /**
+     * {@code channel}: "control" (local HTTP endpoint) or "queue" (database fallback).
+     */
+    public record Entry(long time, String channel, String method, String path, int status, long millis,
+                        String action, String taskId, String requestedBy, String response) {
+        public boolean ok() {
+            return status >= 200 && status < 300;
+        }
+    }
 }

@@ -1,7 +1,5 @@
 package service;
 
-import static org.junit.Assert.*;
-
 import model.TaskRunRecord;
 import org.junit.Before;
 import org.junit.Test;
@@ -13,7 +11,11 @@ import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
-/** v2: UI reads use their own read-only connection and must never queue behind the write lock. */
+import static org.junit.Assert.*;
+
+/**
+ * v2: UI reads use their own read-only connection and must never queue behind the write lock.
+ */
 public class RunHistoryReadSplitTest {
 
     private File dir;
@@ -48,7 +50,10 @@ public class RunHistoryReadSplitTest {
         Thread writer = new Thread(() -> {
             synchronized (rhs) { // simulates a long write / purge holding the writer lock
                 held.countDown();
-                try { release.await(10, TimeUnit.SECONDS); } catch (InterruptedException ignored) { }
+                try {
+                    release.await(10, TimeUnit.SECONDS);
+                } catch (InterruptedException ignored) {
+                }
             }
         });
         writer.start();

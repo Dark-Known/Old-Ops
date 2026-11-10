@@ -18,25 +18,11 @@ import java.util.Vector;
  */
 public final class SftpBrowseService implements AutoCloseable {
 
-    public static final class Entry {
-        public final String name;
-        public final boolean directory;
-        public final long size;
-
-        Entry(String name, boolean directory, long size) {
-            this.name = name;
-            this.directory = directory;
-            this.size = size;
-        }
-    }
-
     private final Session session;
     private final ChannelSftp channel;
-
     private String host, user;
     private long openedAt = System.currentTimeMillis();
     private boolean reported = false;
-
     private SftpBrowseService(Session session, ChannelSftp channel) {
         this.session = session;
         this.channel = channel;
@@ -60,7 +46,9 @@ public final class SftpBrowseService implements AutoCloseable {
             ChannelSftp channel = (ChannelSftp) session.openChannel("sftp");
             channel.connect(6_000);
             SftpBrowseService svc = new SftpBrowseService(session, channel);
-            svc.host = host; svc.user = username; svc.reported = true;
+            svc.host = host;
+            svc.user = username;
+            svc.reported = true;
             SshSessionEvents.uiOpened("Remote folder browser", host, username);
             return svc;
         } catch (Exception ex) {
@@ -70,7 +58,9 @@ public final class SftpBrowseService implements AutoCloseable {
         }
     }
 
-    /** The remote user's home / landing directory — used as the initial browse path. */
+    /**
+     * The remote user's home / landing directory — used as the initial browse path.
+     */
     public String home() throws Exception {
         return channel.pwd();
     }
@@ -98,6 +88,18 @@ public final class SftpBrowseService implements AutoCloseable {
         if (reported) {
             reported = false;
             SshSessionEvents.uiClosed("Remote folder browser", host, user, System.currentTimeMillis() - openedAt);
+        }
+    }
+
+    public static final class Entry {
+        public final String name;
+        public final boolean directory;
+        public final long size;
+
+        Entry(String name, boolean directory, long size) {
+            this.name = name;
+            this.directory = directory;
+            this.size = size;
         }
     }
 }

@@ -12,7 +12,10 @@ import java.net.http.HttpResponse;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.*;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
 import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -21,7 +24,7 @@ import java.util.function.Consumer;
 
 /**
  * OAuth2 "device code" client for Microsoft Entra ID (Azure AD).
- *
+ * <p>
  * Exchange Online has disabled Basic Authentication tenant-wide for years,
  * and many tenants additionally block legacy protocols (IMAP/POP/SMTP AUTH)
  * entirely via Conditional Access — even with OAuth2. This service exists to
@@ -45,11 +48,13 @@ import java.util.function.Consumer;
 public class OAuth2TokenService {
 
     private static final String DEFAULT_AUTH_BASE = "https://login.microsoftonline.com/";
-    private String AUTH_BASE = DEFAULT_AUTH_BASE; // overridable for tests only (see setAuthBaseForTesting)
+    private static final java.time.Duration REQUEST_TIMEOUT = java.time.Duration.ofSeconds(30);
     private final HttpClient http = HttpClient.newBuilder()
             .connectTimeout(java.time.Duration.ofSeconds(15)).build();
-    private static final java.time.Duration REQUEST_TIMEOUT = java.time.Duration.ofSeconds(30);
     private final Path tokenDir;
+    private final Map<String, CachedToken> appOnlyCache = new ConcurrentHashMap<>();
+    private final Map<String, CachedToken> accessTokenCache = new ConcurrentHashMap<>();
+    private String AUTH_BASE = DEFAULT_AUTH_BASE; // overridable for tests only (see setAuthBaseForTesting)
 
     /**
      * @deprecated stores tokens under the current OS user's home directory
@@ -69,22 +74,79 @@ public class OAuth2TokenService {
         this(Paths.get(System.getProperty("user.home"), ".opstool", "oauth"));
     }
 
+    // ─── Public API ─────────────────────────────────────────────────────────
+
     public OAuth2TokenService(Path tokenDir) {
         this.tokenDir = tokenDir;
         if (tokenDir != null && tokenDir.getParent() != null) {
             CryptoUtil.configure(tokenDir.getParent().toFile()); // key file lives in <dataDir>
         }
-        try { Files.createDirectories(tokenDir); } catch (IOException ignored) {}
+        try {
+            Files.createDirectories(tokenDir);
+        } catch (IOException ignored) {
+        }
     }
 
-    /** Token storage location shared by every process (GUI, Daemon) regardless of which OS account runs it. */
+    /**
+     * Token storage location shared by every process (GUI, Daemon) regardless of which OS account runs it.
+     */
     public static Path sharedTokenDir(File dataDir) {
         return dataDir.toPath().resolve("oauth");
     }
 
-    // ─── Public API ─────────────────────────────────────────────────────────
+    /**
+     * Signed JWT proving possession of the certificate's private key. Package-private for tests.
+     */
+    static String buildClientAssertion(String clientId, String audience, Path pfxFile, char[] pfxPassword)
+            throws IOException {
+        try {
+            java.security.KeyStore ks = java.security.KeyStore.getInstance("PKCS12");
+            try (java.io.InputStream in = Files.newInputStream(pfxFile)) {
+                ks.load(in, pfxPassword);
+            }
+            java.security.PrivateKey key = null;
+            java.security.cert.X509Certificate cert = null;
+            for (java.util.Enumeration<String> e = ks.aliases(); e.hasMoreElements(); ) {
+                String alias = e.nextElement();
+                if (ks.isKeyEntry(alias)) {
+                    key = (java.security.PrivateKey) ks.getKey(alias, pfxPassword);
+                    cert = (java.security.cert.X509Certificate) ks.getCertificate(alias);
+                    break;
+                }
+            }
+            if (key == null || cert == null) throw new IOException("No private key + certificate found in " + pfxFile);
 
-    /** True if a cached (encrypted) refresh token exists for this account key. */
+            java.util.Base64.Encoder b64 = java.util.Base64.getUrlEncoder().withoutPadding();
+            String thumb = b64.encodeToString(
+                    java.security.MessageDigest.getInstance("SHA-256").digest(cert.getEncoded()));
+            long now = System.currentTimeMillis() / 1000;
+            String header = "{\"alg\":\"RS256\",\"typ\":\"JWT\",\"x5t#S256\":\"" + thumb + "\"}";
+            String claims = "{\"aud\":\"" + audience + "\",\"iss\":\"" + clientId + "\",\"sub\":\"" + clientId
+                    + "\",\"jti\":\"" + java.util.UUID.randomUUID() + "\",\"nbf\":" + (now - 30)
+                    + ",\"exp\":" + (now + 600) + "}";
+            String signingInput = b64.encodeToString(header.getBytes(StandardCharsets.UTF_8)) + "."
+                    + b64.encodeToString(claims.getBytes(StandardCharsets.UTF_8));
+            java.security.Signature sig = java.security.Signature.getInstance("SHA256withRSA");
+            sig.initSign(key);
+            sig.update(signingInput.getBytes(StandardCharsets.US_ASCII));
+            return signingInput + "." + b64.encodeToString(sig.sign());
+        } catch (Exception e) {
+            throw new IOException("Could not build the client assertion from " + pfxFile + ": " + e.getMessage(), e);
+        }
+    }
+
+
+    // ─── App-only login with a client certificate (client-credentials flow) ─────────────────
+    //
+    // No user, no refresh token, nothing that rotates: the app registration proves itself with a
+    // short-lived JWT signed by the certificate's private key (RFC 7523 / Microsoft "client
+    // assertion"), and receives an access token for https://graph.microsoft.com/.default.
+    // The registration needs *application* permissions (e.g. Mail.ReadWrite) with admin consent;
+    // mailboxes are addressed as /users/{mailbox} (see GraphMailService#forMailbox).
+
+    /**
+     * True if a cached (encrypted) refresh token exists for this account key.
+     */
     public boolean isEnrolled(String accountKey) {
         return Files.exists(tokenFile(accountKey));
     }
@@ -92,14 +154,14 @@ public class OAuth2TokenService {
     /**
      * Interactive one-time enrollment via the OAuth2 device code grant.
      *
-     * @param accountKey  local identifier for this mailbox (typically its email address)
-     * @param tenantId    Azure AD tenant ID, or "common" for any org/personal account
-     * @param clientId    the Application (client) ID of the self-registered Azure AD app
-     * @param scope       space-separated scopes, e.g. "https://graph.microsoft.com/Mail.Read offline_access"
-     * @param onPrompt    called with the human-readable "open this URL and enter this code" message
+     * @param accountKey local identifier for this mailbox (typically its email address)
+     * @param tenantId   Azure AD tenant ID, or "common" for any org/personal account
+     * @param clientId   the Application (client) ID of the self-registered Azure AD app
+     * @param scope      space-separated scopes, e.g. "https://graph.microsoft.com/Mail.Read offline_access"
+     * @param onPrompt   called with the human-readable "open this URL and enter this code" message
      */
     public void enroll(String accountKey, String tenantId, String clientId, String scope,
-                        Consumer<String> onPrompt) throws IOException, InterruptedException {
+                       Consumer<String> onPrompt) throws IOException, InterruptedException {
 
         HttpRequest deviceReq = HttpRequest.newBuilder()
                 .uri(URI.create(AUTH_BASE + tenantId + "/oauth2/v2.0/devicecode"))
@@ -127,7 +189,7 @@ public class OAuth2TokenService {
         String deviceCode = MiniJson.getString(dc, "device_code", null);
         if (deviceCode == null) throw new IOException("Device code response missing device_code: " + deviceResp.body());
 
-        int interval  = MiniJson.getInt(dc, "interval", 5);
+        int interval = MiniJson.getInt(dc, "interval", 5);
         int expiresIn = MiniJson.getInt(dc, "expires_in", 900);
         long deadline = System.currentTimeMillis() + expiresIn * 1000L;
 
@@ -169,7 +231,7 @@ public class OAuth2TokenService {
     /**
      * Silently exchanges the cached refresh token for a fresh access token.
      * Intended for unattended/scheduled use — throws if no enrollment exists yet.
-     *
+     * <p>
      * Caches the access token in memory until shortly before it expires, so
      * repeated calls in quick succession (e.g. a task polling every 30s)
      * don't hit the refresh-token endpoint every time. This also shrinks the
@@ -195,7 +257,7 @@ public class OAuth2TokenService {
 
         Path lockFile = tokenDir.resolve(safeName(accountKey) + ".lock");
         try (FileChannel channel = FileChannel.open(lockFile,
-                    StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+                StandardOpenOption.CREATE, StandardOpenOption.WRITE);
              FileLock fileLock = channel.lock()) {
 
             // Re-check after acquiring the lock — another thread/process may
@@ -226,7 +288,8 @@ public class OAuth2TokenService {
                     try {
                         size = Files.size(resolvedTokenFile);
                         mtime = java.time.Instant.ofEpochMilli(Files.getLastModifiedTime(resolvedTokenFile).toMillis()).toString();
-                    } catch (IOException ignored) {}
+                    } catch (IOException ignored) {
+                    }
                     throw new IOException("Mailbox '" + accountKey + "' has a token file at "
                             + resolvedTokenFile.toAbsolutePath() + " (size=" + size + " bytes, last modified " + mtime
                             + ") but it could not be decrypted/parsed — it may be corrupted, from a different "
@@ -285,19 +348,12 @@ public class OAuth2TokenService {
         }
     }
 
-
-    // ─── App-only login with a client certificate (client-credentials flow) ─────────────────
-    //
-    // No user, no refresh token, nothing that rotates: the app registration proves itself with a
-    // short-lived JWT signed by the certificate's private key (RFC 7523 / Microsoft "client
-    // assertion"), and receives an access token for https://graph.microsoft.com/.default.
-    // The registration needs *application* permissions (e.g. Mail.ReadWrite) with admin consent;
-    // mailboxes are addressed as /users/{mailbox} (see GraphMailService#forMailbox).
-
-    private final Map<String, CachedToken> appOnlyCache = new ConcurrentHashMap<>();
-
-    /** For tests: point the token endpoint at a local fake. */
-    void setAuthBaseForTesting(String base) { this.AUTH_BASE = base.endsWith("/") ? base : base + "/"; }
+    /**
+     * For tests: point the token endpoint at a local fake.
+     */
+    void setAuthBaseForTesting(String base) {
+        this.AUTH_BASE = base.endsWith("/") ? base : base + "/";
+    }
 
     public String getAppOnlyAccessToken(String tenantId, String clientId, Path pfxFile, char[] pfxPassword,
                                         String scope) throws IOException {
@@ -345,62 +401,15 @@ public class OAuth2TokenService {
         return token;
     }
 
-    /** Signed JWT proving possession of the certificate's private key. Package-private for tests. */
-    static String buildClientAssertion(String clientId, String audience, Path pfxFile, char[] pfxPassword)
-            throws IOException {
-        try {
-            java.security.KeyStore ks = java.security.KeyStore.getInstance("PKCS12");
-            try (java.io.InputStream in = Files.newInputStream(pfxFile)) {
-                ks.load(in, pfxPassword);
-            }
-            java.security.PrivateKey key = null;
-            java.security.cert.X509Certificate cert = null;
-            for (java.util.Enumeration<String> e = ks.aliases(); e.hasMoreElements(); ) {
-                String alias = e.nextElement();
-                if (ks.isKeyEntry(alias)) {
-                    key = (java.security.PrivateKey) ks.getKey(alias, pfxPassword);
-                    cert = (java.security.cert.X509Certificate) ks.getCertificate(alias);
-                    break;
-                }
-            }
-            if (key == null || cert == null) throw new IOException("No private key + certificate found in " + pfxFile);
-
-            java.util.Base64.Encoder b64 = java.util.Base64.getUrlEncoder().withoutPadding();
-            String thumb = b64.encodeToString(
-                    java.security.MessageDigest.getInstance("SHA-256").digest(cert.getEncoded()));
-            long now = System.currentTimeMillis() / 1000;
-            String header = "{\"alg\":\"RS256\",\"typ\":\"JWT\",\"x5t#S256\":\"" + thumb + "\"}";
-            String claims = "{\"aud\":\"" + audience + "\",\"iss\":\"" + clientId + "\",\"sub\":\"" + clientId
-                    + "\",\"jti\":\"" + java.util.UUID.randomUUID() + "\",\"nbf\":" + (now - 30)
-                    + ",\"exp\":" + (now + 600) + "}";
-            String signingInput = b64.encodeToString(header.getBytes(StandardCharsets.UTF_8)) + "."
-                    + b64.encodeToString(claims.getBytes(StandardCharsets.UTF_8));
-            java.security.Signature sig = java.security.Signature.getInstance("SHA256withRSA");
-            sig.initSign(key);
-            sig.update(signingInput.getBytes(StandardCharsets.US_ASCII));
-            return signingInput + "." + b64.encodeToString(sig.sign());
-        } catch (Exception e) {
-            throw new IOException("Could not build the client assertion from " + pfxFile + ": " + e.getMessage(), e);
-        }
-    }
-
-    private static class CachedToken {
-        final String accessToken;
-        final long expiresAtEpochMs;
-        CachedToken(String accessToken, long expiresAtEpochMs) {
-            this.accessToken = accessToken;
-            this.expiresAtEpochMs = expiresAtEpochMs;
-        }
-    }
-
-    private final Map<String, CachedToken> accessTokenCache = new ConcurrentHashMap<>();
-
-    /** Removes the cached authorization for this mailbox (forces re-enrollment). */
+    /**
+     * Removes the cached authorization for this mailbox (forces re-enrollment).
+     */
     public void revoke(String accountKey) {
-        try { Files.deleteIfExists(tokenFile(accountKey)); } catch (IOException ignored) {}
+        try {
+            Files.deleteIfExists(tokenFile(accountKey));
+        } catch (IOException ignored) {
+        }
     }
-
-    // ─── Cache persistence (encrypted at rest via CryptoUtil) ────────────────
 
     private void saveRefreshToken(String accountKey, String refreshToken) throws IOException {
         if (refreshToken == null) return; // not rotated this call — keep whatever is already cached
@@ -417,8 +426,11 @@ public class OAuth2TokenService {
             f.toFile().setReadable(true, true);
             f.toFile().setWritable(false, false);
             f.toFile().setWritable(true, true);
-        } catch (Exception ignored) {}
+        } catch (Exception ignored) {
+        }
     }
+
+    // ─── Cache persistence (encrypted at rest via CryptoUtil) ────────────────
 
     private String loadRefreshToken(String accountKey) {
         Path f = tokenFile(accountKey);
@@ -443,5 +455,15 @@ public class OAuth2TokenService {
 
     private String urlEnc(String s) {
         return java.net.URLEncoder.encode(s, StandardCharsets.UTF_8);
+    }
+
+    private static class CachedToken {
+        final String accessToken;
+        final long expiresAtEpochMs;
+
+        CachedToken(String accessToken, long expiresAtEpochMs) {
+            this.accessToken = accessToken;
+            this.expiresAtEpochMs = expiresAtEpochMs;
+        }
     }
 }

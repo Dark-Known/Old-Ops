@@ -10,19 +10,22 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 
-/** Colors, number/time formatting and tiny helpers shared by the monitor's components. */
+/**
+ * Colors, number/time formatting and tiny helpers shared by the monitor's components.
+ */
 public final class MonitorStyle {
-
-    private MonitorStyle() {}
 
     private static final DateTimeFormatter HMS = DateTimeFormatter.ofPattern("HH:mm:ss");
     private static final DateTimeFormatter DAY_HMS = DateTimeFormatter.ofPattern("MMM d  HH:mm:ss");
     private static final DateTimeFormatter FULL = DateTimeFormatter.ofPattern("EEE d MMM yyyy, HH:mm:ss");
-
-    private static final Color INFO_FG  = new Color(0x5E5A52), INFO_BG  = new Color(0xECEAE4);
+    private static final Color INFO_FG = new Color(0x5E5A52), INFO_BG = new Color(0xECEAE4);
     private static final Color DEBUG_FG = new Color(0x8A8378), DEBUG_BG = new Color(0xF2F0EC);
+    private MonitorStyle() {
+    }
 
-    /** {foreground, background} for a status pill. */
+    /**
+     * {foreground, background} for a status pill.
+     */
     public static Color[] pill(FeedRow.Outcome o) {
         return switch (o) {
             case SUCCEEDED -> new Color[]{AppTheme.SUCCESS_FG, AppTheme.SUCCESS_BG};
@@ -34,7 +37,9 @@ public final class MonitorStyle {
         };
     }
 
-    /** Colored edge shown at the left of rows that need attention; null for calm rows. */
+    /**
+     * Colored edge shown at the left of rows that need attention; null for calm rows.
+     */
     public static Color edge(FeedRow.Outcome o) {
         return switch (o) {
             case FAILED, ERROR -> new Color(0xC0504A);
@@ -86,7 +91,9 @@ public final class MonitorStyle {
 
     // ── Formatting ──────────────────────────────────────────────────
 
-    /** "12:03:11" for today, "Oct 4  23:58:02" for earlier days. */
+    /**
+     * "12:03:11" for today, "Oct 4  23:58:02" for earlier days.
+     */
     public static String time(LocalDateTime t) {
         if (t == null) return "\u2014";
         return t.toLocalDate().equals(LocalDate.now()) ? t.format(HMS) : t.format(DAY_HMS);
@@ -96,7 +103,9 @@ public final class MonitorStyle {
         return t == null ? "\u2014" : t.format(FULL);
     }
 
-    /** 850 -> "850 ms", 4200 -> "4.2 s", 72_000 -> "1m 12s", 7_500_000 -> "2h 5m"; negative -> "". */
+    /**
+     * 850 -> "850 ms", 4200 -> "4.2 s", 72_000 -> "1m 12s", 7_500_000 -> "2h 5m"; negative -> "".
+     */
     public static String duration(long ms) {
         if (ms < 0) return "";
         if (ms < 1000) return ms + " ms";

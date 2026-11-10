@@ -7,25 +7,26 @@ import java.util.Map;
 
 /**
  * Minimal, dependency-free JSON reader/writer.
- *
+ * <p>
  * The project intentionally avoids adding a JSON library dependency (e.g.
  * org.json / Jackson / Gson) so the build does not need to reach Maven
  * Central for anything beyond what it already pulls in. This parser only
  * needs to handle the shapes returned by Microsoft's OAuth2 token endpoint
  * and the Microsoft Graph API — plain objects, arrays, strings, numbers,
  * booleans, and null — which is a small, well-defined subset of JSON.
- *
+ * <p>
  * Parsed objects come back as:
- *   object -> LinkedHashMap<String, Object>
- *   array  -> List<Object>
- *   string -> String
- *   number -> Long (no fraction/exponent) or Double
- *   true/false -> Boolean
- *   null   -> null
+ * object -> LinkedHashMap<String, Object>
+ * array  -> List<Object>
+ * string -> String
+ * number -> Long (no fraction/exponent) or Double
+ * true/false -> Boolean
+ * null   -> null
  */
 public final class MiniJson {
 
-    private MiniJson() {}
+    private MiniJson() {
+    }
 
     // ─── Parsing ────────────────────────────────────────────────────────────
 
@@ -42,24 +43,149 @@ public final class MiniJson {
         return new Parser(json).parseValue();
     }
 
+    /**
+     * Serializes a simple Map<String,String> into a compact JSON object. Null values become JSON null.
+     */
+    public static String writeObject(Map<String, String> fields) {
+        StringBuilder sb = new StringBuilder();
+        sb.append('{');
+        boolean first = true;
+        for (Map.Entry<String, String> e : fields.entrySet()) {
+            if (!first) sb.append(',');
+            first = false;
+            sb.append('"').append(escape(e.getKey())).append("\":");
+            if (e.getValue() == null) {
+                sb.append("null");
+            } else {
+                sb.append('"').append(escape(e.getValue())).append('"');
+            }
+        }
+        sb.append('}');
+        return sb.toString();
+    }
+
+    // ─── Writing (only what's needed: flat string-keyed objects) ─────────────
+
+    /**
+     * Serializes a list of flat Map<String,String> objects into a compact JSON array.
+     */
+    public static String writeArrayOfObjects(List<Map<String, String>> rows) {
+        StringBuilder sb = new StringBuilder();
+        sb.append('[');
+        boolean first = true;
+        for (Map<String, String> row : rows) {
+            if (!first) sb.append(',');
+            first = false;
+            sb.append(writeObject(row));
+        }
+        sb.append(']');
+        return sb.toString();
+    }
+
+    private static String escape(String s) {
+        return escapeString(s);
+    }
+
+    /**
+     * Public escaping helper for hand-built JSON request bodies (e.g. small PATCH/POST payloads).
+     */
+    public static String escapeString(String s) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '"':
+                    sb.append("\\\"");
+                    break;
+                case '\\':
+                    sb.append("\\\\");
+                    break;
+                case '\n':
+                    sb.append("\\n");
+                    break;
+                case '\r':
+                    sb.append("\\r");
+                    break;
+                case '\t':
+                    sb.append("\\t");
+                    break;
+                default:
+                    if (c < 0x20) sb.append(String.format("\\u%04x", (int) c));
+                    else sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+
+    public static String getString(Map<String, Object> obj, String key, String def) {
+        Object v = obj.get(key);
+        return v != null ? String.valueOf(v) : def;
+    }
+
+    // ─── Convenience accessors ─────────────────────────────────────────────
+
+    public static int getInt(Map<String, Object> obj, String key, int def) {
+        Object v = obj.get(key);
+        if (v instanceof Number) return ((Number) v).intValue();
+        if (v instanceof String) {
+            try {
+                return Integer.parseInt((String) v);
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        return def;
+    }
+
+    public static boolean getBoolean(Map<String, Object> obj, String key, boolean def) {
+        Object v = obj.get(key);
+        if (v instanceof Boolean) return (Boolean) v;
+        if (v instanceof String) return Boolean.parseBoolean((String) v);
+        return def;
+    }
+
+    @SuppressWarnings("unchecked")
+    public static List<Object> getArray(Map<String, Object> obj, String key) {
+        Object v = obj.get(key);
+        return v instanceof List ? (List<Object>) v : null;
+    }
+
+    @SuppressWarnings("unchecked")
+    public static Map<String, Object> getObject(Map<String, Object> obj, String key) {
+        Object v = obj.get(key);
+        return v instanceof Map ? (Map<String, Object>) v : null;
+    }
+
     private static final class Parser {
         private final String s;
         private int pos;
 
-        Parser(String s) { this.s = s; this.pos = 0; }
+        Parser(String s) {
+            this.s = s;
+            this.pos = 0;
+        }
 
         Object parseValue() {
             skipWs();
             if (pos >= s.length()) throw err("Unexpected end of input");
             char c = s.charAt(pos);
             switch (c) {
-                case '{': return parseObject();
-                case '[': return parseArray();
-                case '"': return parseString();
-                case 't': expect("true");  return Boolean.TRUE;
-                case 'f': expect("false"); return Boolean.FALSE;
-                case 'n': expect("null");  return null;
-                default:  return parseNumber();
+                case '{':
+                    return parseObject();
+                case '[':
+                    return parseArray();
+                case '"':
+                    return parseString();
+                case 't':
+                    expect("true");
+                    return Boolean.TRUE;
+                case 'f':
+                    expect("false");
+                    return Boolean.FALSE;
+                case 'n':
+                    expect("null");
+                    return null;
+                default:
+                    return parseNumber();
             }
         }
 
@@ -67,7 +193,10 @@ public final class MiniJson {
             Map<String, Object> map = new LinkedHashMap<>();
             expectChar('{');
             skipWs();
-            if (peek() == '}') { pos++; return map; }
+            if (peek() == '}') {
+                pos++;
+                return map;
+            }
             while (true) {
                 skipWs();
                 String key = parseString();
@@ -88,7 +217,10 @@ public final class MiniJson {
             List<Object> list = new ArrayList<>();
             expectChar('[');
             skipWs();
-            if (peek() == ']') { pos++; return list; }
+            if (peek() == ']') {
+                pos++;
+                return list;
+            }
             while (true) {
                 Object value = parseValue();
                 list.add(value);
@@ -112,21 +244,38 @@ public final class MiniJson {
                     if (pos >= s.length()) throw err("Unterminated escape");
                     char esc = s.charAt(pos++);
                     switch (esc) {
-                        case '"':  sb.append('"');  break;
-                        case '\\': sb.append('\\'); break;
-                        case '/':  sb.append('/');  break;
-                        case 'b':  sb.append('\b'); break;
-                        case 'f':  sb.append('\f'); break;
-                        case 'n':  sb.append('\n'); break;
-                        case 'r':  sb.append('\r'); break;
-                        case 't':  sb.append('\t'); break;
+                        case '"':
+                            sb.append('"');
+                            break;
+                        case '\\':
+                            sb.append('\\');
+                            break;
+                        case '/':
+                            sb.append('/');
+                            break;
+                        case 'b':
+                            sb.append('\b');
+                            break;
+                        case 'f':
+                            sb.append('\f');
+                            break;
+                        case 'n':
+                            sb.append('\n');
+                            break;
+                        case 'r':
+                            sb.append('\r');
+                            break;
+                        case 't':
+                            sb.append('\t');
+                            break;
                         case 'u':
                             if (pos + 4 > s.length()) throw err("Bad \\u escape");
                             String hex = s.substring(pos, pos + 4);
                             sb.append((char) Integer.parseInt(hex, 16));
                             pos += 4;
                             break;
-                        default: throw err("Bad escape: \\" + esc);
+                        default:
+                            throw err("Bad escape: \\" + esc);
                     }
                 } else {
                     sb.append(c);
@@ -192,98 +341,5 @@ public final class MiniJson {
             return new IllegalArgumentException(msg + " at pos " + pos
                     + " near: ..." + s.substring(ctxStart, ctxEnd) + "...");
         }
-    }
-
-    // ─── Writing (only what's needed: flat string-keyed objects) ─────────────
-
-    /** Serializes a simple Map<String,String> into a compact JSON object. Null values become JSON null. */
-    public static String writeObject(Map<String, String> fields) {
-        StringBuilder sb = new StringBuilder();
-        sb.append('{');
-        boolean first = true;
-        for (Map.Entry<String, String> e : fields.entrySet()) {
-            if (!first) sb.append(',');
-            first = false;
-            sb.append('"').append(escape(e.getKey())).append("\":");
-            if (e.getValue() == null) {
-                sb.append("null");
-            } else {
-                sb.append('"').append(escape(e.getValue())).append('"');
-            }
-        }
-        sb.append('}');
-        return sb.toString();
-    }
-
-    /** Serializes a list of flat Map<String,String> objects into a compact JSON array. */
-    public static String writeArrayOfObjects(List<Map<String, String>> rows) {
-        StringBuilder sb = new StringBuilder();
-        sb.append('[');
-        boolean first = true;
-        for (Map<String, String> row : rows) {
-            if (!first) sb.append(',');
-            first = false;
-            sb.append(writeObject(row));
-        }
-        sb.append(']');
-        return sb.toString();
-    }
-
-    private static String escape(String s) {
-        return escapeString(s);
-    }
-
-    /** Public escaping helper for hand-built JSON request bodies (e.g. small PATCH/POST payloads). */
-    public static String escapeString(String s) {
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < s.length(); i++) {
-            char c = s.charAt(i);
-            switch (c) {
-                case '"':  sb.append("\\\""); break;
-                case '\\': sb.append("\\\\"); break;
-                case '\n': sb.append("\\n");  break;
-                case '\r': sb.append("\\r");  break;
-                case '\t': sb.append("\\t");  break;
-                default:
-                    if (c < 0x20) sb.append(String.format("\\u%04x", (int) c));
-                    else sb.append(c);
-            }
-        }
-        return sb.toString();
-    }
-
-    // ─── Convenience accessors ─────────────────────────────────────────────
-
-    public static String getString(Map<String, Object> obj, String key, String def) {
-        Object v = obj.get(key);
-        return v != null ? String.valueOf(v) : def;
-    }
-
-    public static int getInt(Map<String, Object> obj, String key, int def) {
-        Object v = obj.get(key);
-        if (v instanceof Number) return ((Number) v).intValue();
-        if (v instanceof String) {
-            try { return Integer.parseInt((String) v); } catch (NumberFormatException ignored) {}
-        }
-        return def;
-    }
-
-    public static boolean getBoolean(Map<String, Object> obj, String key, boolean def) {
-        Object v = obj.get(key);
-        if (v instanceof Boolean) return (Boolean) v;
-        if (v instanceof String) return Boolean.parseBoolean((String) v);
-        return def;
-    }
-
-    @SuppressWarnings("unchecked")
-    public static List<Object> getArray(Map<String, Object> obj, String key) {
-        Object v = obj.get(key);
-        return v instanceof List ? (List<Object>) v : null;
-    }
-
-    @SuppressWarnings("unchecked")
-    public static Map<String, Object> getObject(Map<String, Object> obj, String key) {
-        Object v = obj.get(key);
-        return v instanceof Map ? (Map<String, Object>) v : null;
     }
 }

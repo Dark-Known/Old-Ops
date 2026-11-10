@@ -90,25 +90,29 @@
 [CmdletBinding()]
 param(
     [string]$InstallDir = (Get-Location).Path,
-    [string]$WinSwPath  = $null,
-    [string]$JarPath    = $null,
-    [string]$DataDir    = "C:\OpsTools\Data",
+    [string]$WinSwPath = $null,
+    [string]$JarPath = $null,
+    [string]$DataDir = "C:\OpsTools\Data",
     [string]$ExistingScheduledTaskName = "Monitoring-Tool-Daemon",
     [string]$RceditPath = $null,
-    [string]$IconPath   = $null,
-    [string]$DaemonExeName     = "MonitoringToolDaemon.exe",
+    [string]$IconPath = $null,
+    [string]$DaemonExeName = "MonitoringToolDaemon.exe",
     [string]$DaemonDisplayName = "Monitoring tool",
     [switch]$BrandWinSwWrapper
 )
 
 $ErrorActionPreference = "Stop"
 
-function Log([string]$msg) { Write-Host "[install-service] $msg" }
+function Log([string]$msg)
+{
+    Write-Host "[install-service] $msg"
+}
 
 # ── Pre-flight checks ────────────────────────────────────────────────────
 $currentPrincipal = New-Object Security.Principal.WindowsPrincipal(
-    [Security.Principal.WindowsIdentity]::GetCurrent())
-if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+[Security.Principal.WindowsIdentity]::GetCurrent())
+if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))
+{
     throw "This script must be run as Administrator (right-click PowerShell -> Run as Administrator)."
 }
 
@@ -117,53 +121,79 @@ if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Adm
 # back to the hardcoded default above - so a plain
 # ".\install-service.ps1 -InstallDir X" picks up a customized dataDir
 # without needing to also repeat -DataDir.
-if (-not $PSBoundParameters.ContainsKey('DataDir')) {
+if (-not $PSBoundParameters.ContainsKey('DataDir'))
+{
     $deployedConfig = Join-Path $InstallDir "app-config.xml"
-    if (Test-Path $deployedConfig) {
-        try {
+    if (Test-Path $deployedConfig)
+    {
+        try
+        {
             [xml]$cfg = Get-Content $deployedConfig
             $node = $cfg.SelectSingleNode("/application/installation/dataDir")
-            if ($node -and -not [string]::IsNullOrEmpty($node.InnerText)) {
+            if ($node -and -not [string]::IsNullOrEmpty($node.InnerText))
+            {
                 $DataDir = $node.InnerText
                 Log "Using DataDir from app-config.xml: $DataDir"
             }
-        } catch { Log "WARNING: Could not read dataDir from ${deployedConfig}: $_" }
+        }
+        catch
+        {
+            Log "WARNING: Could not read dataDir from ${deployedConfig}: $_"
+        }
     }
 }
 
-if (-not $JarPath) {
+if (-not $JarPath)
+{
     # Prefer this project's actual default jar name; fall back to any
     # single *.jar in InstallDir, then to the old default name (which
     # will then fail with a clear message below if genuinely not there).
     $preferredJar = Join-Path $InstallDir "Monitoring-Tool.jar"
-    if (Test-Path $preferredJar) {
+    if (Test-Path $preferredJar)
+    {
         $JarPath = $preferredJar
-    } else {
+    }
+    else
+    {
         $anyJar = Get-ChildItem -Path $InstallDir -Filter "*.jar" -File -ErrorAction SilentlyContinue | Select-Object -First 1
-        $JarPath = if ($anyJar) { $anyJar.FullName } else { Join-Path $InstallDir "OpsTransferTool.jar" }
+        $JarPath = if ($anyJar)
+        {
+            $anyJar.FullName
+        }
+        else
+        {
+            Join-Path $InstallDir "OpsTransferTool.jar"
+        }
     }
 }
 $jarPath = $JarPath
-if (-not (Test-Path $jarPath)) {
+if (-not (Test-Path $jarPath))
+{
     throw "Daemon jar not found at '$jarPath'. Pass -JarPath pointing at the actual jar " +
-          "(its name is configurable via /application/installation/jarName and isn't always OpsTransferTool.jar)."
+            "(its name is configurable via /application/installation/jarName and isn't always OpsTransferTool.jar)."
 }
 
-if (-not $WinSwPath) { $WinSwPath = Join-Path $InstallDir "daemon-service.exe" }
-if (-not (Test-Path $WinSwPath)) {
+if (-not $WinSwPath)
+{
+    $WinSwPath = Join-Path $InstallDir "daemon-service.exe"
+}
+if (-not (Test-Path $WinSwPath))
+{
     throw "WinSW executable not found at '$WinSwPath'. Download it from " +
-          "https://github.com/winsw/winsw/releases (WinSW-x64.exe), rename it to " +
-          "'daemon-service.exe', and place it in $InstallDir - or pass -WinSwPath."
+            "https://github.com/winsw/winsw/releases (WinSW-x64.exe), rename it to " +
+            "'daemon-service.exe', and place it in $InstallDir - or pass -WinSwPath."
 }
 
 $configSource = Join-Path $PSScriptRoot "daemon-service.xml"
-if (-not (Test-Path $configSource)) {
+if (-not (Test-Path $configSource))
+{
     throw "daemon-service.xml not found next to this script ($PSScriptRoot). It ships alongside install-service.ps1."
 }
 
 # ── Remove a prior Scheduled Task registration, if present ─────────────────
 $existingTask = Get-ScheduledTask -TaskName $ExistingScheduledTaskName -ErrorAction SilentlyContinue
-if ($existingTask) {
+if ($existingTask)
+{
     Log "Found existing Scheduled Task '$ExistingScheduledTaskName' - removing it so it can't double-run the daemon alongside the new Service."
     Stop-ScheduledTask -TaskName $ExistingScheduledTaskName -ErrorAction SilentlyContinue
     Unregister-ScheduledTask -TaskName $ExistingScheduledTaskName -Confirm:$false
@@ -177,12 +207,14 @@ if ($existingTask) {
     # (see the rebrand step below), since either could be what an older
     # registration was actually running.
     Get-CimInstance Win32_Process -Filter "Name = 'java.exe' OR Name = '$DaemonExeName'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -and $_.CommandLine -like "*$jarPath*" -and $_.CommandLine -like "*Daemon*" } |
-        ForEach-Object {
-            Log "Stopping leftover daemon process (PID $($_.ProcessId))"
-            Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
-        }
-} else {
+            Where-Object { $_.CommandLine -and $_.CommandLine -like "*$jarPath*" -and $_.CommandLine -like "*Daemon*" } |
+            ForEach-Object {
+                Log "Stopping leftover daemon process (PID $( $_.ProcessId ))"
+                Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+            }
+}
+else
+{
     Log "No existing '$ExistingScheduledTaskName' Scheduled Task found - nothing to remove."
 }
 
@@ -193,14 +225,18 @@ if ($existingTask) {
 # to be able to read/write tasks.xml, creds_*.xml, and app-settings here
 # as a plain standard user. Granting the built-in "Users" group Modify
 # here is what makes that actually true, not just true in theory.
-if (-not (Test-Path $DataDir)) {
+if (-not (Test-Path $DataDir))
+{
     New-Item -ItemType Directory -Path $DataDir | Out-Null
     Log "Created data directory: $DataDir"
 }
-try {
+try
+{
     & icacls $DataDir /grant "*S-1-5-32-545:(OI)(CI)M" /T /Q | Out-Null
     Log "Granted standard users write access to: $DataDir"
-} catch {
+}
+catch
+{
     Log "WARNING: Could not set permissions on ${DataDir}: $_ - the GUI may need to be run elevated if it can't write here."
 }
 
@@ -216,11 +252,12 @@ Log "Staged service config at $configTarget"
 [xml]$cfg = Get-Content $configTarget
 $cfg.service.arguments = "-cp `"$jarPath`" Daemon `"$DataDir`""
 $cfg.Save($configTarget)
-Log "Configured service arguments: $($cfg.service.arguments)"
+Log "Configured service arguments: $( $cfg.service.arguments )"
 
 # ── Stop/uninstall a previous instance of this Service, if present ─────────
 $existingService = Get-Service -Name "OpsTransferToolDaemon" -ErrorAction SilentlyContinue
-if ($existingService) {
+if ($existingService)
+{
     Log "Service already registered - stopping and reinstalling with the current config."
     & $WinSwPath stop
     & $WinSwPath uninstall
@@ -239,7 +276,14 @@ if ($existingService) {
 # if rcedit isn't available, Brand-Executable.ps1 logs why and hands back
 # the plain javaw.exe path unchanged, and the daemon installs and runs
 # exactly the same either way; only its Task Manager identity differs.
-$iconCandidate = if ($IconPath -and (Test-Path $IconPath)) { $IconPath } else { Join-Path $InstallDir "Icon.ico" }
+$iconCandidate = if ($IconPath -and (Test-Path $IconPath))
+{
+    $IconPath
+}
+else
+{
+    Join-Path $InstallDir "Icon.ico"
+}
 $brandScript = Join-Path $PSScriptRoot "steps\Brand-Executable.ps1"
 # setup.ps1 and rcedit.exe (per its own header's prerequisite list) live one
 # level up from this script (packaging\install-service.ps1 -> the staging
@@ -252,42 +296,64 @@ $stagingRoot = Split-Path $PSScriptRoot -Parent
 
 $runtimeScript = Join-Path $PSScriptRoot "steps\New-PrivateRuntime.ps1"
 $javaSource = $null
-if (Test-Path $runtimeScript) {
-    try {
+if (Test-Path $runtimeScript)
+{
+    try
+    {
         $runtimeResult = & $runtimeScript -InstallDir $InstallDir
         $javaSource = $runtimeResult.Javaw
-    } catch {
+    }
+    catch
+    {
         Log "WARNING: Could not build private runtime: $_"
     }
 }
-if (-not $javaSource) {
+if (-not $javaSource)
+{
     # Fallback only — see Deploy-Application.ps1's identical fallback for why.
     $javaSource = (Get-Command "javaw.exe" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue)
-    if (-not $javaSource) {
-        try { $javaSource = Join-Path (Split-Path (Get-Command java.exe).Source) "javaw.exe" } catch { $javaSource = $null }
+    if (-not $javaSource)
+    {
+        try
+        {
+            $javaSource = Join-Path (Split-Path (Get-Command java.exe).Source) "javaw.exe"
+        }
+        catch
+        {
+            $javaSource = $null
+        }
     }
 }
 
-if (-not $javaSource -or -not (Test-Path $javaSource)) {
+if (-not $javaSource -or -not (Test-Path $javaSource))
+{
     Log "NOTE: Couldn't locate javaw.exe to rebrand (is Java on PATH?) - daemon will run as plain java.exe in Task Manager."
-} elseif (-not (Test-Path $brandScript)) {
+}
+elseif (-not (Test-Path $brandScript))
+{
     Log "NOTE: packaging\steps\Brand-Executable.ps1 not found - skipping Task Manager rebrand."
-} else {
+}
+else
+{
     $brandArgs = @{
-        SourceExe   = $javaSource
-        DestExe     = $DaemonExeName
-        IconPath    = $iconCandidate
+        SourceExe = $javaSource
+        DestExe = $DaemonExeName
+        IconPath = $iconCandidate
         Description = "$DaemonDisplayName - background daemon"
         ProductName = $DaemonDisplayName
-        SearchDir   = $stagingRoot
+        SearchDir = $stagingRoot
     }
-    if ($RceditPath) { $brandArgs.RceditPath = $RceditPath }
+    if ($RceditPath)
+    {
+        $brandArgs.RceditPath = $RceditPath
+    }
     $brandResult = & $brandScript @brandArgs
-    if ($brandResult.Branded) {
+    if ($brandResult.Branded)
+    {
         [xml]$cfg = Get-Content $configTarget
         $cfg.service.executable = $brandResult.ExePath
         $cfg.Save($configTarget)
-        Log "Daemon JVM process rebranded for Task Manager: $($brandResult.ExePath)"
+        Log "Daemon JVM process rebranded for Task Manager: $( $brandResult.ExePath )"
     }
 }
 
@@ -301,45 +367,65 @@ if (-not $javaSource -or -not (Test-Path $javaSource)) {
 # exactly the failure this setup previously hit. The child JVM process
 # above is always rebranded regardless of this switch; only the WinSW
 # wrapper's own Task Manager entry is affected.
-if ($BrandWinSwWrapper) {
-    if ((Test-Path $WinSwPath) -and $brandScript -and (Test-Path $brandScript) -and (Test-Path $iconCandidate)) {
+if ($BrandWinSwWrapper)
+{
+    if ((Test-Path $WinSwPath) -and $brandScript -and (Test-Path $brandScript) -and (Test-Path $iconCandidate))
+    {
         $wrapperBrandArgs = @{
-            SourceExe   = $WinSwPath
-            DestExe     = (Split-Path $WinSwPath -Leaf)
-            IconPath    = $iconCandidate
+            SourceExe = $WinSwPath
+            DestExe = (Split-Path $WinSwPath -Leaf)
+            IconPath = $iconCandidate
             Description = "$DaemonDisplayName - background daemon"
             ProductName = $DaemonDisplayName
-            SearchDir   = $stagingRoot
+            SearchDir = $stagingRoot
         }
-        if ($RceditPath) { $wrapperBrandArgs.RceditPath = $RceditPath }
+        if ($RceditPath)
+        {
+            $wrapperBrandArgs.RceditPath = $RceditPath
+        }
         # DestExe intentionally has the SAME name as SourceExe here: this brands
         # daemon-service.exe in place (it's already a per-app renamed copy of
         # WinSW the operator created during setup, not a shared system binary),
         # rather than producing a second differently-named copy alongside it.
-        try {
+        try
+        {
             Copy-Item -Path $WinSwPath -Destination "$WinSwPath.tmp" -Force
             $wrapperBrandArgs.SourceExe = "$WinSwPath.tmp"
             $wrapperResult = & $brandScript @wrapperBrandArgs
-            if ($wrapperResult.Branded) {
+            if ($wrapperResult.Branded)
+            {
                 Log "WinSW wrapper rebranded for Task Manager: $WinSwPath"
             }
             Remove-Item "$WinSwPath.tmp" -ErrorAction SilentlyContinue
-        } catch {
+        }
+        catch
+        {
             Log "WARNING: Could not rebrand WinSW wrapper: $_"
         }
     }
-} else {
+}
+else
+{
     Log "Skipping WinSW wrapper rebrand (default - pass -BrandWinSwWrapper only if your daemon-service.exe is confirmed NOT a single-file .NET publish)."
 }
 
 # ── Install and start ───────────────────────────────────────────────────────
 Push-Location $InstallDir
-try {
+try
+{
     & $WinSwPath install
-    if ($LASTEXITCODE -ne 0) { throw "WinSW install failed with exit code $LASTEXITCODE" }
+    if ($LASTEXITCODE -ne 0)
+    {
+        throw "WinSW install failed with exit code $LASTEXITCODE"
+    }
     & $WinSwPath start
-    if ($LASTEXITCODE -ne 0) { throw "WinSW start failed with exit code $LASTEXITCODE" }
-} finally {
+    if ($LASTEXITCODE -ne 0)
+    {
+        throw "WinSW start failed with exit code $LASTEXITCODE"
+    }
+}
+finally
+{
     Pop-Location
 }
 
@@ -350,5 +436,5 @@ sc.exe failure "OpsTransferToolDaemon" reset= 3600 actions= restart/10000/restar
 Log "Configured Service Recovery (restart on 1st/2nd/subsequent failure)."
 
 $status = Get-Service -Name "OpsTransferToolDaemon"
-Log "Service '$($status.Name)' is now: $($status.Status)"
+Log "Service '$( $status.Name )' is now: $( $status.Status )"
 Log "Done. Check Event Viewer / $InstallDir logs if it did not reach 'Running'."

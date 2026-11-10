@@ -11,7 +11,7 @@ import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * An immutable "this task becomes due at this instant" event.
- *
+ * <p>
  * Implements {@link Delayed} so a {@link java.util.concurrent.DelayQueue} can
  * hold it and only release it to a consumer once {@link #dueAt} has arrived.
  * This IS the scheduling mechanism for the event-driven scheduler — it
@@ -55,13 +55,8 @@ public final class TaskDueEvent implements Delayed {
     }
 
     public TaskDueEvent(String taskId, LocalDateTime dueAt, int attempt, boolean immediate,
-                         Set<String> changedFileNames) {
+                        Set<String> changedFileNames) {
         this(taskId, dueAt, attempt, immediate, changedFileNames, false);
-    }
-
-    /** A run requested explicitly (manual or retry): executed by a worker as soon as one is free. */
-    public static TaskDueEvent manual(String taskId) {
-        return new TaskDueEvent(taskId, LocalDateTime.now(), 0, false, Collections.emptySet(), true);
     }
 
     private TaskDueEvent(String taskId, LocalDateTime dueAt, int attempt, boolean immediate,
@@ -75,15 +70,46 @@ public final class TaskDueEvent implements Delayed {
         this.sequence = SEQ.incrementAndGet();
     }
 
-    public String getTaskId() { return taskId; }
-    public LocalDateTime getDueAt() { return dueAt; }
-    public int getAttempt() { return attempt; }
-    public boolean isImmediate() { return immediate; }
-    /** True for an explicit run request (Run Now / retry) as opposed to a scheduled or watcher fire. */
-    public boolean isManual() { return manual; }
-    /** Filenames the push-watch layer named for this fire, or empty for an ordinary scheduled occurrence. */
-    public Set<String> getChangedFileNames() { return changedFileNames; }
-    long getSequence() { return sequence; }
+    /**
+     * A run requested explicitly (manual or retry): executed by a worker as soon as one is free.
+     */
+    public static TaskDueEvent manual(String taskId) {
+        return new TaskDueEvent(taskId, LocalDateTime.now(), 0, false, Collections.emptySet(), true);
+    }
+
+    public String getTaskId() {
+        return taskId;
+    }
+
+    public LocalDateTime getDueAt() {
+        return dueAt;
+    }
+
+    public int getAttempt() {
+        return attempt;
+    }
+
+    public boolean isImmediate() {
+        return immediate;
+    }
+
+    /**
+     * True for an explicit run request (Run Now / retry) as opposed to a scheduled or watcher fire.
+     */
+    public boolean isManual() {
+        return manual;
+    }
+
+    /**
+     * Filenames the push-watch layer named for this fire, or empty for an ordinary scheduled occurrence.
+     */
+    public Set<String> getChangedFileNames() {
+        return changedFileNames;
+    }
+
+    long getSequence() {
+        return sequence;
+    }
 
     @Override
     public long getDelay(TimeUnit unit) {

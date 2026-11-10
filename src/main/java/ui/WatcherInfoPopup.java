@@ -10,7 +10,6 @@ import javax.swing.border.EmptyBorder;
 import java.awt.*;
 import java.nio.file.Path;
 import java.text.SimpleDateFormat;
-import java.time.LocalDateTime;
 import java.util.Date;
 
 /**
@@ -28,10 +27,11 @@ import java.util.Date;
  */
 final class WatcherInfoPopup {
 
-    private WatcherInfoPopup() {}
+    private WatcherInfoPopup() {
+    }
 
     static void show(Component invoker, Point screenLocation, ScheduledTask task,
-                      XmlStorageService storage, TaskSchedulerService scheduler) {
+                     XmlStorageService storage, TaskSchedulerService scheduler) {
 
         JWindow popup = new JWindow(SwingUtilities.getWindowAncestor(invoker));
         popup.setType(Window.Type.POPUP);
@@ -136,7 +136,10 @@ final class WatcherInfoPopup {
 
         // Dismiss like a normal popup: click anywhere else, or hit Escape.
         popup.addWindowFocusListener(new java.awt.event.WindowAdapter() {
-            @Override public void windowLostFocus(java.awt.event.WindowEvent e) { popup.dispose(); }
+            @Override
+            public void windowLostFocus(java.awt.event.WindowEvent e) {
+                popup.dispose();
+            }
         });
         content.registerKeyboardAction(e -> popup.dispose(),
                 KeyStroke.getKeyStroke(java.awt.event.KeyEvent.VK_ESCAPE, 0),
@@ -167,14 +170,30 @@ final class WatcherInfoPopup {
         String label;
         Color color;
         switch (mode) {
-            case "NATIVE_WATCH" -> { label = "\u26A1 Live \u2014 native watch"; color = new Color(0x2E7D32); }
-            case "REMOTE_PUSH" -> { label = "\u26A1 Live \u2014 remote push"; color = new Color(0x2E7D32); }
-            case "POLLING_ONLY_UNSUPPORTED" -> { label = "Polling only \u2014 unsupported"; color = new Color(0xE65100); }
-            case "POLLING_ONLY" -> { label = "Polling only"; color = new Color(0x757575); }
-            default -> { label = "Not applicable"; color = new Color(0x9E9E9E); }
+            case "NATIVE_WATCH" -> {
+                label = "\u26A1 Live \u2014 native watch";
+                color = new Color(0x2E7D32);
+            }
+            case "REMOTE_PUSH" -> {
+                label = "\u26A1 Live \u2014 remote push";
+                color = new Color(0x2E7D32);
+            }
+            case "POLLING_ONLY_UNSUPPORTED" -> {
+                label = "Polling only \u2014 unsupported";
+                color = new Color(0xE65100);
+            }
+            case "POLLING_ONLY" -> {
+                label = "Polling only";
+                color = new Color(0x757575);
+            }
+            default -> {
+                label = "Not applicable";
+                color = new Color(0x9E9E9E);
+            }
         }
         return new Result(mode, label, color, detail != null ? detail : "", fromDaemon);
     }
 
-    private record Result(String mode, String label, Color color, String detail, boolean fromDaemon) {}
+    private record Result(String mode, String label, Color color, String detail, boolean fromDaemon) {
+    }
 }

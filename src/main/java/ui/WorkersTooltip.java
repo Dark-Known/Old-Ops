@@ -16,7 +16,8 @@ import java.util.function.Function;
  * service is the active scheduler it reads what that process exports; otherwise this window's own pool.
  */
 final class WorkersTooltip {
-    private WorkersTooltip() {}
+    private WorkersTooltip() {
+    }
 
     static String build(TaskSchedulerService scheduler, AppFeeds.Daemon daemon, Function<String, String> taskName) {
         boolean viaService = !scheduler.isStarted() && daemon != null && daemon.alive() && daemon.snapshot() != null;
@@ -47,12 +48,15 @@ final class WorkersTooltip {
             List<String> mine = new ArrayList<>(service.Workers.summaryLines());
             mine.addAll(service.BackgroundJobs.liveLines(6));
             sb.append("<br><br><b>Other work</b> \u2014 this window");
-            for (String l : mine) sb.append("<br>").append(l.matches(".*: \\d+ busy.*") ? "" : "\u2022 ").append(esc(l));
+            for (String l : mine)
+                sb.append("<br>").append(l.matches(".*: \\d+ busy.*") ? "" : "\u2022 ").append(esc(l));
         }
         return sb.append("</html>").toString();
     }
 
-    private static String esc(String t) { return t.replace("&", "&amp;").replace("<", "&lt;"); }
+    private static String esc(String t) {
+        return t.replace("&", "&amp;").replace("<", "&lt;");
+    }
 
     private static String ago(LocalDateTime since) {
         long s = Math.max(0, Duration.between(since, LocalDateTime.now()).getSeconds());

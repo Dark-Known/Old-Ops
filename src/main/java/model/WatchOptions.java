@@ -20,5 +20,7 @@ public record WatchOptions(boolean onNew, boolean onChanged) {
         return new WatchOptions(n, c);
     }
 
-    public String toText() { return "new=" + (onNew ? 1 : 0) + ";changed=" + (onChanged ? 1 : 0); }
+    public String toText() {
+        return "new=" + (onNew ? 1 : 0) + ";changed=" + (onChanged ? 1 : 0);
+    }
 }

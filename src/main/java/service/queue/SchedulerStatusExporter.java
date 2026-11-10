@@ -17,7 +17,7 @@ import java.util.logging.Logger;
  * so another process — typically the GUI's Event Monitor window reading the
  * headless Daemon's file — can observe it without any IPC beyond the
  * filesystem both processes already share.
- *
+ * <p>
  * Writes are atomic (temp file + {@link StandardCopyOption#ATOMIC_MOVE})
  * so a concurrent reader (see {@link SchedulerStatusSnapshot#read}) never
  * sees a half-written file.
@@ -26,11 +26,17 @@ public final class SchedulerStatusExporter {
 
     private static final Logger log = Logger.getLogger(SchedulerStatusExporter.class.getName());
 
-    /** Longest the file may go without a rewrite: readers treat a file older than ~8 s as "daemon not running". */
+    /**
+     * Longest the file may go without a rewrite: readers treat a file older than ~8 s as "daemon not running".
+     */
     private static final long DAEMON_HEARTBEAT_MS = 5_000;
-    /** Other processes' files are not used for liveness by anyone, so they only need an occasional refresh. */
+    /**
+     * Other processes' files are not used for liveness by anyone, so they only need an occasional refresh.
+     */
     private static final long OTHER_HEARTBEAT_MS = 60_000;
-    /** Under activity, never rewrite the file more often than the old fixed 2 s cadence. */
+    /**
+     * Under activity, never rewrite the file more often than the old fixed 2 s cadence.
+     */
     private static final long MIN_FILE_GAP_MS = 2_000;
 
     private final Path targetFile;
@@ -63,34 +69,50 @@ public final class SchedulerStatusExporter {
         this.pid = resolvedPid;
     }
 
+    private static long toEpochMillis(LocalDateTime t) {
+        return t.atZone(ZoneId.systemDefault()).toInstant().toEpochMilli();
+    }
+
     /**
      * Receives the full snapshot text every time the exported <em>state</em> actually changes (not on a
      * timer). This is what feeds the push stream; the file below is now just the fallback layer.
      */
-    public void setListener(Consumer<String> listener) { this.listener = listener; }
+    public void setListener(Consumer<String> listener) {
+        this.listener = listener;
+    }
 
-    /** How many times the status file has actually been rewritten (diagnostics and tests). */
-    public long filesWritten() { synchronized (lock) { return filesWritten; } }
+    /**
+     * How many times the status file has actually been rewritten (diagnostics and tests).
+     */
+    public long filesWritten() {
+        synchronized (lock) {
+            return filesWritten;
+        }
+    }
 
-    /** Writes the current snapshot. Safe to call from any thread; never throws. */
+    /**
+     * Writes the current snapshot. Safe to call from any thread; never throws.
+     */
     public void export(int poolSize, int activeWorkers, List<TaskDueEvent> pending,
-                        List<TaskWorkerPool.ActivityEntry> activity,
-                        List<SchedulerStatusSnapshot.WatchEntry> watchEntries,
-                        List<SchedulerStatusSnapshot.FireEntry> fireEntries,
-                        List<String> runningTaskIds,
-                        List<SchedulerStatusSnapshot.SessionEntry> sessionEntries) {
+                       List<TaskWorkerPool.ActivityEntry> activity,
+                       List<SchedulerStatusSnapshot.WatchEntry> watchEntries,
+                       List<SchedulerStatusSnapshot.FireEntry> fireEntries,
+                       List<String> runningTaskIds,
+                       List<SchedulerStatusSnapshot.SessionEntry> sessionEntries) {
         export(poolSize, activeWorkers, pending, activity, watchEntries, fireEntries, runningTaskIds, sessionEntries,
                 java.util.Collections.emptyList(), java.util.Collections.emptyList());
     }
 
-    /** As above, plus what each worker is running and the process's lane/job lines for the GUI tooltip. */
+    /**
+     * As above, plus what each worker is running and the process's lane/job lines for the GUI tooltip.
+     */
     public void export(int poolSize, int activeWorkers, List<TaskDueEvent> pending,
-                        List<TaskWorkerPool.ActivityEntry> activity,
-                        List<SchedulerStatusSnapshot.WatchEntry> watchEntries,
-                        List<SchedulerStatusSnapshot.FireEntry> fireEntries,
-                        List<String> runningTaskIds,
-                        List<SchedulerStatusSnapshot.SessionEntry> sessionEntries,
-                        List<TaskWorkerPool.InFlightTask> inFlight, List<String> liveLines) {
+                       List<TaskWorkerPool.ActivityEntry> activity,
+                       List<SchedulerStatusSnapshot.WatchEntry> watchEntries,
+                       List<SchedulerStatusSnapshot.FireEntry> fireEntries,
+                       List<String> runningTaskIds,
+                       List<SchedulerStatusSnapshot.SessionEntry> sessionEntries,
+                       List<TaskWorkerPool.InFlightTask> inFlight, List<String> liveLines) {
         try {
             StringBuilder sb = new StringBuilder(512); // every record AFTER the PROC header line
 
@@ -148,25 +170,38 @@ public final class SchedulerStatusExporter {
             boolean writeFileNow;
             synchronized (lock) {
                 changed = !fingerprint.equals(lastFingerprint);
-                if (changed) { lastFingerprint = fingerprint; fileDirty = true; }
+                if (changed) {
+                    lastFingerprint = fingerprint;
+                    fileDirty = true;
+                }
                 long since = now - lastFileWriteMs;
                 writeFileNow = (fileDirty && since >= MIN_FILE_GAP_MS) || since >= heartbeatMs;
             }
             if (changed) {
                 Consumer<String> l = listener;
                 if (l != null) {
-                    try { l.accept(full); } catch (RuntimeException e) { log.fine("Status listener failed: " + e.getMessage()); }
+                    try {
+                        l.accept(full);
+                    } catch (RuntimeException e) {
+                        log.fine("Status listener failed: " + e.getMessage());
+                    }
                 }
             }
             if (writeFileNow && writeFile(full)) {
-                synchronized (lock) { lastFileWriteMs = now; fileDirty = false; filesWritten++; }
+                synchronized (lock) {
+                    lastFileWriteMs = now;
+                    fileDirty = false;
+                    filesWritten++;
+                }
             }
         } catch (RuntimeException e) {
             log.fine("Scheduler status export skipped: " + e);
         }
     }
 
-    /** Atomically replaces the status file. Returns false (leaving the dirty flag set, so it is retried) on failure. */
+    /**
+     * Atomically replaces the status file. Returns false (leaving the dirty flag set, so it is retried) on failure.
+     */
     private boolean writeFile(String text) {
         try {
             Path dir = targetFile.toAbsolutePath().getParent();
@@ -193,7 +228,12 @@ public final class SchedulerStatusExporter {
                 IOException lastFailure = null;
                 for (int attempt = 0; attempt < 3 && !moved; attempt++) {
                     if (attempt > 0) {
-                        try { Thread.sleep(15); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
+                        try {
+                            Thread.sleep(15);
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                            break;
+                        }
                     }
                     try {
                         Files.writeString(tmp, text, StandardCharsets.UTF_8);
@@ -214,7 +254,9 @@ public final class SchedulerStatusExporter {
                 if (!moved && lastFailure != null) throw lastFailure;
             } finally {
                 if (!moved) {
-                    try { Files.deleteIfExists(tmp); } catch (IOException ignored) { /* best effort */ }
+                    try {
+                        Files.deleteIfExists(tmp);
+                    } catch (IOException ignored) { /* best effort */ }
                 }
             }
             return true;
@@ -242,15 +284,13 @@ public final class SchedulerStatusExporter {
                     String name = p.getFileName().toString();
                     return name.startsWith("scheduler-status-") && name.endsWith(".tmp");
                 }).forEach(p -> {
-                    try { Files.deleteIfExists(p); } catch (IOException ignored) { /* best effort */ }
+                    try {
+                        Files.deleteIfExists(p);
+                    } catch (IOException ignored) { /* best effort */ }
                 });
             }
         } catch (IOException e) {
             log.fine("Orphaned status temp-file cleanup skipped: " + e.getMessage());
         }
-    }
-
-    private static long toEpochMillis(LocalDateTime t) {
-        return t.atZone(ZoneId.systemDefault()).toInstant().toEpochMilli();
     }
 }

@@ -28,19 +28,6 @@ public class CredentialListModel extends AbstractListModel<Credential> {
         return credentials.get(index);
     }
 
-    public void setCredentials(List<Credential> newCredentials) {
-        int oldSize = credentials.size();
-        credentials.clear();
-        credentials.addAll(newCredentials);
-        
-        if (oldSize > 0) {
-            fireIntervalRemoved(this, 0, oldSize - 1);
-        }
-        if (credentials.size() > 0) {
-            fireIntervalAdded(this, 0, credentials.size() - 1);
-        }
-    }
-
     public void findCredentialByUsername(String username) {
         for (int i = 0; i < credentials.size(); i++) {
             if (credentials.get(i).getUsername().equals(username)) {
@@ -52,5 +39,18 @@ public class CredentialListModel extends AbstractListModel<Credential> {
 
     public List<Credential> getCredentials() {
         return new ArrayList<>(credentials);
+    }
+
+    public void setCredentials(List<Credential> newCredentials) {
+        int oldSize = credentials.size();
+        credentials.clear();
+        credentials.addAll(newCredentials);
+
+        if (oldSize > 0) {
+            fireIntervalRemoved(this, 0, oldSize - 1);
+        }
+        if (credentials.size() > 0) {
+            fireIntervalAdded(this, 0, credentials.size() - 1);
+        }
     }
 }

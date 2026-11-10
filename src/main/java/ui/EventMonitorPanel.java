@@ -1,10 +1,9 @@
 package ui;
 
-import service.BackgroundJobs;
-
 import model.EventKind;
 import model.ScheduledTask;
 import model.TaskRunRecord;
+import service.BackgroundJobs;
 import service.RunHistoryService;
 import service.TaskSchedulerService;
 import service.queue.SchedulerStatusSnapshot;
@@ -18,7 +17,6 @@ import java.time.LocalDateTime;
 import java.util.*;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
@@ -66,11 +64,16 @@ public class EventMonitorPanel extends JPanel {
     private static final long STATS_REFRESH_MS = 5_000;
     private static final int MAX_TOASTS_PER_BATCH = 3;
     private static final java.time.Duration TOAST_MAX_AGE = java.time.Duration.ofSeconds(90);
-
+    // Cross-process change signal (see service.DbChangeMonitor): lets the 1 s tick skip the three
+    // MAX(id) token queries entirely while neither history database has been committed to.
+    private static final long TOKEN_SAFETY_MS = 15_000;
+    // The Statistics tab re-reads up to STATS_QUERY_LIMIT rows. Skip that while run_history.db has not been
+    // committed to and the range is unchanged; the age cap covers the sliding time window. Stamps are written
+    // only after a SUCCESSFUL load, so a busy-database miss is retried on the next tick instead of going stale.
+    private static final long STATS_SAFETY_MS = 60_000;
     private final TaskSchedulerService scheduler;
     private final Path daemonStatusFile;
     private final MonitorPrefs prefs = new MonitorPrefs();
-
     private final SummaryBar summary = new SummaryBar();
     private final EventFeedPanel feed;
     private final DetailPane detail;
@@ -78,39 +81,33 @@ public class EventMonitorPanel extends JPanel {
     private final StatisticsPanel statsPanel = new StatisticsPanel();
     private final JTabbedPane tabs = new JTabbedPane();
     private final JPanel centerHolder = new JPanel(new BorderLayout());
-
     private final javax.swing.Timer refreshTimer;
-    private volatile AppFeeds.Daemon daemonState = AppFeeds.Daemon.OFFLINE;
-    private Runnable daemonUnsub = () -> { };
     private final java.util.function.Consumer<TaskRunRecord> historyListener;
 
     // Background loading
     private final ExecutorService loader = service.Workers.newPool(service.Workers.Lane.FEED, 1);
     private final AtomicBoolean loading = new AtomicBoolean();
     private final AtomicBoolean reloadAgain = new AtomicBoolean();
+    private final AtomicBoolean statsLoading = new AtomicBoolean();
+    private final Set<String> toastSeen = new HashSet<>();
+    private volatile AppFeeds.Daemon daemonState = AppFeeds.Daemon.OFFLINE;
+    private Runnable daemonUnsub = () -> {
+    };
     private volatile boolean forceNext;
     private volatile boolean stopped;
     private volatile Map<String, ScheduledTask> latestById = Map.of();
     private volatile long lastTasksMs;
     private String lastToken;                 // loader thread only
     private int lastRangeIndex = -1;          // loader thread only
-    // Cross-process change signal (see service.DbChangeMonitor): lets the 1 s tick skip the three
-    // MAX(id) token queries entirely while neither history database has been committed to.
-    private static final long TOKEN_SAFETY_MS = 15_000;
     private long lastRunsGen = -1, lastBgGen = -1, lastTokenCheckMs; // loader thread only
-    private Runnable monitorUnsubRuns = () -> { }, monitorUnsubBg = () -> { };
-    private final AtomicBoolean statsLoading = new AtomicBoolean();
+    private Runnable monitorUnsubRuns = () -> {
+    }, monitorUnsubBg = () -> {
+    };
     private long lastStatsMs;                 // EDT only
-    // The Statistics tab re-reads up to STATS_QUERY_LIMIT rows. Skip that while run_history.db has not been
-    // committed to and the range is unchanged; the age cap covers the sliding time window. Stamps are written
-    // only after a SUCCESSFUL load, so a busy-database miss is retried on the next tick instead of going stale.
-    private static final long STATS_SAFETY_MS = 60_000;
     private volatile long lastStatsGen = -1, lastStatsLoadedMs;
     private volatile int lastStatsRange = -1;
-
     // Toasts
     private ToastManager toasts;
-    private final Set<String> toastSeen = new HashSet<>();
     private boolean toastBaseline;
 
     public EventMonitorPanel(TaskSchedulerService scheduler) {
@@ -131,7 +128,10 @@ public class EventMonitorPanel extends JPanel {
         summary.set("queued", "Queued", "0", null, "Runs waiting for their scheduled time");
         summary.set("watchers", "Watchers", "\u2014", null, "How watcher-enabled tasks are being triggered");
         summary.setLiveTooltip("workers", () -> WorkersTooltip.build(scheduler, daemonState,
-                id -> { ScheduledTask t = latestById.get(id); return t != null ? t.getName() : id; }));
+                id -> {
+                    ScheduledTask t = latestById.get(id);
+                    return t != null ? t.getName() : id;
+                }));
         summary.set("attention", "Attention", "\u2026", null, "Click to show only warnings and errors \u2014 click again to go back");
         // Toggle: first click narrows the feed to problems, second click goes back to normal.
         summary.onClick("attention", () -> prefs.setLevelIndex(
@@ -151,7 +151,9 @@ public class EventMonitorPanel extends JPanel {
         add(tabs, BorderLayout.CENTER);
 
         statsPanel.setRangeChangeListener(hours -> refreshStats(true));
-        tabs.addChangeListener(e -> { if (tabs.getSelectedIndex() == 1) refreshStats(true); });
+        tabs.addChangeListener(e -> {
+            if (tabs.getSelectedIndex() == 1) refreshStats(true);
+        });
 
         layoutSide();
         // React narrowly: rebuilding the split panes on every preference change would reset the
@@ -161,7 +163,8 @@ public class EventMonitorPanel extends JPanel {
             switch (what) {
                 case "showDetail", "showQueue" -> layoutSide();
                 case "range" -> requestLoad(true);
-                default -> { }
+                default -> {
+                }
             }
         });
 
@@ -187,7 +190,22 @@ public class EventMonitorPanel extends JPanel {
         refreshTimer.start();
     }
 
-    /** Stops all background work. Call when the enclosing window is disposed. */
+    private static String name(Map<String, ScheduledTask> byId, String id) {
+        if (service.MaintenanceService.isSystemJob(id)) return service.MaintenanceService.displayName(id);
+        ScheduledTask t = byId.get(id);
+        return t != null ? t.getName() : "(deleted task)";
+    }
+
+    // ── Layout ──────────────────────────────────────────────────────
+
+    private static String glyph(Map<String, ScheduledTask> byId, String id) {
+        ScheduledTask t = byId.get(id);
+        return t != null ? MonitorStyle.directionGlyph(t.getTransferDirection()) : "";
+    }
+
+    /**
+     * Stops all background work. Call when the enclosing window is disposed.
+     */
     public void stopRefreshing() {
         stopped = true;
         if (refreshTimer != null) refreshTimer.stop();
@@ -202,7 +220,7 @@ public class EventMonitorPanel extends JPanel {
         scheduler.getBackgroundLogService().removeListener(historyListener);
     }
 
-    // ── Layout ──────────────────────────────────────────────────────
+    // ── Background loading ──────────────────────────────────────────
 
     private JComponent framed(JComponent c, int minWidth) {
         JPanel p = new JPanel(new BorderLayout());
@@ -213,7 +231,9 @@ public class EventMonitorPanel extends JPanel {
         return p;
     }
 
-    /** Rebuilds the feed/side-pane arrangement to match the Options toggles. */
+    /**
+     * Rebuilds the feed/side-pane arrangement to match the Options toggles.
+     */
     private void layoutSide() {
         centerHolder.removeAll();
         boolean d = prefs.showDetail(), q = prefs.showQueue();
@@ -247,13 +267,18 @@ public class EventMonitorPanel extends JPanel {
         centerHolder.repaint();
     }
 
-    // ── Background loading ──────────────────────────────────────────
+    // ── Periodic EDT refresh: live scheduler state ──────────────────
 
-    /** Asks for a (re)load of the event history. Cheap to call often: it coalesces, and skips the query when nothing changed. */
+    /**
+     * Asks for a (re)load of the event history. Cheap to call often: it coalesces, and skips the query when nothing changed.
+     */
     private void requestLoad(boolean force) {
         if (stopped) return;
         if (force) forceNext = true;
-        if (!loading.compareAndSet(false, true)) { reloadAgain.set(true); return; }
+        if (!loading.compareAndSet(false, true)) {
+            reloadAgain.set(true);
+            return;
+        }
         final boolean f = forceNext;
         forceNext = false;
         try {
@@ -321,8 +346,6 @@ public class EventMonitorPanel extends JPanel {
         }
     }
 
-    // ── Periodic EDT refresh: live scheduler state ──────────────────
-
     private void refresh() {
         if (stopped) return;
         Map<String, ScheduledTask> byId = latestById;
@@ -376,18 +399,26 @@ public class EventMonitorPanel extends JPanel {
 
         // Watchers: prefer the active scheduler's own view; fall back to this process for tasks it hasn't mentioned.
         Map<String, SchedulerStatusSnapshot.WatchEntry> daemonWatch = new HashMap<>();
-        if (snap != null) for (SchedulerStatusSnapshot.WatchEntry w : snap.getWatchEntries()) daemonWatch.put(w.taskId(), w);
+        if (snap != null)
+            for (SchedulerStatusSnapshot.WatchEntry w : snap.getWatchEntries()) daemonWatch.put(w.taskId(), w);
         int instant = 0, polling = 0;
         for (ScheduledTask t : byId.values()) {
             if (t.getTaskType() != ScheduledTask.TaskType.FILE_TRANSFER || !t.isWatcherEnabled()) continue;
             String mode, why;
             SchedulerStatusSnapshot.WatchEntry de = daemonWatch.get(t.getId());
-            if (de != null) { mode = de.mode(); why = de.detail(); }
-            else { TaskSchedulerService.WatchStatus s = scheduler.getWatchStatus(t); mode = s.mode().name(); why = s.detail(); }
+            if (de != null) {
+                mode = de.mode();
+                why = de.detail();
+            } else {
+                TaskSchedulerService.WatchStatus s = scheduler.getWatchStatus(t);
+                mode = s.mode().name();
+                why = s.detail();
+            }
             if ("NOT_APPLICABLE".equals(mode)) continue;
             String state = mode.equals("NATIVE_WATCH") || mode.equals("REMOTE_PUSH") ? "INSTANT"
                     : mode.equals("POLLING_ONLY_UNSUPPORTED") ? "UNSUPPORTED" : "POLLING";
-            if (state.equals("INSTANT")) instant++; else polling++;
+            if (state.equals("INSTANT")) instant++;
+            else polling++;
             watch.add(new QueuePanel.WatchRow(t.getName(), glyph(byId, t.getId()), state, why));
         }
 
@@ -415,23 +446,12 @@ public class EventMonitorPanel extends JPanel {
             summary.set("attention", "Attention", "All clear", AppTheme.SUCCESS_FG, "No warnings or errors in the selected time range");
         } else {
             summary.set("attention", "Attention", (errs > 0 ? errs + (errs == 1 ? " error" : " errors") : "")
-                    + (errs > 0 && warns > 0 ? " \u00b7 " : "") + (warns > 0 ? warns + (warns == 1 ? " warning" : " warnings") : ""),
+                            + (errs > 0 && warns > 0 ? " \u00b7 " : "") + (warns > 0 ? warns + (warns == 1 ? " warning" : " warnings") : ""),
                     errs > 0 ? AppTheme.FAILED_FG : AppTheme.SKIPPED_FG, "Click to show only warnings and errors \u2014 click again to go back");
         }
 
         if (tabs.getSelectedIndex() == 1) refreshStats(false);
         requestLoad(false);   // cheap: just a token check unless something was written (e.g. by the Daemon)
-    }
-
-    private static String name(Map<String, ScheduledTask> byId, String id) {
-        if (service.MaintenanceService.isSystemJob(id)) return service.MaintenanceService.displayName(id);
-        ScheduledTask t = byId.get(id);
-        return t != null ? t.getName() : "(deleted task)";
-    }
-
-    private static String glyph(Map<String, ScheduledTask> byId, String id) {
-        ScheduledTask t = byId.get(id);
-        return t != null ? MonitorStyle.directionGlyph(t.getTransferDirection()) : "";
     }
 
     // ── Statistics tab (shares the same history database) ───────────
@@ -463,7 +483,9 @@ public class EventMonitorPanel extends JPanel {
                     lastStatsGen = genAtStart;
                     lastStatsRange = rangeHours;
                     lastStatsLoadedMs = System.currentTimeMillis();
-                    SwingUtilities.invokeLater(() -> { if (!stopped) statsPanel.update(current, prior); });
+                    SwingUtilities.invokeLater(() -> {
+                        if (!stopped) statsPanel.update(current, prior);
+                    });
                 } catch (Exception ignored) {
                     // History DB briefly busy — the next refresh catches up.
                 } finally {
@@ -487,8 +509,14 @@ public class EventMonitorPanel extends JPanel {
     private void handleToasts(List<MonitorEvent> events) {
         List<MonitorEvent> fresh = new ArrayList<>();
         for (MonitorEvent e : events) if (toastSeen.add(e.key())) fresh.add(e);
-        if (toastSeen.size() > 20_000) { toastSeen.clear(); toastSeen.addAll(events.stream().map(MonitorEvent::key).toList()); }
-        if (!toastBaseline) { toastBaseline = true; return; }   // opening the window must not dump a toast per past event
+        if (toastSeen.size() > 20_000) {
+            toastSeen.clear();
+            toastSeen.addAll(events.stream().map(MonitorEvent::key).toList());
+        }
+        if (!toastBaseline) {
+            toastBaseline = true;
+            return;
+        }   // opening the window must not dump a toast per past event
 
         MonitorPrefs.ToastMode mode = prefs.toastMode();
         if (mode == MonitorPrefs.ToastMode.OFF || fresh.isEmpty()) return;
@@ -500,11 +528,11 @@ public class EventMonitorPanel extends JPanel {
             boolean wanted = mode == MonitorPrefs.ToastMode.ALL
                     ? e.isOutcome()
                     : e.severity().compareTo(EventKind.Severity.WARN) >= 0
-                        && e.kind() != EventKind.RETRY_SCHEDULED   // its failed run already toasted
-                        && e.kind() != EventKind.ALERT_RETRY       // only the final "not delivered" is worth a popup
-                        && e.kind().category() != EventKind.Category.QUEUE
-                        && e.kind().category() != EventKind.Category.SSH     // connect failures already surface as the run/watcher failure
-                        && e.kind().category() != EventKind.Category.BACKGROUND; // slow-job / UI-stall notes are for the feed, not popups
+                    && e.kind() != EventKind.RETRY_SCHEDULED   // its failed run already toasted
+                    && e.kind() != EventKind.ALERT_RETRY       // only the final "not delivered" is worth a popup
+                    && e.kind().category() != EventKind.Category.QUEUE
+                    && e.kind().category() != EventKind.Category.SSH     // connect failures already surface as the run/watcher failure
+                    && e.kind().category() != EventKind.Category.BACKGROUND; // slow-job / UI-stall notes are for the feed, not popups
             if (wanted) pick.add(e);
         }
         if (pick.isEmpty()) return;

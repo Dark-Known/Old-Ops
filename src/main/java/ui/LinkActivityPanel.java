@@ -12,11 +12,8 @@ import java.awt.*;
 import java.awt.datatransfer.StringSelection;
 import java.io.File;
 import java.text.SimpleDateFormat;
-import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.Date;
+import java.util.*;
 import java.util.List;
-import java.util.Locale;
 
 /**
  * One feed of everything that crossed the wire: requests from the sending applications and calls to the Outlook mail
@@ -33,18 +30,11 @@ final class LinkActivityPanel extends JPanel {
 
     private static final int LOAD = 1000;
     private static final String[] COLUMNS = {"Time", "Type", "Who / mailbox", "What", "Status", "Time taken", "Answer"};
-
-    /** One line of the feed, whatever it came from. */
-    record Row(long time, String type, String who, String what, int status, long millis, String answer,
-               String detail, boolean ok, boolean muted) {}
-
     private final File dataDir;
-    private List<Row> all = new ArrayList<>();
-    private List<Row> shown = new ArrayList<>();
     private final Model model = new Model();
     private final JTable table = new JTable(model);
     private final JComboBox<String> type = new JComboBox<>();
-    private final JComboBox<String> outcome = new JComboBox<>(new String[] {
+    private final JComboBox<String> outcome = new JComboBox<>(new String[]{
             "All outcomes", "Problems only", "Hide health checks"});
     private final JTextField search = new JTextField(16);
     private final JCheckBox pause = new JCheckBox("Pause");
@@ -52,13 +42,16 @@ final class LinkActivityPanel extends JPanel {
     private final JTextArea detail = new JTextArea();
     private final SimpleDateFormat when = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
     private final SimpleDateFormat whenLong = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS");
+    private final java.util.Set<String> only;
+    private List<Row> all = new ArrayList<>();
+    private List<Row> shown = new ArrayList<>();
     private long stamp = Long.MIN_VALUE;
     private javax.swing.Timer timer;
     private JSplitPane split;
 
-    private final java.util.Set<String> only;
-
-    /** @param types which kinds of traffic this feed shows (LINK, GRAPH, TOKEN, DAEMON) */
+    /**
+     * @param types which kinds of traffic this feed shows (LINK, GRAPH, TOKEN, DAEMON)
+     */
     LinkActivityPanel(File dataDir, String... types) {
         this.dataDir = dataDir;
         this.only = new java.util.HashSet<>(java.util.Arrays.asList(types));
@@ -83,7 +76,9 @@ final class LinkActivityPanel extends JPanel {
         JButton openFolder = new JButton("Open folder");
         openFolder.setToolTipText("The logs folder with " + LinkActivityLog.FILE_NAME + " and " + GraphCallLog.FILE_NAME);
         openFolder.addActionListener(e -> {
-            try { Desktop.getDesktop().open(service.LogFiles.dir(dataDir)); } catch (Exception ex) {
+            try {
+                Desktop.getDesktop().open(service.LogFiles.dir(dataDir));
+            } catch (Exception ex) {
                 JOptionPane.showMessageDialog(this, service.LogFiles.dir(dataDir).getAbsolutePath());
             }
         });
@@ -103,7 +98,8 @@ final class LinkActivityPanel extends JPanel {
         table.getColumnModel().getColumn(0).setMinWidth(145);
         table.getColumnModel().getColumn(5).setMinWidth(80);
         table.setDefaultRenderer(Object.class, new DefaultTableCellRenderer() {
-            @Override public Component getTableCellRendererComponent(JTable t, Object v, boolean sel, boolean focus, int r, int c) {
+            @Override
+            public Component getTableCellRendererComponent(JTable t, Object v, boolean sel, boolean focus, int r, int c) {
                 Component comp = super.getTableCellRendererComponent(t, v, sel, focus, r, c);
                 if (!sel && r < shown.size()) {
                     Row row = shown.get(r);
@@ -112,7 +108,9 @@ final class LinkActivityPanel extends JPanel {
                 return comp;
             }
         });
-        table.getSelectionModel().addListSelectionListener(e -> { if (!e.getValueIsAdjusting()) showDetail(); });
+        table.getSelectionModel().addListSelectionListener(e -> {
+            if (!e.getValueIsAdjusting()) showDetail();
+        });
 
         detail.setEditable(false);
         detail.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
@@ -131,41 +129,23 @@ final class LinkActivityPanel extends JPanel {
         type.addActionListener(e -> applyFilter());
         outcome.addActionListener(e -> applyFilter());
         search.getDocument().addDocumentListener(new javax.swing.event.DocumentListener() {
-            public void insertUpdate(javax.swing.event.DocumentEvent e) { applyFilter(); }
-            public void removeUpdate(javax.swing.event.DocumentEvent e) { applyFilter(); }
-            public void changedUpdate(javax.swing.event.DocumentEvent e) { applyFilter(); }
+            public void insertUpdate(javax.swing.event.DocumentEvent e) {
+                applyFilter();
+            }
+
+            public void removeUpdate(javax.swing.event.DocumentEvent e) {
+                applyFilter();
+            }
+
+            public void changedUpdate(javax.swing.event.DocumentEvent e) {
+                applyFilter();
+            }
         });
     }
 
-    @Override public void addNotify() {
-        super.addNotify();
-        SwingUtilities.invokeLater(() -> { if (split != null && split.getHeight() > 0) split.setDividerLocation(0.55); });
-        load(true);
-        if (timer == null) {
-            timer = new javax.swing.Timer(3000, e -> { if (!pause.isSelected()) load(false); });
-            timer.start();
-        }
-    }
-
-    @Override public void removeNotify() {
-        if (timer != null) { timer.stop(); timer = null; }
-        super.removeNotify();
-    }
-
-    private void load(boolean force) {
-        long st = stampOf(LinkActivityLog.FILE_NAME) * 31 + stampOf(GraphCallLog.FILE_NAME);
-        if (!force && st == stamp) return;
-        stamp = st;
-        Async.latest(this, () -> rows(dataDir, LOAD), list -> { all = list; applyFilter(); },
-                e -> System.err.println("Link activity could not be read: " + e));
-    }
-
-    private long stampOf(String name) {
-        File f = service.LogFiles.file(dataDir, name);
-        return f.isFile() ? f.lastModified() * 31 + f.length() : -1;
-    }
-
-    /** Both logs merged, newest first. */
+    /**
+     * Both logs merged, newest first.
+     */
     static List<Row> rows(File dir, int limit) {
         List<Row> out = new ArrayList<>();
         SimpleDateFormat longFmt = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS");
@@ -194,7 +174,8 @@ final class LinkActivityPanel extends JPanel {
             d.append("Attempt:   ").append(e.attempt()).append('\n');
             d.append("Duration:  ").append(e.millis()).append(" ms\n");
             if (e.bytes() >= 0) d.append("Size:      ").append(e.bytes()).append(" bytes\n");
-            if (!e.requestId().isEmpty()) d.append("Request id: ").append(e.requestId()).append("   (quote this to Microsoft support)\n");
+            if (!e.requestId().isEmpty())
+                d.append("Request id: ").append(e.requestId()).append("   (quote this to Microsoft support)\n");
             d.append("\nREQUEST\n").append(e.method()).append(' ').append(e.target()).append('\n');
             d.append("\nRESPONSE\n").append(e.status() == 0 ? "(no answer)" : String.valueOf(e.status())).append('\n');
             if (!e.note().isEmpty()) d.append(e.note()).append('\n');
@@ -214,7 +195,8 @@ final class LinkActivityPanel extends JPanel {
             if (!e.taskId().isEmpty()) d.append("Task id:   ").append(e.taskId()).append('\n');
             if (e.millis() > 0) d.append("Duration:  ").append(e.millis()).append(" ms\n");
             d.append("\nREQUEST\n").append(e.method()).append(' ').append(e.path());
-            if (!e.action().isEmpty()) d.append("\naction=").append(e.action()).append(e.taskId().isEmpty() ? "" : "&taskId=" + e.taskId());
+            if (!e.action().isEmpty())
+                d.append("\naction=").append(e.action()).append(e.taskId().isEmpty() ? "" : "&taskId=" + e.taskId());
             d.append("\n\nRESPONSE\n").append(e.status() == 0 ? "(failed)" : String.valueOf(e.status())).append('\n').append(e.response()).append('\n');
             String why = DaemonCallLog.explain(e);
             if (!why.isEmpty()) d.append('\n').append(why).append('\n');
@@ -240,6 +222,103 @@ final class LinkActivityPanel extends JPanel {
         return out;
     }
 
+    /**
+     * Light indentation of JSON for reading.
+     */
+    static String pretty(String json) {
+        StringBuilder sb = new StringBuilder();
+        int depth = 0;
+        boolean inStr = false, esc = false;
+        for (int i = 0; i < json.length(); i++) {
+            char c = json.charAt(i);
+            if (inStr) {
+                sb.append(c);
+                if (esc) esc = false;
+                else if (c == '\\') esc = true;
+                else if (c == '"') inStr = false;
+                continue;
+            }
+            switch (c) {
+                case '"':
+                    inStr = true;
+                    sb.append(c);
+                    break;
+                case '{':
+                case '[':
+                    sb.append(c).append('\n');
+                    depth++;
+                    indent(sb, depth);
+                    break;
+                case '}':
+                case ']':
+                    sb.append('\n');
+                    depth = Math.max(0, depth - 1);
+                    indent(sb, depth);
+                    sb.append(c);
+                    break;
+                case ',':
+                    sb.append(",\n");
+                    indent(sb, depth);
+                    break;
+                case ':':
+                    sb.append(": ");
+                    break;
+                case ' ':
+                case '\n':
+                case '\r':
+                case '\t':
+                    break;
+                default:
+                    sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+
+    private static void indent(StringBuilder sb, int d) {
+        for (int i = 0; i < d; i++) sb.append("  ");
+    }
+
+    @Override
+    public void addNotify() {
+        super.addNotify();
+        SwingUtilities.invokeLater(() -> {
+            if (split != null && split.getHeight() > 0) split.setDividerLocation(0.55);
+        });
+        load(true);
+        if (timer == null) {
+            timer = new javax.swing.Timer(3000, e -> {
+                if (!pause.isSelected()) load(false);
+            });
+            timer.start();
+        }
+    }
+
+    @Override
+    public void removeNotify() {
+        if (timer != null) {
+            timer.stop();
+            timer = null;
+        }
+        super.removeNotify();
+    }
+
+    private void load(boolean force) {
+        long st = stampOf(LinkActivityLog.FILE_NAME) * 31 + stampOf(GraphCallLog.FILE_NAME);
+        if (!force && st == stamp) return;
+        stamp = st;
+        Async.latest(this, () -> rows(dataDir, LOAD), list -> {
+                    all = list;
+                    applyFilter();
+                },
+                e -> System.err.println("Link activity could not be read: " + e));
+    }
+
+    private long stampOf(String name) {
+        File f = service.LogFiles.file(dataDir, name);
+        return f.isFile() ? f.lastModified() * 31 + f.length() : -1;
+    }
+
     private void applyFilter() {
         Row selected = table.getSelectedRow() >= 0 && table.getSelectedRow() < shown.size() ? shown.get(table.getSelectedRow()) : null;
         String wanted = type.getSelectedIndex() <= 0 ? null : (String) type.getSelectedItem();
@@ -260,59 +339,66 @@ final class LinkActivityPanel extends JPanel {
         shown = out;
         model.fireTableDataChanged();
         if (selected != null) {
-            for (int i = 0; i < shown.size(); i++) if (shown.get(i) == selected) { table.setRowSelectionInterval(i, i); break; }
+            for (int i = 0; i < shown.size(); i++)
+                if (shown.get(i) == selected) {
+                    table.setRowSelectionInterval(i, i);
+                    break;
+                }
         }
         count.setText(all.stream().noneMatch(r -> only.contains(r.type())) ? "Nothing recorded yet." : shown.size() + " shown   |   " + bad + " with problems");
     }
 
     private void showDetail() {
         int r = table.getSelectedRow();
-        if (r < 0 || r >= shown.size()) { detail.setText("Select a line to see it in full."); return; }
+        if (r < 0 || r >= shown.size()) {
+            detail.setText("Select a line to see it in full.");
+            return;
+        }
         detail.setText(shown.get(r).detail());
         detail.setCaretPosition(0);
     }
 
-    /** Light indentation of JSON for reading. */
-    static String pretty(String json) {
-        StringBuilder sb = new StringBuilder();
-        int depth = 0;
-        boolean inStr = false, esc = false;
-        for (int i = 0; i < json.length(); i++) {
-            char c = json.charAt(i);
-            if (inStr) {
-                sb.append(c);
-                if (esc) esc = false; else if (c == '\\') esc = true; else if (c == '"') inStr = false;
-                continue;
-            }
-            switch (c) {
-                case '"': inStr = true; sb.append(c); break;
-                case '{': case '[': sb.append(c).append('\n'); depth++; indent(sb, depth); break;
-                case '}': case ']': sb.append('\n'); depth = Math.max(0, depth - 1); indent(sb, depth); sb.append(c); break;
-                case ',': sb.append(",\n"); indent(sb, depth); break;
-                case ':': sb.append(": "); break;
-                case ' ': case '\n': case '\r': case '\t': break;
-                default: sb.append(c);
-            }
-        }
-        return sb.toString();
+    /**
+     * One line of the feed, whatever it came from.
+     */
+    record Row(long time, String type, String who, String what, int status, long millis, String answer,
+               String detail, boolean ok, boolean muted) {
     }
 
-    private static void indent(StringBuilder sb, int d) { for (int i = 0; i < d; i++) sb.append("  "); }
-
     private final class Model extends AbstractTableModel {
-        @Override public int getRowCount() { return shown.size(); }
-        @Override public int getColumnCount() { return COLUMNS.length; }
-        @Override public String getColumnName(int c) { return COLUMNS[c]; }
-        @Override public Object getValueAt(int r, int c) {
+        @Override
+        public int getRowCount() {
+            return shown.size();
+        }
+
+        @Override
+        public int getColumnCount() {
+            return COLUMNS.length;
+        }
+
+        @Override
+        public String getColumnName(int c) {
+            return COLUMNS[c];
+        }
+
+        @Override
+        public Object getValueAt(int r, int c) {
             Row row = shown.get(r);
             switch (c) {
-                case 0: return when.format(new Date(row.time()));
-                case 1: return row.type();
-                case 2: return row.who();
-                case 3: return row.what();
-                case 4: return row.status() == 0 ? "-" : String.valueOf(row.status());
-                case 5: return row.millis() < 0 ? "" : row.millis() + " ms";
-                default: return row.answer().length() > 90 ? row.answer().substring(0, 90) + "..." : row.answer();
+                case 0:
+                    return when.format(new Date(row.time()));
+                case 1:
+                    return row.type();
+                case 2:
+                    return row.who();
+                case 3:
+                    return row.what();
+                case 4:
+                    return row.status() == 0 ? "-" : String.valueOf(row.status());
+                case 5:
+                    return row.millis() < 0 ? "" : row.millis() + " ms";
+                default:
+                    return row.answer().length() > 90 ? row.answer().substring(0, 90) + "..." : row.answer();
             }
         }
     }

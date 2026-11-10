@@ -1,7 +1,5 @@
 package service;
 
-import static org.junit.Assert.*;
-
 import model.EventKind;
 import org.junit.Test;
 
@@ -22,13 +20,58 @@ import java.util.List;
 import java.util.Properties;
 import java.util.concurrent.atomic.AtomicLong;
 
+import static org.junit.Assert.*;
+
 public class LinkIngestTest {
 
     private static final long HOUR = 3_600_000L;
 
     // ── Settings file ─────────────────────────────────────────────────────
 
-    @Test public void configParsingHandlesHashesLegacyTokensAndBadEntries() {
+    private static File dataDirWith(LinkMonitorConfig cfg) throws Exception {
+        File dir = Files.createTempDirectory("lm").toFile();
+        cfg.save(dir);
+        return dir;
+    }
+
+    private static LinkMonitorConfig plainConfig(int port, String tokenHash) {
+        Properties p = new Properties();
+        p.setProperty("port", String.valueOf(port));
+        p.setProperty("bind", "127.0.0.1");
+        p.setProperty("tls.enabled", "false");
+        p.setProperty("source.a.label", "A to B");
+        p.setProperty("source.a.tokenHash", tokenHash);
+        return LinkMonitorConfig.parse(p);
+    }
+
+    private static long count(List<LinkMonitor.Alert> l, EventKind k) {
+        return l.stream().filter(x -> x.kind() == k).count();
+    }
+
+    private static javax.net.ssl.SSLContext trusting(File cer) throws Exception {
+        Certificate cert;
+        try (InputStream in = Files.newInputStream(cer.toPath())) {
+            cert = CertificateFactory.getInstance("X.509").generateCertificate(in);
+        }
+        KeyStore ts = KeyStore.getInstance(KeyStore.getDefaultType());
+        ts.load(null, null);
+        ts.setCertificateEntry("link", cert);
+        TrustManagerFactory tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
+        tmf.init(ts);
+        SSLContext ctx = SSLContext.getInstance("TLS");
+        ctx.init(null, tmf.getTrustManagers(), null);
+        return ctx;
+    }
+
+    private static HttpResponse<String> post(HttpClient http, String base, String token, String body) throws Exception {
+        HttpRequest.Builder b = HttpRequest.newBuilder(URI.create(base + "/socketLink/events"))
+                .POST(HttpRequest.BodyPublishers.ofString(body));
+        if (token != null) b.header("Authorization", "Bearer " + token);
+        return http.send(b.build(), HttpResponse.BodyHandlers.ofString());
+    }
+
+    @Test
+    public void configParsingHandlesHashesLegacyTokensAndBadEntries() {
         Properties p = new Properties();
         p.setProperty("source.a.label", "A to B");
         p.setProperty("source.a.tokenHash", LinkTokens.hash("secret-a-secret-a-secret"));
@@ -49,7 +92,8 @@ public class LinkIngestTest {
         assertFalse("no sources, nothing to serve", LinkMonitorConfig.empty().enabled());
     }
 
-    @Test public void tlsCanOnlyBeSwitchedOffExplicitly() {
+    @Test
+    public void tlsCanOnlyBeSwitchedOffExplicitly() {
         Properties p = new Properties();
         p.setProperty("tls.enabled", "false");
         assertFalse(LinkMonitorConfig.parse(p).tlsEnabled);
@@ -57,7 +101,8 @@ public class LinkIngestTest {
         assertTrue(LinkMonitorConfig.parse(p).tlsEnabled);
     }
 
-    @Test public void settingsSurviveASaveAndReload_andStoreOnlyHashes() throws Exception {
+    @Test
+    public void settingsSurviveASaveAndReload_andStoreOnlyHashes() throws Exception {
         File dir = Files.createTempDirectory("lm").toFile();
         LinkMonitorConfig.Issued first = LinkMonitorConfig.empty().addSource("Order feed A to B", 60, 0, 30, 5, 10, 1000);
         first.config().withEndpoint(9443, List.of("serverc.corp", "10.1.2.3")).save(dir);
@@ -75,7 +120,10 @@ public class LinkIngestTest {
         assertTrue(back.problems.isEmpty());
     }
 
-    @Test public void sourceIdsAreSafeAndUnique() {
+    // ── The endpoint ──────────────────────────────────────────────────────
+
+    @Test
+    public void sourceIdsAreSafeAndUnique() {
         LinkMonitorConfig c = LinkMonitorConfig.empty();
         assertEquals("a-b-feed", c.newSourceId("  A/B feed!! "));
         assertEquals("source", c.newSourceId("***"));
@@ -83,7 +131,8 @@ public class LinkIngestTest {
         assertEquals("orders-2", c.newSourceId("Orders"));
     }
 
-    @Test public void regeneratingKeepsTheOldTokenForTheGracePeriodThenOnlyTheNewOne() {
+    @Test
+    public void regeneratingKeepsTheOldTokenForTheGracePeriodThenOnlyTheNewOne() {
         LinkMonitorConfig.Issued a = LinkMonitorConfig.empty().addSource("Orders", 60, 0, 30, 5, 10, 0);
         LinkMonitorConfig.Issued b = a.config().regenerateToken(a.sourceId(), 24 * HOUR, 10 * HOUR);
         LinkMonitor.Source s = b.config().source(a.sourceId());
@@ -97,7 +146,8 @@ public class LinkIngestTest {
         assertTrue(revoked.config().source(a.sourceId()).accepts(revoked.token(), 10 * HOUR));
     }
 
-    @Test public void editingKeepsTheTokenAndRemovingForgetsTheSource() {
+    @Test
+    public void editingKeepsTheTokenAndRemovingForgetsTheSource() {
         LinkMonitorConfig.Issued a = LinkMonitorConfig.empty().addSource("Orders", 60, 0, 30, 5, 10, 0);
         LinkMonitorConfig edited = a.config().updateSource(a.sourceId(), "Orders feed", false, 30, 120, 15, 3, 5);
         LinkMonitor.Source s = edited.source(a.sourceId());
@@ -109,7 +159,8 @@ public class LinkIngestTest {
         assertTrue(edited.removeSource(a.sourceId()).sources.isEmpty());
     }
 
-    @Test public void tokensAreRandomRecognisableAndHashedNotReversible() {
+    @Test
+    public void tokensAreRandomRecognisableAndHashedNotReversible() {
         String t1 = LinkTokens.generate(), t2 = LinkTokens.generate();
         assertNotEquals(t1, t2);
         assertTrue(t1.startsWith("opl_"));
@@ -120,40 +171,36 @@ public class LinkIngestTest {
         assertFalse(LinkTokens.matches(t1, ""));
     }
 
-    @Test public void parsesSingleEventsBatchesAndRejectsUnknownTypes() {
+    @Test
+    public void parsesSingleEventsBatchesAndRejectsUnknownTypes() {
         assertEquals(1, LinkIngestServer.parse("{\"type\":\"disconnected\",\"seq\":3,\"reason\":\"reset\\nby peer\"}").size());
         assertEquals("newlines in a reason are flattened",
                 "reset by peer", LinkIngestServer.parse("{\"type\":\"disconnected\",\"reason\":\"reset\\nby peer\"}").get(0).reason());
         assertEquals(2, LinkIngestServer.parse("{\"events\":[{\"type\":\"connected\"},{\"type\":\"heartbeat\",\"state\":\"connected\"}]}").size());
-        try { LinkIngestServer.parse("{\"type\":\"explode\"}"); fail("unknown type"); } catch (IllegalArgumentException expected) { }
-        try { LinkIngestServer.parse("not json"); fail("bad json"); } catch (RuntimeException expected) { }
+        try {
+            LinkIngestServer.parse("{\"type\":\"explode\"}");
+            fail("unknown type");
+        } catch (IllegalArgumentException expected) {
+        }
+        try {
+            LinkIngestServer.parse("not json");
+            fail("bad json");
+        } catch (RuntimeException expected) {
+        }
     }
 
-    // ── The endpoint ──────────────────────────────────────────────────────
-
-    private static File dataDirWith(LinkMonitorConfig cfg) throws Exception {
-        File dir = Files.createTempDirectory("lm").toFile();
-        cfg.save(dir);
-        return dir;
-    }
-
-    private static LinkMonitorConfig plainConfig(int port, String tokenHash) {
-        Properties p = new Properties();
-        p.setProperty("port", String.valueOf(port));
-        p.setProperty("bind", "127.0.0.1");
-        p.setProperty("tls.enabled", "false");
-        p.setProperty("source.a.label", "A to B");
-        p.setProperty("source.a.tokenHash", tokenHash);
-        return LinkMonitorConfig.parse(p);
-    }
-
-    @Test public void endToEndOverPlainHttpWhenExplicitlyAllowed() throws Exception {
+    @Test
+    public void endToEndOverPlainHttpWhenExplicitlyAllowed() throws Exception {
         String token = LinkTokens.generate();
         File dir = dataDirWith(plainConfig(18943, LinkTokens.hash(token)));
 
         List<LinkMonitor.Alert> alerts = new ArrayList<>();
         AtomicLong now = new AtomicLong(1_000_000);
-        try (LinkMonitorService svc = new LinkMonitorService(dir, a -> { synchronized (alerts) { alerts.add(a); } }, now::get)) {
+        try (LinkMonitorService svc = new LinkMonitorService(dir, a -> {
+            synchronized (alerts) {
+                alerts.add(a);
+            }
+        }, now::get)) {
             svc.refresh();
             int port = svc.listeningPort();
             assertTrue("endpoint should be listening", port > 0);
@@ -172,7 +219,7 @@ public class LinkIngestTest {
             assertEquals("{\"accepted\":2,\"duplicates\":0}", ok.body());
             assertEquals("a retry of the same batch is recognised", "{\"accepted\":0,\"duplicates\":2}",
                     post(http, base, token,
-                    "{\"events\":[{\"type\":\"connected\",\"seq\":1,\"instance\":\"x\"},{\"type\":\"disconnected\",\"seq\":2,\"instance\":\"x\"}]}").body());
+                            "{\"events\":[{\"type\":\"connected\",\"seq\":1,\"instance\":\"x\"},{\"type\":\"disconnected\",\"seq\":2,\"instance\":\"x\"}]}").body());
             synchronized (alerts) {
                 assertEquals(1, count(alerts, EventKind.LINK_DOWN));
                 assertEquals("every accepted request is logged", 2, count(alerts, EventKind.LINK_REPORT));
@@ -211,14 +258,16 @@ public class LinkIngestTest {
         }
     }
 
-    @Test public void selfTestFindsTheEndpointAndMatchesTheCertificate() throws Exception {
+    @Test
+    public void selfTestFindsTheEndpointAndMatchesTheCertificate() throws Exception {
         String token = LinkTokens.generate();
         Properties p = new Properties();
         p.setProperty("port", "18947");
         p.setProperty("bind", "127.0.0.1");
         p.setProperty("source.a.tokenHash", LinkTokens.hash(token));
         File dir = dataDirWith(LinkMonitorConfig.parse(p));
-        try (LinkMonitorService svc = new LinkMonitorService(dir, a -> { }, System::currentTimeMillis)) {
+        try (LinkMonitorService svc = new LinkMonitorService(dir, a -> {
+        }, System::currentTimeMillis)) {
             svc.refresh();
             assertEquals(18947, svc.listeningPort());
             LinkSelfTest.Result r = LinkSelfTest.run("localhost", 18947, true, LinkTls.certificateFile(dir));
@@ -229,11 +278,8 @@ public class LinkIngestTest {
         }
     }
 
-    private static long count(List<LinkMonitor.Alert> l, EventKind k) {
-        return l.stream().filter(x -> x.kind() == k).count();
-    }
-
-    @Test public void httpsIsTheDefault_withAGeneratedCertificateTheSenderCanTrust() throws Exception {
+    @Test
+    public void httpsIsTheDefault_withAGeneratedCertificateTheSenderCanTrust() throws Exception {
         String token = LinkTokens.generate();
         Properties p = new Properties();
         p.setProperty("port", "18945");
@@ -241,7 +287,8 @@ public class LinkIngestTest {
         p.setProperty("source.a.tokenHash", LinkTokens.hash(token));
         File dir = dataDirWith(LinkMonitorConfig.parse(p));
 
-        try (LinkMonitorService svc = new LinkMonitorService(dir, a -> { })) {
+        try (LinkMonitorService svc = new LinkMonitorService(dir, a -> {
+        })) {
             svc.refresh();
             int port = svc.listeningPort();
             assertTrue(port > 0);
@@ -267,13 +314,15 @@ public class LinkIngestTest {
                 HttpClient.newHttpClient().send(HttpRequest.newBuilder(URI.create(base + "/socketLink/health")).build(),
                         HttpResponse.BodyHandlers.ofString());
                 fail("an untrusted certificate must be rejected");
-            } catch (javax.net.ssl.SSLException expected) { }
+            } catch (javax.net.ssl.SSLException expected) {
+            }
             // And plain HTTP is not served at all.
             try {
                 HttpClient.newHttpClient().send(HttpRequest.newBuilder(URI.create("http://localhost:" + port + "/socketLink/health")).build(),
                         HttpResponse.BodyHandlers.ofString());
                 fail("plain HTTP must not work on the HTTPS port");
-            } catch (java.io.IOException expected) { }
+            } catch (java.io.IOException expected) {
+            }
         }
 
         // A second start reuses the same certificate (the sender does not have to trust a new one).
@@ -286,12 +335,14 @@ public class LinkIngestTest {
         assertTrue(LinkTls.describe(dir).names().contains("serverc.corp.example"));
     }
 
-    @Test public void aRegeneratedTokenTakesEffectWithoutARestart() throws Exception {
+    @Test
+    public void aRegeneratedTokenTakesEffectWithoutARestart() throws Exception {
         LinkMonitorConfig.Issued first = LinkMonitorConfig.empty().addSource("Orders", 60, 0, 30, 5, 10, 0);
         Properties base = new Properties();
         LinkMonitorConfig cfg = new LinkMonitorConfig(18946, "127.0.0.1", false, null, null, List.of(), first.config().sources, List.of());
         File dir = dataDirWith(cfg);
-        try (LinkMonitorService svc = new LinkMonitorService(dir, a -> { })) {
+        try (LinkMonitorService svc = new LinkMonitorService(dir, a -> {
+        })) {
             svc.refresh();
             String url = "http://127.0.0.1:" + svc.listeningPort();
             HttpClient http = HttpClient.newHttpClient();
@@ -304,27 +355,5 @@ public class LinkIngestTest {
             assertEquals("the new token is accepted", 200, post(http, url, second.token(), "{\"type\":\"heartbeat\",\"state\":\"connected\"}").statusCode());
             assertEquals("the revoked one is not", 401, post(http, url, first.token(), "{\"type\":\"heartbeat\",\"state\":\"connected\"}").statusCode());
         }
-    }
-
-    private static javax.net.ssl.SSLContext trusting(File cer) throws Exception {
-        Certificate cert;
-        try (InputStream in = Files.newInputStream(cer.toPath())) {
-            cert = CertificateFactory.getInstance("X.509").generateCertificate(in);
-        }
-        KeyStore ts = KeyStore.getInstance(KeyStore.getDefaultType());
-        ts.load(null, null);
-        ts.setCertificateEntry("link", cert);
-        TrustManagerFactory tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
-        tmf.init(ts);
-        SSLContext ctx = SSLContext.getInstance("TLS");
-        ctx.init(null, tmf.getTrustManagers(), null);
-        return ctx;
-    }
-
-    private static HttpResponse<String> post(HttpClient http, String base, String token, String body) throws Exception {
-        HttpRequest.Builder b = HttpRequest.newBuilder(URI.create(base + "/socketLink/events"))
-                .POST(HttpRequest.BodyPublishers.ofString(body));
-        if (token != null) b.header("Authorization", "Bearer " + token);
-        return http.send(b.build(), HttpResponse.BodyHandlers.ofString());
     }
 }

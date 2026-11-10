@@ -22,23 +22,95 @@ import java.util.function.Consumer;
  */
 public final class SftpScriptRunner {
 
-    /** Opens connections; replaceable in tests. */
-    public interface Connector {
-        SftpClient connect(String host, int port, String user, String password) throws IOException;
-    }
-
     private final Connector connector;
     private final Consumer<SftpClient> onOpen;
     private final Consumer<SftpClient> onClose;
-
     public SftpScriptRunner(Connector connector, Consumer<SftpClient> onOpen, Consumer<SftpClient> onClose) {
         this.connector = connector;
         this.onOpen = onOpen;
         this.onClose = onClose;
     }
 
-    /** Result of running a script. */
-    public record Outcome(boolean ok, String host, String user) {}
+    private static void need(SftpClient c) throws IOException {
+        if (c == null) throw new IOException("No open session (script has no 'open' line before this command)");
+    }
+
+    /**
+     * {@code sftp://user@host[:port]/ ...} -> [user, host, port-or-empty]. The password is never in the URL.
+     */
+    static String[] parseOpen(String url) throws IOException {
+        String rest = url.startsWith("sftp://") ? url.substring("sftp://".length()) : url;
+        int slash = rest.indexOf('/');
+        if (slash >= 0) rest = rest.substring(0, slash);
+        int at = rest.lastIndexOf('@');
+        String hostPart = at >= 0 ? rest.substring(at + 1) : rest;
+        String user = at >= 0 ? rest.substring(0, at) : "";
+        int colonUser = user.indexOf(':'); // tolerate old-style user:password
+        if (colonUser >= 0) user = user.substring(0, colonUser);
+        try {
+            user = URLDecoder.decode(user, StandardCharsets.UTF_8);
+        } catch (IllegalArgumentException e) {
+            throw new IOException("Bad user name in open line");
+        }
+        String host = hostPart, port = "";
+        int c = hostPart.lastIndexOf(':');
+        if (c > 0 && !hostPart.endsWith("]")) {
+            host = hostPart.substring(0, c);
+            port = hostPart.substring(c + 1);
+        }
+        if (host.isEmpty()) throw new IOException("No host in open line");
+        return new String[]{user, host, port};
+    }
+
+    /**
+     * Splits on spaces; a double-quoted token keeps its spaces and loses its quotes (escapes stay raw).
+     */
+    static List<String> tokens(String line) {
+        List<String> out = new ArrayList<>();
+        StringBuilder cur = new StringBuilder();
+        boolean inQuote = false, have = false;
+        for (int i = 0; i < line.length(); i++) {
+            char ch = line.charAt(i);
+            if (inQuote) {
+                if (ch == '\\' && i + 1 < line.length()) {
+                    cur.append(ch).append(line.charAt(++i));
+                } else if (ch == '"') inQuote = false;
+                else cur.append(ch);
+            } else if (ch == '"') {
+                inQuote = true;
+                have = true;
+            } else if (Character.isWhitespace(ch)) {
+                if (have || cur.length() > 0) {
+                    out.add(cur.toString());
+                    cur.setLength(0);
+                    have = false;
+                }
+            } else cur.append(ch);
+        }
+        if (have || cur.length() > 0) out.add(cur.toString());
+        return out;
+    }
+
+    /**
+     * Local paths were written with {@code \\} and {@code \"} escapes.
+     */
+    static String unescapeLocal(String s) {
+        StringBuilder b = new StringBuilder();
+        for (int i = 0; i < s.length(); i++) {
+            char ch = s.charAt(i);
+            if (ch == '\\' && i + 1 < s.length() && (s.charAt(i + 1) == '\\' || s.charAt(i + 1) == '"'))
+                b.append(s.charAt(++i));
+            else b.append(ch);
+        }
+        return b.toString();
+    }
+
+    /**
+     * Remote paths were written with only {@code \"} escaped.
+     */
+    static String unescapeRemote(String s) {
+        return s.replace("\\\"", "\"");
+    }
 
     public Outcome run(List<String> script, String password, Consumer<String> log) throws IOException {
         boolean abortOnError = true;
@@ -90,7 +162,8 @@ public final class SftpScriptRunner {
                                 if (!local.isFile() || local.length() != re.size()) {
                                     throw new IOException("Kept " + remote + " on the server: the copy on this PC is missing or has the wrong size");
                                 }
-                                if (!client.delete(remote)) throw new IOException("Could not delete " + remote + " on the server");
+                                if (!client.delete(remote))
+                                    throw new IOException("Could not delete " + remote + " on the server");
                             }
                         }
                         case "put" -> {
@@ -121,9 +194,14 @@ public final class SftpScriptRunner {
                             log.accept("[INFO] Moved " + from + " -> " + to);
                         }
                         case "close" -> {
-                            if (client != null) { closeClient(client); client = null; }
+                            if (client != null) {
+                                closeClient(client);
+                                client = null;
+                            }
                         }
-                        case "exit" -> { return new Outcome(abortOnError ? failures == 0 : true, host, user); }
+                        case "exit" -> {
+                            return new Outcome(abortOnError ? failures == 0 : true, host, user);
+                        }
                         default -> throw new IOException("Unsupported script command: " + cmd);
                     }
                 } catch (ConnectFailed cf) {
@@ -144,74 +222,33 @@ public final class SftpScriptRunner {
         }
     }
 
-    /** Marks an {@code open} failure so it is rethrown instead of being treated as a command failure. */
-    private static final class ConnectFailed extends RuntimeException {
-        ConnectFailed(IOException cause) { super(cause); }
-    }
-
     private void closeClient(SftpClient c) {
-        try { c.close(); } finally { if (onClose != null) onClose.accept(c); }
-    }
-
-    private static void need(SftpClient c) throws IOException {
-        if (c == null) throw new IOException("No open session (script has no 'open' line before this command)");
-    }
-
-    /** {@code sftp://user@host[:port]/ ...} -> [user, host, port-or-empty]. The password is never in the URL. */
-    static String[] parseOpen(String url) throws IOException {
-        String rest = url.startsWith("sftp://") ? url.substring("sftp://".length()) : url;
-        int slash = rest.indexOf('/');
-        if (slash >= 0) rest = rest.substring(0, slash);
-        int at = rest.lastIndexOf('@');
-        String hostPart = at >= 0 ? rest.substring(at + 1) : rest;
-        String user = at >= 0 ? rest.substring(0, at) : "";
-        int colonUser = user.indexOf(':'); // tolerate old-style user:password
-        if (colonUser >= 0) user = user.substring(0, colonUser);
         try {
-            user = URLDecoder.decode(user, StandardCharsets.UTF_8);
-        } catch (IllegalArgumentException e) {
-            throw new IOException("Bad user name in open line");
+            c.close();
+        } finally {
+            if (onClose != null) onClose.accept(c);
         }
-        String host = hostPart, port = "";
-        int c = hostPart.lastIndexOf(':');
-        if (c > 0 && !hostPart.endsWith("]")) { host = hostPart.substring(0, c); port = hostPart.substring(c + 1); }
-        if (host.isEmpty()) throw new IOException("No host in open line");
-        return new String[]{user, host, port};
     }
 
-    /** Splits on spaces; a double-quoted token keeps its spaces and loses its quotes (escapes stay raw). */
-    static List<String> tokens(String line) {
-        List<String> out = new ArrayList<>();
-        StringBuilder cur = new StringBuilder();
-        boolean inQuote = false, have = false;
-        for (int i = 0; i < line.length(); i++) {
-            char ch = line.charAt(i);
-            if (inQuote) {
-                if (ch == '\\' && i + 1 < line.length()) { cur.append(ch).append(line.charAt(++i)); }
-                else if (ch == '"') inQuote = false;
-                else cur.append(ch);
-            } else if (ch == '"') { inQuote = true; have = true; }
-            else if (Character.isWhitespace(ch)) {
-                if (have || cur.length() > 0) { out.add(cur.toString()); cur.setLength(0); have = false; }
-            } else cur.append(ch);
-        }
-        if (have || cur.length() > 0) out.add(cur.toString());
-        return out;
+    /**
+     * Opens connections; replaceable in tests.
+     */
+    public interface Connector {
+        SftpClient connect(String host, int port, String user, String password) throws IOException;
     }
 
-    /** Local paths were written with {@code \\} and {@code \"} escapes. */
-    static String unescapeLocal(String s) {
-        StringBuilder b = new StringBuilder();
-        for (int i = 0; i < s.length(); i++) {
-            char ch = s.charAt(i);
-            if (ch == '\\' && i + 1 < s.length() && (s.charAt(i + 1) == '\\' || s.charAt(i + 1) == '"')) b.append(s.charAt(++i));
-            else b.append(ch);
-        }
-        return b.toString();
+    /**
+     * Result of running a script.
+     */
+    public record Outcome(boolean ok, String host, String user) {
     }
 
-    /** Remote paths were written with only {@code \"} escaped. */
-    static String unescapeRemote(String s) {
-        return s.replace("\\\"", "\"");
+    /**
+     * Marks an {@code open} failure so it is rethrown instead of being treated as a command failure.
+     */
+    private static final class ConnectFailed extends RuntimeException {
+        ConnectFailed(IOException cause) {
+            super(cause);
+        }
     }
 }

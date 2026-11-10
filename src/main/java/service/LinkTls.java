@@ -14,12 +14,7 @@ import java.security.KeyStore;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.security.cert.X509Certificate;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Date;
-import java.util.LinkedHashSet;
-import java.util.List;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
 
@@ -40,15 +35,16 @@ public final class LinkTls {
     private static final int VALIDITY_DAYS = 3650;
     private static final long RENEW_BEFORE_MILLIS = 30L * 24 * 60 * 60 * 1000;
 
-    /** What the endpoint needs, and what the operator needs to give the sender. */
-    public record Material(String keystorePath, String password, File certificate,
-                           String sha256Fingerprint, Date notAfter, List<String> names) {}
+    private LinkTls() {
+    }
 
-    private LinkTls() {}
+    public static File certificateFile(File dataDir) {
+        return new File(dataDir, "link-server.cer");
+    }
 
-    public static File certificateFile(File dataDir) { return new File(dataDir, "link-server.cer"); }
-
-    /** Returns the existing certificate material, creating or renewing it when needed. */
+    /**
+     * Returns the existing certificate material, creating or renewing it when needed.
+     */
     public static synchronized Material ensure(File dataDir, List<String> extraNames) throws Exception {
         CryptoUtil.configure(dataDir);
         File ks = new File(dataDir, "link-tls.p12");
@@ -93,7 +89,9 @@ public final class LinkTls {
         return material(ks, pw, cer, certificate(ks, pw), names);
     }
 
-    /** What the certificate file currently in the data folder says, for display; null when none exists yet. */
+    /**
+     * What the certificate file currently in the data folder says, for display; null when none exists yet.
+     */
     public static Material describe(File dataDir) {
         File cer = certificateFile(dataDir);
         if (!cer.isFile()) return null;
@@ -108,7 +106,9 @@ public final class LinkTls {
         }
     }
 
-    /** The machine's own names and addresses, then the operator's extras, without duplicates; the first is the CN. */
+    /**
+     * The machine's own names and addresses, then the operator's extras, without duplicates; the first is the CN.
+     */
     static List<String> hostNames(List<String> extra) {
         Set<String> out = new LinkedHashSet<>();
         try {
@@ -116,7 +116,8 @@ public final class LinkTls {
             out.add(me.getHostName());
             String fqdn = me.getCanonicalHostName();
             if (fqdn != null && !isIp(fqdn)) out.add(fqdn);
-        } catch (Exception ignored) { }
+        } catch (Exception ignored) {
+        }
         out.add("localhost");
         try {
             for (NetworkInterface nic : Collections.list(NetworkInterface.getNetworkInterfaces())) {
@@ -125,7 +126,8 @@ public final class LinkTls {
                     if (a instanceof java.net.Inet4Address && !a.isLinkLocalAddress()) out.add(a.getHostAddress());
                 }
             }
-        } catch (Exception ignored) { }
+        } catch (Exception ignored) {
+        }
         out.add("127.0.0.1");
         if (extra != null) for (String e : extra) if (e != null && !e.isBlank()) out.add(e.trim());
         out.removeIf(n -> n == null || n.isBlank());
@@ -146,7 +148,9 @@ public final class LinkTls {
 
     private static X509Certificate certificate(File ks, String pw) throws Exception {
         KeyStore store = KeyStore.getInstance("PKCS12");
-        try (InputStream in = Files.newInputStream(ks.toPath())) { store.load(in, pw.toCharArray()); }
+        try (InputStream in = Files.newInputStream(ks.toPath())) {
+            store.load(in, pw.toCharArray());
+        }
         return (X509Certificate) store.getCertificate(ALIAS);
     }
 
@@ -165,7 +169,10 @@ public final class LinkTls {
         pb.environment().put("OPSTOOL_KS_PW", password);   // not on the command line, so not visible in the process list
         Process p = pb.start();
         String out = new String(p.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-        if (!p.waitFor(60, TimeUnit.SECONDS)) { p.destroyForcibly(); throw new IOException("keytool timed out"); }
+        if (!p.waitFor(60, TimeUnit.SECONDS)) {
+            p.destroyForcibly();
+            throw new IOException("keytool timed out");
+        }
         if (p.exitValue() != 0) throw new IOException("keytool failed: " + out.trim());
     }
 
@@ -173,5 +180,12 @@ public final class LinkTls {
         boolean win = System.getProperty("os.name", "").toLowerCase().contains("win");
         Path bundled = Path.of(System.getProperty("java.home"), "bin", win ? "keytool.exe" : "keytool");
         return Files.isRegularFile(bundled) ? bundled.toString() : "keytool";
+    }
+
+    /**
+     * What the endpoint needs, and what the operator needs to give the sender.
+     */
+    public record Material(String keystorePath, String password, File certificate,
+                           String sha256Fingerprint, Date notAfter, List<String> names) {
     }
 }

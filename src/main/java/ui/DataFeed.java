@@ -2,11 +2,14 @@ package ui;
 
 import service.BackgroundJobs;
 
-import javax.swing.SwingUtilities;
+import javax.swing.*;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
-import java.util.concurrent.*;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
@@ -40,22 +43,41 @@ public final class DataFeed<T> {
         this.loader = loader;
     }
 
-    /** Publish every load result even when equal to the previous one. */
-    public DataFeed<T> alwaysPublish() { this.alwaysPublish = true; return this; }
+    /**
+     * Publish every load result even when equal to the previous one.
+     */
+    public DataFeed<T> alwaysPublish() {
+        this.alwaysPublish = true;
+        return this;
+    }
 
-    /** Name shown for this feed's background loads in the Event Monitor. */
-    public DataFeed<T> named(String name) { this.name = name; return this; }
+    /**
+     * Name shown for this feed's background loads in the Event Monitor.
+     */
+    public DataFeed<T> named(String name) {
+        this.name = name;
+        return this;
+    }
 
-    /** Last delivered value (may be null before the first load). */
-    public T latest() { return latest; }
+    /**
+     * Last delivered value (may be null before the first load).
+     */
+    public T latest() {
+        return latest;
+    }
 
-    /** Subscribe on the EDT. Returns an unsubscribe action. */
+    /**
+     * Subscribe on the EDT. Returns an unsubscribe action.
+     */
     public Runnable subscribe(Consumer<T> onEdt) {
         synchronized (this) {
             // Adding the subscriber and reading the latest value happen under the same lock that
             // load() uses to publish, so a subscriber gets either the replay or the publish — never both.
             subscribers.add(onEdt);
-            if (hasValue) { T v = latest; SwingUtilities.invokeLater(() -> onEdt.accept(v)); }
+            if (hasValue) {
+                T v = latest;
+                SwingUtilities.invokeLater(() -> onEdt.accept(v));
+            }
             if (task == null) task = TICKER.scheduleWithFixedDelay(this::load, 0, periodMs, TimeUnit.MILLISECONDS);
             if (!announced) {
                 announced = true; // once per feed per app run — screens opening later reuse it
@@ -67,19 +89,30 @@ public final class DataFeed<T> {
         return () -> {
             subscribers.remove(onEdt);
             synchronized (this) {
-                if (subscribers.isEmpty() && task != null) { task.cancel(false); task = null; }
+                if (subscribers.isEmpty() && task != null) {
+                    task.cancel(false);
+                    task = null;
+                }
             }
         };
     }
 
-    /** Ask for a load soon (e.g. after the user changed something). */
+    /**
+     * Ask for a load soon (e.g. after the user changed something).
+     */
     public void refreshNow() {
-        if (loading.get()) { again.set(true); return; }
+        if (loading.get()) {
+            again.set(true);
+            return;
+        }
         TICKER.execute(this::load);
     }
 
     private void load() {
-        if (!loading.compareAndSet(false, true)) { again.set(true); return; }
+        if (!loading.compareAndSet(false, true)) {
+            again.set(true);
+            return;
+        }
         try (BackgroundJobs.Job job = BackgroundJobs.begin(name, false)) {
             T v;
             try {
@@ -97,7 +130,9 @@ public final class DataFeed<T> {
             }
             if (toNotify != null) {
                 final List<Consumer<T>> targets = toNotify;
-                SwingUtilities.invokeLater(() -> { for (Consumer<T> s : targets) s.accept(v); });
+                SwingUtilities.invokeLater(() -> {
+                    for (Consumer<T> s : targets) s.accept(v);
+                });
             }
         } catch (Throwable t) {
             System.err.println("[DataFeed] load failed: " + t);

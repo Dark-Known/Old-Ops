@@ -22,13 +22,13 @@ import java.util.regex.Pattern;
 
 /**
  * Reads Outlook mail via the Microsoft Graph REST API instead of raw IMAP.
- *
+ * <p>
  * Why: many Microsoft 365 tenants block legacy protocols (IMAP/POP/SMTP AUTH)
  * tenant-wide via Conditional Access / authentication policies — regardless
  * of whether the client authenticates with Basic Auth or OAuth2. Graph is a
  * plain HTTPS REST API — the same path the Outlook web app and mobile apps
  * use — so it is unaffected by that policy.
- *
+ * <p>
  * This service intentionally accepts the *same* task-level search criteria
  * string the app already collects via {@code SearchCriteriaPanel} (built
  * from IMAP RFC 3501 syntax) and translates the subset that has a reasonable
@@ -40,13 +40,64 @@ import java.util.regex.Pattern;
 public class GraphMailService {
 
     private static final String DEFAULT_GRAPH_BASE = "https://graph.microsoft.com/v1.0";
-    private final HttpClient http;
-    /** "/me" for a signed-in user token; "/users/{mailbox}" for an app-only (certificate) token. */
-    private final String userPath;
-    private String graphBase = DEFAULT_GRAPH_BASE; // overridable for tests only
+    private static final java.time.Duration REQUEST_TIMEOUT = java.time.Duration.ofSeconds(60);
+    private static final int MAX_ATTEMPTS = 4;
+    private static final java.util.logging.Logger LOG = java.util.logging.Logger.getLogger(GraphMailService.class.getName());
+    private static final java.time.Duration ATTACHMENT_TIMEOUT = java.time.Duration.ofMinutes(5);
+    private static final java.util.concurrent.atomic.AtomicBoolean SWEPT = new java.util.concurrent.atomic.AtomicBoolean();
+    private static final DateTimeFormatter IMAP_DATE_FMT = new DateTimeFormatterBuilder()
+            .appendPattern("dd-MMM-yyyy")
+            .toFormatter(Locale.ENGLISH);
+    private static final Pattern TEXT_CRITERION =
+            Pattern.compile("(FROM|TO|CC|BCC|SUBJECT|BODY|TEXT)\\s+\"([^\"]*)\"", Pattern.CASE_INSENSITIVE);
+    private static final Pattern DATE_CRITERION =
+            Pattern.compile("(SINCE|BEFORE|ON|SENTSINCE|SENTBEFORE|SENTON)\\s+(\\d{1,2}-[A-Za-z]{3}-\\d{4})", Pattern.CASE_INSENSITIVE);
+    private static final Pattern SIZE_CRITERION =
+            Pattern.compile("(LARGER|SMALLER)\\s+(\\d+)", Pattern.CASE_INSENSITIVE);
+    private static final Pattern KEYWORD_CRITERION =
+            Pattern.compile("(KEYWORD|UNKEYWORD)\\s+(\\S+)", Pattern.CASE_INSENSITIVE);
+    private static final Pattern HEADER_CRITERION =
+            Pattern.compile("HEADER\\s+\\S+\\s+\"([^\"]*)\"", Pattern.CASE_INSENSITIVE);
+    private static final Pattern UID_CRITERION =
+            Pattern.compile("UID\\s+\\S+", Pattern.CASE_INSENSITIVE);
+    // Simple (no-argument) IMAP flags that map directly to a Graph $filter
+    // clause. NEW has no true Graph equivalent (it means "\Recent and
+    // \Unseen", and Graph has no session-based \Recent concept) — approximated
+    // as unread, which is the closest useful behavior, not an exact match.
+    private static final Map<String, String> SIMPLE_CRITERIA_FILTERS = new LinkedHashMap<>();
+    // Simple flags with genuinely no Graph mail API equivalent — flagged with
+    // a specific reason rather than falling through to the generic
+    // "unrecognized portion" warning, so it's clear this isn't a typo/gap in
+    // parsing but an actual capability Graph doesn't expose.
+    private static final Map<String, String> SIMPLE_CRITERIA_UNSUPPORTED = new LinkedHashMap<>();
 
-    /** For tests: talk to a local fake instead of graph.microsoft.com. */
-    void setGraphBaseForTesting(String base) { this.graphBase = base; }
+    static {
+        SIMPLE_CRITERIA_FILTERS.put("UNSEEN", "isRead eq false");
+        SIMPLE_CRITERIA_FILTERS.put("SEEN", "isRead eq true");
+        SIMPLE_CRITERIA_FILTERS.put("DRAFT", "isDraft eq true");
+        SIMPLE_CRITERIA_FILTERS.put("UNDRAFT", "isDraft eq false");
+        SIMPLE_CRITERIA_FILTERS.put("FLAGGED", "flag/flagStatus eq 'flagged'");
+        SIMPLE_CRITERIA_FILTERS.put("UNFLAGGED", "flag/flagStatus eq 'notFlagged'");
+        SIMPLE_CRITERIA_FILTERS.put("NEW", "isRead eq false");
+    }
+
+    static {
+        SIMPLE_CRITERIA_UNSUPPORTED.put("ANSWERED", "Graph has no \\Answered-equivalent property on messages");
+        SIMPLE_CRITERIA_UNSUPPORTED.put("UNANSWERED", "Graph has no \\Answered-equivalent property on messages");
+        SIMPLE_CRITERIA_UNSUPPORTED.put("DELETED", "Graph has no per-message deleted flag — deletion just moves the message to Deleted Items");
+        SIMPLE_CRITERIA_UNSUPPORTED.put("UNDELETED", "Graph has no per-message deleted flag — deletion just moves the message to Deleted Items");
+        SIMPLE_CRITERIA_UNSUPPORTED.put("RECENT", "Graph has no session-based \\Recent concept");
+        SIMPLE_CRITERIA_UNSUPPORTED.put("OLD", "Graph has no session-based \\Recent concept");
+    }
+
+    private final HttpClient http;
+    /**
+     * "/me" for a signed-in user token; "/users/{mailbox}" for an app-only (certificate) token.
+     */
+    private final String userPath;
+
+    // ─── Attachments ─────────────────────────────────────────────────────────
+    private String graphBase = DEFAULT_GRAPH_BASE; // overridable for tests only
 
     public GraphMailService() {
         this(HttpClient.newBuilder().connectTimeout(java.time.Duration.ofSeconds(15)).build(), "/me");
@@ -55,6 +106,46 @@ public class GraphMailService {
     private GraphMailService(HttpClient http, String userPath) {
         this.http = http;
         this.userPath = userPath;
+    }
+
+    /**
+     * Once per run of the program: removes attachment temp files a crashed earlier run left behind (older than a day).
+     */
+    private static void sweepStaleTempFiles() {
+        if (!SWEPT.compareAndSet(false, true)) return;
+        try (var dir = Files.newDirectoryStream(Path.of(System.getProperty("java.io.tmpdir")), "opstool-att-*.part")) {
+            long cutoff = System.currentTimeMillis() - 24L * 3600 * 1000;
+            for (Path p : dir) {
+                try {
+                    if (Files.getLastModifiedTime(p).toMillis() < cutoff) Files.deleteIfExists(p);
+                } catch (IOException ignored) {
+                }
+            }
+        } catch (IOException | RuntimeException ignored) {
+        }
+    }
+
+    private static void logCall(HttpRequest req, HttpResponse<?> resp, String mailbox, long millis, int attempt) {
+        int code = resp.statusCode();
+        String note = "";
+        if (code < 200 || code >= 300) {
+            Object b = resp.body();
+            note = b instanceof String ? GraphCallLog.errorText((String) b)
+                    : b instanceof byte[] ? GraphCallLog.errorText(new String((byte[]) b, StandardCharsets.UTF_8)) : "";
+            String ra = resp.headers().firstValue("Retry-After").orElse(null);
+            if (ra != null) note += (note.isEmpty() ? "" : " ") + "(Retry-After " + ra + " s)";
+        }
+        long len = resp.headers().firstValueAsLong("Content-Length").orElse(-1);
+        GraphCallLog.record("graph", req.method(), req.uri(), mailbox, code, millis, len,
+                resp.headers().firstValue("request-id").orElse(resp.headers().firstValue("client-request-id").orElse(null)),
+                attempt, note);
+    }
+
+    /**
+     * For tests: talk to a local fake instead of graph.microsoft.com.
+     */
+    void setGraphBaseForTesting(String base) {
+        this.graphBase = base;
     }
 
     /**
@@ -67,111 +158,25 @@ public class GraphMailService {
         return g;
     }
 
-    String userPath() { return userPath; }
-    private static final java.time.Duration REQUEST_TIMEOUT = java.time.Duration.ofSeconds(60);
-    private static final int MAX_ATTEMPTS = 4;
-    private static final java.util.logging.Logger LOG = java.util.logging.Logger.getLogger(GraphMailService.class.getName());
-    private static final java.time.Duration ATTACHMENT_TIMEOUT = java.time.Duration.ofMinutes(5);
+    // ─── Folder resolution ──────────────────────────────────────────────────
 
-    public static class MailMessage {
-        public final String id;
-        public final String subject;
-        public final String from;
-        public final String receivedDateTime;
-        public final String bodyContent;
-        public final String bodyType; // "html" or "text"
-        public final String attachmentText;    // combined text of parseable text attachments, "" if none
-        public final List<String> attachmentNames; // names of the attachments attachmentText was built from
-        public final List<AttachmentFile> attachmentFiles; // ALL non-inline file attachments, raw bytes, for saving to disk
-
-        MailMessage(String id, String subject, String from,
-                    String receivedDateTime, String bodyContent, String bodyType,
-                    String attachmentText, List<String> attachmentNames) {
-            this(id, subject, from, receivedDateTime, bodyContent, bodyType,
-                    attachmentText, attachmentNames, Collections.emptyList());
-        }
-
-        MailMessage(String id, String subject, String from,
-                    String receivedDateTime, String bodyContent, String bodyType,
-                    String attachmentText, List<String> attachmentNames,
-                    List<AttachmentFile> attachmentFiles) {
-            this.id = id;
-            this.subject = subject;
-            this.from = from;
-            this.receivedDateTime = receivedDateTime;
-            this.bodyContent = bodyContent;
-            this.bodyType = bodyType;
-            this.attachmentText = attachmentText != null ? attachmentText : "";
-            this.attachmentNames = attachmentNames != null ? attachmentNames : Collections.emptyList();
-            this.attachmentFiles = attachmentFiles != null ? attachmentFiles : Collections.emptyList();
-        }
+    String userPath() {
+        return userPath;
     }
 
     /**
-     * A single downloadable (non-inline, file-type) attachment. Small ones are kept in memory; anything over
-     * {@link #IN_MEMORY_LIMIT} stays in a temporary file, so a big attachment never has to fit in the heap.
-     * Call {@link #discard()} when done with it (the temporary file is also removed when the JVM exits).
-     */
-    public static class AttachmentFile {
-        /** Attachments up to this size are held in memory; bigger ones are spilled to a temporary file. */
-        public static final int IN_MEMORY_LIMIT = 1024 * 1024;
-
-        public final String name;
-        public final String contentType;
-        private final byte[] bytes;   // null when spilled
-        private final Path spill;     // null when in memory
-        private final long length;
-
-        AttachmentFile(String name, String contentType, byte[] bytes) {
-            this.name = name != null ? name : "attachment";
-            this.contentType = contentType != null ? contentType : "";
-            this.bytes = bytes != null ? bytes : new byte[0];
-            this.spill = null;
-            this.length = this.bytes.length;
-        }
-
-        AttachmentFile(String name, String contentType, Path spill, long length) {
-            this.name = name != null ? name : "attachment";
-            this.contentType = contentType != null ? contentType : "";
-            this.bytes = null;
-            this.spill = spill;
-            this.length = length;
-        }
-
-        /** Size in bytes. */
-        public long length() { return length; }
-
-        /** True when the content lives in a temporary file rather than in memory. */
-        boolean isSpilled() { return spill != null; }
-
-        /** Writes the content to {@code dest} (which may already exist as an empty placeholder). */
-        public void copyTo(Path dest) throws IOException {
-            if (spill != null) Files.copy(spill, dest, StandardCopyOption.REPLACE_EXISTING);
-            else Files.write(dest, bytes);
-        }
-
-        /** The whole content as bytes (reads the temporary file back if spilled — use for small text only). */
-        byte[] readAll() throws IOException { return spill != null ? Files.readAllBytes(spill) : bytes; }
-
-        /** Removes the temporary file, if any. Safe to call more than once. */
-        public void discard() {
-            if (spill != null) { try { Files.deleteIfExists(spill); } catch (IOException ignored) { } }
-        }
-    }
-
-    /**
-     * @param folder          e.g. "INBOX" (mapped to Graph's well-known "inbox" folder);
-     *                        other names are resolved via a display-name lookup
-     * @param searchCriteria  IMAP-style criteria string from the task, best-effort
-     *                        translated to a Graph $filter (see class docs)
-     * @param mode            controls how much of each message body is fetched
-     * @param maxResults      upper bound on how many matching messages to return —
-     *                        pass 1 for "latest only"; for "entire folder" this is a
-     *                        safety cap, not an invitation to fetch unbounded mail —
-     *                        results beyond this are paginated via @odata.nextLink
-     *                        until either the cap or the last page is reached
-     * @param afterEpochMillis  when > 0, only returns messages with receivedDateTime
-     *                        strictly after this instant (watcher mode); pass 0 to disable
+     * @param folder           e.g. "INBOX" (mapped to Graph's well-known "inbox" folder);
+     *                         other names are resolved via a display-name lookup
+     * @param searchCriteria   IMAP-style criteria string from the task, best-effort
+     *                         translated to a Graph $filter (see class docs)
+     * @param mode             controls how much of each message body is fetched
+     * @param maxResults       upper bound on how many matching messages to return —
+     *                         pass 1 for "latest only"; for "entire folder" this is a
+     *                         safety cap, not an invitation to fetch unbounded mail —
+     *                         results beyond this are paginated via @odata.nextLink
+     *                         until either the cap or the last page is reached
+     * @param afterEpochMillis when > 0, only returns messages with receivedDateTime
+     *                         strictly after this instant (watcher mode); pass 0 to disable
      */
     public List<MailMessage> fetchMessages(String accessToken, String folder,
                                            String searchCriteria, MailFetchMode mode,
@@ -180,11 +185,6 @@ public class GraphMailService {
             throws IOException, InterruptedException {
         return fetchMessages(accessToken, folder, searchCriteria, mode, maxResults,
                 afterEpochMillis, logLine, 1, null);
-    }
-
-    /** Called for each message right after its content was fetched, on the worker thread that fetched it. */
-    public interface MessageProcessor {
-        void process(MailMessage message);
     }
 
     /**
@@ -305,11 +305,15 @@ public class GraphMailService {
         }
     }
 
-    /** Downloads one message's content (body, or raw MIME, plus attachments) given its list-page entry. */
+    // ─── Search criteria translation (IMAP-string -> Graph $filter) ─────────
+
+    /**
+     * Downloads one message's content (body, or raw MIME, plus attachments) given its list-page entry.
+     */
     private MailMessage fetchOneMessage(String accessToken, Map<String, Object> item, MailFetchMode mode,
                                         Consumer<String> logLine) throws IOException, InterruptedException {
-        String id       = MiniJson.getString(item, "id", "");
-        String subject  = MiniJson.getString(item, "subject", "");
+        String id = MiniJson.getString(item, "id", "");
+        String subject = MiniJson.getString(item, "subject", "");
         String received = MiniJson.getString(item, "receivedDateTime", "");
 
         String from = "";
@@ -336,7 +340,7 @@ public class GraphMailService {
             Map<String, Object> body = MiniJson.getObject(full, "body");
             if (body != null) {
                 bodyContent = MiniJson.getString(body, "content", "");
-                bodyType    = MiniJson.getString(body, "contentType", "text");
+                bodyType = MiniJson.getString(body, "contentType", "text");
             } else {
                 bodyContent = "";
             }
@@ -351,19 +355,6 @@ public class GraphMailService {
                 attachmentText, attachmentNames, attachmentFiles);
     }
 
-    // ─── Attachments ─────────────────────────────────────────────────────────
-
-    static class AttachmentBundle {
-        final String text;
-        final List<String> names;
-        final List<AttachmentFile> files;
-        AttachmentBundle(String text, List<String> names, List<AttachmentFile> files) {
-            this.text = text;
-            this.names = names;
-            this.files = files;
-        }
-    }
-
     /**
      * Fetches a message's non-inline, file-type attachments: returns both
      * the combined text of the ones that are actually parseable as text
@@ -371,15 +362,15 @@ public class GraphMailService {
      * contentType is sometimes a generic octet-stream for these, so the
      * filename is checked too) AND the raw bytes of every non-inline file
      * attachment (text or binary) so callers can save them to disk as-is.
-     *
+     * <p>
      * Fetches the plain /attachments collection with NO $select and NO
      * type-cast path segment. Combining an OData cast (e.g.
      * ".../microsoft.graph.fileAttachment") with $select is unreliable on
      * this endpoint — Graph sometimes still validates the $select list
      * against the base "attachment" type (which has no contentBytes) and
      * rejects the whole request with a 400:
-     *   "Could not find a property named 'contentBytes' on type
-     *    'microsoft.graph.attachment'"
+     * "Could not find a property named 'contentBytes' on type
+     * 'microsoft.graph.attachment'"
      * even though the cast should have narrowed the type first. Fetching
      * the untouched collection sidesteps the bug: Graph returns each
      * attachment with all of its real (derived-type) properties — including
@@ -402,7 +393,8 @@ public class GraphMailService {
         }
 
         List<Object> arr = MiniJson.getArray(resp, "value");
-        if (arr == null || arr.isEmpty()) return new AttachmentBundle("", Collections.emptyList(), Collections.emptyList());
+        if (arr == null || arr.isEmpty())
+            return new AttachmentBundle("", Collections.emptyList(), Collections.emptyList());
 
         StringBuilder combined = new StringBuilder();
         List<String> textNames = new ArrayList<>();
@@ -482,10 +474,16 @@ public class GraphMailService {
                     return new AttachmentFile(name, contentType, tmp, len);
                 }
             } catch (IOException | InterruptedException | RuntimeException e) {
-                try { Files.deleteIfExists(tmp); } catch (IOException ignored) { }
+                try {
+                    Files.deleteIfExists(tmp);
+                } catch (IOException ignored) {
+                }
                 throw e;
             }
-            try { Files.deleteIfExists(tmp); } catch (IOException ignored) { }
+            try {
+                Files.deleteIfExists(tmp);
+            } catch (IOException ignored) {
+            }
         }
         // Fallback: this single attachment as JSON (base64) — memory is bounded by one attachment.
         Map<String, Object> one = graphGetJson(accessToken, attachmentUrl);
@@ -498,20 +496,9 @@ public class GraphMailService {
         }
     }
 
-    private static final java.util.concurrent.atomic.AtomicBoolean SWEPT = new java.util.concurrent.atomic.AtomicBoolean();
-
-    /** Once per run of the program: removes attachment temp files a crashed earlier run left behind (older than a day). */
-    private static void sweepStaleTempFiles() {
-        if (!SWEPT.compareAndSet(false, true)) return;
-        try (var dir = Files.newDirectoryStream(Path.of(System.getProperty("java.io.tmpdir")), "opstool-att-*.part")) {
-            long cutoff = System.currentTimeMillis() - 24L * 3600 * 1000;
-            for (Path p : dir) {
-                try { if (Files.getLastModifiedTime(p).toMillis() < cutoff) Files.deleteIfExists(p); } catch (IOException ignored) { }
-            }
-        } catch (IOException | RuntimeException ignored) { }
-    }
-
-    /** The previous way: one request returning every attachment with its base64 content. Used only as a fallback. */
+    /**
+     * The previous way: one request returning every attachment with its base64 content. Used only as a fallback.
+     */
     private AttachmentBundle fetchTextAttachmentsInline(String accessToken, String messageId, Consumer<String> logLine)
             throws IOException, InterruptedException {
         Map<String, Object> resp;
@@ -523,7 +510,8 @@ public class GraphMailService {
         }
 
         List<Object> arr = MiniJson.getArray(resp, "value");
-        if (arr == null || arr.isEmpty()) return new AttachmentBundle("", Collections.emptyList(), Collections.emptyList());
+        if (arr == null || arr.isEmpty())
+            return new AttachmentBundle("", Collections.emptyList(), Collections.emptyList());
 
         StringBuilder combined = new StringBuilder();
         List<String> textNames = new ArrayList<>();
@@ -570,8 +558,6 @@ public class GraphMailService {
         return lower.endsWith(".txt") || lower.endsWith(".csv") || lower.endsWith(".log") || lower.endsWith(".rcv");
     }
 
-    // ─── Folder resolution ──────────────────────────────────────────────────
-
     private String resolveFolderSegment(String accessToken, String folder, Consumer<String> logLine)
             throws IOException, InterruptedException {
         return resolveFolderSegment(accessToken, folder, logLine, null);
@@ -607,13 +593,18 @@ public class GraphMailService {
         if (folder == null || folder.trim().isEmpty() || folder.equalsIgnoreCase("INBOX")) return "inbox";
         switch (folder.trim().toUpperCase(Locale.ROOT)) {
             case "SENT":
-            case "SENTITEMS":    return "sentitems";
-            case "DRAFTS":       return "drafts";
+            case "SENTITEMS":
+                return "sentitems";
+            case "DRAFTS":
+                return "drafts";
             case "DELETED":
-            case "TRASH":        return "deleteditems";
+            case "TRASH":
+                return "deleteditems";
             case "JUNK":
-            case "SPAM":         return "junkemail";
-            case "ARCHIVE":      return "archive";
+            case "SPAM":
+                return "junkemail";
+            case "ARCHIVE":
+                return "archive";
             default: {
                 String url = graphBase + userPath + "/mailFolders?$filter="
                         + urlEnc("displayName eq '" + folder.trim().replace("'", "''") + "'");
@@ -648,54 +639,6 @@ public class GraphMailService {
                 return "inbox";
             }
         }
-    }
-
-    // ─── Search criteria translation (IMAP-string -> Graph $filter) ─────────
-
-    private static final DateTimeFormatter IMAP_DATE_FMT = new DateTimeFormatterBuilder()
-            .appendPattern("dd-MMM-yyyy")
-            .toFormatter(Locale.ENGLISH);
-
-    private static final Pattern TEXT_CRITERION =
-            Pattern.compile("(FROM|TO|CC|BCC|SUBJECT|BODY|TEXT)\\s+\"([^\"]*)\"", Pattern.CASE_INSENSITIVE);
-    private static final Pattern DATE_CRITERION =
-            Pattern.compile("(SINCE|BEFORE|ON|SENTSINCE|SENTBEFORE|SENTON)\\s+(\\d{1,2}-[A-Za-z]{3}-\\d{4})", Pattern.CASE_INSENSITIVE);
-    private static final Pattern SIZE_CRITERION =
-            Pattern.compile("(LARGER|SMALLER)\\s+(\\d+)", Pattern.CASE_INSENSITIVE);
-    private static final Pattern KEYWORD_CRITERION =
-            Pattern.compile("(KEYWORD|UNKEYWORD)\\s+(\\S+)", Pattern.CASE_INSENSITIVE);
-    private static final Pattern HEADER_CRITERION =
-            Pattern.compile("HEADER\\s+\\S+\\s+\"([^\"]*)\"", Pattern.CASE_INSENSITIVE);
-    private static final Pattern UID_CRITERION =
-            Pattern.compile("UID\\s+\\S+", Pattern.CASE_INSENSITIVE);
-
-    // Simple (no-argument) IMAP flags that map directly to a Graph $filter
-    // clause. NEW has no true Graph equivalent (it means "\Recent and
-    // \Unseen", and Graph has no session-based \Recent concept) — approximated
-    // as unread, which is the closest useful behavior, not an exact match.
-    private static final Map<String, String> SIMPLE_CRITERIA_FILTERS = new LinkedHashMap<>();
-    static {
-        SIMPLE_CRITERIA_FILTERS.put("UNSEEN", "isRead eq false");
-        SIMPLE_CRITERIA_FILTERS.put("SEEN", "isRead eq true");
-        SIMPLE_CRITERIA_FILTERS.put("DRAFT", "isDraft eq true");
-        SIMPLE_CRITERIA_FILTERS.put("UNDRAFT", "isDraft eq false");
-        SIMPLE_CRITERIA_FILTERS.put("FLAGGED", "flag/flagStatus eq 'flagged'");
-        SIMPLE_CRITERIA_FILTERS.put("UNFLAGGED", "flag/flagStatus eq 'notFlagged'");
-        SIMPLE_CRITERIA_FILTERS.put("NEW", "isRead eq false");
-    }
-
-    // Simple flags with genuinely no Graph mail API equivalent — flagged with
-    // a specific reason rather than falling through to the generic
-    // "unrecognized portion" warning, so it's clear this isn't a typo/gap in
-    // parsing but an actual capability Graph doesn't expose.
-    private static final Map<String, String> SIMPLE_CRITERIA_UNSUPPORTED = new LinkedHashMap<>();
-    static {
-        SIMPLE_CRITERIA_UNSUPPORTED.put("ANSWERED", "Graph has no \\Answered-equivalent property on messages");
-        SIMPLE_CRITERIA_UNSUPPORTED.put("UNANSWERED", "Graph has no \\Answered-equivalent property on messages");
-        SIMPLE_CRITERIA_UNSUPPORTED.put("DELETED", "Graph has no per-message deleted flag — deletion just moves the message to Deleted Items");
-        SIMPLE_CRITERIA_UNSUPPORTED.put("UNDELETED", "Graph has no per-message deleted flag — deletion just moves the message to Deleted Items");
-        SIMPLE_CRITERIA_UNSUPPORTED.put("RECENT", "Graph has no session-based \\Recent concept");
-        SIMPLE_CRITERIA_UNSUPPORTED.put("OLD", "Graph has no session-based \\Recent concept");
     }
 
     /**
@@ -733,11 +676,21 @@ public class GraphMailService {
             String field = tm.group(1).toUpperCase(Locale.ROOT);
             String value = tm.group(2).replace("'", "''");
             switch (field) {
-                case "SUBJECT": clauses.add("contains(subject,'" + value + "')"); break;
-                case "FROM":    clauses.add("from/emailAddress/address eq '" + value + "'"); break;
-                case "TO":      clauses.add("toRecipients/any(r:r/emailAddress/address eq '" + value + "')"); break;
-                case "CC":      clauses.add("ccRecipients/any(r:r/emailAddress/address eq '" + value + "')"); break;
-                case "BCC":     clauses.add("bccRecipients/any(r:r/emailAddress/address eq '" + value + "')"); break;
+                case "SUBJECT":
+                    clauses.add("contains(subject,'" + value + "')");
+                    break;
+                case "FROM":
+                    clauses.add("from/emailAddress/address eq '" + value + "'");
+                    break;
+                case "TO":
+                    clauses.add("toRecipients/any(r:r/emailAddress/address eq '" + value + "')");
+                    break;
+                case "CC":
+                    clauses.add("ccRecipients/any(r:r/emailAddress/address eq '" + value + "')");
+                    break;
+                case "BCC":
+                    clauses.add("bccRecipients/any(r:r/emailAddress/address eq '" + value + "')");
+                    break;
                 // Graph's $filter has no contains() support for message body —
                 // only a handful of properties (subject among them) are
                 // filterable that way; body text needs $search, which isn't
@@ -760,14 +713,16 @@ public class GraphMailService {
             switch (op) {
                 case "SINCE":
                 case "SENTSINCE":
-                    clauses.add(prop + " ge " + isoDate); break;
+                    clauses.add(prop + " ge " + isoDate);
+                    break;
                 case "BEFORE":
                 case "SENTBEFORE":
-                    clauses.add(prop + " lt " + isoDate); break;
+                    clauses.add(prop + " lt " + isoDate);
+                    break;
                 case "ON":
                 case "SENTON":
                     clauses.add(prop + " ge " + isoDate
-                        + " and " + prop + " lt " + isoDate.replace("T00:00:00Z", "T23:59:59Z"));
+                            + " and " + prop + " lt " + isoDate.replace("T00:00:00Z", "T23:59:59Z"));
                     break;
             }
             remaining = remaining.replace(dm.group(), "");
@@ -819,9 +774,9 @@ public class GraphMailService {
         return Pattern.compile("(?i)(^|\\s)" + token + "(\\s|$)").matcher(s).replaceFirst(" ").trim();
     }
 
-    // ─── Post-processing: mark as read / move to another folder ─────────────
-
-    /** Marks a single message as read. Call before {@link #moveMessage} if doing both — move changes the message ID. */
+    /**
+     * Marks a single message as read. Call before {@link #moveMessage} if doing both — move changes the message ID.
+     */
     public void markAsRead(String accessToken, String messageId) throws IOException, InterruptedException {
         graphPatch(accessToken, graphBase + userPath + "/messages/" + messageId, "{\"isRead\":true}");
     }
@@ -843,7 +798,9 @@ public class GraphMailService {
         moveMessage(accessToken, messageId, destinationFolder, logLine, null);
     }
 
-    /** Same, reusing {@code folderIdCache} (one per run) so the destination folder is looked up once, not per message. */
+    /**
+     * Same, reusing {@code folderIdCache} (one per run) so the destination folder is looked up once, not per message.
+     */
     public void moveMessage(String accessToken, String messageId, String destinationFolder,
                             Consumer<String> logLine, Map<String, String> folderIdCache)
             throws IOException, InterruptedException {
@@ -852,7 +809,7 @@ public class GraphMailService {
         graphPost(accessToken, graphBase + userPath + "/messages/" + messageId + "/move", body);
     }
 
-    // ─── HTTP helpers ────────────────────────────────────────────────────────
+    // ─── Post-processing: mark as read / move to another folder ─────────────
 
     private Map<String, Object> graphGetJson(String accessToken, String url)
             throws IOException, InterruptedException {
@@ -892,6 +849,8 @@ public class GraphMailService {
         }
     }
 
+    // ─── HTTP helpers ────────────────────────────────────────────────────────
+
     private void graphPost(String accessToken, String url, String jsonBody)
             throws IOException, InterruptedException {
         HttpRequest req = HttpRequest.newBuilder()
@@ -909,8 +868,10 @@ public class GraphMailService {
         }
     }
 
-    /** Like {@link #graphPost}, but returns the response body — needed when the caller
-     *  wants something back from the created/updated resource (e.g. a new folder's id). */
+    /**
+     * Like {@link #graphPost}, but returns the response body — needed when the caller
+     * wants something back from the created/updated resource (e.g. a new folder's id).
+     */
     private String graphPostJson(String accessToken, String url, String jsonBody)
             throws IOException, InterruptedException {
         HttpRequest req = HttpRequest.newBuilder()
@@ -967,30 +928,143 @@ public class GraphMailService {
             try {
                 String ra = resp.headers().firstValue("Retry-After").orElse(null);
                 if (ra != null) waitSec = Long.parseLong(ra.trim());
-            } catch (NumberFormatException ignored) {}
+            } catch (NumberFormatException ignored) {
+            }
             waitSec = Math.max(1, Math.min(waitSec, 60));
             Thread.sleep(waitSec * 1000);
         }
         return resp;
     }
 
-    private static void logCall(HttpRequest req, HttpResponse<?> resp, String mailbox, long millis, int attempt) {
-        int code = resp.statusCode();
-        String note = "";
-        if (code < 200 || code >= 300) {
-            Object b = resp.body();
-            note = b instanceof String ? GraphCallLog.errorText((String) b)
-                    : b instanceof byte[] ? GraphCallLog.errorText(new String((byte[]) b, StandardCharsets.UTF_8)) : "";
-            String ra = resp.headers().firstValue("Retry-After").orElse(null);
-            if (ra != null) note += (note.isEmpty() ? "" : " ") + "(Retry-After " + ra + " s)";
-        }
-        long len = resp.headers().firstValueAsLong("Content-Length").orElse(-1);
-        GraphCallLog.record("graph", req.method(), req.uri(), mailbox, code, millis, len,
-                resp.headers().firstValue("request-id").orElse(resp.headers().firstValue("client-request-id").orElse(null)),
-                attempt, note);
-    }
-
     private String urlEnc(String s) {
         return java.net.URLEncoder.encode(s, StandardCharsets.UTF_8);
+    }
+
+    /**
+     * Called for each message right after its content was fetched, on the worker thread that fetched it.
+     */
+    public interface MessageProcessor {
+        void process(MailMessage message);
+    }
+
+    public static class MailMessage {
+        public final String id;
+        public final String subject;
+        public final String from;
+        public final String receivedDateTime;
+        public final String bodyContent;
+        public final String bodyType; // "html" or "text"
+        public final String attachmentText;    // combined text of parseable text attachments, "" if none
+        public final List<String> attachmentNames; // names of the attachments attachmentText was built from
+        public final List<AttachmentFile> attachmentFiles; // ALL non-inline file attachments, raw bytes, for saving to disk
+
+        MailMessage(String id, String subject, String from,
+                    String receivedDateTime, String bodyContent, String bodyType,
+                    String attachmentText, List<String> attachmentNames) {
+            this(id, subject, from, receivedDateTime, bodyContent, bodyType,
+                    attachmentText, attachmentNames, Collections.emptyList());
+        }
+
+        MailMessage(String id, String subject, String from,
+                    String receivedDateTime, String bodyContent, String bodyType,
+                    String attachmentText, List<String> attachmentNames,
+                    List<AttachmentFile> attachmentFiles) {
+            this.id = id;
+            this.subject = subject;
+            this.from = from;
+            this.receivedDateTime = receivedDateTime;
+            this.bodyContent = bodyContent;
+            this.bodyType = bodyType;
+            this.attachmentText = attachmentText != null ? attachmentText : "";
+            this.attachmentNames = attachmentNames != null ? attachmentNames : Collections.emptyList();
+            this.attachmentFiles = attachmentFiles != null ? attachmentFiles : Collections.emptyList();
+        }
+    }
+
+    /**
+     * A single downloadable (non-inline, file-type) attachment. Small ones are kept in memory; anything over
+     * {@link #IN_MEMORY_LIMIT} stays in a temporary file, so a big attachment never has to fit in the heap.
+     * Call {@link #discard()} when done with it (the temporary file is also removed when the JVM exits).
+     */
+    public static class AttachmentFile {
+        /**
+         * Attachments up to this size are held in memory; bigger ones are spilled to a temporary file.
+         */
+        public static final int IN_MEMORY_LIMIT = 1024 * 1024;
+
+        public final String name;
+        public final String contentType;
+        private final byte[] bytes;   // null when spilled
+        private final Path spill;     // null when in memory
+        private final long length;
+
+        AttachmentFile(String name, String contentType, byte[] bytes) {
+            this.name = name != null ? name : "attachment";
+            this.contentType = contentType != null ? contentType : "";
+            this.bytes = bytes != null ? bytes : new byte[0];
+            this.spill = null;
+            this.length = this.bytes.length;
+        }
+
+        AttachmentFile(String name, String contentType, Path spill, long length) {
+            this.name = name != null ? name : "attachment";
+            this.contentType = contentType != null ? contentType : "";
+            this.bytes = null;
+            this.spill = spill;
+            this.length = length;
+        }
+
+        /**
+         * Size in bytes.
+         */
+        public long length() {
+            return length;
+        }
+
+        /**
+         * True when the content lives in a temporary file rather than in memory.
+         */
+        boolean isSpilled() {
+            return spill != null;
+        }
+
+        /**
+         * Writes the content to {@code dest} (which may already exist as an empty placeholder).
+         */
+        public void copyTo(Path dest) throws IOException {
+            if (spill != null) Files.copy(spill, dest, StandardCopyOption.REPLACE_EXISTING);
+            else Files.write(dest, bytes);
+        }
+
+        /**
+         * The whole content as bytes (reads the temporary file back if spilled — use for small text only).
+         */
+        byte[] readAll() throws IOException {
+            return spill != null ? Files.readAllBytes(spill) : bytes;
+        }
+
+        /**
+         * Removes the temporary file, if any. Safe to call more than once.
+         */
+        public void discard() {
+            if (spill != null) {
+                try {
+                    Files.deleteIfExists(spill);
+                } catch (IOException ignored) {
+                }
+            }
+        }
+    }
+
+    static class AttachmentBundle {
+        final String text;
+        final List<String> names;
+        final List<AttachmentFile> files;
+
+        AttachmentBundle(String text, List<String> names, List<AttachmentFile> files) {
+            this.text = text;
+            this.names = names;
+            this.files = files;
+        }
     }
 }

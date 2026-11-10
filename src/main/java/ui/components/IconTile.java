@@ -53,5 +53,7 @@ public class IconTile extends JComponent {
     }
 
     @Override
-    public Dimension getPreferredSize() { return new Dimension(size, size); }
+    public Dimension getPreferredSize() {
+        return new Dimension(size, size);
+    }
 }

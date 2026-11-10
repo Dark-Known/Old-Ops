@@ -1,7 +1,6 @@
 package ui.monitor;
 
 import model.EventKind;
-import model.TaskRunRecord;
 
 import java.time.Duration;
 import java.time.LocalDateTime;
@@ -21,17 +20,24 @@ import java.util.regex.Pattern;
  */
 public final class FeedBuilder {
 
-    private FeedBuilder() {}
-
-    /** Result of one build. */
-    public record Result(List<FeedRow> rows, List<MonitorEvent> matchedEvents,
-                         Map<EventKind.Category, Integer> categoryCounts,
-                         int errors, int warnings) {}
-
+    /**
+     * Oldest first: by second, then lifecycle stage, then id.
+     */
+    static final Comparator<MonitorEvent> CHRONOLOGICAL =
+            Comparator.comparing((MonitorEvent e) -> e.time().truncatedTo(java.time.temporal.ChronoUnit.SECONDS))
+                    .thenComparingInt(FeedBuilder::rank)
+                    .thenComparingLong(MonitorEvent::id);
     // "3 file(s), 4.2 MB total in 12ms: ..." — the scheduler's detection summary line.
     private static final Pattern DETECTED = Pattern.compile("^(\\d+) file\\(s\\),\\s*(.+?) total");
     // How recently a run must have started to still count as "in progress" before its outcome row lands.
     private static final Duration FRESH_START = Duration.ofSeconds(15);
+    private static final Comparator<FeedRow> NEWEST_FIRST =
+            Comparator.comparing((FeedRow r) -> r.time.truncatedTo(java.time.temporal.ChronoUnit.SECONDS)).reversed()
+                    .thenComparing((FeedRow r) -> rank(r.head), Comparator.reverseOrder())
+                    .thenComparing(r -> r.head.id(), Comparator.reverseOrder());
+
+    private FeedBuilder() {
+    }
 
     public static Result build(List<MonitorEvent> all, EventFilter filter, boolean group, boolean collapseRepeats,
                                Set<String> runningTaskIds, Set<String> expandedKeys, LocalDateTime now) {
@@ -113,19 +119,6 @@ public final class FeedBuilder {
         };
     }
 
-    /** Oldest first: by second, then lifecycle stage, then id. */
-    static final Comparator<MonitorEvent> CHRONOLOGICAL =
-            Comparator.comparing((MonitorEvent e) -> e.time().truncatedTo(java.time.temporal.ChronoUnit.SECONDS))
-                    .thenComparingInt(FeedBuilder::rank)
-                    .thenComparingLong(MonitorEvent::id);
-
-    private static final Comparator<FeedRow> NEWEST_FIRST =
-            Comparator.comparing((FeedRow r) -> r.time.truncatedTo(java.time.temporal.ChronoUnit.SECONDS)).reversed()
-                    .thenComparing((FeedRow r) -> rank(r.head), Comparator.reverseOrder())
-                    .thenComparing(r -> r.head.id(), Comparator.reverseOrder());
-
-    // ── Row construction ────────────────────────────────────────────
-
     static FeedRow eventRow(MonitorEvent e, int depth) {
         FeedRow.Outcome outcome = outcomeOf(e);
         String label = e.isOutcome() ? "Outcome" : e.kind().label();
@@ -134,6 +127,8 @@ public final class FeedBuilder {
         return new FeedRow(FeedRow.Type.EVENT, depth, "e:" + e.key(), e, List.of(e), List.of(), 1, e.time(), e.start(),
                 outcome, label, e.summary(), e.trigger(), dur, files, false, false);
     }
+
+    // ── Row construction ────────────────────────────────────────────
 
     private static FeedRow runRow(String runKey, List<MonitorEvent> visible, List<MonitorEvent> full,
                                   Set<String> runningTaskIds, LocalDateTime now) {
@@ -188,8 +183,6 @@ public final class FeedBuilder {
                 filesEv != null ? filesText(filesEv.summary()) : null, true, false);
     }
 
-    // ── Collapsing identical consecutive runs ───────────────────────
-
     /**
      * Folds consecutive, identical, uneventful runs of the same task into one
      * bucket. "Identical" means same task, same outcome and the exact same
@@ -209,7 +202,10 @@ public final class FeedBuilder {
                     && row.outcome != FeedRow.Outcome.RUNNING && row.outcome != FeedRow.Outcome.WARNING;
             String task = row.taskId;
             if (!eligible) {
-                if (task != null) { open.remove(task); openSig.remove(task); }   // anything else ends the streak
+                if (task != null) {
+                    open.remove(task);
+                    openSig.remove(task);
+                }   // anything else ends the streak
                 out.add(row);
                 continue;
             }
@@ -238,15 +234,21 @@ public final class FeedBuilder {
         return result;
     }
 
+    // ── Collapsing identical consecutive runs ───────────────────────
+
     private static FeedRow bucket(List<FeedRow> members) {
         FeedRow newest = members.get(0);
         FeedRow oldest = members.get(members.size() - 1);
         List<MonitorEvent> events = new ArrayList<>();
-        long sum = 0; int timed = 0;
+        long sum = 0;
+        int timed = 0;
         Map<String, Integer> triggers = new HashMap<>();
         for (FeedRow m : members) {
             events.addAll(m.events);
-            if (m.durationMs >= 0) { sum += m.durationMs; timed++; }
+            if (m.durationMs >= 0) {
+                sum += m.durationMs;
+                timed++;
+            }
             if (m.trigger != null) triggers.merge(m.trigger, 1, Integer::sum);
         }
         String trigger = triggers.entrySet().stream().max(Map.Entry.comparingByValue()).map(Map.Entry::getKey).orElse(null);
@@ -255,13 +257,13 @@ public final class FeedBuilder {
                 newest.summary, trigger, timed > 0 ? sum / timed : -1, null, true, false);
     }
 
-    // ── Flattening ──────────────────────────────────────────────────
-
     private static List<FeedRow> flatten(List<FeedRow> top, Set<String> expanded) {
         List<FeedRow> out = new ArrayList<>(top.size());
         for (FeedRow r : top) addWithChildren(out, r, 0, expanded);
         return out;
     }
+
+    // ── Flattening ──────────────────────────────────────────────────
 
     private static void addWithChildren(List<FeedRow> out, FeedRow row, int depth, Set<String> expanded) {
         boolean open = row.expandable && expanded.contains(row.key);
@@ -274,32 +276,42 @@ public final class FeedBuilder {
         }
     }
 
-    // ── Helpers ─────────────────────────────────────────────────────
-
     static FeedRow.Outcome outcomeOf(MonitorEvent e) {
         if (e.isOutcome()) {
             return switch (e.status()) {
                 case SUCCESS -> FeedRow.Outcome.SUCCEEDED;
-                case FAILED  -> FeedRow.Outcome.FAILED;
+                case FAILED -> FeedRow.Outcome.FAILED;
                 case SKIPPED -> FeedRow.Outcome.SKIPPED;
             };
         }
         return fromSeverity(e.severity());
     }
 
+    // ── Helpers ─────────────────────────────────────────────────────
+
     private static FeedRow.Outcome fromSeverity(EventKind.Severity s) {
         return switch (s) {
             case ERROR -> FeedRow.Outcome.ERROR;
-            case WARN  -> FeedRow.Outcome.WARNING;
-            case INFO  -> FeedRow.Outcome.INFO;
+            case WARN -> FeedRow.Outcome.WARNING;
+            case INFO -> FeedRow.Outcome.INFO;
             case DEBUG -> FeedRow.Outcome.DEBUG;
         };
     }
 
-    /** "3 file(s), 4.2 MB total in 12ms: ..." -> "3 \u00b7 4.2 MB"; null if it doesn't match. */
+    /**
+     * "3 file(s), 4.2 MB total in 12ms: ..." -> "3 \u00b7 4.2 MB"; null if it doesn't match.
+     */
     static String filesText(String summary) {
         if (summary == null) return null;
         Matcher m = DETECTED.matcher(summary);
         return m.find() ? m.group(1) + " \u00b7 " + m.group(2) : null;
+    }
+
+    /**
+     * Result of one build.
+     */
+    public record Result(List<FeedRow> rows, List<MonitorEvent> matchedEvents,
+                         Map<EventKind.Category, Integer> categoryCounts,
+                         int errors, int warnings) {
     }
 }

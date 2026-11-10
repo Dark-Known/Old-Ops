@@ -11,8 +11,9 @@ import java.awt.*;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.HashMap;
 import java.util.List;
-import java.util.*;
+import java.util.Map;
 
 /**
  * Slim, always-visible, full-width health bar — v3. One line, "is everything
@@ -47,40 +48,43 @@ public class StatusStrip extends JPanel {
     private static final int LOOKBACK_HOURS = 24;
     private static final int QUERY_LIMIT = 500;
     private static final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("EEE HH:mm");
-
+    // The failures query only re-runs when run_history.db was actually committed to (see
+    // service.DbChangeMonitor) - or, because the 24 h look-back window slides with time, every couple of minutes.
+    private static final long FAILURES_MAX_AGE_MS = 120_000;
     private final XmlStorageService storage;
     private final TaskSchedulerService scheduler;
     private final WatchStatusMonitor watchStatusMonitor;
-
     // Session-only: group key -> when the snooze expires. Never written to disk;
     // see class javadoc for why that's deliberate. Owned here (not in
     // NotificationPanel) because a fresh NotificationPanel instance is created
     // every time the feed dialog is opened, and this state needs to survive
     // across opens/closes.
     private final Map<String, Instant> snoozedUntil = new HashMap<>();
-
     private final JLabel dot = new JLabel("\u25CF");
     private final JLabel summary = new JLabel();
-    /** Task-id -> name, refreshed off the EDT; used by the workers tooltip, which is built live on hover. */
-    private volatile Map<String, String> taskNames = Map.of();
-
-    // The failures query only re-runs when run_history.db was actually committed to (see
-    // service.DbChangeMonitor) - or, because the 24 h look-back window slides with time, every couple of minutes.
-    private static final long FAILURES_MAX_AGE_MS = 120_000;
-    private List<TaskRunRecord> cachedFailures;       // Async worker thread only
-    private long cachedFailuresGen = -1, cachedFailuresAtMs;
     private final java.util.concurrent.atomic.AtomicBoolean refreshQueued = new java.util.concurrent.atomic.AtomicBoolean();
-    private Runnable monitorUnsubRuns = () -> { }, monitorUnsubTasks = () -> { };
-    private final JLabel workersChip = new JLabel() {
-        @Override public String getToolTipText(java.awt.event.MouseEvent e) { return buildWorkersTooltip(); }
-    };
     private final JLabel nextRunChip = glanceChip();
     private final JLabel bellBadge = new JLabel();
-
     private final javax.swing.Timer pollTimer;
     private final javax.swing.Timer chipTimer;
-    private Runnable daemonUnsub = () -> { };
     private final java.util.function.Consumer<TaskRunRecord> runListener;
+    /**
+     * Task-id -> name, refreshed off the EDT; used by the workers tooltip, which is built live on hover.
+     */
+    private volatile Map<String, String> taskNames = Map.of();
+    private final JLabel workersChip = new JLabel() {
+        @Override
+        public String getToolTipText(java.awt.event.MouseEvent e) {
+            return buildWorkersTooltip();
+        }
+    };
+    private List<TaskRunRecord> cachedFailures;       // Async worker thread only
+    private long cachedFailuresGen = -1, cachedFailuresAtMs;
+    private Runnable monitorUnsubRuns = () -> {
+    }, monitorUnsubTasks = () -> {
+    };
+    private Runnable daemonUnsub = () -> {
+    };
 
     public StatusStrip(XmlStorageService storage, TaskSchedulerService scheduler, WatchStatusMonitor watchStatusMonitor) {
         this.storage = storage;
@@ -96,7 +100,10 @@ public class StatusStrip extends JPanel {
         setMaximumSize(new Dimension(Integer.MAX_VALUE, 32));
         setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
         java.awt.event.MouseAdapter openOnClick = new java.awt.event.MouseAdapter() {
-            @Override public void mouseClicked(java.awt.event.MouseEvent e) { openFeed(); }
+            @Override
+            public void mouseClicked(java.awt.event.MouseEvent e) {
+                openFeed();
+            }
         };
         addMouseListener(openOnClick);
 
@@ -146,8 +153,15 @@ public class StatusStrip extends JPanel {
                     workersChip, java.awt.event.MouseEvent.MOUSE_MOVED, System.currentTimeMillis(), 0, pt.x, pt.y, 0, false));
         });
         workersChip.addMouseListener(new java.awt.event.MouseAdapter() {
-            @Override public void mouseEntered(java.awt.event.MouseEvent e) { hover.start(); }
-            @Override public void mouseExited(java.awt.event.MouseEvent e) { hover.stop(); }
+            @Override
+            public void mouseEntered(java.awt.event.MouseEvent e) {
+                hover.start();
+            }
+
+            @Override
+            public void mouseExited(java.awt.event.MouseEvent e) {
+                hover.stop();
+            }
         });
         // Cheap in-memory read, so the chip can follow short background jobs instead of updating every 15 s.
         chipTimer = new javax.swing.Timer(1000, e -> updateWorkersChip());
@@ -162,7 +176,10 @@ public class StatusStrip extends JPanel {
             service.DbChangeMonitor monitor = service.DbChangeMonitor.forDataDir(storage.getDataDir());
             Runnable queueRefresh = () -> {
                 if (refreshQueued.compareAndSet(false, true)) {
-                    SwingUtilities.invokeLater(() -> { refreshQueued.set(false); refresh(); });
+                    SwingUtilities.invokeLater(() -> {
+                        refreshQueued.set(false);
+                        refresh();
+                    });
                 }
             };
             monitorUnsubRuns = monitor.subscribe(service.DbChangeMonitor.Topic.RUNS, queueRefresh);
@@ -191,8 +208,10 @@ public class StatusStrip extends JPanel {
         l.setForeground(AppTheme.NEUTRAL_FG);
     }
 
-    /** Stops the internal poll timer and detaches the run listener — call before discarding
-     *  a StatusStrip instance (e.g. on a UI rebuild), so rebuilds don't stack duplicates. */
+    /**
+     * Stops the internal poll timer and detaches the run listener — call before discarding
+     * a StatusStrip instance (e.g. on a UI rebuild), so rebuilds don't stack duplicates.
+     */
     public void dispose() {
         pollTimer.stop();
         chipTimer.stop();
@@ -209,13 +228,17 @@ public class StatusStrip extends JPanel {
     // instance is currently open (see openFeed()).
     // ------------------------------------------------------------------
 
-    /** Snoozes a failure group (by its {@link IssueGrouping#groupByLikelyCause} key) for 2 hours. */
+    /**
+     * Snoozes a failure group (by its {@link IssueGrouping#groupByLikelyCause} key) for 2 hours.
+     */
     void snooze(String groupKey) {
         snoozedUntil.put(groupKey, Instant.now().plusSeconds(2 * 3600));
         refresh();
     }
 
-    /** Cancels an active snooze early. */
+    /**
+     * Cancels an active snooze early.
+     */
     void unsnooze(String groupKey) {
         snoozedUntil.remove(groupKey);
         refresh();
@@ -235,7 +258,9 @@ public class StatusStrip extends JPanel {
     // Data refresh
     // ------------------------------------------------------------------
 
-    /** Re-reads failures, trend, and worker/schedule glance-stats, then repaints. Cheap — call freely. */
+    /**
+     * Re-reads failures, trend, and worker/schedule glance-stats, then repaints. Cheap — call freely.
+     */
     public void refresh() {
         if (scheduler == null || scheduler.getRunHistoryService() == null) return;
         // SQLite + task-store reads run off the EDT; only the repaint happens on it.
@@ -265,10 +290,10 @@ public class StatusStrip extends JPanel {
                 taskNames = names;
             } catch (Exception ignored) { /* keep the previous names */ }
             return new Loaded(f, describeNextScheduledCompact());
-        }, loaded -> { if (loaded != null) apply(loaded); }, null);
+        }, loaded -> {
+            if (loaded != null) apply(loaded);
+        }, null);
     }
-
-    private record Loaded(List<TaskRunRecord> failures, String nextText) {}
 
     private void apply(Loaded loaded) {
         List<TaskRunRecord> failures = loaded.failures();
@@ -300,14 +325,18 @@ public class StatusStrip extends JPanel {
         }
     }
 
-    /** Built each time the tooltip is shown; see {@link WorkersTooltip}. */
+    /**
+     * Built each time the tooltip is shown; see {@link WorkersTooltip}.
+     */
     private String buildWorkersTooltip() {
         AppFeeds.Daemon d = storage == null ? null
                 : AppFeeds.daemon(storage.getDataDir().toPath().resolve("scheduler-status-daemon.dat")).latest();
         return WorkersTooltip.build(scheduler, d, id -> taskNames.getOrDefault(id, id));
     }
 
-    /** Busy/total task workers of the process that is actually scheduling (this GUI, or the Daemon). */
+    /**
+     * Busy/total task workers of the process that is actually scheduling (this GUI, or the Daemon).
+     */
     private void updateWorkersChip() {
         int active, total;
         AppFeeds.Daemon d = storage == null ? null
@@ -325,7 +354,9 @@ public class StatusStrip extends JPanel {
         workersChip.setText(active + "/" + total + " workers" + (bg > 0 ? " \u00b7 +" + bg + " bg" : ""));
     }
 
-    /** Best-effort "what's coming up next" — cheapest useful signal to balance a bar that's otherwise all-bad-news. */
+    /**
+     * Best-effort "what's coming up next" — cheapest useful signal to balance a bar that's otherwise all-bad-news.
+     */
     private String describeNextScheduledCompact() {
         ScheduledTask next = findNextScheduled();
         if (next == null || next.getScheduledAt() == null) return "\u2014";
@@ -351,10 +382,6 @@ public class StatusStrip extends JPanel {
         }
     }
 
-    // ------------------------------------------------------------------
-    // Opening the feed
-    // ------------------------------------------------------------------
-
     private void openFeed() {
         Window ownerWindow = SwingUtilities.getWindowAncestor(this);
         JDialog dialog = new JDialog(ownerWindow, "Health Feed", Dialog.ModalityType.MODELESS);
@@ -363,8 +390,18 @@ public class StatusStrip extends JPanel {
         dialog.setSize(760, 640);
         dialog.setLocationRelativeTo(ownerWindow);
         dialog.addWindowListener(new java.awt.event.WindowAdapter() {
-            @Override public void windowClosed(java.awt.event.WindowEvent e) { refresh(); }
+            @Override
+            public void windowClosed(java.awt.event.WindowEvent e) {
+                refresh();
+            }
         });
         dialog.setVisible(true);
+    }
+
+    // ------------------------------------------------------------------
+    // Opening the feed
+    // ------------------------------------------------------------------
+
+    private record Loaded(List<TaskRunRecord> failures, String nextText) {
     }
 }

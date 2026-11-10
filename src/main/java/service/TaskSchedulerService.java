@@ -1,20 +1,20 @@
 package service;
 
-import model.ScheduledTask.*;
 import model.EventKind;
 import model.ScheduledTask;
-import model.ScheduledTask.TaskStatus;
 import model.ScheduledTask.ScheduleType;
+import model.ScheduledTask.TaskStatus;
 import model.TaskRunRecord;
-import service.TaskLogService;
+import service.queue.SchedulerStatusSnapshot;
 import service.queue.TaskDueEvent;
 import service.queue.TaskEventQueue;
-import service.queue.SchedulerStatusSnapshot;
 import service.queue.TaskWorkerPool;
 import service.watch.LocalWatchManager;
 import service.watch.RemotePushWatcher;
 
 import java.io.IOException;
+import java.lang.management.ManagementFactory;
+import java.lang.management.ThreadMXBean;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
 import java.nio.channels.OverlappingFileLockException;
@@ -25,11 +25,9 @@ import java.time.DayOfWeek;
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
-import java.lang.management.ManagementFactory;
-import java.lang.management.ThreadMXBean;
 import java.time.format.DateTimeFormatter;
-import java.util.List;
 import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.*;
 import java.util.function.BiConsumer;
@@ -62,7 +60,9 @@ public class TaskSchedulerService {
     private final RunHistoryService runHistoryService;
     private final BackgroundLogService backgroundLogService;
     private final MaintenanceService maintenance;
-    /** Tasks whose "change arrived during a run" deferral has already been recorded for the current run. */
+    /**
+     * Tasks whose "change arrived during a run" deferral has already been recorded for the current run.
+     */
     private final java.util.Set<String> deferNoted = java.util.concurrent.ConcurrentHashMap.newKeySet();
     private final ScheduledExecutorService scheduler = Workers.newScheduled(Workers.Lane.SCHEDULER, 4);
     // There is deliberately no second "run it now" executor any more. Run Now, the Daemon's RUN_NOW
@@ -74,11 +74,103 @@ public class TaskSchedulerService {
     // task, releasing each to a worker exactly at its due instant. Replaces
     // the old shared poll tick + separate short-interval-timer map.
     private final TaskEventQueue eventQueue = new TaskEventQueue();
-    // Independent worker threads draining eventQueue; execution concurrency
+    private final RemotePushWatcher remotePushWatcher;    // Independent worker threads draining eventQueue; execution concurrency
     // is controlled by pool size, same knob as before (AppSettings.getMaxConcurrentTaskThreads()).
     private final TaskWorkerPool workerPool = new TaskWorkerPool(
             eventQueue, Math.max(4, util.AppSettings.getMaxConcurrentTaskThreads()), this::onTaskDue,
             this::consumeOutcomeNote);
+    // Tracks currently running task futures so they can be cancelled on request
+    // Worker thread currently executing each running task (so cancelTask can interrupt it).
+    private final ConcurrentMap<String, Thread> runningThreads = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, TaskMetrics> taskMetrics = new ConcurrentHashMap<>();
+    // Last time ANY log line was emitted for a task's current run (wall-clock
+    // millis). Used by isStaleRunning() to catch a run whose connection has
+    // gone silent — e.g. network dropped mid-transfer — much faster than
+    // waiting out the full "since start" threshold; see emit() and
+    // getStaleInactivityThresholdMinutes.
+    private final ConcurrentMap<String, Long> lastActivityMillis = new ConcurrentHashMap<>();
+    /**
+     * Poll loop interval in seconds (default 60). If a task requests INTERVAL_SECONDS
+     * smaller than this value we schedule it with its own dedicated timer so it can
+     * run at higher frequency without depending on the global poll loop.
+     */
+    private final int pollIntervalSeconds;
+    // Set by onTaskDue/executeTask just before returning (from the worker
+    // thread handling that event), read-and-cleared by consumeOutcomeNote()
+    // right after — see TaskWorkerPool.HandlerOutcome. Lets the Events feed
+    // show *why* a quick no-op happened (e.g. "already running elsewhere")
+    // instead of a blank "OK", and lets pure scheduling bookkeeping (task
+    // disabled/deleted, a watcher fire that arrived while the same task was
+    // still mid-run, etc.) be left out of the feed entirely rather than
+    // showing up as a confusing 0-second row with no description.
+    private final ThreadLocal<String> pendingOutcomeNote = new ThreadLocal<>();
+    // Base stale threshold, configurable live from the Settings panel
+    // (util.AppSettings#KEY_STALE_RUNNING_THRESHOLD_MINUTES, default 30
+    // minutes — see getStaleRunningThreshold below). For interval-based
+    // tasks it's additionally scaled up relative to their own interval, to
+    // accommodate longer-running operations like large file transfers.
+    private final ThreadLocal<Boolean> pendingSuppressActivity = new ThreadLocal<>();
+    private final ThreadLocal<Boolean> pendingErrored = new ThreadLocal<>();
+    // Set by executeTask when it skipped because another process held the task's lock.
+    private final ThreadLocal<Boolean> lockSkipped = new ThreadLocal<>();
+    // ── Event Monitor bookkeeping ────────────────────────────────────────
+    // Run key of the execution currently in flight for each task, so notes
+    // recorded from OTHER threads (a cancel from the UI, a stale-run reset
+    // from the reconcile sweep) can be attached to the run they're about.
+    private final ConcurrentMap<String, String> activeRunKeys = new ConcurrentHashMap<>();
+    // Run key minted by the first watcher wake-up of a burst, consumed by the
+    // run that eventually handles it — so "Change detected" (watch thread) and
+    // "Started"/outcome (worker thread) land in the same run group.
+    private final ConcurrentMap<String, String> pendingWakeKeys = new ConcurrentHashMap<>();
+    // Tasks whose next runNow() is an automatic retry rather than a manual run.
+    private final java.util.Set<String> retryTriggered = ConcurrentHashMap.newKeySet();
+    // Per-task watcher state, for emitting arm/degrade/restore events on change only.
+    private final Map<String, WatchMode> lastEventWatchMode = new ConcurrentHashMap<>();
+    private final java.util.Set<String> everPushed = ConcurrentHashMap.newKeySet();
+    private final ConcurrentMap<String, WatchGroup> watchGroups = new ConcurrentHashMap<>();
+    private final java.util.concurrent.atomic.AtomicBoolean purgeQueued = new java.util.concurrent.atomic.AtomicBoolean();
+    // Last WatchMode we logged for each task, purely so exportStatus() can log
+    // a clear line the moment a task's trigger mode changes (e.g. "push
+    // stopped working, now polling") instead of the Daemon's log silently
+    // saying nothing — this is the same signal ui.WatchStatusMonitor polls
+    // for cross-process, but logging it here too means it's visible even
+    // when no GUI is attached to a headless Daemon at all.
+    private final Map<String, WatchMode> lastLoggedWatchMode = new ConcurrentHashMap<>();
+    private final java.util.concurrent.atomic.AtomicBoolean statusExportQueued = new java.util.concurrent.atomic.AtomicBoolean();
+    /**
+     * Tasks whose last look found nothing, so the run is shown as skipped instead of a success.
+     */
+    private final java.util.concurrent.ConcurrentHashMap<String, Boolean> folderWatchQuiet = new java.util.concurrent.ConcurrentHashMap<>();
+    /**
+     * Callback: (taskId, logLine) -> void — for UI log panel updates
+     */
+    private BiConsumer<String, String> logCallback;
+    private volatile String purgeTrigger = "scheduled";
+    /**
+     * When this scheduler started: time the program was not running is not counted as "no files arrived".
+     */
+    private volatile long startedAtMillis = System.currentTimeMillis();
+    /**
+     * Socket-link monitor: serves the endpoint another server's application posts to and raises alerts for it.
+     * Created in {@link #start()}; null while this instance is not started (the window never starts one, so only the Daemon serves it).
+     */
+    private volatile LinkMonitorService linkMonitor;
+    private volatile AlertDispatcher alertDispatcher;
+    private volatile MonitorEvents monitorEvents;
+    // ── Cross-process status export ─────────────────────────────────────
+    // Lets a scheduler running in one JVM (typically the headless Daemon)
+    // publish its live state to a shared file that another process
+    // (typically the GUI's Event Monitor window) can read back — see
+    // service.queue.SchedulerStatusExporter / SchedulerStatusSnapshot.
+    private service.queue.SchedulerStatusExporter statusExporter;
+    private ScheduledFuture<?> statusExportFuture;
+    // Populated at the top of every reconcileSchedules() sweep; read by
+    // exportStatus() (which runs on its own faster 2s tick) so the "watch
+    // mode" line in each status export doesn't need its own storage.loadTasks()
+    // call every 2s — reconcile's 8s-ish cadence is fresh enough for a
+    // status display, and volatile gives exportStatus a safe, tear-free read
+    // of whatever reconcile last saw.
+    private volatile List<ScheduledTask> lastLoadedTasks = java.util.Collections.emptyList();
     // Push-notification producers that feed eventQueue directly, in addition
     // to (not instead of) the normal poll-based publishNextOccurrence path —
     // see each class's javadoc for exactly what it replaces and what it
@@ -96,44 +188,152 @@ public class TaskSchedulerService {
     // Constructed here (not as a plain field initializer) because both need
     // this.storage, which isn't assigned until the constructor body runs.
     private final LocalWatchManager localWatchManager = new LocalWatchManager(this::onWatchWakeup);
-    private final RemotePushWatcher remotePushWatcher;
-    // Tracks currently running task futures so they can be cancelled on request
-     // Worker thread currently executing each running task (so cancelTask can interrupt it).
-     private final ConcurrentMap<String, Thread> runningThreads = new ConcurrentHashMap<>();
-     private final ConcurrentMap<String, TaskMetrics> taskMetrics = new ConcurrentHashMap<>();
-     // Last time ANY log line was emitted for a task's current run (wall-clock
-     // millis). Used by isStaleRunning() to catch a run whose connection has
-     // gone silent — e.g. network dropped mid-transfer — much faster than
-     // waiting out the full "since start" threshold; see emit() and
-     // getStaleInactivityThresholdMinutes.
-     private final ConcurrentMap<String, Long> lastActivityMillis = new ConcurrentHashMap<>();
-     // Base stale threshold, configurable live from the Settings panel
-     // (util.AppSettings#KEY_STALE_RUNNING_THRESHOLD_MINUTES, default 30
-     // minutes — see getStaleRunningThreshold below). For interval-based
-     // tasks it's additionally scaled up relative to their own interval, to
-     // accommodate longer-running operations like large file transfers.
+    /**
+     * Turns SSH open/close/fail reports from any component into Event Monitor events for the task.
+     */
+    private final java.util.function.Consumer<SshSessionEvents.Event> sshSink = this::onSshEvent;
+    // Whether this instance's worker pool/reconcile loop has actually been
+    // started. Lets a caller (see ui.MainWindow) hold a scheduler object for
+    // read-only access (task list, run history) without it firing anything —
+    // e.g. while a headless Daemon process is the active scheduler for this
+    // data directory — and later promote it to active with a plain start()
+    // call. TaskWorkerPool.start() is only safe to call once per instance
+    // (see its own javadoc), so this flag also guards against a double
+    // start() accidentally tearing that invariant.
+    private volatile boolean started = false;
 
-    /** Poll loop interval in seconds (default 60). If a task requests INTERVAL_SECONDS
-     * smaller than this value we schedule it with its own dedicated timer so it can
-     * run at higher frequency without depending on the global poll loop. */
-    private final int pollIntervalSeconds;
+    public TaskSchedulerService(XmlStorageService storage, TransferService transferService) {
+        this(storage, transferService, 60);
+    }
 
-    /** Callback: (taskId, logLine) -> void — for UI log panel updates */
-    private BiConsumer<String, String> logCallback;
+    /**
+     * Create scheduler with a custom poll interval (in seconds).
+     */
+    public TaskSchedulerService(XmlStorageService storage, TransferService transferService, int pollIntervalSeconds) {
+        this.storage = storage;
+        this.transferService = transferService;
+        this.logService = new TaskLogService(storage.getDataDir().getAbsolutePath());
+        this.runHistoryService = new RunHistoryService(storage.getDataDir().getAbsolutePath());
+        // One Events-feed entry per mail message a mail task handles (see TransferService#fireMailEvent).
+        if (transferService != null) {
+            transferService.setMailEventListener((task, saved, summary, details, start, end, runKey, trigger) -> {
+                try {
+                    runHistoryService.recordEvent(saved ? EventKind.MAIL_PROCESSED : EventKind.MAIL_NOT_SAVED,
+                            task.getId(), task.getName(),
+                            task.getTaskType() != null ? task.getTaskType().name() : null,
+                            saved ? TaskRunRecord.Status.SUCCESS : TaskRunRecord.Status.FAILED,
+                            summary, details, start, end, runKey, trigger);
+                } catch (Exception ignored) {
+                    // Best-effort, like every other scheduler event.
+                }
+            });
+        }
+        // "No files found" alerts: one Events-feed entry (warning) that also pops a toast in the GUI.
+        if (transferService != null) {
+            transferService.setNoFilesListener(new TransferService.NoFilesListener() {
+                @Override
+                public void noFiles(ScheduledTask task, String summary, String details) {
+                    recordFileAlert(EventKind.NO_FILES, TaskRunRecord.Status.SKIPPED, task, summary, details);
+                }
 
-    // Set by onTaskDue/executeTask just before returning (from the worker
-    // thread handling that event), read-and-cleared by consumeOutcomeNote()
-    // right after — see TaskWorkerPool.HandlerOutcome. Lets the Events feed
-    // show *why* a quick no-op happened (e.g. "already running elsewhere")
-    // instead of a blank "OK", and lets pure scheduling bookkeeping (task
-    // disabled/deleted, a watcher fire that arrived while the same task was
-    // still mid-run, etc.) be left out of the feed entirely rather than
-    // showing up as a confusing 0-second row with no description.
-    private final ThreadLocal<String> pendingOutcomeNote = new ThreadLocal<>();
-    private final ThreadLocal<Boolean> pendingSuppressActivity = new ThreadLocal<>();
-    private final ThreadLocal<Boolean> pendingErrored = new ThreadLocal<>();
-    // Set by executeTask when it skipped because another process held the task's lock.
-    private final ThreadLocal<Boolean> lockSkipped = new ThreadLocal<>();
+                @Override
+                public void resumed(ScheduledTask task, String summary, String details) {
+                    recordFileAlert(EventKind.FILES_RESUMED, TaskRunRecord.Status.SUCCESS, task, summary, details);
+                }
+            });
+        }
+        // Background-thread events get their own database, so they can be purged and vacuumed
+        // independently of the run history. Older builds stored them in run history: move them over.
+        this.backgroundLogService = new BackgroundLogService(storage.getDataDir().getAbsolutePath());
+        MaintenanceService.migrateLegacyBackgroundRows(runHistoryService, backgroundLogService);
+        BackgroundJobs.attach(backgroundLogService);
+        this.maintenance = new MaintenanceService(runHistoryService, backgroundLogService);
+        // Retention (age + size) is enforced by a scheduled purge that runs on a task worker —
+        // see maintenanceTick() — rather than blocking start-up with a synchronous delete here.
+        this.pollIntervalSeconds = Math.max(1, pollIntervalSeconds);
+        this.remotePushWatcher = new RemotePushWatcher(storage, this::onWatchWakeup);
+        SshSessionEvents.setSink(sshSink);
+    }
+
+    /**
+     * Lane summary plus every running background job of this process, for the workers tooltip.
+     */
+    private static List<String> workerLines() {
+        List<String> out = new ArrayList<>();
+        out.addAll(Workers.summaryLines());
+        out.addAll(BackgroundJobs.liveLines(10));
+        return out;
+    }
+
+    private static boolean justDue(LocalDateTime occurrence, LocalDateTime now, LocalDateTime lastRunAt) {
+        if (occurrence.isAfter(now)) return false;
+        if (Duration.between(occurrence, now).toMillis() > DUE_TOLERANCE_MS) return false;
+        return lastRunAt == null || lastRunAt.isBefore(occurrence);
+    }
+
+    private static long millisUntil(LocalDateTime target, LocalDateTime now) {
+        return Math.max(0L, Duration.between(now, target).toMillis());
+    }
+
+    /**
+     * Parses "MON", "MONDAY", etc. (case-insensitive, prefix-tolerant) to a DayOfWeek, or null if unrecognized.
+     */
+    private static DayOfWeek parseDayOfWeek(String raw) {
+        if (raw == null || raw.isBlank()) return null;
+        String norm = raw.trim().toUpperCase();
+        for (DayOfWeek d : DayOfWeek.values()) {
+            if (d.name().equals(norm) || d.name().startsWith(norm) || norm.startsWith(d.name().substring(0, 3))) {
+                return d;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Last "[ERROR] ..." line in a captured run log, with the tag stripped — or a generic fallback.
+     */
+    private static String lastErrorLine(String runLogText) {
+        String[] lines = runLogText.split("\n");
+        for (int i = lines.length - 1; i >= 0; i--) {
+            String l = lines[i].trim();
+            if (l.startsWith("[ERROR]")) return l.substring("[ERROR]".length()).trim();
+        }
+        return "Failed — see run details for the full log.";
+    }
+
+    /**
+     * Last "[INFO] ..." line in a captured run log (skipping boilerplate
+     * start/debug lines), with the tag stripped — used as the run's
+     * one-line summary shown both in the Event Monitor row and as the Logs
+     * tab's Reason column.
+     *
+     * <p>Prefers a "Transfer summary: ..." line if the log has one,
+     * regardless of whether it's truly the last INFO line. FILE_TRANSFER
+     * runs that also copy to additional destination folders
+     * (see TransferService#copyDownloadedFilesToExtraFolders) log their own
+     * per-file "[INFO] Copied ..." lines *after* the transfer summary line,
+     * which used to bury it — the row would then show something like
+     * "Copied invoice_04.csv to extra folder" instead of the actual
+     * files/bytes/batches/sessions/threads summary. Falling back to
+     * "true last INFO line" for every other task type/shape keeps this safe
+     * for logs that never emit a transfer summary at all.
+     */
+    private static String lastInfoLine(String runLogText) {
+        String[] lines = runLogText.split("\n");
+        for (String rawLine : lines) {
+            String l = rawLine.trim();
+            if (l.startsWith("[INFO] Transfer summary:")) {
+                return l.substring("[INFO]".length()).trim();
+            }
+        }
+        for (int i = lines.length - 1; i >= 0; i--) {
+            String l = lines[i].trim();
+            if (l.startsWith("[INFO]") && !l.startsWith("[INFO] Task reset to PENDING")) {
+                return l.substring("[INFO]".length()).trim();
+            }
+        }
+        return "Completed successfully.";
+    }
 
     /**
      * This process marked the task RUNNING just before discovering another process holds its
@@ -168,57 +368,6 @@ public class TaskSchedulerService {
         return new TaskWorkerPool.HandlerOutcome(Boolean.TRUE.equals(suppress), Boolean.TRUE.equals(errored), note);
     }
 
-    public TaskSchedulerService(XmlStorageService storage, TransferService transferService) {
-        this(storage, transferService, 60);
-    }
-
-    /** Create scheduler with a custom poll interval (in seconds). */
-    public TaskSchedulerService(XmlStorageService storage,TransferService transferService, int pollIntervalSeconds) {
-        this.storage = storage;
-        this.transferService = transferService;
-        this.logService = new TaskLogService(storage.getDataDir().getAbsolutePath());
-        this.runHistoryService = new RunHistoryService(storage.getDataDir().getAbsolutePath());
-        // One Events-feed entry per mail message a mail task handles (see TransferService#fireMailEvent).
-        if (transferService != null) {
-            transferService.setMailEventListener((task, saved, summary, details, start, end, runKey, trigger) -> {
-                try {
-                    runHistoryService.recordEvent(saved ? EventKind.MAIL_PROCESSED : EventKind.MAIL_NOT_SAVED,
-                            task.getId(), task.getName(),
-                            task.getTaskType() != null ? task.getTaskType().name() : null,
-                            saved ? TaskRunRecord.Status.SUCCESS : TaskRunRecord.Status.FAILED,
-                            summary, details, start, end, runKey, trigger);
-                } catch (Exception ignored) {
-                    // Best-effort, like every other scheduler event.
-                }
-            });
-        }
-        // "No files found" alerts: one Events-feed entry (warning) that also pops a toast in the GUI.
-        if (transferService != null) {
-            transferService.setNoFilesListener(new TransferService.NoFilesListener() {
-                @Override public void noFiles(ScheduledTask task, String summary, String details) {
-                    recordFileAlert(EventKind.NO_FILES, TaskRunRecord.Status.SKIPPED, task, summary, details);
-                }
-                @Override public void resumed(ScheduledTask task, String summary, String details) {
-                    recordFileAlert(EventKind.FILES_RESUMED, TaskRunRecord.Status.SUCCESS, task, summary, details);
-                }
-            });
-        }
-        // Background-thread events get their own database, so they can be purged and vacuumed
-        // independently of the run history. Older builds stored them in run history: move them over.
-        this.backgroundLogService = new BackgroundLogService(storage.getDataDir().getAbsolutePath());
-        MaintenanceService.migrateLegacyBackgroundRows(runHistoryService, backgroundLogService);
-        BackgroundJobs.attach(backgroundLogService);
-        this.maintenance = new MaintenanceService(runHistoryService, backgroundLogService);
-        // Retention (age + size) is enforced by a scheduled purge that runs on a task worker —
-        // see maintenanceTick() — rather than blocking start-up with a synchronous delete here.
-        this.pollIntervalSeconds = Math.max(1, pollIntervalSeconds);
-        this.remotePushWatcher = new RemotePushWatcher(storage, this::onWatchWakeup);
-        SshSessionEvents.setSink(sshSink);
-    }
-
-    /** Turns SSH open/close/fail reports from any component into Event Monitor events for the task. */
-    private final java.util.function.Consumer<SshSessionEvents.Event> sshSink = this::onSshEvent;
-
     private void onSshEvent(SshSessionEvents.Event e0) {
         SshSessionEvents.Event e = e0;
         if (e.taskId() == null) {
@@ -227,7 +376,10 @@ public class TaskSchedulerService {
             String rk = RunHistoryService.currentRunKey();
             String tid = null;
             if (rk != null) for (Map.Entry<String, String> en : activeRunKeys.entrySet())
-                if (rk.equals(en.getValue())) { tid = en.getKey(); break; }
+                if (rk.equals(en.getValue())) {
+                    tid = en.getKey();
+                    break;
+                }
             if (tid == null) { // genuinely not a task session
                 switch (e.phase()) {
                     case OPENED -> SshSessionEvents.uiOpened(e.purpose(), e.host(), e.user());
@@ -245,7 +397,10 @@ public class TaskSchedulerService {
         TaskRunRecord.Status status = TaskRunRecord.Status.SUCCESS;
         String msg;
         switch (e.phase()) {
-            case OPENED -> { kind = EventKind.SSH_OPENED; msg = "SSH session opened to " + who + " (" + what + ")"; }
+            case OPENED -> {
+                kind = EventKind.SSH_OPENED;
+                msg = "SSH session opened to " + who + " (" + what + ")";
+            }
             case CLOSED -> {
                 kind = EventKind.SSH_CLOSED;
                 msg = "SSH session closed to " + who + " (" + what + ")"
@@ -253,7 +408,8 @@ public class TaskSchedulerService {
                         + (e.reason() != null ? " — " + e.reason() : "");
             }
             default -> {
-                kind = EventKind.SSH_FAILED; status = TaskRunRecord.Status.FAILED;
+                kind = EventKind.SSH_FAILED;
+                status = TaskRunRecord.Status.FAILED;
                 msg = "SSH connect to " + who + " failed (" + what + ")" + (e.reason() != null ? ": " + e.reason() : "");
             }
         }
@@ -277,46 +433,18 @@ public class TaskSchedulerService {
                     LocalDateTime now = LocalDateTime.now();
                     runHistoryService.recordEvent(kind, e.taskId(), name, type, status, msg, details, now, now,
                             e.runKey(), RunHistoryService.currentTrigger());
-                } catch (Exception ignored) { }
+                } catch (Exception ignored) {
+                }
             } else {
                 recordSchedulerEvent(kind, e.taskId(), name, type, status, msg, details);
             }
         }
     }
 
-
-    // ── Event Monitor bookkeeping ────────────────────────────────────────
-    // Run key of the execution currently in flight for each task, so notes
-    // recorded from OTHER threads (a cancel from the UI, a stale-run reset
-    // from the reconcile sweep) can be attached to the run they're about.
-    private final ConcurrentMap<String, String> activeRunKeys = new ConcurrentHashMap<>();
-    // Run key minted by the first watcher wake-up of a burst, consumed by the
-    // run that eventually handles it — so "Change detected" (watch thread) and
-    // "Started"/outcome (worker thread) land in the same run group.
-    private final ConcurrentMap<String, String> pendingWakeKeys = new ConcurrentHashMap<>();
-    // Tasks whose next runNow() is an automatic retry rather than a manual run.
-    private final java.util.Set<String> retryTriggered = ConcurrentHashMap.newKeySet();
-    // Per-task watcher state, for emitting arm/degrade/restore events on change only.
-    private final Map<String, WatchMode> lastEventWatchMode = new ConcurrentHashMap<>();
-    private final java.util.Set<String> everPushed = ConcurrentHashMap.newKeySet();
-
     private ScheduledTask lookupTask(String taskId) {
         for (ScheduledTask t : lastLoadedTasks) if (t.getId().equals(taskId)) return t;
         return null;
     }
-
-    /**
-     * Best-effort write of one structured event to the Event Monitor feed.
-     * Never throws and never affects scheduling — a failure to log must not
-     * change what the scheduler does. The run key comes from the calling
-     * thread's run context if it has one, else from the task's in-flight run.
-     */
-    // ── Watcher groups ───────────────────────────────────────────────────
-    // A watcher is not a run, but its events belong together: "armed", the SSH session it keeps open, and the
-    // eventual "closed" / "lost". They share one group key so the Event Monitor shows them as one Watcher row.
-    private enum WatchStep { OPEN, KEEP, END }
-    private static final class WatchGroup { final String key; boolean ended; WatchGroup(String k) { key = k; } }
-    private final ConcurrentMap<String, WatchGroup> watchGroups = new ConcurrentHashMap<>();
 
     private synchronized String watchGroupKey(String taskId, WatchStep step) {
         WatchGroup g = watchGroups.get(taskId);
@@ -338,6 +466,8 @@ public class TaskSchedulerService {
             // Best-effort.
         }
     }
+
+    // ── System jobs (purge) — executed by the same task workers as every other run ──────────────
 
     private void recordSchedulerEvent(EventKind kind, String taskId, String taskName, String taskType,
                                       TaskRunRecord.Status status, String message, String details) {
@@ -397,6 +527,8 @@ public class TaskSchedulerService {
         // POLLING_ONLY with no prior push is the transient "not yet attempted" state — not an event.
     }
 
+    /** Periodic check (on the scheduler clock, not a worker): queues a purge when the schedule says it is due. */
+
     /**
      * Called by {@link LocalWatchManager} or {@link RemotePushWatcher} the
      * moment they observe a change for a watcher-enabled task. Publishes a
@@ -418,7 +550,10 @@ public class TaskSchedulerService {
             if (n > 0) {
                 int shown = 0;
                 for (String f : new java.util.TreeSet<>(changedFileNames)) {
-                    if (shown++ >= 50) { details.append("  ... and ").append(n - 50).append(" more\n"); break; }
+                    if (shown++ >= 50) {
+                        details.append("  ... and ").append(n - 50).append(" more\n");
+                        break;
+                    }
                     details.append("  ").append(f).append('\n');
                 }
             }
@@ -433,33 +568,10 @@ public class TaskSchedulerService {
         eventQueue.publish(new TaskDueEvent(taskId, LocalDateTime.now(), 0, true, changedFileNames));
     }
 
-    /** How a watcher-enabled task is currently being triggered — for UI display only. */
-    public enum WatchMode {
-        /** OUTBOUND task with a live OS-level directory watch registered — instant. */
-        NATIVE_WATCH,
-        /** INBOUND task with a live remote push listener (inotifywait on Linux,
-         *  PowerShell FileSystemWatcher on Windows) — instant. */
-        REMOTE_PUSH,
-        /** No push mechanism currently active; relying solely on the scheduled poll interval. */
-        POLLING_ONLY,
-        /** Push was attempted for this task but the remote host doesn't support it
-         *  (no inotify-tools, or exec refused) — same as POLLING_ONLY but distinguishes
-         *  "tried and can't" from "not applicable yet" for the UI. */
-        POLLING_ONLY_UNSUPPORTED,
-        /** Not a watcher-enabled FILE_TRANSFER task. */
-        NOT_APPLICABLE
-    }
-
     /**
-     * {@code mode} plus a short human-readable {@code detail} explaining *why*
-     * — critical for telling "never attempted" apart from "tried and this is
-     * exactly what went wrong" apart from "confirmed working". See
-     * {@link #getWatchStatus}.
+     * Convenience wrapper around {@link #getWatchStatus} for callers that
+     * only need the mode, not the explanation. Prefer getWatchStatus in new code.
      */
-    public record WatchStatus(WatchMode mode, String detail) {}
-
-    /** Convenience wrapper around {@link #getWatchStatus} for callers that
-     *  only need the mode, not the explanation. Prefer getWatchStatus in new code. */
     public WatchMode getWatchMode(ScheduledTask task) {
         return getWatchStatus(task).mode();
     }
@@ -610,10 +722,10 @@ public class TaskSchedulerService {
         return maintenance;
     }
 
-    // ── System jobs (purge) — executed by the same task workers as every other run ──────────────
-
-    private final java.util.concurrent.atomic.AtomicBoolean purgeQueued = new java.util.concurrent.atomic.AtomicBoolean();
-    private volatile String purgeTrigger = "scheduled";
+    // ── Monitoring accessors ────────────────────────────────────────────
+    // Read-only views onto the event queue / worker pool for the Event
+    // Monitor GUI (see ui.EventMonitorPanel). None of these affect
+    // scheduling or execution; they're plain snapshots for display.
 
     /**
      * Queues a purge of the log databases for a task worker to execute. Returns false when this
@@ -630,8 +742,9 @@ public class TaskSchedulerService {
         return true;
     }
 
-    /** Periodic check (on the scheduler clock, not a worker): queues a purge when the schedule says it is due. */
-    /** Records one file-alert event (best-effort, like every other scheduler event). */
+    /**
+     * Records one file-alert event (best-effort, like every other scheduler event).
+     */
     private void recordFileAlert(EventKind kind, TaskRunRecord.Status status, ScheduledTask task, String summary, String details) {
         try {
             LocalDateTime now = LocalDateTime.now();
@@ -644,9 +757,6 @@ public class TaskSchedulerService {
         }
     }
 
-    /** When this scheduler started: time the program was not running is not counted as "no files arrived". */
-    private volatile long startedAtMillis = System.currentTimeMillis();
-
     /**
      * For every file-transfer task that asked to be told when no new file arrives for N minutes (File Selection →
      * Alerts), raises the alert once the quiet time passes. Works for watcher tasks too, which have no run to hook
@@ -658,20 +768,24 @@ public class TaskSchedulerService {
         for (ScheduledTask t : storage.loadTasksSnapshot()) {
             try {
                 boolean watchOnly = t.getTaskType() == ScheduledTask.TaskType.FOLDER_WATCH;
-                if ((t.getTaskType() != ScheduledTask.TaskType.FILE_TRANSFER && !watchOnly) || t.getStatus() == TaskStatus.DISABLED) continue;
+                if ((t.getTaskType() != ScheduledTask.TaskType.FILE_TRANSFER && !watchOnly) || t.getStatus() == TaskStatus.DISABLED)
+                    continue;
                 model.FileSelection sel = t.getFileSelection();
                 if (sel.getSilenceMinutes() <= 0) continue;
                 TransferLedger.State st = ledger.state(t.getId());
                 long limit = sel.getSilenceMinutes() * 60_000L;
                 SilenceWatch.Verdict v = SilenceWatch.judge(st.lastFilesAt(), st.watchingSince(), startedAtMillis, now, limit);
-                if (v == SilenceWatch.Verdict.START) { ledger.startWatching(t.getId()); continue; }
+                if (v == SilenceWatch.Verdict.START) {
+                    ledger.startWatching(t.getId());
+                    continue;
+                }
                 if (v != SilenceWatch.Verdict.OVERDUE) continue;
                 if (!ledger.claimSilenceAlert(t.getId(), sel.getAlertRepeatMinutes() * 60_000L)) continue;
                 boolean inbound = !watchOnly && t.getTransferDirection() == ScheduledTask.TransferDirection.INBOUND;
                 long ref = Math.max(st.lastFilesAt() > 0 ? st.lastFilesAt() : st.watchingSince(), startedAtMillis);
                 String last = st.lastFilesAt() > 0
                         ? java.time.Instant.ofEpochMilli(st.lastFilesAt()).atZone(java.time.ZoneId.systemDefault())
-                                .format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
+                        .format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
                         : "none since this task has been watched";
                 String where = watchOnly ? t.getBackupSourcePath() : inbound ? t.getTargetPath() : t.getSourcePath();
                 String summary = "No new files for " + ((now - ref) / 60_000) + " min (limit " + sel.getSilenceMinutes() + " min) \u2014 "
@@ -690,14 +804,6 @@ public class TaskSchedulerService {
             }
         }
     }
-
-    /**
-     * Socket-link monitor: serves the endpoint another server's application posts to and raises alerts for it.
-     * Created in {@link #start()}; null while this instance is not started (the window never starts one, so only the Daemon serves it).
-     */
-    private volatile LinkMonitorService linkMonitor;
-    private volatile AlertDispatcher alertDispatcher;
-    private volatile MonitorEvents monitorEvents;
 
     private void recordLinkAlert(LinkMonitor.Alert a) {
         EventKind.Severity sev = a.kind().defaultSeverity();
@@ -731,7 +837,9 @@ public class TaskSchedulerService {
         }
     }
 
-    /** Executes a system job on the calling worker thread. */
+    /**
+     * Executes a system job on the calling worker thread.
+     */
     private void runSystemJob(String jobId) {
         pendingSuppressActivity.set(true); // not a user task: keep it out of the per-task activity list
         try {
@@ -751,57 +859,40 @@ public class TaskSchedulerService {
         return taskId == null ? null : taskMetrics.get(taskId);
     }
 
-    // ── Monitoring accessors ────────────────────────────────────────────
-    // Read-only views onto the event queue / worker pool for the Event
-    // Monitor GUI (see ui.EventMonitorPanel). None of these affect
-    // scheduling or execution; they're plain snapshots for display.
-
-    /** Every task's pending TaskDueEvent, soonest-due first. Non-destructive. */
+    /**
+     * Every task's pending TaskDueEvent, soonest-due first. Non-destructive.
+     */
     public List<service.queue.TaskDueEvent> getPendingEvents() {
         return eventQueue.snapshotPending();
     }
 
-    /** Total configured worker threads (the execution-concurrency ceiling). */
+    /**
+     * Total configured worker threads (the execution-concurrency ceiling).
+     */
     public int getWorkerPoolSize() {
         return workerPool.getWorkerCount();
     }
 
-    /** Workers currently executing a task right now. */
+    /**
+     * Workers currently executing a task right now.
+     */
     public int getActiveWorkerCount() {
         return workerPool.getActiveWorkerCount();
     }
 
-    /** Newest-first feed of the last {@code limit} events a worker has handled. */
+    /**
+     * Newest-first feed of the last {@code limit} events a worker has handled.
+     */
     public List<service.queue.TaskWorkerPool.ActivityEntry> getRecentActivity(int limit) {
         return workerPool.getRecentActivity(limit);
     }
 
-    /** What every currently-busy worker thread is executing right now — see {@link service.queue.TaskWorkerPool#getInFlightSnapshot()}. */
+    /**
+     * What every currently-busy worker thread is executing right now — see {@link service.queue.TaskWorkerPool#getInFlightSnapshot()}.
+     */
     public List<service.queue.TaskWorkerPool.InFlightTask> getInFlightTasks() {
         return workerPool.getInFlightSnapshot();
     }
-
-    // ── Cross-process status export ─────────────────────────────────────
-    // Lets a scheduler running in one JVM (typically the headless Daemon)
-    // publish its live state to a shared file that another process
-    // (typically the GUI's Event Monitor window) can read back — see
-    // service.queue.SchedulerStatusExporter / SchedulerStatusSnapshot.
-    private service.queue.SchedulerStatusExporter statusExporter;
-    private ScheduledFuture<?> statusExportFuture;
-    // Populated at the top of every reconcileSchedules() sweep; read by
-    // exportStatus() (which runs on its own faster 2s tick) so the "watch
-    // mode" line in each status export doesn't need its own storage.loadTasks()
-    // call every 2s — reconcile's 8s-ish cadence is fresh enough for a
-    // status display, and volatile gives exportStatus a safe, tear-free read
-    // of whatever reconcile last saw.
-    private volatile List<ScheduledTask> lastLoadedTasks = java.util.Collections.emptyList();
-    // Last WatchMode we logged for each task, purely so exportStatus() can log
-    // a clear line the moment a task's trigger mode changes (e.g. "push
-    // stopped working, now polling") instead of the Daemon's log silently
-    // saying nothing — this is the same signal ui.WatchStatusMonitor polls
-    // for cross-process, but logging it here too means it's visible even
-    // when no GUI is attached to a headless Daemon at all.
-    private final Map<String, WatchMode> lastLoggedWatchMode = new ConcurrentHashMap<>();
 
     /**
      * Enables periodic status export to {@code <dataDir>/scheduler-status-<processLabel>.dat},
@@ -833,24 +924,19 @@ public class TaskSchedulerService {
         if (statusExporter != null) statusExporter.setListener(listener);
     }
 
-    private final java.util.concurrent.atomic.AtomicBoolean statusExportQueued = new java.util.concurrent.atomic.AtomicBoolean();
-
-    /** Coalesces bursts of state changes into a single export ~100 ms later. Cheap enough for hot paths. */
+    /**
+     * Coalesces bursts of state changes into a single export ~100 ms later. Cheap enough for hot paths.
+     */
     private void requestStatusExport() {
         if (statusExporter == null || !statusExportQueued.compareAndSet(false, true)) return;
         try {
-            scheduler.schedule(() -> { statusExportQueued.set(false); exportStatus(); }, 100, TimeUnit.MILLISECONDS);
+            scheduler.schedule(() -> {
+                statusExportQueued.set(false);
+                exportStatus();
+            }, 100, TimeUnit.MILLISECONDS);
         } catch (java.util.concurrent.RejectedExecutionException e) {
             statusExportQueued.set(false); // scheduler shutting down
         }
-    }
-
-    /** Lane summary plus every running background job of this process, for the workers tooltip. */
-    private static List<String> workerLines() {
-        List<String> out = new ArrayList<>();
-        out.addAll(Workers.summaryLines());
-        out.addAll(BackgroundJobs.liveLines(10));
-        return out;
     }
 
     private void exportStatus() {
@@ -877,12 +963,14 @@ public class TaskSchedulerService {
         }
     }
 
-    /** Logs a WARNING the moment a watcher task's trigger mode degrades from
-     *  push (NATIVE_WATCH/REMOTE_PUSH) to polling, or is newly confirmed
-     *  unsupported — so it's visible in this process's own log even with no
-     *  GUI attached. Silent otherwise (including on the very first observation
-     *  of a task, and on POLLING_ONLY -> POLLING_ONLY re-evaluations, both of
-     *  which are non-events here). */
+    /**
+     * Logs a WARNING the moment a watcher task's trigger mode degrades from
+     * push (NATIVE_WATCH/REMOTE_PUSH) to polling, or is newly confirmed
+     * unsupported — so it's visible in this process's own log even with no
+     * GUI attached. Silent otherwise (including on the very first observation
+     * of a task, and on POLLING_ONLY -> POLLING_ONLY re-evaluations, both of
+     * which are non-events here).
+     */
     private void logWatchTransitionIfNotable(ScheduledTask t, WatchStatus status) {
         WatchMode prev = lastLoggedWatchMode.put(t.getId(), status.mode());
         if (prev == null || prev == status.mode()) return;
@@ -897,52 +985,6 @@ public class TaskSchedulerService {
 
     private TaskMetrics ensureMetrics(String taskId) {
         return taskMetrics.computeIfAbsent(taskId, TaskMetrics::new);
-    }
-
-    public static class TaskMetrics {
-        private final String taskId;
-        private volatile boolean running;
-        private volatile long lastDurationMs;
-        private volatile long lastHeapUsedBytes;
-        private volatile long lastHeapCommittedBytes;
-        private volatile long lastHeapMaxBytes;
-        private volatile long lastCpuTimeMs;
-        private volatile int lastThreadCount;
-        private volatile String lastResult = "Unknown";
-        private volatile String lastStatus = "UNKNOWN";
-        private volatile long currentHeapUsedBytes;
-        private volatile long currentCpuTimeMs;
-        private volatile int currentThreadCount;
-
-        public TaskMetrics(String taskId) {
-            this.taskId = taskId;
-        }
-
-        public String getTaskId() { return taskId; }
-        public boolean isRunning() { return running; }
-        public void setRunning(boolean running) { this.running = running; }
-        public long getLastDurationMs() { return lastDurationMs; }
-        public void setLastDurationMs(long lastDurationMs) { this.lastDurationMs = lastDurationMs; }
-        public long getLastHeapUsedBytes() { return lastHeapUsedBytes; }
-        public void setLastHeapUsedBytes(long lastHeapUsedBytes) { this.lastHeapUsedBytes = lastHeapUsedBytes; }
-        public long getLastHeapCommittedBytes() { return lastHeapCommittedBytes; }
-        public void setLastHeapCommittedBytes(long lastHeapCommittedBytes) { this.lastHeapCommittedBytes = lastHeapCommittedBytes; }
-        public long getLastHeapMaxBytes() { return lastHeapMaxBytes; }
-        public void setLastHeapMaxBytes(long lastHeapMaxBytes) { this.lastHeapMaxBytes = lastHeapMaxBytes; }
-        public long getLastCpuTimeMs() { return lastCpuTimeMs; }
-        public void setLastCpuTimeMs(long lastCpuTimeMs) { this.lastCpuTimeMs = lastCpuTimeMs; }
-        public int getLastThreadCount() { return lastThreadCount; }
-        public void setLastThreadCount(int lastThreadCount) { this.lastThreadCount = lastThreadCount; }
-        public String getLastResult() { return lastResult; }
-        public void setLastResult(String lastResult) { this.lastResult = lastResult; }
-        public String getLastStatus() { return lastStatus; }
-        public void setLastStatus(String lastStatus) { this.lastStatus = lastStatus; }
-        public long getCurrentHeapUsedBytes() { return currentHeapUsedBytes; }
-        public void setCurrentHeapUsedBytes(long currentHeapUsedBytes) { this.currentHeapUsedBytes = currentHeapUsedBytes; }
-        public long getCurrentCpuTimeMs() { return currentCpuTimeMs; }
-        public void setCurrentCpuTimeMs(long currentCpuTimeMs) { this.currentCpuTimeMs = currentCpuTimeMs; }
-        public int getCurrentThreadCount() { return currentThreadCount; }
-        public void setCurrentThreadCount(int currentThreadCount) { this.currentThreadCount = currentThreadCount; }
     }
 
     private void refreshMetrics(String taskId, boolean running) {
@@ -972,23 +1014,17 @@ public class TaskSchedulerService {
         metrics.setCurrentThreadCount(THREAD_BEAN.getThreadCount());
     }
 
-    // Whether this instance's worker pool/reconcile loop has actually been
-    // started. Lets a caller (see ui.MainWindow) hold a scheduler object for
-    // read-only access (task list, run history) without it firing anything —
-    // e.g. while a headless Daemon process is the active scheduler for this
-    // data directory — and later promote it to active with a plain start()
-    // call. TaskWorkerPool.start() is only safe to call once per instance
-    // (see its own javadoc), so this flag also guards against a double
-    // start() accidentally tearing that invariant.
-    private volatile boolean started = false;
-
-    /** True once {@link #start()} has actually started the worker pool. */
+    /**
+     * True once {@link #start()} has actually started the worker pool.
+     */
     public boolean isStarted() {
         return started;
     }
 
-    /** Start the event-driven scheduler: worker pool + safety-net reconcile sweep.
-     *  Safe to call more than once — every call after the first is a no-op. */
+    /**
+     * Start the event-driven scheduler: worker pool + safety-net reconcile sweep.
+     * Safe to call more than once — every call after the first is a no-op.
+     */
     public void start() {
         if (started) return;
         started = true;
@@ -1056,7 +1092,9 @@ public class TaskSchedulerService {
         log.info("TaskSchedulerService stopped.");
     }
 
-    /** Immediately execute a task regardless of schedule. */
+    /**
+     * Immediately execute a task regardless of schedule.
+     */
     public void runNow(String taskId) {
         List<ScheduledTask> tasks = storage.loadTasks();
         tasks.stream().filter(t -> t.getId().equals(taskId)).findFirst().ifPresent(t -> {
@@ -1148,7 +1186,10 @@ public class TaskSchedulerService {
             java.util.Set<String> liveIds = new java.util.HashSet<>();
             for (ScheduledTask t : tasks) {
                 liveIds.add(t.getId());
-                try { trackWatchTransition(t); } catch (Exception ignored) {}
+                try {
+                    trackWatchTransition(t);
+                } catch (Exception ignored) {
+                }
             }
             lastEventWatchMode.keySet().retainAll(liveIds);
             everPushed.retainAll(liveIds);
@@ -1169,11 +1210,13 @@ public class TaskSchedulerService {
                                         + "reset so it can be scheduled again.");
                         try {
                             cancelTask(task.getId());
-                        } catch (Exception ignored) {}
+                        } catch (Exception ignored) {
+                        }
                         task.setLastStartedAt(null);
                         task.setLastRunResult("FAILED (stale)");
                         task.setStatus(TaskStatus.PENDING);
-                        if (!storage.saveTaskRunState(task)) logBackendSaveFailure(task, "PENDING status after stale-RUNNING recovery");
+                        if (!storage.saveTaskRunState(task))
+                            logBackendSaveFailure(task, "PENDING status after stale-RUNNING recovery");
                         lastActivityMillis.remove(task.getId());
                         // falls through to get (re)published below
                     } else {
@@ -1323,7 +1366,9 @@ public class TaskSchedulerService {
      * this a DAILY/WEEKLY task re-validated at delivery was judged "not due" and re-armed for ~24 h
      * ("Re-armed scheduled fire — schedule changed since it was queued") and so never ran.
      */
-    /** For the deferral event: how long the run that is holding the task has been going, and on which thread. */
+    /**
+     * For the deferral event: how long the run that is holding the task has been going, and on which thread.
+     */
     private String describeRunInProgress(ScheduledTask task, LocalDateTime now) {
         StringBuilder sb = new StringBuilder("Previous run: ");
         if (task.getLastStartedAt() != null) {
@@ -1335,30 +1380,95 @@ public class TaskSchedulerService {
         }
         Thread runner = runningThreads.get(task.getId());
         if (runner != null) sb.append(" on ").append(runner.getName());
-        else sb.append(" \u2014 but no worker is executing it right now (the status may be stale; the reconcile sweep resets stuck runs)");
+        else
+            sb.append(" \u2014 but no worker is executing it right now (the status may be stale; the reconcile sweep resets stuck runs)");
         return sb.toString();
     }
 
-    private static boolean justDue(LocalDateTime occurrence, LocalDateTime now, LocalDateTime lastRunAt) {
-        if (occurrence.isAfter(now)) return false;
-        if (Duration.between(occurrence, now).toMillis() > DUE_TOLERANCE_MS) return false;
-        return lastRunAt == null || lastRunAt.isBefore(occurrence);
-    }
-
-    private static long millisUntil(LocalDateTime target, LocalDateTime now) {
-        return Math.max(0L, Duration.between(now, target).toMillis());
-    }
-
-    /** Parses "MON", "MONDAY", etc. (case-insensitive, prefix-tolerant) to a DayOfWeek, or null if unrecognized. */
-    private static DayOfWeek parseDayOfWeek(String raw) {
-        if (raw == null || raw.isBlank()) return null;
-        String norm = raw.trim().toUpperCase();
-        for (DayOfWeek d : DayOfWeek.values()) {
-            if (d.name().equals(norm) || d.name().startsWith(norm) || norm.startsWith(d.name().substring(0, 3))) {
-                return d;
+    /**
+     * Records a "picked up by a worker thread, about to run" event for the
+     * Event Monitor — one per task type, not just FILE_TRANSFER, so a
+     * backup or mail job consuming a worker thread shows up in the activity
+     * feed at the moment it starts, not only once it completes (previously
+     * the *only* row for a BACKUP/OUTLOOK_MAIL run was its eventual
+     * completion; there was no historical record of when a run actually
+     * began, only of the eventual outcome).
+     *
+     * <p>Recorded via {@link RunHistoryService#recordActivityEvent} into the
+     * separate {@code event_monitor_history} table rather than
+     * {@code run_history} — see that class's doc comment for why: every
+     * real run also eventually records its own completion row via
+     * {@link #onTaskDue}/{@code executeTask}, so a "started" row living
+     * alongside outcomes would double-count every run in the Statistics
+     * tab's totals and skew the success-rate math.
+     */
+    private void recordStartedEvent(ScheduledTask task, LocalDateTime startedAt) {
+        try {
+            String trigger = RunHistoryService.currentTrigger();
+            String reason;
+            if ("MANUAL".equals(trigger)) {
+                reason = "Started \u2014 manual run (Run Now).";
+            } else if ("RETRY".equals(trigger)) {
+                reason = "Started \u2014 automatic retry after a failed attempt.";
+            } else {
+                reason = "Started \u2014 picked up by a worker thread ("
+                        + workerPool.getActiveWorkerCount() + "/" + workerPool.getWorkerCount() + " busy).";
             }
+            runHistoryService.recordEvent(EventKind.RUN_STARTED, task.getId(), task.getName(),
+                    task.getTaskType().name(), TaskRunRecord.Status.SUCCESS, reason, reason, startedAt, startedAt,
+                    RunHistoryService.currentRunKey(), trigger);
+        } catch (Exception ignored) {
+            // Best-effort — a failure to log the start event shouldn't affect the run itself.
         }
-        return null;
+    }
+
+    private List<FolderWatch.Item> listFolder(ScheduledTask task, java.util.function.Consumer<String> log) throws Exception {
+        String dir = task.getBackupSourcePath() == null ? "" : task.getBackupSourcePath().trim();
+        if (dir.isEmpty()) throw new java.io.IOException("No folder to watch is set on this task.");
+        String credName = task.getBackupSourceUsername() == null ? "" : task.getBackupSourceUsername().trim();
+        if (credName.isEmpty()) return FolderWatch.listLocal(dir);
+        model.Credential cred = transferService.credentialByName(credName, "watch", log);
+        if (cred == null) throw new java.io.IOException("No credential named '" + credName + "'.");
+        try (RemoteFileMetadataServiceFactory.ManagedMetadataService m = new RemoteFileMetadataServiceFactory(storage).create(task, cred)) {
+            List<FolderWatch.Item> out = new ArrayList<>();
+            for (model.RemoteFileMetadata f : m.service().getFilesModifiedAfter(TransferPaths.normalizeRemotePath(dir), java.time.Instant.EPOCH))
+                out.add(new FolderWatch.Item(f.fileName(), f.size(), f.lastModified().toEpochMilli()));
+            return out;
+        }
+    }
+
+    /**
+     * One look at a watched folder: records what is new or changed as events; true unless the folder could not be read.
+     */
+    private boolean runFolderWatch(ScheduledTask task, java.util.function.Consumer<String> log) throws Exception {
+        boolean remote = task.getBackupSourceUsername() != null && !task.getBackupSourceUsername().trim().isEmpty();
+        String where = task.getBackupSourcePath() + (remote ? " (SFTP, " + task.getBackupSourceUsername().trim() + ")" : "");
+        log.accept("[INFO] Watching folder: " + where);
+        FolderWatch.Outcome o = new FolderWatch(storage.getDataDir(), this::listFolder).look(task, log);
+        if (o.baseline()) {
+            log.accept("[INFO] First look: " + o.watching() + " file(s) already there are remembered and not reported.");
+            recordSchedulerEvent(EventKind.WATCH_ARMED, task, TaskRunRecord.Status.SUCCESS,
+                    "Watching " + task.getBackupSourcePath() + " (" + o.watching() + " file(s) already there)",
+                    "Folder: " + where + "\nThe " + o.watching() + " file(s) found now are remembered; only files that appear or change from now on are reported.");
+            return true;
+        }
+        if (!o.added().isEmpty()) {
+            log.accept("[INFO] " + o.added().size() + " new file(s) in " + where);
+            recordFolderFiles(EventKind.FILES_DETECTED, task, o.added(), where, "New file(s)");
+        }
+        if (!o.changed().isEmpty()) {
+            log.accept("[INFO] " + o.changed().size() + " changed file(s) in " + where);
+            recordFolderFiles(EventKind.FILES_CHANGED, task, o.changed(), where, "Changed file(s)");
+        }
+        if (o.resumed()) {
+            recordFileAlert(EventKind.FILES_RESUMED, TaskRunRecord.Status.SUCCESS, task, "Files are arriving again",
+                    "Task:  " + task.getName() + "\nFolder: " + where + "\nNew files were found again, ending the \"no new files\" alert.");
+        }
+        if (o.quiet()) {
+            log.accept("[INFO] Nothing new or changed (" + o.watching() + " file(s) watched).");
+            folderWatchQuiet.put(task.getId(), Boolean.TRUE);
+        }
+        return true;
     }
 
     /**
@@ -1403,98 +1513,15 @@ public class TaskSchedulerService {
      * files led the transfer is now visible before ever needing to click
      * in for the full list (the per-file listing in {@code details} below).
      */
-    /**
-     * Records a "picked up by a worker thread, about to run" event for the
-     * Event Monitor — one per task type, not just FILE_TRANSFER, so a
-     * backup or mail job consuming a worker thread shows up in the activity
-     * feed at the moment it starts, not only once it completes (previously
-     * the *only* row for a BACKUP/OUTLOOK_MAIL run was its eventual
-     * completion; there was no historical record of when a run actually
-     * began, only of the eventual outcome).
-     *
-     * <p>Recorded via {@link RunHistoryService#recordActivityEvent} into the
-     * separate {@code event_monitor_history} table rather than
-     * {@code run_history} — see that class's doc comment for why: every
-     * real run also eventually records its own completion row via
-     * {@link #onTaskDue}/{@code executeTask}, so a "started" row living
-     * alongside outcomes would double-count every run in the Statistics
-     * tab's totals and skew the success-rate math.
-     */
-    private void recordStartedEvent(ScheduledTask task, LocalDateTime startedAt) {
-        try {
-            String trigger = RunHistoryService.currentTrigger();
-            String reason;
-            if ("MANUAL".equals(trigger)) {
-                reason = "Started \u2014 manual run (Run Now).";
-            } else if ("RETRY".equals(trigger)) {
-                reason = "Started \u2014 automatic retry after a failed attempt.";
-            } else {
-                reason = "Started \u2014 picked up by a worker thread ("
-                        + workerPool.getActiveWorkerCount() + "/" + workerPool.getWorkerCount() + " busy).";
-            }
-            runHistoryService.recordEvent(EventKind.RUN_STARTED, task.getId(), task.getName(),
-                    task.getTaskType().name(), TaskRunRecord.Status.SUCCESS, reason, reason, startedAt, startedAt,
-                    RunHistoryService.currentRunKey(), trigger);
-        } catch (Exception ignored) {
-            // Best-effort — a failure to log the start event shouldn't affect the run itself.
-        }
-    }
-
-    /** Tasks whose last look found nothing, so the run is shown as skipped instead of a success. */
-    private final java.util.concurrent.ConcurrentHashMap<String, Boolean> folderWatchQuiet = new java.util.concurrent.ConcurrentHashMap<>();
-
-    private List<FolderWatch.Item> listFolder(ScheduledTask task, java.util.function.Consumer<String> log) throws Exception {
-        String dir = task.getBackupSourcePath() == null ? "" : task.getBackupSourcePath().trim();
-        if (dir.isEmpty()) throw new java.io.IOException("No folder to watch is set on this task.");
-        String credName = task.getBackupSourceUsername() == null ? "" : task.getBackupSourceUsername().trim();
-        if (credName.isEmpty()) return FolderWatch.listLocal(dir);
-        model.Credential cred = transferService.credentialByName(credName, "watch", log);
-        if (cred == null) throw new java.io.IOException("No credential named '" + credName + "'.");
-        try (RemoteFileMetadataServiceFactory.ManagedMetadataService m = new RemoteFileMetadataServiceFactory(storage).create(task, cred)) {
-            List<FolderWatch.Item> out = new ArrayList<>();
-            for (model.RemoteFileMetadata f : m.service().getFilesModifiedAfter(TransferPaths.normalizeRemotePath(dir), java.time.Instant.EPOCH))
-                out.add(new FolderWatch.Item(f.fileName(), f.size(), f.lastModified().toEpochMilli()));
-            return out;
-        }
-    }
-
-    /** One look at a watched folder: records what is new or changed as events; true unless the folder could not be read. */
-    private boolean runFolderWatch(ScheduledTask task, java.util.function.Consumer<String> log) throws Exception {
-        boolean remote = task.getBackupSourceUsername() != null && !task.getBackupSourceUsername().trim().isEmpty();
-        String where = task.getBackupSourcePath() + (remote ? " (SFTP, " + task.getBackupSourceUsername().trim() + ")" : "");
-        log.accept("[INFO] Watching folder: " + where);
-        FolderWatch.Outcome o = new FolderWatch(storage.getDataDir(), this::listFolder).look(task, log);
-        if (o.baseline()) {
-            log.accept("[INFO] First look: " + o.watching() + " file(s) already there are remembered and not reported.");
-            recordSchedulerEvent(EventKind.WATCH_ARMED, task, TaskRunRecord.Status.SUCCESS,
-                    "Watching " + task.getBackupSourcePath() + " (" + o.watching() + " file(s) already there)",
-                    "Folder: " + where + "\nThe " + o.watching() + " file(s) found now are remembered; only files that appear or change from now on are reported.");
-            return true;
-        }
-        if (!o.added().isEmpty()) {
-            log.accept("[INFO] " + o.added().size() + " new file(s) in " + where);
-            recordFolderFiles(EventKind.FILES_DETECTED, task, o.added(), where, "New file(s)");
-        }
-        if (!o.changed().isEmpty()) {
-            log.accept("[INFO] " + o.changed().size() + " changed file(s) in " + where);
-            recordFolderFiles(EventKind.FILES_CHANGED, task, o.changed(), where, "Changed file(s)");
-        }
-        if (o.resumed()) {
-            recordFileAlert(EventKind.FILES_RESUMED, TaskRunRecord.Status.SUCCESS, task, "Files are arriving again",
-                    "Task:  " + task.getName() + "\nFolder: " + where + "\nNew files were found again, ending the \"no new files\" alert.");
-        }
-        if (o.quiet()) {
-            log.accept("[INFO] Nothing new or changed (" + o.watching() + " file(s) watched).");
-            folderWatchQuiet.put(task.getId(), Boolean.TRUE);
-        }
-        return true;
-    }
 
     private void recordFolderFiles(EventKind kind, ScheduledTask task, List<FolderWatch.Item> files, String where, String title) {
         StringBuilder names = new StringBuilder();
         int shown = 0;
         for (FolderWatch.Item f : files) {
-            if (shown >= 5) { names.append(", +").append(files.size() - shown).append(" more"); break; }
+            if (shown >= 5) {
+                names.append(", +").append(files.size() - shown).append(" more");
+                break;
+            }
             if (shown++ > 0) names.append(", ");
             names.append(f.name()).append(" (").append(TransferService.humanReadableBytes(Math.max(f.size(), 0))).append(')');
         }
@@ -1652,7 +1679,8 @@ public class TaskSchedulerService {
                 final LocalDateTime prevStartedAt = task.getLastStartedAt();
                 task.setStatus(TaskStatus.RUNNING);
                 task.setLastStartedAt(now);
-                if (!storage.saveTaskRunState(task)) logBackendSaveFailure(task, "RUNNING status at event-triggered run start");
+                if (!storage.saveTaskRunState(task))
+                    logBackendSaveFailure(task, "RUNNING status at event-triggered run start");
                 refreshMetrics(task.getId(), true);
                 recordStartedEvent(task, now);
                 lockSkipped.remove();
@@ -1672,14 +1700,18 @@ public class TaskSchedulerService {
         });
     }
 
-    /** Public: publish/refresh due-events for all tasks immediately — called
+    /**
+     * Public: publish/refresh due-events for all tasks immediately — called
      * by the UI on the EDT after every save/edit/delete so changes take
-     * effect right away instead of waiting for the next reconcile sweep. */
+     * effect right away instead of waiting for the next reconcile sweep.
+     */
     public void refresh() {
         reconcileSchedules();
     }
 
-    /** Attempt to cancel a task: removes its pending queue event and cancels running future if present. */
+    /**
+     * Attempt to cancel a task: removes its pending queue event and cancels running future if present.
+     */
     public boolean cancelTask(String taskId) {
         boolean pendingRemoved = eventQueue.cancel(taskId);
         boolean cancelledAny = pendingRemoved;
@@ -1693,7 +1725,8 @@ public class TaskSchedulerService {
         // Also attempt to terminate any external process associated with the task
         try {
             if (transferService != null) transferService.cancelRunningTask(taskId);
-        } catch (Exception ignored) {}
+        } catch (Exception ignored) {
+        }
         if (cancelledAny) {
             ScheduledTask t = lookupTask(taskId);
             recordSchedulerEvent(EventKind.RUN_CANCELLED, taskId,
@@ -1718,7 +1751,9 @@ public class TaskSchedulerService {
         return transferService != null ? transferService.getActiveSessionCount(taskId) : 0;
     }
 
-    /** Total WinSCP/SFTP sessions open across every task right now. */
+    /**
+     * Total WinSCP/SFTP sessions open across every task right now.
+     */
     public int getTotalActiveSessionCount() {
         return transferService != null ? transferService.getTotalActiveSessionCount() : 0;
     }
@@ -1759,10 +1794,10 @@ public class TaskSchedulerService {
 
     /**
      * @param changedFileNames filenames the watch layer actually observed changing
-     *     for this run (empty if this is an ordinary scheduled/manual run, or the
-     *     watcher only knows "something changed" — e.g. an OVERFLOW event). Passed
-     *     straight through to {@link TransferService#executeTransfer(ScheduledTask,
-     *     java.util.function.Consumer, java.util.Set)} — see that method for how it's used.
+     *                         for this run (empty if this is an ordinary scheduled/manual run, or the
+     *                         watcher only knows "something changed" — e.g. an OVERFLOW event). Passed
+     *                         straight through to {@link TransferService#executeTransfer(ScheduledTask,
+     *                         java.util.function.Consumer, java.util.Set)} — see that method for how it's used.
      */
     private void executeTask(ScheduledTask task, java.util.Set<String> changedFileNames) {
         // onTaskDue already opened a run context (and recorded "Started") for scheduled and
@@ -1851,231 +1886,201 @@ public class TaskSchedulerService {
                     TaskRunRecord.Status.SKIPPED, reason, reason, runStartedAt, LocalDateTime.now());
             pendingOutcomeNote.set(reason);
             lockSkipped.set(true);
-            try { lockChannel.close(); } catch (IOException ignored) {}
-            try { runningThreads.remove(task.getId()); } catch (Exception ignored) {}
+            try {
+                lockChannel.close();
+            } catch (IOException ignored) {
+            }
+            try {
+                runningThreads.remove(task.getId());
+            } catch (Exception ignored) {
+            }
             lastActivityMillis.remove(task.getId());
             return;
         }
 
         try {
-        emitCap.accept("=== Starting task: " + task.getName() + " ===");
-        emitCap.accept("[DEBUG] Task ID: " + task.getId());
-        emitCap.accept("[DEBUG] Task Type: " + task.getTaskType());
-        emitCap.accept("[DEBUG] Schedule Type: " + task.getScheduleType());
-        if (task.getTaskType() == ScheduledTask.TaskType.FILE_TRANSFER) {
-            // Transfer Mode only applies to file-transfer tasks — logging it
-            // unconditionally printed a leftover/default value for every
-            // mail task too, which was just noise (and misleading, since
-            // that field isn't actually used for anything on mail tasks).
-            emitCap.accept("[DEBUG] Transfer Mode: " + (task.getTransferMode() != null ? task.getTransferMode().name() : "NULL"));
-        }
-        
-        boolean success;
-        boolean skipped = false;
-        String skipReason = null;
-        String failureReason = null;
-        try {
-            switch (task.getTaskType()) {
-                case FILE_TRANSFER:
-                    try {
-                        // Real wall-clock scan time, not the "now == now"
-                        // placeholder recordDetectionEvent used to stamp for
-                        // both its startedAt and endedAt (always showing a
-                        // 0-duration "detection" no matter how long the
-                        // remote directory listing actually took). Captured
-                        // here, just before the scan/listing begins inside
-                        // executeTransfer, rather than inside the callback
-                        // itself (which only fires once the scan is already
-                        // done and files are known).
-                        final LocalDateTime detectionScanStart = LocalDateTime.now();
-                        transferService.setDetectionCallback(files -> recordDetectionEvent(task, files, detectionScanStart));
-                        success = transferService.executeTransfer(task, emitCap, changedFileNames);
-                    }
-                    catch (TransferService.WatcherSkipException e) {
-                        emitCap.accept("[INFO] Inbound watcher skipped transfer: " + e.getMessage());
-                        success = true;
-                        skipped = true;
-                        skipReason = e.getMessage();
-                    }
-                    break;
-                case OUTLOOK_MAIL:
-                    try {
-                        success = transferService.executeImapMailTask(task, emitCap);
-                    }
-                    catch (TransferService.WatcherSkipException e) {
-                        emitCap.accept("[INFO] Mail watcher skipped run: " + e.getMessage());
-                        success = true;
-                        skipped = true;
-                        skipReason = e.getMessage();
-                    }
-                    break;
-                case BACKUP:
-                    success = transferService.executeBackup(task, emitCap);
-                    break;
-                case FOLDER_WATCH:
-                    try {
-                        success = runFolderWatch(task, emitCap);
-                        if (success && folderWatchQuiet.remove(task.getId()) != null) {
+            emitCap.accept("=== Starting task: " + task.getName() + " ===");
+            emitCap.accept("[DEBUG] Task ID: " + task.getId());
+            emitCap.accept("[DEBUG] Task Type: " + task.getTaskType());
+            emitCap.accept("[DEBUG] Schedule Type: " + task.getScheduleType());
+            if (task.getTaskType() == ScheduledTask.TaskType.FILE_TRANSFER) {
+                // Transfer Mode only applies to file-transfer tasks — logging it
+                // unconditionally printed a leftover/default value for every
+                // mail task too, which was just noise (and misleading, since
+                // that field isn't actually used for anything on mail tasks).
+                emitCap.accept("[DEBUG] Transfer Mode: " + (task.getTransferMode() != null ? task.getTransferMode().name() : "NULL"));
+            }
+
+            boolean success;
+            boolean skipped = false;
+            String skipReason = null;
+            String failureReason = null;
+            try {
+                switch (task.getTaskType()) {
+                    case FILE_TRANSFER:
+                        try {
+                            // Real wall-clock scan time, not the "now == now"
+                            // placeholder recordDetectionEvent used to stamp for
+                            // both its startedAt and endedAt (always showing a
+                            // 0-duration "detection" no matter how long the
+                            // remote directory listing actually took). Captured
+                            // here, just before the scan/listing begins inside
+                            // executeTransfer, rather than inside the callback
+                            // itself (which only fires once the scan is already
+                            // done and files are known).
+                            final LocalDateTime detectionScanStart = LocalDateTime.now();
+                            transferService.setDetectionCallback(files -> recordDetectionEvent(task, files, detectionScanStart));
+                            success = transferService.executeTransfer(task, emitCap, changedFileNames);
+                        } catch (TransferService.WatcherSkipException e) {
+                            emitCap.accept("[INFO] Inbound watcher skipped transfer: " + e.getMessage());
+                            success = true;
                             skipped = true;
-                            skipReason = "No new or changed files";
+                            skipReason = e.getMessage();
                         }
-                    } catch (Exception e) {
-                        emitCap.accept("[ERROR] Could not look at the folder: " + e.getMessage());
-                        failureReason = "Could not look at the folder: " + e.getMessage();
+                        break;
+                    case OUTLOOK_MAIL:
+                        try {
+                            success = transferService.executeImapMailTask(task, emitCap);
+                        } catch (TransferService.WatcherSkipException e) {
+                            emitCap.accept("[INFO] Mail watcher skipped run: " + e.getMessage());
+                            success = true;
+                            skipped = true;
+                            skipReason = e.getMessage();
+                        }
+                        break;
+                    case BACKUP:
+                        success = transferService.executeBackup(task, emitCap);
+                        break;
+                    case FOLDER_WATCH:
+                        try {
+                            success = runFolderWatch(task, emitCap);
+                            if (success && folderWatchQuiet.remove(task.getId()) != null) {
+                                skipped = true;
+                                skipReason = "No new or changed files";
+                            }
+                        } catch (Exception e) {
+                            emitCap.accept("[ERROR] Could not look at the folder: " + e.getMessage());
+                            failureReason = "Could not look at the folder: " + e.getMessage();
+                            success = false;
+                        }
+                        break;
+                    default:
+                        emitCap.accept("[ERROR] Unknown task type: " + task.getTaskType());
                         success = false;
-                    }
-                    break;
-                default:
-                    emitCap.accept("[ERROR] Unknown task type: " + task.getTaskType());
-                    success = false;
-                    failureReason = "Unknown task type: " + task.getTaskType();
+                        failureReason = "Unknown task type: " + task.getTaskType();
+                }
+            } catch (Exception e) {
+                emitCap.accept("[ERROR] Unexpected error: " + e.getMessage());
+                e.printStackTrace();
+                success = false;
+                failureReason = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
+            } finally {
+                transferService.clearDetectionCallback();
             }
-        } catch (Exception e) {
-            emitCap.accept("[ERROR] Unexpected error: " + e.getMessage());
-            e.printStackTrace();
-            success = false;
-            failureReason = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
-        } finally {
-            transferService.clearDetectionCallback();
-        }
 
-        if (!success && task.getRetryCount() > 0) {
-            String retryReason = failureReason != null ? failureReason : lastErrorLine(runLog.toString());
-            emitCap.accept("[INFO] Task failed and will be retried " + task.getRetryCount() + " time(s).\n");
-            runHistoryService.recordRun(task.getId(), task.getName(), task.getTaskType().name(),
-                    TaskRunRecord.Status.FAILED, retryReason, runLog.toString(), runStartedAt, LocalDateTime.now());
-            recordSchedulerEvent(EventKind.RETRY_SCHEDULED, task, TaskRunRecord.Status.SUCCESS,
-                    "Run failed \u2014 retrying in 5s (" + task.getRetryCount() + " retry attempt(s) left)",
-                    "Failure: " + retryReason);
-            pendingErrored.set(true);
-            pendingOutcomeNote.set(retryReason + " (will retry)");
-            task.setStatus(TaskStatus.RETRYING);
-            task.setLastStartedAt(null);
-            if (!storage.saveTaskRunState(task)) logBackendSaveFailure(task, "RETRYING status before scheduled retry");
-            lastActivityMillis.remove(task.getId());
-            scheduler.schedule(() -> retryTask(task), 5, TimeUnit.SECONDS);
-            return;
-        }
+            if (!success && task.getRetryCount() > 0) {
+                String retryReason = failureReason != null ? failureReason : lastErrorLine(runLog.toString());
+                emitCap.accept("[INFO] Task failed and will be retried " + task.getRetryCount() + " time(s).\n");
+                runHistoryService.recordRun(task.getId(), task.getName(), task.getTaskType().name(),
+                        TaskRunRecord.Status.FAILED, retryReason, runLog.toString(), runStartedAt, LocalDateTime.now());
+                recordSchedulerEvent(EventKind.RETRY_SCHEDULED, task, TaskRunRecord.Status.SUCCESS,
+                        "Run failed \u2014 retrying in 5s (" + task.getRetryCount() + " retry attempt(s) left)",
+                        "Failure: " + retryReason);
+                pendingErrored.set(true);
+                pendingOutcomeNote.set(retryReason + " (will retry)");
+                task.setStatus(TaskStatus.RETRYING);
+                task.setLastStartedAt(null);
+                if (!storage.saveTaskRunState(task))
+                    logBackendSaveFailure(task, "RETRYING status before scheduled retry");
+                lastActivityMillis.remove(task.getId());
+                scheduler.schedule(() -> retryTask(task), 5, TimeUnit.SECONDS);
+                return;
+            }
 
-        // Persist result
-        final boolean finalSuccess = success;
-        final boolean finalSkipped = skipped;
-        List<ScheduledTask> tasks = storage.loadTasks();
-        tasks.stream().filter(t -> t.getId().equals(task.getId())).findFirst().ifPresent(t -> {
-            t.setLastRunAt(LocalDateTime.now());
+            // Persist result
+            final boolean finalSuccess = success;
+            final boolean finalSkipped = skipped;
+            List<ScheduledTask> tasks = storage.loadTasks();
+            tasks.stream().filter(t -> t.getId().equals(task.getId())).findFirst().ifPresent(t -> {
+                t.setLastRunAt(LocalDateTime.now());
+                if (finalSkipped) {
+                    t.setLastRunResult("SKIPPED");
+                } else {
+                    t.setLastRunResult(finalSuccess ? "SUCCESS" : "FAILED");
+                }
+                // For recurring tasks, reset to PENDING if successful so they can run again
+                if ((!finalSkipped && finalSuccess && (t.getScheduleType() == ScheduleType.INTERVAL_MINUTES
+                        || t.getScheduleType() == ScheduleType.INTERVAL_SECONDS))
+                        || finalSkipped) {
+                    t.setStatus(TaskStatus.PENDING);
+                    emit(task, "[INFO] Task reset to PENDING for next scheduled run");
+                } else {
+                    t.setStatus(finalSuccess ? TaskStatus.SUCCESS : TaskStatus.FAILED);
+                }
+                if (!storage.saveTaskRunState(t)) logBackendSaveFailure(t, "run result/status after completion");
+                // Publish the task's next occurrence immediately — this is what
+                // eliminates the old "wait for the next shared poll tick" delay.
+                // Works uniformly for every schedule type: computeNextFireDelayMs
+                // returns null (nothing to publish) for schedule types with no
+                // future occurrence, e.g. a ONCE task that just ran.
+                if (t.getStatus() != TaskStatus.DISABLED) {
+                    publishNextOccurrence(t, LocalDateTime.now());
+                }
+            });
+
+            LocalDateTime runEndedAt = LocalDateTime.now();
+            TaskRunRecord.Status historyStatus = finalSkipped ? TaskRunRecord.Status.SKIPPED
+                    : (finalSuccess ? TaskRunRecord.Status.SUCCESS : TaskRunRecord.Status.FAILED);
+            String historyReason;
             if (finalSkipped) {
-                t.setLastRunResult("SKIPPED");
+                historyReason = skipReason != null ? skipReason : "Skipped (no specific reason captured).";
+            } else if (finalSuccess) {
+                historyReason = lastInfoLine(runLog.toString());
             } else {
-                t.setLastRunResult(finalSuccess ? "SUCCESS" : "FAILED");
+                historyReason = failureReason != null ? failureReason : lastErrorLine(runLog.toString());
             }
-            // For recurring tasks, reset to PENDING if successful so they can run again
-            if ((!finalSkipped && finalSuccess && (t.getScheduleType() == ScheduleType.INTERVAL_MINUTES
-                    || t.getScheduleType() == ScheduleType.INTERVAL_SECONDS))
-                    || finalSkipped) {
-                t.setStatus(TaskStatus.PENDING);
-                emit(task, "[INFO] Task reset to PENDING for next scheduled run");
-            } else {
-                t.setStatus(finalSuccess ? TaskStatus.SUCCESS : TaskStatus.FAILED);
+            runHistoryService.recordRun(task.getId(), task.getName(), task.getTaskType().name(),
+                    historyStatus, historyReason, runLog.toString(), runStartedAt, runEndedAt);
+            // The last automatic retry just failed too (it ran with no retries left, so it took this
+            // normal failure path rather than scheduling another) — say so explicitly, since otherwise
+            // the feed only shows one more ordinary failure and the end of the retry chain is invisible.
+            if (historyStatus == TaskRunRecord.Status.FAILED && "RETRY".equals(RunHistoryService.currentTrigger())) {
+                recordSchedulerEvent(EventKind.RETRIES_EXHAUSTED, task, TaskRunRecord.Status.FAILED,
+                        "All retry attempts used \u2014 task marked FAILED",
+                        "The task failed and every configured automatic retry also failed. It stays FAILED until it is re-run or edited.");
             }
-            if (!storage.saveTaskRunState(t)) logBackendSaveFailure(t, "run result/status after completion");
-            // Publish the task's next occurrence immediately — this is what
-            // eliminates the old "wait for the next shared poll tick" delay.
-            // Works uniformly for every schedule type: computeNextFireDelayMs
-            // returns null (nothing to publish) for schedule types with no
-            // future occurrence, e.g. a ONCE task that just ran.
-            if (t.getStatus() != TaskStatus.DISABLED) {
-                publishNextOccurrence(t, LocalDateTime.now());
+            if (finalSkipped || !finalSuccess) {
+                pendingErrored.set(!finalSkipped && !finalSuccess);
+                pendingOutcomeNote.set(historyReason);
             }
-        });
 
-        LocalDateTime runEndedAt = LocalDateTime.now();
-        TaskRunRecord.Status historyStatus = finalSkipped ? TaskRunRecord.Status.SKIPPED
-                : (finalSuccess ? TaskRunRecord.Status.SUCCESS : TaskRunRecord.Status.FAILED);
-        String historyReason;
-        if (finalSkipped) {
-            historyReason = skipReason != null ? skipReason : "Skipped (no specific reason captured).";
-        } else if (finalSuccess) {
-            historyReason = lastInfoLine(runLog.toString());
-        } else {
-            historyReason = failureReason != null ? failureReason : lastErrorLine(runLog.toString());
-        }
-        runHistoryService.recordRun(task.getId(), task.getName(), task.getTaskType().name(),
-                historyStatus, historyReason, runLog.toString(), runStartedAt, runEndedAt);
-        // The last automatic retry just failed too (it ran with no retries left, so it took this
-        // normal failure path rather than scheduling another) — say so explicitly, since otherwise
-        // the feed only shows one more ordinary failure and the end of the retry chain is invisible.
-        if (historyStatus == TaskRunRecord.Status.FAILED && "RETRY".equals(RunHistoryService.currentTrigger())) {
-            recordSchedulerEvent(EventKind.RETRIES_EXHAUSTED, task, TaskRunRecord.Status.FAILED,
-                    "All retry attempts used \u2014 task marked FAILED",
-                    "The task failed and every configured automatic retry also failed. It stays FAILED until it is re-run or edited.");
-        }
-        if (finalSkipped || !finalSuccess) {
-            pendingErrored.set(!finalSkipped && !finalSuccess);
-            pendingOutcomeNote.set(historyReason);
-        }
-
-        emit(task, "=== Task " + task.getName() + " finished: " + (success ? "SUCCESS" : "FAILED") + " ===");
-        task.setLastStartedAt(null);
-        long durationMs = (System.nanoTime() - startNanos) / 1_000_000;
-        long cpuMs = THREAD_BEAN.isCurrentThreadCpuTimeSupported() ? (THREAD_BEAN.getCurrentThreadCpuTime() - startCpuNanos) / 1_000_000 : 0L;
-        recordMetricsOnComplete(task.getId(), success, durationMs, cpuMs);
-        // Clean up running future mapping
-        try { runningThreads.remove(task.getId()); } catch (Exception ignored) {}
-        lastActivityMillis.remove(task.getId());
+            emit(task, "=== Task " + task.getName() + " finished: " + (success ? "SUCCESS" : "FAILED") + " ===");
+            task.setLastStartedAt(null);
+            long durationMs = (System.nanoTime() - startNanos) / 1_000_000;
+            long cpuMs = THREAD_BEAN.isCurrentThreadCpuTimeSupported() ? (THREAD_BEAN.getCurrentThreadCpuTime() - startCpuNanos) / 1_000_000 : 0L;
+            recordMetricsOnComplete(task.getId(), success, durationMs, cpuMs);
+            // Clean up running future mapping
+            try {
+                runningThreads.remove(task.getId());
+            } catch (Exception ignored) {
+            }
+            lastActivityMillis.remove(task.getId());
         } finally {
             // Always release the cross-process lock, however this run ended
             // (normal completion, exception, or the early "retry scheduled" return).
             if (fileLock != null) {
-                try { fileLock.release(); } catch (IOException ignored) {}
+                try {
+                    fileLock.release();
+                } catch (IOException ignored) {
+                }
             }
             if (lockChannel != null) {
-                try { lockChannel.close(); } catch (IOException ignored) {}
+                try {
+                    lockChannel.close();
+                } catch (IOException ignored) {
+                }
             }
         }
-    }
-
-    /** Last "[ERROR] ..." line in a captured run log, with the tag stripped — or a generic fallback. */
-    private static String lastErrorLine(String runLogText) {
-        String[] lines = runLogText.split("\n");
-        for (int i = lines.length - 1; i >= 0; i--) {
-            String l = lines[i].trim();
-            if (l.startsWith("[ERROR]")) return l.substring("[ERROR]".length()).trim();
-        }
-        return "Failed — see run details for the full log.";
-    }
-
-    /**
-     * Last "[INFO] ..." line in a captured run log (skipping boilerplate
-     * start/debug lines), with the tag stripped — used as the run's
-     * one-line summary shown both in the Event Monitor row and as the Logs
-     * tab's Reason column.
-     *
-     * <p>Prefers a "Transfer summary: ..." line if the log has one,
-     * regardless of whether it's truly the last INFO line. FILE_TRANSFER
-     * runs that also copy to additional destination folders
-     * (see TransferService#copyDownloadedFilesToExtraFolders) log their own
-     * per-file "[INFO] Copied ..." lines *after* the transfer summary line,
-     * which used to bury it — the row would then show something like
-     * "Copied invoice_04.csv to extra folder" instead of the actual
-     * files/bytes/batches/sessions/threads summary. Falling back to
-     * "true last INFO line" for every other task type/shape keeps this safe
-     * for logs that never emit a transfer summary at all.
-     */
-    private static String lastInfoLine(String runLogText) {
-        String[] lines = runLogText.split("\n");
-        for (String rawLine : lines) {
-            String l = rawLine.trim();
-            if (l.startsWith("[INFO] Transfer summary:")) {
-                return l.substring("[INFO]".length()).trim();
-            }
-        }
-        for (int i = lines.length - 1; i >= 0; i--) {
-            String l = lines[i].trim();
-            if (l.startsWith("[INFO]") && !l.startsWith("[INFO] Task reset to PENDING")) {
-                return l.substring("[INFO]".length()).trim();
-            }
-        }
-        return "Completed successfully.";
     }
 
     private void retryTask(ScheduledTask task) {
@@ -2106,7 +2111,187 @@ public class TaskSchedulerService {
         logService.log(taskId, taskName, line);
         if (logCallback != null) {
             logCallback.accept(taskId, LocalDateTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"))
-                + "  " + line);
+                    + "  " + line);
         }
     }
+
+    /**
+     * Best-effort write of one structured event to the Event Monitor feed.
+     * Never throws and never affects scheduling — a failure to log must not
+     * change what the scheduler does. The run key comes from the calling
+     * thread's run context if it has one, else from the task's in-flight run.
+     */
+    // ── Watcher groups ───────────────────────────────────────────────────
+    // A watcher is not a run, but its events belong together: "armed", the SSH session it keeps open, and the
+    // eventual "closed" / "lost". They share one group key so the Event Monitor shows them as one Watcher row.
+    private enum WatchStep {OPEN, KEEP, END}
+
+    /**
+     * How a watcher-enabled task is currently being triggered — for UI display only.
+     */
+    public enum WatchMode {
+        /**
+         * OUTBOUND task with a live OS-level directory watch registered — instant.
+         */
+        NATIVE_WATCH,
+        /**
+         * INBOUND task with a live remote push listener (inotifywait on Linux,
+         * PowerShell FileSystemWatcher on Windows) — instant.
+         */
+        REMOTE_PUSH,
+        /**
+         * No push mechanism currently active; relying solely on the scheduled poll interval.
+         */
+        POLLING_ONLY,
+        /**
+         * Push was attempted for this task but the remote host doesn't support it
+         * (no inotify-tools, or exec refused) — same as POLLING_ONLY but distinguishes
+         * "tried and can't" from "not applicable yet" for the UI.
+         */
+        POLLING_ONLY_UNSUPPORTED,
+        /**
+         * Not a watcher-enabled FILE_TRANSFER task.
+         */
+        NOT_APPLICABLE
+    }
+
+    private static final class WatchGroup {
+        final String key;
+        boolean ended;
+
+        WatchGroup(String k) {
+            key = k;
+        }
+    }
+
+    /**
+     * {@code mode} plus a short human-readable {@code detail} explaining *why*
+     * — critical for telling "never attempted" apart from "tried and this is
+     * exactly what went wrong" apart from "confirmed working". See
+     * {@link #getWatchStatus}.
+     */
+    public record WatchStatus(WatchMode mode, String detail) {
+    }
+
+    public static class TaskMetrics {
+        private final String taskId;
+        private volatile boolean running;
+        private volatile long lastDurationMs;
+        private volatile long lastHeapUsedBytes;
+        private volatile long lastHeapCommittedBytes;
+        private volatile long lastHeapMaxBytes;
+        private volatile long lastCpuTimeMs;
+        private volatile int lastThreadCount;
+        private volatile String lastResult = "Unknown";
+        private volatile String lastStatus = "UNKNOWN";
+        private volatile long currentHeapUsedBytes;
+        private volatile long currentCpuTimeMs;
+        private volatile int currentThreadCount;
+
+        public TaskMetrics(String taskId) {
+            this.taskId = taskId;
+        }
+
+        public String getTaskId() {
+            return taskId;
+        }
+
+        public boolean isRunning() {
+            return running;
+        }
+
+        public void setRunning(boolean running) {
+            this.running = running;
+        }
+
+        public long getLastDurationMs() {
+            return lastDurationMs;
+        }
+
+        public void setLastDurationMs(long lastDurationMs) {
+            this.lastDurationMs = lastDurationMs;
+        }
+
+        public long getLastHeapUsedBytes() {
+            return lastHeapUsedBytes;
+        }
+
+        public void setLastHeapUsedBytes(long lastHeapUsedBytes) {
+            this.lastHeapUsedBytes = lastHeapUsedBytes;
+        }
+
+        public long getLastHeapCommittedBytes() {
+            return lastHeapCommittedBytes;
+        }
+
+        public void setLastHeapCommittedBytes(long lastHeapCommittedBytes) {
+            this.lastHeapCommittedBytes = lastHeapCommittedBytes;
+        }
+
+        public long getLastHeapMaxBytes() {
+            return lastHeapMaxBytes;
+        }
+
+        public void setLastHeapMaxBytes(long lastHeapMaxBytes) {
+            this.lastHeapMaxBytes = lastHeapMaxBytes;
+        }
+
+        public long getLastCpuTimeMs() {
+            return lastCpuTimeMs;
+        }
+
+        public void setLastCpuTimeMs(long lastCpuTimeMs) {
+            this.lastCpuTimeMs = lastCpuTimeMs;
+        }
+
+        public int getLastThreadCount() {
+            return lastThreadCount;
+        }
+
+        public void setLastThreadCount(int lastThreadCount) {
+            this.lastThreadCount = lastThreadCount;
+        }
+
+        public String getLastResult() {
+            return lastResult;
+        }
+
+        public void setLastResult(String lastResult) {
+            this.lastResult = lastResult;
+        }
+
+        public String getLastStatus() {
+            return lastStatus;
+        }
+
+        public void setLastStatus(String lastStatus) {
+            this.lastStatus = lastStatus;
+        }
+
+        public long getCurrentHeapUsedBytes() {
+            return currentHeapUsedBytes;
+        }
+
+        public void setCurrentHeapUsedBytes(long currentHeapUsedBytes) {
+            this.currentHeapUsedBytes = currentHeapUsedBytes;
+        }
+
+        public long getCurrentCpuTimeMs() {
+            return currentCpuTimeMs;
+        }
+
+        public void setCurrentCpuTimeMs(long currentCpuTimeMs) {
+            this.currentCpuTimeMs = currentCpuTimeMs;
+        }
+
+        public int getCurrentThreadCount() {
+            return currentThreadCount;
+        }
+
+        public void setCurrentThreadCount(int currentThreadCount) {
+            this.currentThreadCount = currentThreadCount;
+        }
+    }
+
+
 }

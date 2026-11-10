@@ -21,12 +21,12 @@ public final class SshAuth {
 
     public static final String KEY_PREFIX = "key:";
 
-    private SshAuth() {}
+    private SshAuth() {
+    }
 
-    /** Parsed key reference. */
-    public record KeyRef(String path, String passphrase) {}
-
-    /** The key reference in {@code secret}, or null if it is a plain password. */
+    /**
+     * The key reference in {@code secret}, or null if it is a plain password.
+     */
     public static KeyRef parse(String secret) {
         if (secret == null || !secret.regionMatches(true, 0, KEY_PREFIX, 0, KEY_PREFIX.length())) return null;
         String rest = secret.substring(KEY_PREFIX.length()).trim();
@@ -39,7 +39,9 @@ public final class SshAuth {
         return rest.isEmpty() ? null : new KeyRef(rest, pass == null || pass.isEmpty() ? null : pass);
     }
 
-    /** Call after {@code jsch.getSession(...)} and before {@code session.connect(...)}. */
+    /**
+     * Call after {@code jsch.getSession(...)} and before {@code session.connect(...)}.
+     */
     public static void apply(JSch jsch, Session session, String secret) throws JSchException {
         KeyRef k = parse(secret);
         if (k == null) {
@@ -52,5 +54,11 @@ public final class SshAuth {
         if (k.passphrase() == null) jsch.addIdentity(k.path());
         else jsch.addIdentity(k.path(), k.passphrase());
         session.setConfig("PreferredAuthentications", "publickey");
+    }
+
+    /**
+     * Parsed key reference.
+     */
+    public record KeyRef(String path, String passphrase) {
     }
 }

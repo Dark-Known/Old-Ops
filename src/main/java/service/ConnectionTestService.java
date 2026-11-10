@@ -19,23 +19,10 @@ import java.util.Properties;
  */
 public final class ConnectionTestService {
 
-    private ConnectionTestService() {}
-
     private static final int DEFAULT_PORT = 22;
     private static final int CONNECT_TIMEOUT_MS = 8_000;
     private static final int CHANNEL_TIMEOUT_MS = 6_000;
-
-    /** Outcome of a single test attempt. */
-    public static final class Result {
-        public final boolean success;
-        public final String message;
-        public final long elapsedMs;
-
-        public Result(boolean success, String message, long elapsedMs) {
-            this.success   = success;
-            this.message   = message;
-            this.elapsedMs = elapsedMs;
-        }
+    private ConnectionTestService() {
     }
 
     public static Result testSftp(String host, String username, String password) {
@@ -79,7 +66,8 @@ public final class ConnectionTestService {
                     "Authenticated over SFTP. Home directory: " + home, elapsed);
 
         } catch (Exception ex) {
-            if (!opened) SshSessionEvents.uiFailed("Test connection", host.trim(), username.trim(), describeFailure(ex));
+            if (!opened)
+                SshSessionEvents.uiFailed("Test connection", host.trim(), username.trim(), describeFailure(ex));
             long elapsed = System.currentTimeMillis() - start;
             return new Result(false, describeFailure(ex), elapsed);
         } finally {
@@ -90,7 +78,9 @@ public final class ConnectionTestService {
         }
     }
 
-    /** Turns a raw JSch/IO exception into a short, human-readable reason. */
+    /**
+     * Turns a raw JSch/IO exception into a short, human-readable reason.
+     */
     private static String describeFailure(Exception ex) {
         String raw = ex.getMessage() != null ? ex.getMessage() : ex.getClass().getSimpleName();
         String lower = raw.toLowerCase();
@@ -108,5 +98,20 @@ public final class ConnectionTestService {
             return "Could not reach host on port 22 — check firewall / SSH service status.";
         }
         return "Connection failed: " + raw;
+    }
+
+    /**
+     * Outcome of a single test attempt.
+     */
+    public static final class Result {
+        public final boolean success;
+        public final String message;
+        public final long elapsedMs;
+
+        public Result(boolean success, String message, long elapsedMs) {
+            this.success = success;
+            this.message = message;
+            this.elapsedMs = elapsedMs;
+        }
     }
 }

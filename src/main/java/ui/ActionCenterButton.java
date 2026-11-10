@@ -50,10 +50,9 @@ public class ActionCenterButton extends JPanel {
 
     private final JLabel dot = new JLabel();
     private final JLabel countLabel = new JLabel();
-
-    private JDialog popup;
     private final javax.swing.Timer pollTimer;
     private final java.util.function.Consumer<TaskRunRecord> runListener;
+    private JDialog popup;
 
     public ActionCenterButton(XmlStorageService storage, TaskSchedulerService scheduler, WatchStatusMonitor watchStatusMonitor) {
         this.storage = storage;
@@ -84,7 +83,10 @@ public class ActionCenterButton extends JPanel {
         add(countLabel);
 
         MouseAdapter toggle = new MouseAdapter() {
-            @Override public void mouseClicked(MouseEvent e) { togglePopup(); }
+            @Override
+            public void mouseClicked(MouseEvent e) {
+                togglePopup();
+            }
         };
         addMouseListener(toggle);
         bellText.addMouseListener(toggle);
@@ -105,8 +107,62 @@ public class ActionCenterButton extends JPanel {
         }
     }
 
-    /** Stops the internal poll timer, detaches the run listener, and closes any open popup —
-     *  call before discarding an instance (e.g. on a UI rebuild), so rebuilds don't stack duplicates. */
+    private static double successRate(service.RunHistoryService history, LocalDateTime from, LocalDateTime to) {
+        int ok = history.queryRuns(null, TaskRunRecord.Status.SUCCESS, from, to, QUERY_LIMIT).size();
+        int bad = history.queryRuns(null, TaskRunRecord.Status.FAILED, from, to, QUERY_LIMIT).size();
+        int totalRuns = ok + bad;
+        return totalRuns == 0 ? -1 : (100.0 * ok / totalRuns);
+    }
+
+    private static String formatTrend(double rateNow, double ratePrev) {
+        if (rateNow < 0) return "No runs in the last " + LOOKBACK_HOURS + "h yet.";
+        String nowStr = String.format(Locale.US, "%.0f%% success (last %dh)", rateNow, LOOKBACK_HOURS);
+        if (ratePrev < 0) return nowStr;
+        double delta = rateNow - ratePrev;
+        if (Math.abs(delta) < 0.5) return nowStr + " \u2014 steady";
+        String arrow = delta > 0 ? "\u2191" : "\u2193";
+        return nowStr + "  " + arrow + " " + String.format(Locale.US, "%.0f", Math.abs(delta)) + "pt vs. previous " + LOOKBACK_HOURS + "h";
+    }
+
+    // ------------------------------------------------------------------
+    // Popup lifecycle
+    // ------------------------------------------------------------------
+
+    private static boolean isBlocking(TaskRunRecord r) {
+        return r.getFailureCategory() != null && BLOCKING_CATEGORIES.contains(r.getFailureCategory());
+    }
+
+    private static Map<String, List<TaskRunRecord>> groupByLikelyCause(List<TaskRunRecord> failures) {
+        Map<String, List<TaskRunRecord>> raw = new LinkedHashMap<>();
+        for (TaskRunRecord r : failures) {
+            String category = r.getFailureCategory() != null ? r.getFailureCategory().name() : "UNKNOWN";
+            String key = r.getTaskName() + " (" + category + ")";
+            raw.computeIfAbsent(key, k -> new ArrayList<>()).add(r);
+        }
+        Map<String, List<TaskRunRecord>> sorted = new LinkedHashMap<>();
+        raw.entrySet().stream()
+                .sorted((a, b) -> {
+                    boolean ablock = isBlocking(a.getValue().get(0));
+                    boolean bblock = isBlocking(b.getValue().get(0));
+                    if (ablock != bblock) return ablock ? -1 : 1;
+                    return Integer.compare(b.getValue().size(), a.getValue().size());
+                })
+                .forEach(e -> sorted.put(e.getKey(), e.getValue()));
+        return sorted;
+    }
+
+    private static String escape(String s) {
+        return s == null ? "" : s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
+    }
+
+    // ------------------------------------------------------------------
+    // Data + popup content
+    // ------------------------------------------------------------------
+
+    /**
+     * Stops the internal poll timer, detaches the run listener, and closes any open popup —
+     * call before discarding an instance (e.g. on a UI rebuild), so rebuilds don't stack duplicates.
+     */
     public void dispose() {
         pollTimer.stop();
         if (runListener != null && scheduler != null && scheduler.getRunHistoryService() != null) {
@@ -114,22 +170,6 @@ public class ActionCenterButton extends JPanel {
         }
         closePopup();
     }
-
-    /** Thin rounded border matching the pill's own corner radius; no extra dependency. */
-    private static class RoundedLineBorder extends javax.swing.border.AbstractBorder {
-        @Override public void paintBorder(Component c, Graphics g, int x, int y, int w, int h) {
-            Graphics2D g2 = (Graphics2D) g.create();
-            g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
-            g2.setColor(AppTheme.isDark() ? new Color(0x3A3D4D) : new Color(0xD9D9E3));
-            g2.drawRoundRect(x, y, w - 1, h - 1, 14, 14);
-            g2.dispose();
-        }
-        @Override public Insets getBorderInsets(Component c) { return new Insets(1, 1, 1, 1); }
-    }
-
-    // ------------------------------------------------------------------
-    // Popup lifecycle
-    // ------------------------------------------------------------------
 
     private void togglePopup() {
         if (popup != null && popup.isVisible()) {
@@ -170,7 +210,8 @@ public class ActionCenterButton extends JPanel {
         // anywhere outside — including back in the main window — closes it,
         // without needing a document-wide mouse listener.
         popup.addWindowFocusListener(new WindowAdapter() {
-            @Override public void windowLostFocus(WindowEvent e) {
+            @Override
+            public void windowLostFocus(WindowEvent e) {
                 SwingUtilities.invokeLater(() -> {
                     if (popup != null && !popup.isActive()) closePopup();
                 });
@@ -185,11 +226,9 @@ public class ActionCenterButton extends JPanel {
         popup.toFront();
     }
 
-    // ------------------------------------------------------------------
-    // Data + popup content
-    // ------------------------------------------------------------------
-
-    /** Re-reads failures/trend/impact and updates the pill's badge; if the popup is open, rebuilds it live. Cheap — call freely. */
+    /**
+     * Re-reads failures/trend/impact and updates the pill's badge; if the popup is open, rebuilds it live. Cheap — call freely.
+     */
     public void refresh() {
         if (scheduler == null || scheduler.getRunHistoryService() == null) return;
         Snapshot snap = loadSnapshot();
@@ -207,15 +246,6 @@ public class ActionCenterButton extends JPanel {
             popup.revalidate();
             popup.repaint();
         }
-    }
-
-    private static class Snapshot {
-        List<TaskRunRecord> failures;
-        Map<String, List<TaskRunRecord>> activeGroups;
-        Map<String, List<TaskRunRecord>> snoozedGroups;
-        boolean anyBlocking;
-        double rateNow, ratePrev;
-        LocalDateTime lastSuccessAt;
     }
 
     private Snapshot loadSnapshot() {
@@ -362,7 +392,10 @@ public class ActionCenterButton extends JPanel {
             JButton unsnooze = new JButton("Un-snooze");
             unsnooze.setFont(unsnooze.getFont().deriveFont(11f));
             unsnooze.setMargin(new Insets(1, 6, 1, 6));
-            unsnooze.addActionListener(ev -> { snoozedUntil.remove(groupKey); refresh(); });
+            unsnooze.addActionListener(ev -> {
+                snoozedUntil.remove(groupKey);
+                refresh();
+            });
             actions.add(unsnooze);
         } else {
             JButton view = new JButton("Log");
@@ -387,6 +420,10 @@ public class ActionCenterButton extends JPanel {
                 AppTheme.isDark() ? new Color(0x2B2E3E) : new Color(0xEDEDF2)));
         return wrap;
     }
+
+    // ------------------------------------------------------------------
+    // Computation helpers (same logic previously in StatusStrip)
+    // ------------------------------------------------------------------
 
     private JPanel buildWatcherRow() {
         JPanel row = new JPanel(new BorderLayout(8, 0));
@@ -439,58 +476,17 @@ public class ActionCenterButton extends JPanel {
         }
     }
 
-    // ------------------------------------------------------------------
-    // Computation helpers (same logic previously in StatusStrip)
-    // ------------------------------------------------------------------
-
-    private static double successRate(service.RunHistoryService history, LocalDateTime from, LocalDateTime to) {
-        int ok = history.queryRuns(null, TaskRunRecord.Status.SUCCESS, from, to, QUERY_LIMIT).size();
-        int bad = history.queryRuns(null, TaskRunRecord.Status.FAILED, from, to, QUERY_LIMIT).size();
-        int totalRuns = ok + bad;
-        return totalRuns == 0 ? -1 : (100.0 * ok / totalRuns);
-    }
-
-    private static String formatTrend(double rateNow, double ratePrev) {
-        if (rateNow < 0) return "No runs in the last " + LOOKBACK_HOURS + "h yet.";
-        String nowStr = String.format(Locale.US, "%.0f%% success (last %dh)", rateNow, LOOKBACK_HOURS);
-        if (ratePrev < 0) return nowStr;
-        double delta = rateNow - ratePrev;
-        if (Math.abs(delta) < 0.5) return nowStr + " \u2014 steady";
-        String arrow = delta > 0 ? "\u2191" : "\u2193";
-        return nowStr + "  " + arrow + " " + String.format(Locale.US, "%.0f", Math.abs(delta)) + "pt vs. previous " + LOOKBACK_HOURS + "h";
-    }
-
-    private static boolean isBlocking(TaskRunRecord r) {
-        return r.getFailureCategory() != null && BLOCKING_CATEGORIES.contains(r.getFailureCategory());
-    }
-
-    private static Map<String, List<TaskRunRecord>> groupByLikelyCause(List<TaskRunRecord> failures) {
-        Map<String, List<TaskRunRecord>> raw = new LinkedHashMap<>();
-        for (TaskRunRecord r : failures) {
-            String category = r.getFailureCategory() != null ? r.getFailureCategory().name() : "UNKNOWN";
-            String key = r.getTaskName() + " (" + category + ")";
-            raw.computeIfAbsent(key, k -> new ArrayList<>()).add(r);
-        }
-        Map<String, List<TaskRunRecord>> sorted = new LinkedHashMap<>();
-        raw.entrySet().stream()
-                .sorted((a, b) -> {
-                    boolean ablock = isBlocking(a.getValue().get(0));
-                    boolean bblock = isBlocking(b.getValue().get(0));
-                    if (ablock != bblock) return ablock ? -1 : 1;
-                    return Integer.compare(b.getValue().size(), a.getValue().size());
-                })
-                .forEach(e -> sorted.put(e.getKey(), e.getValue()));
-        return sorted;
-    }
-
     private void purgeExpiredSnoozes() {
         Instant now = Instant.now();
         snoozedUntil.entrySet().removeIf(e -> !e.getValue().isAfter(now));
     }
 
-    /** For AUTH failures, counts other enabled tasks that share the same credential id — real, computed, not invented. */
+    /**
+     * For AUTH failures, counts other enabled tasks that share the same credential id — real, computed, not invented.
+     */
     private String describeCredentialImpact(TaskRunRecord example) {
-        if (example.getFailureCategory() != TaskRunRecord.FailureCategory.AUTH || example.getTaskId() == null) return null;
+        if (example.getFailureCategory() != TaskRunRecord.FailureCategory.AUTH || example.getTaskId() == null)
+            return null;
         try {
             List<ScheduledTask> all = storage.loadTasks();
             ScheduledTask failing = all.stream().filter(t -> t.getId().equals(example.getTaskId())).findFirst().orElse(null);
@@ -536,10 +532,6 @@ public class ActionCenterButton extends JPanel {
         }
     }
 
-    // ------------------------------------------------------------------
-    // Actions
-    // ------------------------------------------------------------------
-
     private void retryTask(String taskId, String taskName) {
         if (taskId == null) return;
         // This quick-action retry had NO event logging or failure check at all —
@@ -561,7 +553,7 @@ public class ActionCenterButton extends JPanel {
                 logActivityFailed("Task restart failed",
                         "Could not retry task \"" + taskName + "\""
                                 + (storage.isConnected() ? " — database connected, but this write failed"
-                                        : " — database not connected")
+                                : " — database not connected")
                                 + (detail != null ? ": " + detail : "."));
             }
         }, () -> logActivityFailed("Task restart failed",
@@ -581,8 +573,14 @@ public class ActionCenterButton extends JPanel {
         refresh();
     }
 
-    /** Records an application-activity note into the Event Monitor's feed —
-     *  see {@link service.RunHistoryService#recordActivityEvent}. */
+    // ------------------------------------------------------------------
+    // Actions
+    // ------------------------------------------------------------------
+
+    /**
+     * Records an application-activity note into the Event Monitor's feed —
+     * see {@link service.RunHistoryService#recordActivityEvent}.
+     */
     private void logActivity(String title, String detail) {
         if (scheduler == null || scheduler.getRunHistoryService() == null) return;
         java.time.LocalDateTime now = java.time.LocalDateTime.now();
@@ -593,7 +591,9 @@ public class ActionCenterButton extends JPanel {
         }
     }
 
-    /** Same as {@link #logActivity} but marks the event FAILED. */
+    /**
+     * Same as {@link #logActivity} but marks the event FAILED.
+     */
     private void logActivityFailed(String title, String detail) {
         if (scheduler == null || scheduler.getRunHistoryService() == null) return;
         java.time.LocalDateTime now = java.time.LocalDateTime.now();
@@ -626,12 +626,39 @@ public class ActionCenterButton extends JPanel {
         dialog.setSize(900, 600);
         dialog.setLocationRelativeTo(ownerWindow);
         dialog.addWindowListener(new WindowAdapter() {
-            @Override public void windowClosed(WindowEvent e) { refresh(); }
+            @Override
+            public void windowClosed(WindowEvent e) {
+                refresh();
+            }
         });
         dialog.setVisible(true);
     }
 
-    private static String escape(String s) {
-        return s == null ? "" : s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
+    /**
+     * Thin rounded border matching the pill's own corner radius; no extra dependency.
+     */
+    private static class RoundedLineBorder extends javax.swing.border.AbstractBorder {
+        @Override
+        public void paintBorder(Component c, Graphics g, int x, int y, int w, int h) {
+            Graphics2D g2 = (Graphics2D) g.create();
+            g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+            g2.setColor(AppTheme.isDark() ? new Color(0x3A3D4D) : new Color(0xD9D9E3));
+            g2.drawRoundRect(x, y, w - 1, h - 1, 14, 14);
+            g2.dispose();
+        }
+
+        @Override
+        public Insets getBorderInsets(Component c) {
+            return new Insets(1, 1, 1, 1);
+        }
+    }
+
+    private static class Snapshot {
+        List<TaskRunRecord> failures;
+        Map<String, List<TaskRunRecord>> activeGroups;
+        Map<String, List<TaskRunRecord>> snoozedGroups;
+        boolean anyBlocking;
+        double rateNow, ratePrev;
+        LocalDateTime lastSuccessAt;
     }
 }

@@ -1,7 +1,5 @@
 package ui.monitor;
 
-import static org.junit.Assert.*;
-
 import model.EventKind;
 import model.TaskRunRecord;
 import org.junit.Test;
@@ -9,6 +7,8 @@ import org.junit.Test;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
+
+import static org.junit.Assert.assertEquals;
 
 public class EventOrderTest {
 

@@ -8,16 +8,18 @@ import java.nio.file.Path;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
 
-/** Writes events to RFC 4180 CSV — one row per event, regardless of how they are grouped on screen. */
+/**
+ * Writes events to RFC 4180 CSV — one row per event, regardless of how they are grouped on screen.
+ */
 public final class EventCsv {
 
-    private EventCsv() {}
-
     private static final DateTimeFormatter ISO = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
-
     private static final String[] HEADER = {
             "time", "task", "task_type", "category", "event", "level", "status", "trigger", "run_id",
             "duration_ms", "summary", "failure_category", "retryable", "suggested_action"};
+
+    private EventCsv() {
+    }
 
     public static void write(Path file, List<MonitorEvent> events) throws IOException {
         try (Writer w = Files.newBufferedWriter(file, StandardCharsets.UTF_8)) {

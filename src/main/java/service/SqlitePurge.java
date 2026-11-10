@@ -1,11 +1,7 @@
 package service;
 
 import java.io.File;
-import java.sql.Connection;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
-import java.sql.SQLException;
-import java.sql.Statement;
+import java.sql.*;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
@@ -21,16 +17,20 @@ import java.util.function.BooleanSupplier;
  * longer, and it is skipped unless it would reclaim something worthwhile.
  */
 final class SqlitePurge {
-    private SqlitePurge() {}
-
     private static final DateTimeFormatter TS = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss");
     private static final int CHUNK = 2_000;
-    /** After a size purge the file is brought down to this fraction of the cap, so it doesn't re-trigger at once. */
+    /**
+     * After a size purge the file is brought down to this fraction of the cap, so it doesn't re-trigger at once.
+     */
     private static final double TARGET_FRACTION = 0.90;
     private static final int MAX_SIZE_ITERATIONS = 200;
     private static final long VACUUM_MIN_FREE_BYTES = 1L << 20; // 1 MB
+    private SqlitePurge() {
+    }
 
-    /** On-disk footprint: database file plus its write-ahead log. */
+    /**
+     * On-disk footprint: database file plus its write-ahead log.
+     */
     static long fileBytes(File db) {
         long n = db.length();
         n += new File(db.getPath() + "-wal").length();
@@ -70,7 +70,9 @@ final class SqlitePurge {
         }
     }
 
-    /** Deletes oldest rows until the live data fits under {@code 90 %} of the cap. */
+    /**
+     * Deletes oldest rows until the live data fits under {@code 90 %} of the cap.
+     */
     private static int purgeToSize(Object lock, Connection conn, List<String> tables, long maxBytes,
                                    BooleanSupplier cancelled) throws SQLException {
         long target = (long) (maxBytes * TARGET_FRACTION);
@@ -81,7 +83,10 @@ final class SqlitePurge {
                 if (live <= (i == 0 ? maxBytes : target)) break;      // only act once the cap is exceeded
                 long[] counts = new long[tables.size()];
                 long total = 0;
-                for (int t = 0; t < counts.length; t++) { counts[t] = count(conn, tables.get(t)); total += counts[t]; }
+                for (int t = 0; t < counts.length; t++) {
+                    counts[t] = count(conn, tables.get(t));
+                    total += counts[t];
+                }
                 if (total == 0) break;
                 double avg = (double) live / total;                   // average bytes per row, indexes included
                 long need = (long) Math.ceil((live - target) / Math.max(avg, 1.0));
@@ -100,7 +105,9 @@ final class SqlitePurge {
         return deleted;
     }
 
-    /** Gives freed pages back to the operating system when that is worth doing. */
+    /**
+     * Gives freed pages back to the operating system when that is worth doing.
+     */
     private static void reclaim(Object lock, Connection conn, File dbFile) throws SQLException {
         synchronized (lock) {
             long free = freeBytes(conn);

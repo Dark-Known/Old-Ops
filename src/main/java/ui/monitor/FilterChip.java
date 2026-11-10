@@ -18,14 +18,10 @@ import java.awt.event.MouseEvent;
  */
 final class FilterChip extends JComponent {
 
-    /** Receives a click; {@code multi} is true when Ctrl or Shift was held. */
-    interface Listener { void clicked(FilterChip chip, boolean multi); }
-
     private final String label;
     private int count = -1;
     private boolean selected;
     private boolean hover;
-
     FilterChip(String label, String tooltip, Listener listener) {
         this.label = label;
         setToolTipText(tooltip);
@@ -33,39 +29,69 @@ final class FilterChip extends JComponent {
         setFocusable(false);
         setOpaque(false);
         addMouseListener(new MouseAdapter() {
-            @Override public void mouseClicked(MouseEvent e) {
-                if (SwingUtilities.isLeftMouseButton(e)) listener.clicked(FilterChip.this, e.isControlDown() || e.isShiftDown());
+            @Override
+            public void mouseClicked(MouseEvent e) {
+                if (SwingUtilities.isLeftMouseButton(e))
+                    listener.clicked(FilterChip.this, e.isControlDown() || e.isShiftDown());
             }
-            @Override public void mouseEntered(MouseEvent e) { hover = true; repaint(); }
-            @Override public void mouseExited(MouseEvent e)  { hover = false; repaint(); }
+
+            @Override
+            public void mouseEntered(MouseEvent e) {
+                hover = true;
+                repaint();
+            }
+
+            @Override
+            public void mouseExited(MouseEvent e) {
+                hover = false;
+                repaint();
+            }
         });
     }
 
+    boolean isSelected() {
+        return selected;
+    }
+
     void setSelected(boolean s) {
-        if (s != selected) { selected = s; repaint(); }
+        if (s != selected) {
+            selected = s;
+            repaint();
+        }
     }
 
-    boolean isSelected() { return selected; }
-
-    /** Shows {@code n} after the label; a negative value hides the count. */
+    /**
+     * Shows {@code n} after the label; a negative value hides the count.
+     */
     void setCount(int n) {
-        if (n != count) { count = n; revalidate(); repaint(); }
+        if (n != count) {
+            count = n;
+            revalidate();
+            repaint();
+        }
     }
 
-    String label() { return label; }
+    String label() {
+        return label;
+    }
 
     private String text() {
         return count > 0 ? label + "  " + count : label;
     }
 
-    @Override public Dimension getPreferredSize() {
+    @Override
+    public Dimension getPreferredSize() {
         FontMetrics fm = getFontMetrics(getFont().deriveFont(Font.BOLD, 12f));
         return new Dimension(fm.stringWidth(text()) + 20, 26);
     }
 
-    @Override public Dimension getMinimumSize() { return getPreferredSize(); }
+    @Override
+    public Dimension getMinimumSize() {
+        return getPreferredSize();
+    }
 
-    @Override protected void paintComponent(Graphics g) {
+    @Override
+    protected void paintComponent(Graphics g) {
         Graphics2D g2 = (Graphics2D) g.create();
         g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
         g2.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
@@ -92,5 +118,12 @@ final class FilterChip extends JComponent {
         FontMetrics fm = g2.getFontMetrics();
         g2.drawString(text(), (getWidth() - fm.stringWidth(text())) / 2, (getHeight() - fm.getHeight()) / 2 + fm.getAscent());
         g2.dispose();
+    }
+
+    /**
+     * Receives a click; {@code multi} is true when Ctrl or Shift was held.
+     */
+    interface Listener {
+        void clicked(FilterChip chip, boolean multi);
     }
 }

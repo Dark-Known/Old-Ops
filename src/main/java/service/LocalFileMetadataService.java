@@ -4,7 +4,10 @@ import model.RemoteFileException;
 import model.RemoteFileMetadata;
 
 import java.io.IOException;
-import java.nio.file.*;
+import java.nio.file.DirectoryStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -81,7 +84,9 @@ public class LocalFileMetadataService implements RemoteFileMetadataService {
         return result;
     }
 
-    /** Direct {@code Files.readAttributes} on the one named file — no directory scan at all. */
+    /**
+     * Direct {@code Files.readAttributes} on the one named file — no directory scan at all.
+     */
     @Override
     public RemoteFileMetadata statFile(String remoteDirectory, String fileName) throws RemoteFileException {
         Path path = Paths.get(remoteDirectory, fileName);

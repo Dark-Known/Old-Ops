@@ -1,15 +1,13 @@
-
-
 import java.io.File;
 import java.util.logging.Logger;
 
 /**
  * Detects if the application is running with administrator privileges.
  * If not, attempts to restart the application with elevation via PowerShell.
- *
+ * <p>
  * Usage in main():
- *   AdminElevation.ensureAdminOrExit();
- *   // Continue with rest of application
+ * AdminElevation.ensureAdminOrExit();
+ * // Continue with rest of application
  */
 public class AdminElevation {
 
@@ -18,7 +16,8 @@ public class AdminElevation {
     /**
      * Check if running as admin; if not, re-launch with elevation and exit.
      * Safe to call multiple times (no-op if already admin).
-got      */
+     * got
+     */
     public static void ensureAdminOrExit() {
         log.info("=== AdminElevation.ensureAdminOrExit() called ===");
         log.info("Current user: " + System.getProperty("user.name"));
@@ -57,7 +56,7 @@ got      */
         // Method 2: Try to write to HKEY_LOCAL_MACHINE via reg.exe (requires admin)
         try {
             ProcessBuilder pb = new ProcessBuilder(
-                "reg.exe", "query", "HKEY_LOCAL_MACHINE\\Software", "/s", "/f", "opstool_check");
+                    "reg.exe", "query", "HKEY_LOCAL_MACHINE\\Software", "/s", "/f", "opstool_check");
             pb.redirectErrorStream(true);
             Process p = pb.start();
             int exitCode = p.waitFor();
@@ -83,8 +82,8 @@ got      */
         // Method 4: Try to execute a PowerShell command that requires admin
         try {
             ProcessBuilder pb = new ProcessBuilder(
-                "powershell.exe", "-NonInteractive", "-Command", 
-                "if (Test-Path 'C:\\\\Windows\\\\System32\\\\drivers\\\\etc\\\\hosts') { exit 0 } else { exit 1 }");
+                    "powershell.exe", "-NonInteractive", "-Command",
+                    "if (Test-Path 'C:\\\\Windows\\\\System32\\\\drivers\\\\etc\\\\hosts') { exit 0 } else { exit 1 }");
             Process p = pb.start();
             int exitCode = p.waitFor();
             if (exitCode == 0) {
@@ -131,30 +130,32 @@ got      */
         return false;
     }
 
-    /** Elevate using interactive PowerShell with visible UAC prompt. */
+    /**
+     * Elevate using interactive PowerShell with visible UAC prompt.
+     */
     private static boolean elevateViaInteractivePowerShell(String javaExe, String jarPath) {
         try {
             log.info("Trying interactive PowerShell elevation...");
 
             String psCommand = String.format(
-                "Start-Process -FilePath '%s' -ArgumentList '-jar', '%s' -Verb RunAs",
-                javaExe.replace("'", "''"), jarPath.replace("'", "''"));
+                    "Start-Process -FilePath '%s' -ArgumentList '-jar', '%s' -Verb RunAs",
+                    javaExe.replace("'", "''"), jarPath.replace("'", "''"));
 
             log.info("PowerShell command: " + psCommand);
 
             // Run PowerShell INTERACTIVELY (without -NonInteractive) so UAC prompt appears
             ProcessBuilder pb = new ProcessBuilder(
-                "powershell.exe",
-                "-NoProfile",
-                "-ExecutionPolicy", "Bypass",
-                "-Command", psCommand);
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-ExecutionPolicy", "Bypass",
+                    "-Command", psCommand);
 
             pb.redirectErrorStream(true);
             Process p = pb.start();
 
             // Capture any output
             java.io.BufferedReader reader = new java.io.BufferedReader(
-                new java.io.InputStreamReader(p.getInputStream()));
+                    new java.io.InputStreamReader(p.getInputStream()));
             String line;
             StringBuilder output = new StringBuilder();
             int lineCount = 0;
@@ -181,7 +182,9 @@ got      */
         }
     }
 
-    /** Elevate using cmd.exe /start with elevation flag. */
+    /**
+     * Elevate using cmd.exe /start with elevation flag.
+     */
     private static boolean elevateViaCmd(String javaExe, String jarPath) {
         try {
             log.info("Trying cmd.exe elevation...");
@@ -189,20 +192,20 @@ got      */
             // cmd.exe /c start "" /b /max "java.exe" -jar "jarpath"
             // The /max makes it maximize, /b makes it run in background
             // We'll use a simpler approach: just invoke the command directly
-            
+
             ProcessBuilder pb = new ProcessBuilder(
-                "cmd.exe",
-                "/c",
-                "start", "\"OpsTransferTool\"", 
-                javaExe, 
-                "-jar", 
-                jarPath);
+                    "cmd.exe",
+                    "/c",
+                    "start", "\"OpsTransferTool\"",
+                    javaExe,
+                    "-jar",
+                    jarPath);
 
             log.info("cmd.exe elevation command prepared.");
 
             Process p = pb.start();
             int exitCode = p.waitFor();
-            
+
             log.info("cmd.exe exited with code: " + exitCode);
             return exitCode == 0;
 
@@ -212,11 +215,13 @@ got      */
         }
     }
 
-    /** Locate the JAR file containing this application. */
+    /**
+     * Locate the JAR file containing this application.
+     */
     private static String getJarPath() {
         try {
             File codeSource = new File(AdminElevation.class.getProtectionDomain()
-                .getCodeSource().getLocation().toURI());
+                    .getCodeSource().getLocation().toURI());
             if (codeSource.isFile() && codeSource.getName().endsWith(".jar")) {
                 log.info("Found JAR via ProtectionDomain: " + codeSource.getAbsolutePath());
                 return codeSource.getAbsolutePath();
@@ -227,12 +232,12 @@ got      */
 
         // Fallback: look for OpsTransferTool.jar in common locations
         String[] candidates = {
-            "OpsTransferTool.jar",
-            System.getProperty("user.dir") + File.separator + "OpsTransferTool.jar",
-            System.getProperty("user.home") + File.separator + "OpsTransferTool.jar",
-            "C:\\OpsTools\\OpsTransferTool.jar",
-            "C:\\Program Files\\OpsTransferTool\\OpsTransferTool.jar",
-            "C:\\Program Files (x86)\\OpsTransferTool\\OpsTransferTool.jar"
+                "OpsTransferTool.jar",
+                System.getProperty("user.dir") + File.separator + "OpsTransferTool.jar",
+                System.getProperty("user.home") + File.separator + "OpsTransferTool.jar",
+                "C:\\OpsTools\\OpsTransferTool.jar",
+                "C:\\Program Files\\OpsTransferTool\\OpsTransferTool.jar",
+                "C:\\Program Files (x86)\\OpsTransferTool\\OpsTransferTool.jar"
         };
 
         for (String candidate : candidates) {
@@ -247,7 +252,9 @@ got      */
         return null;
     }
 
-    /** Get the path to the Java executable. */
+    /**
+     * Get the path to the Java executable.
+     */
     private static String getJavaExecutable() {
         String javaHome = System.getProperty("java.home");
         String exe = javaHome + File.separator + "bin" + File.separator + "java.exe";

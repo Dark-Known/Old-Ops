@@ -105,6 +105,7 @@ model\EventKind.class
 ui\RunLogSummarizer.class
 ui\monitor\SummaryBar$Chip$2.class
 ui\OAuthAuthorizeDialog$1.class
+util\Scripts.class
 service\GraphMailService$AttachmentBundle.class
 ui\GradientPanel.class
 service\RunHistoryService.class

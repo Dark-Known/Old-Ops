@@ -1,7 +1,5 @@
 package service;
 
-import static org.junit.Assert.*;
-
 import com.sun.net.httpserver.HttpServer;
 import org.junit.Test;
 
@@ -15,16 +13,26 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicInteger;
 
-/** Attachments are streamed one at a time; big ones go to a temporary file instead of the heap. */
+import static org.junit.Assert.*;
+
+/**
+ * Attachments are streamed one at a time; big ones go to a temporary file instead of the heap.
+ */
 public class GraphAttachmentStreamingTest {
 
     private static final byte[] SMALL = "hello,world\n1,2\n".getBytes(StandardCharsets.UTF_8);
     private static final byte[] BIG = new byte[3 * 1024 * 1024];
-    static { new java.util.Random(7).nextBytes(BIG); }
+    private static final java.io.File logDir = newLogDir();
+
+    static {
+        new java.util.Random(7).nextBytes(BIG);
+    }
 
     private static void reply(com.sun.net.httpserver.HttpExchange ex, int code, byte[] body) throws java.io.IOException {
         ex.sendResponseHeaders(code, body.length == 0 ? -1 : body.length);
-        if (body.length > 0) try (OutputStream o = ex.getResponseBody()) { o.write(body); }
+        if (body.length > 0) try (OutputStream o = ex.getResponseBody()) {
+            o.write(body);
+        }
         ex.close();
     }
 
@@ -34,7 +42,10 @@ public class GraphAttachmentStreamingTest {
             String path = ex.getRequestURI().getPath();
             String query = ex.getRequestURI().getRawQuery();
             if (path.endsWith("/a1/$value")) {
-                if (!valueEndpointWorks) { reply(ex, 404, new byte[0]); return; }
+                if (!valueEndpointWorks) {
+                    reply(ex, 404, new byte[0]);
+                    return;
+                }
                 if (throttled != null && throttled.getAndIncrement() == 0) {
                     ex.getResponseHeaders().add("Retry-After", "1");
                     reply(ex, 429, new byte[0]);
@@ -48,7 +59,10 @@ public class GraphAttachmentStreamingTest {
                 String json = "{\"contentBytes\":\"" + java.util.Base64.getEncoder().encodeToString(raw) + "\"}";
                 reply(ex, 200, json.getBytes(StandardCharsets.UTF_8));
             } else {
-                if (query != null && query.contains("select") && !selectWorks) { reply(ex, 400, "{}".getBytes()); return; }
+                if (query != null && query.contains("select") && !selectWorks) {
+                    reply(ex, 400, "{}".getBytes());
+                    return;
+                }
                 boolean meta = query != null && query.contains("select");
                 String c1 = meta ? "" : ",\"contentBytes\":\"" + java.util.Base64.getEncoder().encodeToString(SMALL) + "\"";
                 String c2 = meta ? "" : ",\"contentBytes\":\"" + java.util.Base64.getEncoder().encodeToString(BIG) + "\"";
@@ -65,14 +79,14 @@ public class GraphAttachmentStreamingTest {
         return s;
     }
 
-    private static final java.io.File logDir = newLogDir();
-
     private static java.io.File newLogDir() {
         try {
             java.io.File d = Files.createTempDirectory("graphlog").toFile();
             GraphCallLog.configure(d);
             return d;
-        } catch (Exception e) { throw new RuntimeException(e); }
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
     }
 
     private static GraphMailService.AttachmentBundle fetch(HttpServer s, java.util.List<String> log) throws Exception {
@@ -99,27 +113,32 @@ public class GraphAttachmentStreamingTest {
         Files.delete(out);
     }
 
-    @Test public void attachmentsAreStreamedAndBigOnesSpillToDisk() throws Exception {
-        HttpServer s = server(null, true, true);
-        try {
-            GraphMailService.AttachmentBundle b = fetch(s, new ArrayList<>());
-            check(b);
-            for (GraphMailService.AttachmentFile f : b.files) f.discard();
-            f(b);
-        } finally { s.stop(0); }
-    }
-
     private static void f(GraphMailService.AttachmentBundle b) throws Exception {
         // after discard, the temp file is gone: copying must fail
         Path out = Files.createTempFile("opstool-att-out", ".bin");
         try {
             b.files.get(1).copyTo(out);
             fail("temp file should be gone after discard");
-        } catch (java.io.IOException expected) { }
+        } catch (java.io.IOException expected) {
+        }
         Files.deleteIfExists(out);
     }
 
-    @Test public void aThrottledDownloadIsRetried() throws Exception {
+    @Test
+    public void attachmentsAreStreamedAndBigOnesSpillToDisk() throws Exception {
+        HttpServer s = server(null, true, true);
+        try {
+            GraphMailService.AttachmentBundle b = fetch(s, new ArrayList<>());
+            check(b);
+            for (GraphMailService.AttachmentFile f : b.files) f.discard();
+            f(b);
+        } finally {
+            s.stop(0);
+        }
+    }
+
+    @Test
+    public void aThrottledDownloadIsRetried() throws Exception {
         AtomicInteger hits = new AtomicInteger();
         HttpServer s = server(hits, true, true);
         try {
@@ -139,20 +158,26 @@ public class GraphAttachmentStreamingTest {
             assertEquals("Download attachment", GraphCallLog.describe(new GraphCallLog.Entry(1, "graph", "GET",
                     "h/v1.0/me/messages/m1/attachments/a1/$value", "/me", 200, 5, -1, "", 1, "")));
             for (GraphMailService.AttachmentFile x : b.files) x.discard();
-        } finally { s.stop(0); }
+        } finally {
+            s.stop(0);
+        }
     }
 
-    @Test public void ifTheRawEndpointRefusesEachAttachmentIsFetchedAsJson() throws Exception {
+    @Test
+    public void ifTheRawEndpointRefusesEachAttachmentIsFetchedAsJson() throws Exception {
         HttpServer s = server(null, false, true);
         try {
             GraphMailService.AttachmentBundle b = fetch(s, new ArrayList<>());
             assertEquals(2, b.files.size());
             assertEquals(BIG.length, b.files.get(1).length());
             assertTrue(b.text.contains("hello,world"));
-        } finally { s.stop(0); }
+        } finally {
+            s.stop(0);
+        }
     }
 
-    @Test public void ifTheMetadataListIsRefusedTheOldFullListIsUsed() throws Exception {
+    @Test
+    public void ifTheMetadataListIsRefusedTheOldFullListIsUsed() throws Exception {
         HttpServer s = server(null, true, false);
         try {
             java.util.List<String> log = new ArrayList<>();
@@ -160,6 +185,8 @@ public class GraphAttachmentStreamingTest {
             assertEquals(2, b.files.size());
             assertEquals(BIG.length, b.files.get(1).length());
             assertTrue(log.toString(), log.stream().anyMatch(l -> l.contains("using the full list")));
-        } finally { s.stop(0); }
+        } finally {
+            s.stop(0);
+        }
     }
 }

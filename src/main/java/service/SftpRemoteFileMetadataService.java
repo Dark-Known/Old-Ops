@@ -1,15 +1,14 @@
 package service;
 
-import java.time.Instant;
-import java.util.*;
-
+import com.jcraft.jsch.ChannelSftp;
 import com.jcraft.jsch.SftpATTRS;
 import com.jcraft.jsch.SftpException;
 import model.RemoteFileException;
 import model.RemoteFileMetadata;
-import service.RemoteFileMetadataService;
 
-import com.jcraft.jsch.ChannelSftp;
+import java.time.Instant;
+import java.util.*;
+
 public class SftpRemoteFileMetadataService
         implements RemoteFileMetadataService {
 

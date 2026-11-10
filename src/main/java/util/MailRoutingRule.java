@@ -16,24 +16,37 @@ package util;
  */
 public final class MailRoutingRule {
 
-    /** Case-insensitive fallback key — the bucket for anything that doesn't match another rule. */
+    /**
+     * Case-insensitive fallback key — the bucket for anything that doesn't match another rule.
+     */
     public static final String OTHERS_KEY = "Others";
 
     private String key;
     private String folder;
 
-    public MailRoutingRule() {}
+    public MailRoutingRule() {
+    }
 
     public MailRoutingRule(String key, String folder) {
         this.key = key;
         this.folder = folder;
     }
 
-    public String getKey() { return key; }
-    public void setKey(String key) { this.key = key; }
+    public String getKey() {
+        return key;
+    }
 
-    public String getFolder() { return folder; }
-    public void setFolder(String folder) { this.folder = folder; }
+    public void setKey(String key) {
+        this.key = key;
+    }
+
+    public String getFolder() {
+        return folder;
+    }
+
+    public void setFolder(String folder) {
+        this.folder = folder;
+    }
 
     public boolean isOthers() {
         return key != null && key.trim().equalsIgnoreCase(OTHERS_KEY);

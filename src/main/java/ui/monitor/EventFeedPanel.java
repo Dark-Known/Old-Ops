@@ -1,7 +1,7 @@
 package ui.monitor;
 
-import service.BackgroundJobs;
 import model.EventKind;
+import service.BackgroundJobs;
 import ui.AppTheme;
 import ui.components.PillBadge;
 
@@ -17,7 +17,6 @@ import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.io.IOException;
 import java.nio.file.Path;
-import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.*;
 import java.util.List;
@@ -43,16 +42,11 @@ import java.util.function.Consumer;
  */
 public class EventFeedPanel extends JPanel {
 
-    /** Combo item for the task filter. */
-    private record TaskItem(String id, String label) {
-        @Override public String toString() { return label; }
-    }
-
     private static final int COL_TIME = 0, COL_STATUS = 1, COL_TASK = 2, COL_EVENT = 3, COL_SUMMARY = 4,
             COL_FILES = 5, COL_TRIGGER = 6, COL_DURATION = 7;
     private static final String[] COLUMNS = {"Time", "Status", "Task", "Event", "Summary", "Files", "Trigger", "Took"};
     private static final int[] COL_WIDTH = {116, 98, 154, 128, 300, 76, 80, 64};
-    private static final int[] COL_MIN   = {100, 90, 90,  84,  140, 56, 64, 48};
+    private static final int[] COL_MIN = {100, 90, 90, 84, 140, 56, 64, 48};
     /**
      * Narrow feed: columns are dropped from the right, least important first, rather than being squeezed
      * until the last ones fall off the edge with no scrollbar. Everything dropped here (files, trigger,
@@ -61,18 +55,21 @@ public class EventFeedPanel extends JPanel {
     private static final int[] HIDE_BELOW = {0, 0, 0, 0, 0, 760, 690, 610};
     private static final int FLASH_MS = 1600;
     private static final int INDENT = 14;
-
+    /**
+     * Above this many events the feed is rebuilt on a worker thread instead of inline on the EDT.
+     */
+    private static final int SYNC_BUILD_LIMIT = 800;
+    private static final java.util.concurrent.ExecutorService BUILDER =
+            service.Workers.newPool(service.Workers.Lane.FEED, 1);
     private final MonitorPrefs prefs;
     private final FeedModel model = new FeedModel();
     private final JTable table = new JTable(model);
-
     // toolbar
     private final JTextField search = new JTextField();
     private final JComboBox<TaskItem> taskCombo = new JComboBox<>();
     private final JComboBox<String> rangeCombo = new JComboBox<>();
     private final JComboBox<String> levelCombo = new JComboBox<>();
     private final Map<EventKind.Category, FilterChip> chips = new EnumMap<>(EventKind.Category.class);
-    private FilterChip allChip;
     private final JToggleButton pauseBtn = new JToggleButton("Pause");
     private final JButton resetBtn = new JButton("\u2715  Reset filters");
     private final JLabel banner = new JLabel();
@@ -83,28 +80,35 @@ public class EventFeedPanel extends JPanel {
     private final JPanel cardHost = new JPanel(cards);
     private final JLabel emptyLabel = new JLabel();
     private final JButton emptyReset = new JButton("Reset filters");
-
+    private final Set<String> expanded = new HashSet<>();
+    private final Set<EventKind.Category> activeCategories = EnumSet.allOf(EventKind.Category.class);
+    private final Set<String> seenKeys = new HashSet<>();
+    private final Set<String> flashKeys = new HashSet<>();
+    private final javax.swing.Timer searchDebounce;
+    private FilterChip allChip;
     // state
     private List<MonitorEvent> latestEvents = List.of();   // newest data received
     private List<MonitorEvent> shownEvents = List.of();    // what the table is built from (frozen while paused)
     private boolean hitLimit;
     private int attentionErrors, attentionWarnings;
     private Set<String> runningIds = Set.of();
-    private final Set<String> expanded = new HashSet<>();
-    private final Set<EventKind.Category> activeCategories = EnumSet.allOf(EventKind.Category.class);
     private String taskFilterId;
-    private final Set<String> seenKeys = new HashSet<>();
     private boolean baseline;
-    private final Set<String> flashKeys = new HashSet<>();
     private int pendingWhilePaused;
     private FeedBuilder.Result result = new FeedBuilder.Result(List.of(), List.of(), new EnumMap<>(EventKind.Category.class), 0, 0);
     private String selectedKey;
     private FeedRow selectedRow;
     private boolean adjusting;
-    private Consumer<FeedRow> selectionListener = r -> {};
-    private Consumer<String> taskFilterListener = id -> {};
-    private final javax.swing.Timer searchDebounce;
+    private Consumer<FeedRow> selectionListener = r -> {
+    };
+    private Consumer<String> taskFilterListener = id -> {
+    };
     private long lastRebuildMs;
+
+    // ── Construction ────────────────────────────────────────────────
+    private int lastColumnMask = -1;
+    private boolean building;       // EDT-only: a background build is in flight
+    private boolean buildAgain;     // EDT-only: another rebuild() arrived meanwhile -> run once more
 
     public EventFeedPanel(MonitorPrefs prefs) {
         this.prefs = prefs;
@@ -120,30 +124,100 @@ public class EventFeedPanel extends JPanel {
         prefs.addListener(this::onPrefsChanged);
     }
 
-    // ── Construction ────────────────────────────────────────────────
+    private static void bind(InputMap in, ActionMap act, String name, KeyStroke ks, Runnable r) {
+        in.put(ks, name);
+        act.put(name, new AbstractAction() {
+            public void actionPerformed(java.awt.event.ActionEvent e) {
+                r.run();
+            }
+        });
+    }
+
+    /**
+     * Shows "Prefix: value" in the closed combo, so bare values like "Normal" say what they are.
+     */
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private static void labelled(JComboBox combo, String prefix, Object prototype) {
+        final ListCellRenderer base = combo.getRenderer();
+        combo.setRenderer((list, value, index, isSelected, hasFocus) -> {
+            Component c = base.getListCellRendererComponent(list, value, index, isSelected, hasFocus);
+            if (index < 0 && c instanceof JLabel l) l.setText(prefix + value);
+            return c;
+        });
+        combo.setPrototypeDisplayValue(prototype);
+    }
+
+    private static Built compute(List<MonitorEvent> events, EventFilter filter, boolean group, boolean collapse,
+                                 Set<String> running, Set<String> expandedKeys) {
+        FeedBuilder.Result res = FeedBuilder.build(events, filter, group, collapse, running, expandedKeys, LocalDateTime.now());
+        int errs = 0, warns = 0;
+        for (MonitorEvent e : events) {
+            if (filter.since() != null && e.time().isBefore(filter.since())) continue;
+            if (e.severity() == EventKind.Severity.ERROR) errs++;
+            else if (e.severity() == EventKind.Severity.WARN) warns++;
+        }
+        return new Built(res, errs, warns);
+    }
+
+    // ── Public API ──────────────────────────────────────────────────
+
+    private static boolean changedForDetail(FeedRow a, FeedRow b) {
+        if (a == null || b == null) return a != b;
+        return a.outcome != b.outcome || a.count != b.count || !Objects.equals(a.summary, b.summary)
+                || a.events.size() != b.events.size()
+                || (a.outcome != FeedRow.Outcome.RUNNING && a.durationMs != b.durationMs);
+    }
+
+    private static JCheckBoxMenuItem check(String text, boolean on, java.util.function.Consumer<Boolean> set) {
+        JCheckBoxMenuItem it = new JCheckBoxMenuItem(text, on);
+        it.addActionListener(e -> set.accept(it.isSelected()));
+        return it;
+    }
+
+    static String rowText(FeedRow r) {
+        return MonitorStyle.fullTime(r.time) + "  " + r.outcome.label() + "  " + r.taskName + "  "
+                + r.label + (r.summary.isEmpty() ? "" : "  \u2014  " + r.summary)
+                + (r.durationMs >= 0 ? "  (" + MonitorStyle.duration(r.durationMs) + ")" : "");
+    }
+
+    private static void copy(String text) {
+        Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(text), null);
+    }
 
     private JComponent buildToolbar() {
         search.putClientProperty("JTextField.placeholderText", "Search task, message, file name, error\u2026");
         search.putClientProperty("JTextField.showClearButton", true);
         search.setColumns(14);
         search.getDocument().addDocumentListener(new javax.swing.event.DocumentListener() {
-            public void insertUpdate(javax.swing.event.DocumentEvent e)  { searchDebounce.restart(); }
-            public void removeUpdate(javax.swing.event.DocumentEvent e)  { searchDebounce.restart(); }
-            public void changedUpdate(javax.swing.event.DocumentEvent e) { searchDebounce.restart(); }
+            public void insertUpdate(javax.swing.event.DocumentEvent e) {
+                searchDebounce.restart();
+            }
+
+            public void removeUpdate(javax.swing.event.DocumentEvent e) {
+                searchDebounce.restart();
+            }
+
+            public void changedUpdate(javax.swing.event.DocumentEvent e) {
+                searchDebounce.restart();
+            }
         });
 
         for (MonitorPrefs.Range r : MonitorPrefs.RANGES) rangeCombo.addItem(r.label());
         rangeCombo.setSelectedIndex(prefs.rangeIndex());
         rangeCombo.setToolTipText("How far back to show events");
         labelled(rangeCombo, "Range: ", "Last 24 hours");
-        rangeCombo.addActionListener(e -> { if (!adjusting) prefs.setRangeIndex(rangeCombo.getSelectedIndex()); });
+        rangeCombo.addActionListener(e -> {
+            if (!adjusting) prefs.setRangeIndex(rangeCombo.getSelectedIndex());
+        });
 
         for (MonitorPrefs.Level l : MonitorPrefs.LEVELS) levelCombo.addItem(l.label());
         levelCombo.setSelectedIndex(prefs.levelIndex());
         levelCombo.setToolTipText("<html>How much detail to show.<br><b>Normal</b> hides low-level queue bookkeeping; "
                 + "<b>All incl. debug</b> shows everything that was recorded.</html>");
         labelled(levelCombo, "Level: ", "All incl. debug");
-        levelCombo.addActionListener(e -> { if (!adjusting) prefs.setLevelIndex(levelCombo.getSelectedIndex()); });
+        levelCombo.addActionListener(e -> {
+            if (!adjusting) prefs.setLevelIndex(levelCombo.getSelectedIndex());
+        });
 
         taskCombo.addItem(new TaskItem(null, "All tasks"));
         taskCombo.setToolTipText("Show only one task");
@@ -245,9 +319,18 @@ public class EventFeedPanel extends JPanel {
         });
 
         table.addMouseListener(new MouseAdapter() {
-            @Override public void mousePressed(MouseEvent e)  { popup(e); }
-            @Override public void mouseReleased(MouseEvent e) { popup(e); }
-            @Override public void mouseClicked(MouseEvent e) {
+            @Override
+            public void mousePressed(MouseEvent e) {
+                popup(e);
+            }
+
+            @Override
+            public void mouseReleased(MouseEvent e) {
+                popup(e);
+            }
+
+            @Override
+            public void mouseClicked(MouseEvent e) {
                 int r = table.rowAtPoint(e.getPoint());
                 if (r < 0 || !SwingUtilities.isLeftMouseButton(e)) return;
                 FeedRow row = model.rowAt(r);
@@ -256,6 +339,7 @@ public class EventFeedPanel extends JPanel {
                         && e.getX() <= table.getCellRect(r, COL_TIME, false).x + row.depth * INDENT + INDENT + 8;
                 if (onTree || e.getClickCount() == 2) toggle(row);
             }
+
             private void popup(MouseEvent e) {
                 if (!e.isPopupTrigger()) return;
                 int r = table.rowAtPoint(e.getPoint());
@@ -266,7 +350,10 @@ public class EventFeedPanel extends JPanel {
 
         JScrollPane scroll = new JScrollPane(table);
         scroll.getViewport().addComponentListener(new java.awt.event.ComponentAdapter() {
-            @Override public void componentResized(java.awt.event.ComponentEvent e) { applyColumnVisibility(scroll.getViewport().getWidth()); }
+            @Override
+            public void componentResized(java.awt.event.ComponentEvent e) {
+                applyColumnVisibility(scroll.getViewport().getWidth());
+            }
         });
         scroll.setBorder(BorderFactory.createLineBorder(UIManager.getColor("Component.borderColor") != null
                 ? UIManager.getColor("Component.borderColor") : Color.LIGHT_GRAY));
@@ -291,9 +378,9 @@ public class EventFeedPanel extends JPanel {
         return cardHost;
     }
 
-    private int lastColumnMask = -1;
-
-    /** Shows or hides the optional columns to fit {@code viewportWidth}; no-op unless the set actually changes. */
+    /**
+     * Shows or hides the optional columns to fit {@code viewportWidth}; no-op unless the set actually changes.
+     */
     private void applyColumnVisibility(int viewportWidth) {
         if (viewportWidth <= 0) return;
         int mask = 0;
@@ -331,7 +418,10 @@ public class EventFeedPanel extends JPanel {
         InputMap in = getInputMap(WHEN_ANCESTOR_OF_FOCUSED_COMPONENT);
         ActionMap act = getActionMap();
         bind(in, act, "focusSearch", KeyStroke.getKeyStroke(KeyEvent.VK_F, java.awt.event.InputEvent.CTRL_DOWN_MASK),
-                () -> { search.requestFocusInWindow(); search.selectAll(); });
+                () -> {
+                    search.requestFocusInWindow();
+                    search.selectAll();
+                });
         bind(in, act, "togglePause", KeyStroke.getKeyStroke(KeyEvent.VK_P, java.awt.event.InputEvent.CTRL_DOWN_MASK),
                 () -> setPaused(!pauseBtn.isSelected()));
         bind(in, act, "refreshNow", KeyStroke.getKeyStroke(KeyEvent.VK_F5, 0), () -> rebuild());
@@ -348,48 +438,92 @@ public class EventFeedPanel extends JPanel {
             if (selectedRow != null && selectedRow.expandable) toggle(selectedRow);
         });
         bind(tin, tact, "copyRow", KeyStroke.getKeyStroke(KeyEvent.VK_C, java.awt.event.InputEvent.CTRL_DOWN_MASK),
-                () -> { if (selectedRow != null) copy(rowText(selectedRow)); });
+                () -> {
+                    if (selectedRow != null) copy(rowText(selectedRow));
+                });
         bind(tin, tact, "clearSel", KeyStroke.getKeyStroke(KeyEvent.VK_ESCAPE, 0), () -> table.clearSelection());
         search.getInputMap(WHEN_FOCUSED).put(KeyStroke.getKeyStroke(KeyEvent.VK_ESCAPE, 0), "clearSearch");
         search.getActionMap().put("clearSearch", new AbstractAction() {
-            public void actionPerformed(java.awt.event.ActionEvent e) { search.setText(""); table.requestFocusInWindow(); }
+            public void actionPerformed(java.awt.event.ActionEvent e) {
+                search.setText("");
+                table.requestFocusInWindow();
+            }
         });
     }
 
-    private static void bind(InputMap in, ActionMap act, String name, KeyStroke ks, Runnable r) {
-        in.put(ks, name);
-        act.put(name, new AbstractAction() {
-            public void actionPerformed(java.awt.event.ActionEvent e) { r.run(); }
-        });
+    public void setSelectionListener(Consumer<FeedRow> l) {
+        this.selectionListener = l != null ? l : r -> {
+        };
     }
 
-    // ── Public API ──────────────────────────────────────────────────
+    public void setTaskFilterListener(Consumer<String> l) {
+        this.taskFilterListener = l != null ? l : id -> {
+        };
+    }
 
-    public void setSelectionListener(Consumer<FeedRow> l)  { this.selectionListener = l != null ? l : r -> {}; }
-    public void setTaskFilterListener(Consumer<String> l)  { this.taskFilterListener = l != null ? l : id -> {}; }
-    public FeedRow getSelectedRow()                        { return selectedRow; }
-    public List<MonitorEvent> getMatchedEvents()           { return result.matchedEvents(); }
-    /** Task the feed is currently restricted to, or null for all tasks. */
-    public String getTaskFilterId()                        { return taskFilterId; }
-    public boolean isPaused()                              { return pauseBtn.isSelected(); }
+    public FeedRow getSelectedRow() {
+        return selectedRow;
+    }
+
+    public List<MonitorEvent> getMatchedEvents() {
+        return result.matchedEvents();
+    }
+
+    /**
+     * Task the feed is currently restricted to, or null for all tasks.
+     */
+    public String getTaskFilterId() {
+        return taskFilterId;
+    }
+
+    public boolean isPaused() {
+        return pauseBtn.isSelected();
+    }
+
+    // ── Filtering / rebuilding ──────────────────────────────────────
+
+    public void setPaused(boolean paused) {
+        pauseBtn.setSelected(paused);
+        pauseBtn.setText(paused ? "Resume" : "Pause");
+        if (!paused) {
+            pendingWhilePaused = 0;
+            shownEvents = latestEvents;
+            rebuild();
+        } else {
+            updateStatus();
+        }
+    }
+
     /**
      * Errors / warnings anywhere in the selected time range — deliberately NOT narrowed by the search
      * box, task or category filters, so the "Attention" summary never says "all clear" just because
      * the operator happens to be looking at something else.
      */
-    public int getErrorCount()                             { return attentionErrors; }
-    public int getWarningCount()                           { return attentionWarnings; }
+    public int getErrorCount() {
+        return attentionErrors;
+    }
 
-    /** Shows or hides the slim notice above the toolbar (e.g. "No scheduler is running"). */
+    public int getWarningCount() {
+        return attentionWarnings;
+    }
+
+    /**
+     * Shows or hides the slim notice above the toolbar (e.g. "No scheduler is running").
+     */
     public void setBanner(String text, boolean problem) {
-        if (text == null || text.isBlank()) { bannerHost.setVisible(false); return; }
+        if (text == null || text.isBlank()) {
+            bannerHost.setVisible(false);
+            return;
+        }
         banner.setText(text);
         banner.setForeground(problem ? AppTheme.FAILED_FG : AppTheme.SKIPPED_FG);
         banner.setBackground(problem ? AppTheme.FAILED_BG : AppTheme.SKIPPED_BG);
         bannerHost.setVisible(true);
     }
 
-    /** Offers the live tasks in the task filter, plus any task that only appears in history. */
+    /**
+     * Offers the live tasks in the task filter, plus any task that only appears in history.
+     */
     public void setTaskChoices(Map<String, String> liveTasks) {
         Map<String, String> choices = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
         Map<String, String> byName = new LinkedHashMap<>();
@@ -425,14 +559,20 @@ public class EventFeedPanel extends JPanel {
         }
     }
 
-    /** Restricts the feed to one task (also called from the detail pane's "Only this task" link). */
+    /**
+     * Restricts the feed to one task (also called from the detail pane's "Only this task" link).
+     */
     public void showOnlyTask(String taskId) {
         adjusting = true;
         try {
             taskFilterId = taskId;
             boolean found = false;
             for (int i = 0; i < taskCombo.getItemCount(); i++) {
-                if (Objects.equals(taskCombo.getItemAt(i).id(), taskId)) { taskCombo.setSelectedIndex(i); found = true; break; }
+                if (Objects.equals(taskCombo.getItemAt(i).id(), taskId)) {
+                    taskCombo.setSelectedIndex(i);
+                    found = true;
+                    break;
+                }
             }
             if (!found) taskCombo.setSelectedIndex(0);
         } finally {
@@ -446,7 +586,9 @@ public class EventFeedPanel extends JPanel {
         this.runningIds = ids != null ? ids : Set.of();
     }
 
-    /** Supplies freshly loaded events. {@code limited} is true when the loader hit its row cap. */
+    /**
+     * Supplies freshly loaded events. {@code limited} is true when the loader hit its row cap.
+     */
     public void setEvents(List<MonitorEvent> events, boolean limited) {
         Set<String> newKeys = new HashSet<>();
         // Only genuinely fresh events flash — widening the time range loads old events that were
@@ -474,35 +616,27 @@ public class EventFeedPanel extends JPanel {
         rebuild();
     }
 
-    /** Re-evaluates run states (elapsed time, "running" → "unfinished") without new data. Cheap; call each second. */
+    /**
+     * Re-evaluates run states (elapsed time, "running" → "unfinished") without new data. Cheap; call each second.
+     */
     public void tick() {
         if (pauseBtn.isSelected()) return;
         boolean hasRunning = false;
-        for (FeedRow r : result.rows()) if (r.outcome == FeedRow.Outcome.RUNNING) { hasRunning = true; break; }
+        for (FeedRow r : result.rows())
+            if (r.outcome == FeedRow.Outcome.RUNNING) {
+                hasRunning = true;
+                break;
+            }
         long now = System.currentTimeMillis();
         // Also re-run periodically so events age out of a relative time range on their own.
         if (hasRunning || now - lastRebuildMs > 5000) rebuild();
     }
 
-    public void setPaused(boolean paused) {
-        pauseBtn.setSelected(paused);
-        pauseBtn.setText(paused ? "Resume" : "Pause");
-        if (!paused) {
-            pendingWhilePaused = 0;
-            shownEvents = latestEvents;
-            rebuild();
-        } else {
-            updateStatus();
-        }
-    }
-
-    // ── Filtering / rebuilding ──────────────────────────────────────
-
     private EventFilter currentFilter() {
         MonitorPrefs.Range range = prefs.range();
         LocalDateTime since = range.window() != null ? LocalDateTime.now().minus(range.window()) : null;
         return new EventFilter(search.getText(), taskFilterId, EnumSet.copyOf(activeCategories.isEmpty()
-                        ? EnumSet.noneOf(EventKind.Category.class) : activeCategories),
+                ? EnumSet.noneOf(EventKind.Category.class) : activeCategories),
                 prefs.level().min(), since);
     }
 
@@ -524,7 +658,9 @@ public class EventFeedPanel extends JPanel {
         showOnlyTask(null);
     }
 
-    /** Applies a click on a category chip ({@code null} = the "All" chip). */
+    /**
+     * Applies a click on a category chip ({@code null} = the "All" chip).
+     */
     private void chooseCategory(EventKind.Category c, boolean multi) {
         EnumSet<EventKind.Category> all = EnumSet.allOf(EventKind.Category.class);
         if (c == null) {
@@ -537,7 +673,8 @@ public class EventFeedPanel extends JPanel {
             } else if (!activeCategories.remove(c)) {
                 activeCategories.add(c);
             }
-            if (activeCategories.isEmpty()) activeCategories.addAll(all);   // never leave the feed with nothing selectable
+            if (activeCategories.isEmpty())
+                activeCategories.addAll(all);   // never leave the feed with nothing selectable
         } else if (activeCategories.size() == 1 && activeCategories.contains(c)) {
             activeCategories.addAll(all);                          // click the only chosen one again: back to all
         } else {
@@ -548,7 +685,9 @@ public class EventFeedPanel extends JPanel {
         filterChanged();
     }
 
-    /** Makes the chip row reflect {@link #activeCategories}: "All" lit when nothing is narrowed, else the chosen ones. */
+    /**
+     * Makes the chip row reflect {@link #activeCategories}: "All" lit when nothing is narrowed, else the chosen ones.
+     */
     private void syncChips() {
         boolean everything = activeCategories.size() == EventKind.Category.values().length;
         if (allChip != null) allChip.setSelected(everything);
@@ -557,19 +696,9 @@ public class EventFeedPanel extends JPanel {
         }
     }
 
-    /** Shows "Prefix: value" in the closed combo, so bare values like "Normal" say what they are. */
-    @SuppressWarnings({"unchecked", "rawtypes"})
-    private static void labelled(JComboBox combo, String prefix, Object prototype) {
-        final ListCellRenderer base = combo.getRenderer();
-        combo.setRenderer((list, value, index, isSelected, hasFocus) -> {
-            Component c = base.getListCellRendererComponent(list, value, index, isSelected, hasFocus);
-            if (index < 0 && c instanceof JLabel l) l.setText(prefix + value);
-            return c;
-        });
-        combo.setPrototypeDisplayValue(prototype);
-    }
-
-    /** Reacts to a preference change — narrowly: only what actually changed is redone. */
+    /**
+     * Reacts to a preference change — narrowly: only what actually changed is redone.
+     */
     private void onPrefsChanged(String what) {
         adjusting = true;
         try {
@@ -586,30 +715,12 @@ public class EventFeedPanel extends JPanel {
 
     private void startFlash(Set<String> keys) {
         flashKeys.addAll(keys);
-        javax.swing.Timer t = new javax.swing.Timer(FLASH_MS, e -> { flashKeys.removeAll(keys); table.repaint(); });
+        javax.swing.Timer t = new javax.swing.Timer(FLASH_MS, e -> {
+            flashKeys.removeAll(keys);
+            table.repaint();
+        });
         t.setRepeats(false);
         t.start();
-    }
-
-    /** Above this many events the feed is rebuilt on a worker thread instead of inline on the EDT. */
-    private static final int SYNC_BUILD_LIMIT = 800;
-    private static final java.util.concurrent.ExecutorService BUILDER =
-            service.Workers.newPool(service.Workers.Lane.FEED, 1);
-    private boolean building;       // EDT-only: a background build is in flight
-    private boolean buildAgain;     // EDT-only: another rebuild() arrived meanwhile -> run once more
-
-    private record Built(FeedBuilder.Result result, int errors, int warnings) {}
-
-    private static Built compute(List<MonitorEvent> events, EventFilter filter, boolean group, boolean collapse,
-                                 Set<String> running, Set<String> expandedKeys) {
-        FeedBuilder.Result res = FeedBuilder.build(events, filter, group, collapse, running, expandedKeys, LocalDateTime.now());
-        int errs = 0, warns = 0;
-        for (MonitorEvent e : events) {
-            if (filter.since() != null && e.time().isBefore(filter.since())) continue;
-            if (e.severity() == EventKind.Severity.ERROR) errs++;
-            else if (e.severity() == EventKind.Severity.WARN) warns++;
-        }
-        return new Built(res, errs, warns);
     }
 
     private void rebuild() {
@@ -627,7 +738,10 @@ public class EventFeedPanel extends JPanel {
         }
         // Big feed: build off the EDT. One build at a time; requests that arrive while one is
         // running collapse into a single follow-up build with the newest inputs.
-        if (building) { buildAgain = true; return; }
+        if (building) {
+            buildAgain = true;
+            return;
+        }
         building = true;
         final Set<String> expandedCopy = new HashSet<>(expanded);
         BUILDER.execute(() -> {
@@ -640,13 +754,19 @@ public class EventFeedPanel extends JPanel {
                     throw t;
                 }
             } catch (Throwable t) {
-                SwingUtilities.invokeLater(() -> { building = false; });
+                SwingUtilities.invokeLater(() -> {
+                    building = false;
+                });
                 System.err.println("Feed build failed: " + t);
                 return;
             }
             SwingUtilities.invokeLater(() -> {
                 building = false;
-                if (buildAgain) { buildAgain = false; rebuild(); return; } // newer inputs exist; skip stale apply
+                if (buildAgain) {
+                    buildAgain = false;
+                    rebuild();
+                    return;
+                } // newer inputs exist; skip stale apply
                 applyBuild(built, f);
             });
         });
@@ -676,10 +796,12 @@ public class EventFeedPanel extends JPanel {
         try {
             model.setRows(result.rows());
             int idx = selectedKey != null ? model.indexOfKey(selectedKey) : -1;
-            if (idx >= 0) table.setRowSelectionInterval(idx, idx); else table.clearSelection();
+            if (idx >= 0) table.setRowSelectionInterval(idx, idx);
+            else table.clearSelection();
             if (anchorKey != null) {
                 int ni = model.indexOfKey(anchorKey);
-                if (ni >= 0) vp.setViewPosition(new Point(0, Math.max(0, table.getCellRect(ni, 0, true).y + anchorOffset)));
+                if (ni >= 0)
+                    vp.setViewPosition(new Point(0, Math.max(0, table.getCellRect(ni, 0, true).y + anchorOffset)));
             }
         } finally {
             adjusting = false;
@@ -688,8 +810,11 @@ public class EventFeedPanel extends JPanel {
         FeedRow nowSelected = selectedKey != null && model.indexOfKey(selectedKey) >= 0
                 ? model.rowAt(model.indexOfKey(selectedKey)) : null;
         selectedRow = nowSelected;
-        if (nowSelected == null && previousSelected != null) { selectedKey = null; selectionListener.accept(null); }
-        else if (nowSelected != null && changedForDetail(previousSelected, nowSelected)) selectionListener.accept(nowSelected);
+        if (nowSelected == null && previousSelected != null) {
+            selectedKey = null;
+            selectionListener.accept(null);
+        } else if (nowSelected != null && changedForDetail(previousSelected, nowSelected))
+            selectionListener.accept(nowSelected);
 
         updateChips();
         updateStatus();
@@ -707,13 +832,6 @@ public class EventFeedPanel extends JPanel {
         }
     }
 
-    private static boolean changedForDetail(FeedRow a, FeedRow b) {
-        if (a == null || b == null) return a != b;
-        return a.outcome != b.outcome || a.count != b.count || !Objects.equals(a.summary, b.summary)
-                || a.events.size() != b.events.size()
-                || (a.outcome != FeedRow.Outcome.RUNNING && a.durationMs != b.durationMs);
-    }
-
     private void updateChips() {
         int total = 0;
         for (EventKind.Category c : EventKind.Category.values()) {
@@ -724,15 +842,21 @@ public class EventFeedPanel extends JPanel {
         allChip.setCount(total);
     }
 
+    // ── Row actions ─────────────────────────────────────────────────
+
     private void updateStatus() {
         int shownRows = result.rows().size();
         int events = result.matchedEvents().size();
         StringBuilder sb = new StringBuilder();
         sb.append(events).append(events == 1 ? " event" : " events");
-        if (prefs.groupRuns() && shownRows != events) sb.append(" in ").append(shownRows).append(shownRows == 1 ? " row" : " rows");
-        if (result.errors() > 0) sb.append("  \u00b7  ").append(result.errors()).append(result.errors() == 1 ? " error" : " errors");
-        if (result.warnings() > 0) sb.append("  \u00b7  ").append(result.warnings()).append(result.warnings() == 1 ? " warning" : " warnings");
-        if (hitLimit) sb.append("  \u00b7  showing the newest events only \u2014 narrow the time range to see older ones");
+        if (prefs.groupRuns() && shownRows != events)
+            sb.append(" in ").append(shownRows).append(shownRows == 1 ? " row" : " rows");
+        if (result.errors() > 0)
+            sb.append("  \u00b7  ").append(result.errors()).append(result.errors() == 1 ? " error" : " errors");
+        if (result.warnings() > 0)
+            sb.append("  \u00b7  ").append(result.warnings()).append(result.warnings() == 1 ? " warning" : " warnings");
+        if (hitLimit)
+            sb.append("  \u00b7  showing the newest events only \u2014 narrow the time range to see older ones");
         statusLeft.setText(sb.toString());
 
         if (pauseBtn.isSelected()) {
@@ -743,8 +867,6 @@ public class EventFeedPanel extends JPanel {
             statusRight.setForeground(MonitorStyle.onSurface(AppTheme.SUCCESS_FG));
         }
     }
-
-    // ── Row actions ─────────────────────────────────────────────────
 
     private void toggle(FeedRow row) {
         if (!row.expandable) return;
@@ -814,12 +936,6 @@ public class EventFeedPanel extends JPanel {
         return m;
     }
 
-    private static JCheckBoxMenuItem check(String text, boolean on, java.util.function.Consumer<Boolean> set) {
-        JCheckBoxMenuItem it = new JCheckBoxMenuItem(text, on);
-        it.addActionListener(e -> set.accept(it.isSelected()));
-        return it;
-    }
-
     private void exportCsv() {
         List<MonitorEvent> events = result.matchedEvents();
         if (events.isEmpty()) {
@@ -841,21 +957,43 @@ public class EventFeedPanel extends JPanel {
         }
     }
 
-    static String rowText(FeedRow r) {
-        return MonitorStyle.fullTime(r.time) + "  " + r.outcome.label() + "  " + r.taskName + "  "
-                + r.label + (r.summary.isEmpty() ? "" : "  \u2014  " + r.summary)
-                + (r.durationMs >= 0 ? "  (" + MonitorStyle.duration(r.durationMs) + ")" : "");
+    private boolean isFlashing(FeedRow r) {
+        if (flashKeys.isEmpty()) return false;
+        for (MonitorEvent e : r.events) if (flashKeys.contains(e.key())) return true;
+        return false;
     }
 
-    private static void copy(String text) {
-        Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(text), null);
+    /**
+     * Combo item for the task filter.
+     */
+    private record TaskItem(String id, String label) {
+        @Override
+        public String toString() {
+            return label;
+        }
     }
 
     // ── Table model ─────────────────────────────────────────────────
 
+    private record Built(FeedBuilder.Result result, int errors, int warnings) {
+    }
+
+    // ── Rendering ───────────────────────────────────────────────────
+
     private static final class FeedModel extends AbstractTableModel {
         private List<FeedRow> rows = List.of();
         private Map<String, Integer> index = Map.of();
+
+        /**
+         * True when two rows with the same key would paint identically.
+         */
+        private static boolean displayEqual(FeedRow a, FeedRow b) {
+            return a.type == b.type && a.depth == b.depth && a.count == b.count && a.outcome == b.outcome
+                    && a.durationMs == b.durationMs && a.expanded == b.expanded && a.events.size() == b.events.size()
+                    && Objects.equals(a.time, b.time) && Objects.equals(a.summary, b.summary)
+                    && Objects.equals(a.label, b.label) && Objects.equals(a.trigger, b.trigger)
+                    && Objects.equals(a.files, b.files) && Objects.equals(a.taskName, b.taskName);
+        }
 
         void setRows(List<FeedRow> r) {
             List<FeedRow> old = rows;
@@ -868,7 +1006,10 @@ public class EventFeedPanel extends JPanel {
                 // layout are left alone instead of the whole table being reset.
                 int n = r.size(), i = 0;
                 while (i < n) {
-                    if (displayEqual(old.get(i), r.get(i))) { i++; continue; }
+                    if (displayEqual(old.get(i), r.get(i))) {
+                        i++;
+                        continue;
+                    }
                     int start = i;
                     while (i < n && !displayEqual(old.get(i), r.get(i))) i++;
                     fireTableRowsUpdated(start, i - 1);
@@ -881,28 +1022,33 @@ public class EventFeedPanel extends JPanel {
             fireTableDataChanged();
         }
 
-        /** True when two rows with the same key would paint identically. */
-        private static boolean displayEqual(FeedRow a, FeedRow b) {
-            return a.type == b.type && a.depth == b.depth && a.count == b.count && a.outcome == b.outcome
-                    && a.durationMs == b.durationMs && a.expanded == b.expanded && a.events.size() == b.events.size()
-                    && Objects.equals(a.time, b.time) && Objects.equals(a.summary, b.summary)
-                    && Objects.equals(a.label, b.label) && Objects.equals(a.trigger, b.trigger)
-                    && Objects.equals(a.files, b.files) && Objects.equals(a.taskName, b.taskName);
+        FeedRow rowAt(int i) {
+            return rows.get(i);
         }
-        FeedRow rowAt(int i)              { return rows.get(i); }
-        int indexOfKey(String key)        { return index.getOrDefault(key, -1); }
-        @Override public int getRowCount()    { return rows.size(); }
-        @Override public int getColumnCount() { return COLUMNS.length; }
-        @Override public String getColumnName(int c) { return COLUMNS[c]; }
-        @Override public Object getValueAt(int r, int c) { return rows.get(r); }
-    }
 
-    // ── Rendering ───────────────────────────────────────────────────
+        int indexOfKey(String key) {
+            return index.getOrDefault(key, -1);
+        }
 
-    private boolean isFlashing(FeedRow r) {
-        if (flashKeys.isEmpty()) return false;
-        for (MonitorEvent e : r.events) if (flashKeys.contains(e.key())) return true;
-        return false;
+        @Override
+        public int getRowCount() {
+            return rows.size();
+        }
+
+        @Override
+        public int getColumnCount() {
+            return COLUMNS.length;
+        }
+
+        @Override
+        public String getColumnName(int c) {
+            return COLUMNS[c];
+        }
+
+        @Override
+        public Object getValueAt(int r, int c) {
+            return rows.get(r);
+        }
     }
 
     private final class RowRenderer extends DefaultTableCellRenderer {
@@ -967,11 +1113,13 @@ public class EventFeedPanel extends JPanel {
                 }
                 case COL_EVENT -> {
                     setText(r.label);
-                    if (r.type == FeedRow.Type.RUN) setToolTipText(r.count + " events \u2014 click the arrow to expand");
+                    if (r.type == FeedRow.Type.RUN)
+                        setToolTipText(r.count + " events \u2014 click the arrow to expand");
                     if (r.type == FeedRow.Type.EVENT) dot = MonitorStyle.categoryColor(r.head.kind().category());
                     if (dot != null) setBorder(new EmptyBorder(0, 20, 0, 4));
                     if (r.type != FeedRow.Type.EVENT || r.head.isOutcome()) setForeground(muted == fg ? fg : fg);
-                    if (r.type != FeedRow.Type.RUN) setToolTipText(r.head.kind().category().label() + " \u2014 " + r.head.kind().label());
+                    if (r.type != FeedRow.Type.RUN)
+                        setToolTipText(r.head.kind().category().label() + " \u2014 " + r.head.kind().label());
                 }
                 case COL_SUMMARY -> {
                     setText(r.summary);
@@ -983,8 +1131,14 @@ public class EventFeedPanel extends JPanel {
                                 + " and " + MonitorStyle.fullTime(r.time));
                     }
                 }
-                case COL_FILES -> { setText(r.files != null ? r.files : ""); setForeground(muted); }
-                case COL_TRIGGER -> { setText(MonitorStyle.triggerLabel(r.trigger)); setForeground(muted); }
+                case COL_FILES -> {
+                    setText(r.files != null ? r.files : "");
+                    setForeground(muted);
+                }
+                case COL_TRIGGER -> {
+                    setText(MonitorStyle.triggerLabel(r.trigger));
+                    setForeground(muted);
+                }
                 case COL_DURATION -> {
                     String d = MonitorStyle.duration(r.durationMs);
                     if (r.type == FeedRow.Type.BUCKET && !d.isEmpty()) d = "\u00f8 " + d;
@@ -992,7 +1146,8 @@ public class EventFeedPanel extends JPanel {
                     setForeground(muted);
                     setHorizontalAlignment(RIGHT);
                 }
-                default -> {}
+                default -> {
+                }
             }
             return this;
         }
@@ -1011,9 +1166,13 @@ public class EventFeedPanel extends JPanel {
                 g2.setColor(MonitorStyle.muted());
                 Polygon p = new Polygon();
                 if (expander == 1) {          // ▸
-                    p.addPoint(expanderX + 3, cy - 4); p.addPoint(expanderX + 3, cy + 4); p.addPoint(expanderX + 8, cy);
+                    p.addPoint(expanderX + 3, cy - 4);
+                    p.addPoint(expanderX + 3, cy + 4);
+                    p.addPoint(expanderX + 8, cy);
                 } else {                      // ▾
-                    p.addPoint(expanderX, cy - 2); p.addPoint(expanderX + 8, cy - 2); p.addPoint(expanderX + 4, cy + 3);
+                    p.addPoint(expanderX, cy - 2);
+                    p.addPoint(expanderX + 8, cy - 2);
+                    p.addPoint(expanderX + 4, cy + 3);
                 }
                 g2.fillPolygon(p);
             }

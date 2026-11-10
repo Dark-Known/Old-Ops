@@ -18,12 +18,13 @@ import java.util.*;
  */
 final class IssueGrouping {
 
-    private IssueGrouping() {}
-
     static final Set<TaskRunRecord.FailureCategory> BLOCKING_CATEGORIES = EnumSet.of(
             TaskRunRecord.FailureCategory.AUTH,
             TaskRunRecord.FailureCategory.PERMISSION,
             TaskRunRecord.FailureCategory.DISK_SPACE);
+
+    private IssueGrouping() {
+    }
 
     static boolean isBlocking(TaskRunRecord r) {
         return r.getFailureCategory() != null && BLOCKING_CATEGORIES.contains(r.getFailureCategory());
@@ -74,7 +75,8 @@ final class IssueGrouping {
      * task" signal, not an invented file/item count.
      */
     static String describeCredentialImpact(XmlStorageService storage, TaskRunRecord example) {
-        if (example.getFailureCategory() != TaskRunRecord.FailureCategory.AUTH || example.getTaskId() == null) return null;
+        if (example.getFailureCategory() != TaskRunRecord.FailureCategory.AUTH || example.getTaskId() == null)
+            return null;
         try {
             List<ScheduledTask> all = storage.loadTasks();
             ScheduledTask failing = all.stream().filter(t -> t.getId().equals(example.getTaskId())).findFirst().orElse(null);

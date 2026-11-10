@@ -1,5 +1,5 @@
-
 import ui.MainWindow;
+
 import javax.swing.*;
 
 public class App {
@@ -14,7 +14,10 @@ public class App {
         SwingUtilities.invokeLater(() -> {
             ui.EdtWatchdog.start(150); // logs any UI event that blocks the EDT for 150 ms or more
             new MainWindow().setVisible(true);
-            { String dd = util.AppConfig.readValue("dataDir"); MainWindow.startMemoryReports(dd != null ? dd : "C:\\OpsTools\\Data"); } // trims unused heap; writes logs/memory-gui.txt
+            {
+                String dd = util.AppConfig.readValue("dataDir");
+                MainWindow.startMemoryReports(dd != null ? dd : "C:\\OpsTools\\Data");
+            } // trims unused heap; writes logs/memory-gui.txt
         });
     }
 }

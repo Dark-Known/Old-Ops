@@ -13,12 +13,15 @@ import java.util.Base64;
  */
 public final class LinkTokens {
 
-    /** Makes the token recognisable (and findable by secret scanners) if it ends up in a file or a log. */
+    /**
+     * Makes the token recognisable (and findable by secret scanners) if it ends up in a file or a log.
+     */
     public static final String PREFIX = "opl_";
 
     private static final SecureRandom RANDOM = new SecureRandom();
 
-    private LinkTokens() {}
+    private LinkTokens() {
+    }
 
     public static String generate() {
         byte[] raw = new byte[32];
@@ -26,7 +29,9 @@ public final class LinkTokens {
         return PREFIX + Base64.getUrlEncoder().withoutPadding().encodeToString(raw);
     }
 
-    /** Lower-case hex SHA-256 of the token. */
+    /**
+     * Lower-case hex SHA-256 of the token.
+     */
     public static String hash(String token) {
         try {
             byte[] d = MessageDigest.getInstance("SHA-256").digest(token.getBytes(StandardCharsets.UTF_8));
@@ -38,7 +43,9 @@ public final class LinkTokens {
         }
     }
 
-    /** Constant-time check of a presented token against a stored hash. */
+    /**
+     * Constant-time check of a presented token against a stored hash.
+     */
     public static boolean matches(String presentedToken, String storedHash) {
         if (presentedToken == null || storedHash == null || storedHash.isEmpty()) return false;
         return MessageDigest.isEqual(hash(presentedToken).getBytes(StandardCharsets.UTF_8),

@@ -1,12 +1,7 @@
 package ui;
 
 import model.FileSelection;
-import model.FileSelection.AfterAction;
-import model.FileSelection.MatchMode;
-import model.FileSelection.Op;
-import model.FileSelection.Pick;
-import model.FileSelection.Rule;
-import model.FileSelection.SentPolicy;
+import model.FileSelection.*;
 import service.TransferLedger;
 
 import javax.swing.*;
@@ -31,9 +26,9 @@ import java.util.List;
 public class FileSelectionPanel extends JPanel {
 
     private static final String[] SIZE_UNITS = {"bytes", "KB", "MB", "GB"};
-    private static final long[]   SIZE_MULT  = {1L, 1L << 10, 1L << 20, 1L << 30};
-    private static final String[] AGE_UNITS  = {"minutes", "hours", "days"};
-    private static final long[]   AGE_MIN    = {1L, 60L, 1440L};
+    private static final long[] SIZE_MULT = {1L, 1L << 10, 1L << 20, 1L << 30};
+    private static final String[] AGE_UNITS = {"minutes", "hours", "days"};
+    private static final long[] AGE_MIN = {1L, 60L, 1440L};
 
     private final JPanel rulesBox = new JPanel();
     private final List<RuleRow> rows = new ArrayList<>();
@@ -67,26 +62,31 @@ public class FileSelectionPanel extends JPanel {
     private final JSpinner spAlertEvery = spinner(60, 100_000);
     private final JLabel lblAlertNote = new JLabel(" ");
     private final JLabel lblAfterFolder = new JLabel("Move to folder");
-    private JPanel sink;
-    private int outerY;
-    private Runnable remoteBrowser;
-    private String taskId;
-    private java.io.File dataDir;
-    private boolean inbound;
-
     private final JTextField tfTest = new JTextField(24);
     private final JLabel lblTest = new JLabel(" ");
     private final JLabel lblSummary = new JLabel(" ");
     private final JLabel lblModeNote = new JLabel(
             "<html><body style='width:420px'>Not used in SPECIFIC_FILE mode — that mode transfers the one named file.</body></html>");
     private final JButton btnAdd = new JButton("+ Add condition");
-
-    private boolean modeAllows = true;
-    private boolean watcherActive;
     private final JLabel lblWatcherNote = new JLabel(
             "<html><body style='width:420px'>The watcher is on: it sends every new matching file and remembers what it sent, "
                     + "so \"Send newest N\", \"Files sent before\" and the per-run no-files alert are not used (\"no new file for N minutes\" still works).</body></html>");
+    /**
+     * Starts a titled group; everything added with {@link #put} afterwards goes into it.
+     */
+    private final java.util.Map<String, JPanel> sections = new java.util.HashMap<>();
+    private JPanel sink;
+    private int outerY;
+    private Runnable remoteBrowser;
+    private String taskId;
+    private java.io.File dataDir;
+    private boolean inbound;
+    private boolean modeAllows = true;
+    private boolean watcherActive;
     private boolean loading;
+    private JComponent introNote, pickRowPanel;
+
+    // ── Public API ───────────────────────────────────────────────────
 
     public FileSelectionPanel(FileSelection initial) {
         setLayout(new GridBagLayout());
@@ -239,21 +239,110 @@ public class FileSelectionPanel extends JPanel {
         cbSent.addActionListener(e -> ch0());
         cbAfter.addActionListener(e -> ch0());
         tfAfterFolder.getDocument().addDocumentListener(docListener(this::ch0));
-        btnAdd.addActionListener(e -> { addRow(new Rule(false, Op.ENDS_WITH, "", true)); changed(); });
+        btnAdd.addActionListener(e -> {
+            addRow(new Rule(false, Op.ENDS_WITH, "", true));
+            changed();
+        });
         Runnable ch = this::changed;
-        for (JSpinner s : new JSpinner[]{spMinSize, spMaxSize, spWithin, spSettled, spCount}) s.addChangeListener(e -> ch.run());
-        for (JComboBox<?> c : new JComboBox<?>[]{cbMatch, cbMinUnit, cbMaxUnit, cbWithinUnit, cbPick}) c.addActionListener(e -> ch.run());
+        for (JSpinner s : new JSpinner[]{spMinSize, spMaxSize, spWithin, spSettled, spCount})
+            s.addChangeListener(e -> ch.run());
+        for (JComboBox<?> c : new JComboBox<?>[]{cbMatch, cbMinUnit, cbMaxUnit, cbWithinUnit, cbPick})
+            c.addActionListener(e -> ch.run());
         for (JCheckBox c : new JCheckBox[]{cbToday, cbSkipTemp, cbTies, cbFail}) c.addActionListener(e -> ch.run());
         tfTest.getDocument().addDocumentListener(docListener(ch));
 
         setSelection(initial == null ? new FileSelection() : initial);
     }
 
-    private void ch0() { changed(); }
+    private static void setSized(JSpinner sp, JComboBox<String> unit, long bytes) {
+        int u = 0;
+        for (int i = SIZE_MULT.length - 1; i > 0; i--)
+            if (bytes > 0 && bytes % SIZE_MULT[i] == 0) {
+                u = i;
+                break;
+            }
+        unit.setSelectedIndex(u);
+        sp.setValue(bytes / SIZE_MULT[u]);
+    }
 
-    // ── Public API ───────────────────────────────────────────────────
+    private static void setAged(JSpinner sp, JComboBox<String> unit, long minutes) {
+        int u = 0;
+        for (int i = AGE_MIN.length - 1; i > 0; i--)
+            if (minutes > 0 && minutes % AGE_MIN[i] == 0) {
+                u = i;
+                break;
+            }
+        unit.setSelectedIndex(u);
+        sp.setValue(minutes / AGE_MIN[u]);
+    }
 
-    /** For an existing task: which task's sent-files memory this is, and where it lives (enables "Forget sent files"). */
+    private static JSpinner spinner(long value, long max) {
+        JSpinner s = new JSpinner(new SpinnerNumberModel(value, 0L, max, 1L));
+        ((JSpinner.DefaultEditor) s.getEditor()).getTextField().setColumns(7);
+        return s;
+    }
+
+    /** SPECIFIC_FILE transfers one named file, so these options do not apply there. */
+
+    private static long num(JSpinner s) {
+        return ((Number) s.getValue()).longValue();
+    }
+
+    private static JLabel note(String html) {
+        JLabel l = new JLabel(html);
+        l.setFont(l.getFont().deriveFont(Font.PLAIN, 11f));
+        l.setForeground(UIManager.getColor("Label.disabledForeground"));
+        return l;
+    }
+
+    // ── Loading ──────────────────────────────────────────────────────
+
+    private static GridBagConstraints gbc(int x, int y, int w, double weightx) {
+        GridBagConstraints c = new GridBagConstraints();
+        c.gridx = x;
+        c.gridy = y;
+        c.gridwidth = w;
+        c.weightx = weightx;
+        c.fill = GridBagConstraints.HORIZONTAL;
+        c.anchor = GridBagConstraints.WEST;
+        c.insets = new Insets(2, 2, 2, 2);
+        return c;
+    }
+
+    private static DocumentListener docListener(Runnable r) {
+        return new DocumentListener() {
+            public void insertUpdate(DocumentEvent e) {
+                r.run();
+            }
+
+            public void removeUpdate(DocumentEvent e) {
+                r.run();
+            }
+
+            public void changedUpdate(DocumentEvent e) {
+                r.run();
+            }
+        };
+    }
+
+    private static void setEnabledDeep(Component c, boolean on) {
+        c.setEnabled(on);
+        if (c instanceof Container) for (Component k : ((Container) c).getComponents()) setEnabledDeep(k, on);
+    }
+
+    // ── Condition rows ───────────────────────────────────────────────
+
+    private static String escape(String s) {
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
+    }
+
+    private void ch0() {
+        changed();
+    }
+
+    /**
+     * For an existing task: which task's sent-files memory this is, and where it lives (enables "Forget sent files").
+     */
     public void setTaskContext(String taskId, java.io.File dataDir) {
         this.taskId = taskId;
         this.dataDir = dataDir;
@@ -261,14 +350,20 @@ public class FileSelectionPanel extends JPanel {
         updateEnabledState();
     }
 
-    /** INBOUND downloads from the server (originals are on the server); OUTBOUND uploads from this PC. */
+    // ── Live feedback ────────────────────────────────────────────────
+
+    /**
+     * INBOUND downloads from the server (originals are on the server); OUTBOUND uploads from this PC.
+     */
     public void setInbound(boolean inbound) {
         this.inbound = inbound;
         updateEnabledState();
         changed();
     }
 
-    /** The conditions as currently entered. Condition rows left blank are ignored. */
+    /**
+     * The conditions as currently entered. Condition rows left blank are ignored.
+     */
     public FileSelection getSelection() {
         FileSelection s = new FileSelection().setMatchMode((MatchMode) cbMatch.getSelectedItem());
         for (RuleRow r : rows) {
@@ -293,28 +388,6 @@ public class FileSelectionPanel extends JPanel {
         s.setAfterFolder(tfAfterFolder.getText());
         return s;
     }
-
-    /** Problems that would stop the entered conditions from working, in plain words; empty when fine. */
-    public List<String> validateInput() {
-        return modeAllows ? getSelection().validate() : new ArrayList<>();
-    }
-
-    /** SPECIFIC_FILE transfers one named file, so these options do not apply there. */
-    /** The watcher sends every new matching file itself, so "Send newest N…" and "Files sent before" do not apply. */
-    public void setWatcherActive(boolean active) {
-        this.watcherActive = active;
-        updateEnabledState();
-    }
-
-    public void setTransferMode(String mode) {
-        modeAllows = !"SPECIFIC_FILE".equals(mode);
-        setEnabledDeep(this, modeAllows);
-        lblModeNote.setVisible(!modeAllows);
-        lblModeNote.setEnabled(true);
-        if (modeAllows) updateEnabledState();
-    }
-
-    // ── Loading ──────────────────────────────────────────────────────
 
     private void setSelection(FileSelection s) {
         loading = true;
@@ -346,21 +419,28 @@ public class FileSelectionPanel extends JPanel {
         changed();
     }
 
-    private static void setSized(JSpinner sp, JComboBox<String> unit, long bytes) {
-        int u = 0;
-        for (int i = SIZE_MULT.length - 1; i > 0; i--) if (bytes > 0 && bytes % SIZE_MULT[i] == 0) { u = i; break; }
-        unit.setSelectedIndex(u);
-        sp.setValue(bytes / SIZE_MULT[u]);
+    /**
+     * Problems that would stop the entered conditions from working, in plain words; empty when fine.
+     */
+    public List<String> validateInput() {
+        return modeAllows ? getSelection().validate() : new ArrayList<>();
     }
 
-    private static void setAged(JSpinner sp, JComboBox<String> unit, long minutes) {
-        int u = 0;
-        for (int i = AGE_MIN.length - 1; i > 0; i--) if (minutes > 0 && minutes % AGE_MIN[i] == 0) { u = i; break; }
-        unit.setSelectedIndex(u);
-        sp.setValue(minutes / AGE_MIN[u]);
+    /**
+     * The watcher sends every new matching file itself, so "Send newest N…" and "Files sent before" do not apply.
+     */
+    public void setWatcherActive(boolean active) {
+        this.watcherActive = active;
+        updateEnabledState();
     }
 
-    // ── Condition rows ───────────────────────────────────────────────
+    public void setTransferMode(String mode) {
+        modeAllows = !"SPECIFIC_FILE".equals(mode);
+        setEnabledDeep(this, modeAllows);
+        lblModeNote.setVisible(!modeAllows);
+        lblModeNote.setEnabled(true);
+        if (modeAllows) updateEnabledState();
+    }
 
     private void addRow(Rule r) {
         RuleRow row = new RuleRow(r);
@@ -370,6 +450,8 @@ public class FileSelectionPanel extends JPanel {
         rulesBox.repaint();
     }
 
+    // ── Small helpers ────────────────────────────────────────────────
+
     private void removeRow(RuleRow row) {
         rows.remove(row);
         rulesBox.remove(row);
@@ -377,47 +459,6 @@ public class FileSelectionPanel extends JPanel {
         rulesBox.repaint();
         changed();
     }
-
-    private final class RuleRow extends JPanel {
-        private final JComboBox<String> kind = new JComboBox<>(new String[]{"Include", "Exclude"});
-        private final JComboBox<Op> op = new JComboBox<>(Op.values());
-        private final JTextField text = new JTextField(12);
-        private final JCheckBox ignoreCase = new JCheckBox("ignore case");
-        private final JButton remove = new JButton("−");
-
-        RuleRow(Rule r) {
-            super(new FlowLayout(FlowLayout.LEFT, 6, 2));
-            setOpaque(false);
-            kind.setPrototypeDisplayValue("Exclude");
-            kind.setSelectedIndex(r.exclude ? 1 : 0);
-            op.setSelectedItem(r.op);
-            text.setText(r.value);
-            ignoreCase.setSelected(r.ignoreCase);
-            text.setToolTipText("<html>Examples: <code>.csv</code> &nbsp; <code>LDM_</code> &nbsp; <code>*.txt;*.log</code> &nbsp; "
-                    + "<code>^\\d{8}</code> &nbsp; <code>{today}</code><br>"
-                    + "wildcard: <code>*</code> any text, <code>?</code> one character, <code>;</code> between several patterns<br>"
-                    + "extension is one of: <code>csv, txt</code></html>");
-            remove.setMargin(new Insets(0, 6, 0, 6));
-            remove.setToolTipText("Remove this condition");
-            remove.addActionListener(e -> removeRow(this));
-            kind.addActionListener(e -> changed());
-            op.addActionListener(e -> changed());
-            ignoreCase.addActionListener(e -> changed());
-            text.getDocument().addDocumentListener(docListener(FileSelectionPanel.this::changed));
-            add(kind);
-            add(new JLabel("name"));
-            add(op);
-            add(text);
-            add(ignoreCase);
-            add(remove);
-        }
-
-        Rule toRule() {
-            return new Rule(kind.getSelectedIndex() == 1, (Op) op.getSelectedItem(), text.getText().trim(), ignoreCase.isSelected());
-        }
-    }
-
-    // ── Live feedback ────────────────────────────────────────────────
 
     private void changed() {
         if (loading) return;
@@ -461,7 +502,8 @@ public class FileSelectionPanel extends JPanel {
         AfterAction a = (AfterAction) cbAfter.getSelectedItem();
         String text;
         if (a == AfterAction.DELETE) text = "Deletes " + where + " once the whole transfer has succeeded.";
-        else if (a == AfterAction.MOVE) text = "Moves " + where + " into that folder (created if missing; an archived file is never overwritten \u2014 a timestamp is added to the name instead).";
+        else if (a == AfterAction.MOVE)
+            text = "Moves " + where + " into that folder (created if missing; an archived file is never overwritten \u2014 a timestamp is added to the name instead).";
         else text = "The original (" + where + ") stays where it is.";
         if (a != AfterAction.KEEP) {
             text += " A failed run touches nothing; if the cleanup itself fails the transfer still counts as done and the log says the originals are still there.";
@@ -504,7 +546,8 @@ public class FileSelectionPanel extends JPanel {
         }
         if (JOptionPane.showConfirmDialog(this,
                 n + " file(s) are remembered as sent by this task.\n\nForget them? Files that match will be sent again on the next run.",
-                "Forget sent files", JOptionPane.OK_CANCEL_OPTION, JOptionPane.WARNING_MESSAGE) != JOptionPane.OK_OPTION) return;
+                "Forget sent files", JOptionPane.OK_CANCEL_OPTION, JOptionPane.WARNING_MESSAGE) != JOptionPane.OK_OPTION)
+            return;
         try {
             int removed = new TransferLedger(dataDir).clear(taskId);
             JOptionPane.showMessageDialog(this, "Forgot " + removed + " file(s).", "Forget sent files", JOptionPane.INFORMATION_MESSAGE);
@@ -516,17 +559,26 @@ public class FileSelectionPanel extends JPanel {
     }
 
     private void browseAfterFolder() {
-        if (inbound && remoteBrowser != null) { remoteBrowser.run(); return; }
+        if (inbound && remoteBrowser != null) {
+            remoteBrowser.run();
+            return;
+        }
         JFileChooser fc = new JFileChooser(tfAfterFolder.getText().trim().isEmpty() ? null : new java.io.File(tfAfterFolder.getText().trim()));
         fc.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
         fc.setDialogTitle("Folder for the originals after a successful transfer");
-        if (fc.showOpenDialog(this) == JFileChooser.APPROVE_OPTION) tfAfterFolder.setText(fc.getSelectedFile().getAbsolutePath());
+        if (fc.showOpenDialog(this) == JFileChooser.APPROVE_OPTION)
+            tfAfterFolder.setText(fc.getSelectedFile().getAbsolutePath());
     }
 
-    /** Says, condition by condition, whether a typed file name would be taken (name conditions only). */
+    /**
+     * Says, condition by condition, whether a typed file name would be taken (name conditions only).
+     */
     private void updateTester(FileSelection full) {
         String name = tfTest.getText().trim();
-        if (name.isEmpty()) { lblTest.setText(" "); return; }
+        if (name.isEmpty()) {
+            lblTest.setText(" ");
+            return;
+        }
         FileSelection probe = new FileSelection().setMatchMode(full.getMatchMode()).setSkipTempFiles(full.isSkipTempFiles());
         StringBuilder detail = new StringBuilder();
         int i = 0;
@@ -546,14 +598,12 @@ public class FileSelectionPanel extends JPanel {
                 + (sizeOrAge ? " &nbsp;<i>(size/age conditions not checked here)</i>" : "") + "</body></html>");
     }
 
-    // ── Small helpers ────────────────────────────────────────────────
-
-    /** Adds to the section being built (or to the panel itself before the first section). */
-    private void put(Component c, GridBagConstraints g) { sink.add(c, g); }
-
-    /** Starts a titled group; everything added with {@link #put} afterwards goes into it. */
-    private final java.util.Map<String, JPanel> sections = new java.util.HashMap<>();
-    private JComponent introNote, pickRowPanel;
+    /**
+     * Adds to the section being built (or to the panel itself before the first section).
+     */
+    private void put(Component c, GridBagConstraints g) {
+        sink.add(c, g);
+    }
 
     private void section(String title) {
         JPanel sec = new JPanel(new GridBagLayout());
@@ -573,7 +623,7 @@ public class FileSelectionPanel extends JPanel {
      * pick, "files sent before" and "after a successful transfer" settings are hidden.
      */
     public void setWatchMode(boolean watch) {
-        for (String t : new String[] {"Files sent before", "After a successful transfer"}) {
+        for (String t : new String[]{"Files sent before", "After a successful transfer"}) {
             JPanel sec = sections.get(t);
             if (sec != null) sec.setVisible(!watch);
         }
@@ -591,11 +641,19 @@ public class FileSelectionPanel extends JPanel {
         repaint();
     }
 
-    /** INBOUND: lets the dialog open its server-folder browser for the "move to" folder. */
-    public void setRemoteBrowser(Runnable browser) { this.remoteBrowser = browser; }
+    /**
+     * INBOUND: lets the dialog open its server-folder browser for the "move to" folder.
+     */
+    public void setRemoteBrowser(Runnable browser) {
+        this.remoteBrowser = browser;
+    }
 
-    /** The "move to" folder field, so a browser can fill it in. */
-    public JTextField afterFolderField() { return tfAfterFolder; }
+    /**
+     * The "move to" folder field, so a browser can fill it in.
+     */
+    public JTextField afterFolderField() {
+        return tfAfterFolder;
+    }
 
     private int optionRow(int y, String label, JSpinner sp, JComponent unit, String tip) {
         JPanel r = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
@@ -610,45 +668,42 @@ public class FileSelectionPanel extends JPanel {
         return y + 1;
     }
 
-    private static JSpinner spinner(long value, long max) {
-        JSpinner s = new JSpinner(new SpinnerNumberModel(value, 0L, max, 1L));
-        ((JSpinner.DefaultEditor) s.getEditor()).getTextField().setColumns(7);
-        return s;
-    }
+    private final class RuleRow extends JPanel {
+        private final JComboBox<String> kind = new JComboBox<>(new String[]{"Include", "Exclude"});
+        private final JComboBox<Op> op = new JComboBox<>(Op.values());
+        private final JTextField text = new JTextField(12);
+        private final JCheckBox ignoreCase = new JCheckBox("ignore case");
+        private final JButton remove = new JButton("−");
 
-    private static long num(JSpinner s) { return ((Number) s.getValue()).longValue(); }
+        RuleRow(Rule r) {
+            super(new FlowLayout(FlowLayout.LEFT, 6, 2));
+            setOpaque(false);
+            kind.setPrototypeDisplayValue("Exclude");
+            kind.setSelectedIndex(r.exclude ? 1 : 0);
+            op.setSelectedItem(r.op);
+            text.setText(r.value);
+            ignoreCase.setSelected(r.ignoreCase);
+            text.setToolTipText("<html>Examples: <code>.csv</code> &nbsp; <code>LDM_</code> &nbsp; <code>*.txt;*.log</code> &nbsp; "
+                    + "<code>^\\d{8}</code> &nbsp; <code>{today}</code><br>"
+                    + "wildcard: <code>*</code> any text, <code>?</code> one character, <code>;</code> between several patterns<br>"
+                    + "extension is one of: <code>csv, txt</code></html>");
+            remove.setMargin(new Insets(0, 6, 0, 6));
+            remove.setToolTipText("Remove this condition");
+            remove.addActionListener(e -> removeRow(this));
+            kind.addActionListener(e -> changed());
+            op.addActionListener(e -> changed());
+            ignoreCase.addActionListener(e -> changed());
+            text.getDocument().addDocumentListener(docListener(FileSelectionPanel.this::changed));
+            add(kind);
+            add(new JLabel("name"));
+            add(op);
+            add(text);
+            add(ignoreCase);
+            add(remove);
+        }
 
-    private static JLabel note(String html) {
-        JLabel l = new JLabel(html);
-        l.setFont(l.getFont().deriveFont(Font.PLAIN, 11f));
-        l.setForeground(UIManager.getColor("Label.disabledForeground"));
-        return l;
-    }
-
-    private static GridBagConstraints gbc(int x, int y, int w, double weightx) {
-        GridBagConstraints c = new GridBagConstraints();
-        c.gridx = x; c.gridy = y; c.gridwidth = w;
-        c.weightx = weightx;
-        c.fill = GridBagConstraints.HORIZONTAL;
-        c.anchor = GridBagConstraints.WEST;
-        c.insets = new Insets(2, 2, 2, 2);
-        return c;
-    }
-
-    private static DocumentListener docListener(Runnable r) {
-        return new DocumentListener() {
-            public void insertUpdate(DocumentEvent e)  { r.run(); }
-            public void removeUpdate(DocumentEvent e)  { r.run(); }
-            public void changedUpdate(DocumentEvent e) { r.run(); }
-        };
-    }
-
-    private static void setEnabledDeep(Component c, boolean on) {
-        c.setEnabled(on);
-        if (c instanceof Container) for (Component k : ((Container) c).getComponents()) setEnabledDeep(k, on);
-    }
-
-    private static String escape(String s) {
-        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
+        Rule toRule() {
+            return new Rule(kind.getSelectedIndex() == 1, (Op) op.getSelectedItem(), text.getText().trim(), ignoreCase.isSelected());
+        }
     }
 }

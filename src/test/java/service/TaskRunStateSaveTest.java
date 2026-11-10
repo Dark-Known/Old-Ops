@@ -1,17 +1,18 @@
 package service;
 
-import static org.junit.Assert.*;
-
 import model.ScheduledTask;
 import model.ScheduledTask.TaskStatus;
 import model.ScheduledTask.TaskType;
 import org.junit.Test;
 
-import java.io.File;
 import java.nio.file.Files;
 import java.time.LocalDateTime;
 
-/** A long run must not overwrite settings someone changed while it was running. Needs the sqlite-jdbc driver. */
+import static org.junit.Assert.*;
+
+/**
+ * A long run must not overwrite settings someone changed while it was running. Needs the sqlite-jdbc driver.
+ */
 public class TaskRunStateSaveTest {
 
     private static ScheduledTask task(String id) {
@@ -25,7 +26,8 @@ public class TaskRunStateSaveTest {
         return t;
     }
 
-    @Test public void runStateIsSavedWithoutTouchingSettingsEditedMeanwhile() throws Exception {
+    @Test
+    public void runStateIsSavedWithoutTouchingSettingsEditedMeanwhile() throws Exception {
         TaskDbService db = new TaskDbService(Files.createTempDirectory("opstool-rs").toFile());
         assertTrue(db.save(task("t1")));
 
@@ -58,7 +60,8 @@ public class TaskRunStateSaveTest {
         db.close();
     }
 
-    @Test public void aTaskDeletedDuringTheRunIsNotBroughtBack() throws Exception {
+    @Test
+    public void aTaskDeletedDuringTheRunIsNotBroughtBack() throws Exception {
         TaskDbService db = new TaskDbService(Files.createTempDirectory("opstool-rs").toFile());
         db.save(task("t1"));
         ScheduledTask running = db.loadAll().get(0);
@@ -69,7 +72,8 @@ public class TaskRunStateSaveTest {
         db.close();
     }
 
-    @Test public void aTaskWithoutIdIsRefused() throws Exception {
+    @Test
+    public void aTaskWithoutIdIsRefused() throws Exception {
         TaskDbService db = new TaskDbService(Files.createTempDirectory("opstool-rs").toFile());
         assertFalse(db.saveRunState(new ScheduledTask()));
         db.close();

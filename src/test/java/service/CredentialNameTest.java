@@ -1,7 +1,5 @@
 package service;
 
-import static org.junit.Assert.*;
-
 import model.Credential;
 import model.ScheduledTask;
 import model.ScheduledTask.TaskStatus;
@@ -14,10 +12,16 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.Statement;
 
-/** Credentials are identified by a unique name, not by login username. Needs the sqlite-jdbc driver. */
+import static org.junit.Assert.*;
+
+/**
+ * Credentials are identified by a unique name, not by login username. Needs the sqlite-jdbc driver.
+ */
 public class CredentialNameTest {
 
-    private static File tempDir() throws Exception { return Files.createTempDirectory("opstool-cred").toFile(); }
+    private static File tempDir() throws Exception {
+        return Files.createTempDirectory("opstool-cred").toFile();
+    }
 
     private static Credential cred(String name, String host, String user) {
         return new Credential(null, name, host, user, "pw-" + name, "LINUX");
@@ -35,7 +39,8 @@ public class CredentialNameTest {
         return t;
     }
 
-    @Test public void theSameUsernameCanExistOnTwoServers() throws Exception {
+    @Test
+    public void theSameUsernameCanExistOnTwoServers() throws Exception {
         CredentialDbService db = new CredentialDbService(tempDir());
         assertTrue(db.save(cred("Server A admin", "10.0.0.1", "administrator")));
         assertTrue("same login, other server, must not replace the first", db.save(cred("Server B admin", "10.0.0.2", "administrator")));
@@ -45,7 +50,8 @@ public class CredentialNameTest {
         assertEquals("pw-Server A admin", db.loadByName("Server A admin").getPassword());
     }
 
-    @Test public void aNameCanOnlyBeUsedOnce_ignoringCase() throws Exception {
+    @Test
+    public void aNameCanOnlyBeUsedOnce_ignoringCase() throws Exception {
         CredentialDbService db = new CredentialDbService(tempDir());
         assertTrue(db.save(cred("Prod", "h1", "u")));
         assertFalse(db.save(cred("prod", "h2", "u2")));
@@ -55,14 +61,16 @@ public class CredentialNameTest {
         assertFalse(db.isNameTaken("PROD", db.loadByName("Prod").getId()));
     }
 
-    @Test public void aBlankNameDefaultsToUserAtHost() throws Exception {
+    @Test
+    public void aBlankNameDefaultsToUserAtHost() throws Exception {
         CredentialDbService db = new CredentialDbService(tempDir());
         Credential c = cred("  ", "10.0.0.5", "svc");
         assertTrue(db.save(c));
         assertEquals("svc@10.0.0.5", db.loadAll().get(0).getName());
     }
 
-    @Test public void lookupFindsTheExactNameFirstThenIgnoresCase() throws Exception {
+    @Test
+    public void lookupFindsTheExactNameFirstThenIgnoresCase() throws Exception {
         CredentialDbService db = new CredentialDbService(tempDir());
         db.save(cred("Server A", "h", "u"));
         assertNotNull(db.loadByName("Server A"));
@@ -72,7 +80,8 @@ public class CredentialNameTest {
         assertNull(db.loadByName(null));
     }
 
-    @Test public void saveUpdatesByIdSoACredentialCanBeRenamed() throws Exception {
+    @Test
+    public void saveUpdatesByIdSoACredentialCanBeRenamed() throws Exception {
         CredentialDbService db = new CredentialDbService(tempDir());
         Credential c = cred("Old", "h", "u");
         db.save(c);
@@ -84,7 +93,8 @@ public class CredentialNameTest {
         assertEquals("other", db.loadByName("New").getUsername());
     }
 
-    @Test public void deleteIsByName() throws Exception {
+    @Test
+    public void deleteIsByName() throws Exception {
         CredentialDbService db = new CredentialDbService(tempDir());
         db.save(cred("A", "h1", "same"));
         db.save(cred("B", "h2", "same"));
@@ -93,7 +103,8 @@ public class CredentialNameTest {
         assertTrue("the other server credential is untouched", db.loadByName("B") != null);
     }
 
-    @Test public void anOldDatabaseIsUpgradedAndExistingCredentialsKeepWorkingForTheirTasks() throws Exception {
+    @Test
+    public void anOldDatabaseIsUpgradedAndExistingCredentialsKeepWorkingForTheirTasks() throws Exception {
         File dir = tempDir();
         // The previous schema: username was the unique key, name was the auto-generated "user@host" label.
         try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + new File(dir, "app.db").getAbsolutePath());
@@ -117,7 +128,8 @@ public class CredentialNameTest {
         assertEquals(3, again.loadAll().size());
     }
 
-    @Test public void renamingACredentialPointsItsTasksAtTheNewName() throws Exception {
+    @Test
+    public void renamingACredentialPointsItsTasksAtTheNewName() throws Exception {
         XmlStorageService storage = new XmlStorageService(tempDir().getAbsolutePath());
         Credential a = cred("Server A admin", "h1", "administrator");
         Credential b = cred("Server B admin", "h2", "administrator");
@@ -148,7 +160,8 @@ public class CredentialNameTest {
         }
     }
 
-    @Test public void renamingToAnExistingNameIsRefusedAndChangesNothing() throws Exception {
+    @Test
+    public void renamingToAnExistingNameIsRefusedAndChangesNothing() throws Exception {
         XmlStorageService storage = new XmlStorageService(tempDir().getAbsolutePath());
         Credential a = cred("A", "h1", "u");
         Credential b = cred("B", "h2", "u");

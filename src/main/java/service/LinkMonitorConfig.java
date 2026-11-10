@@ -6,11 +6,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Locale;
-import java.util.Properties;
-import java.util.TreeSet;
+import java.util.*;
 
 /**
  * Settings of the socket-link monitor, kept in {@code <dataDir>/socket-monitor.properties}. The file is written by the
@@ -35,7 +31,7 @@ import java.util.TreeSet;
  * source.orders.flapCount=5
  * source.orders.flapWindowMinutes=10
  * </pre>
- *
+ * <p>
  * A plain {@code source.<id>.token} (an older format, or one typed by hand) is still accepted and hashed in memory; the
  * next save from the Settings screen replaces it with its hash.
  */
@@ -43,7 +39,9 @@ public final class LinkMonitorConfig {
 
     public static final String FILE_NAME = "socket-monitor.properties";
     public static final int DEFAULT_PORT = 8443;
-    /** How long the previous token keeps working after a new one is issued, unless the operator chooses otherwise. */
+    /**
+     * How long the previous token keeps working after a new one is issued, unless the operator chooses otherwise.
+     */
     public static final long DEFAULT_GRACE_MILLIS = 24L * 60 * 60 * 1000;
 
     public final int port;
@@ -57,43 +55,23 @@ public final class LinkMonitorConfig {
 
     public LinkMonitorConfig(int port, String bind, boolean tlsEnabled, String tlsKeystore, String tlsPassword,
                              List<String> tlsHostnames, List<LinkMonitor.Source> sources, List<String> problems) {
-        this.port = port; this.bind = bind; this.tlsEnabled = tlsEnabled;
-        this.tlsKeystore = tlsKeystore; this.tlsPassword = tlsPassword;
+        this.port = port;
+        this.bind = bind;
+        this.tlsEnabled = tlsEnabled;
+        this.tlsKeystore = tlsKeystore;
+        this.tlsPassword = tlsPassword;
         this.tlsHostnames = List.copyOf(tlsHostnames);
         this.sources = List.copyOf(sources);
         this.problems = List.copyOf(problems);
-    }
-
-    /** The monitor serves only when a port is set and at least one source is enabled. */
-    public boolean enabled() {
-        if (port <= 0) return false;
-        for (LinkMonitor.Source s : sources) if (s.enabled()) return true;
-        return false;
-    }
-
-    /** Same listener settings (port, address, HTTPS)? A change means the endpoint must be restarted. */
-    public boolean sameListener(LinkMonitorConfig o) {
-        return o != null && port == o.port && bind.equals(o.bind) && tlsEnabled == o.tlsEnabled
-                && java.util.Objects.equals(tlsKeystore, o.tlsKeystore)
-                && java.util.Objects.equals(tlsPassword, o.tlsPassword)
-                && tlsHostnames.equals(o.tlsHostnames);
     }
 
     public static LinkMonitorConfig empty() {
         return new LinkMonitorConfig(DEFAULT_PORT, "0.0.0.0", true, null, null, List.of(), List.of(), List.of());
     }
 
-    public LinkMonitorConfig withSources(List<LinkMonitor.Source> next) {
-        return new LinkMonitorConfig(port, bind, tlsEnabled, tlsKeystore, tlsPassword, tlsHostnames, next, problems);
-    }
-
-    public LinkMonitorConfig withEndpoint(int newPort, List<String> hostnames) {
-        return new LinkMonitorConfig(newPort, bind, tlsEnabled, tlsKeystore, tlsPassword, hostnames, sources, problems);
-    }
-
-    // ── Loading and saving ────────────────────────────────────────────────
-
-    /** @return the settings, or {@link #empty()} when the file is absent. Never throws. */
+    /**
+     * @return the settings, or {@link #empty()} when the file is absent. Never throws.
+     */
     public static LinkMonitorConfig load(File dataDir) {
         File f = new File(dataDir, FILE_NAME);
         if (!f.isFile()) return empty();
@@ -110,11 +88,15 @@ public final class LinkMonitorConfig {
     static LinkMonitorConfig parse(Properties p) {
         List<String> problems = new ArrayList<>();
         int port = intOf(p.getProperty("port"), DEFAULT_PORT);
-        if (port < 1 || port > 65535) { problems.add("port must be 1-65535"); port = 0; }
+        if (port < 1 || port > 65535) {
+            problems.add("port must be 1-65535");
+            port = 0;
+        }
         String bind = trimmed(p.getProperty("bind"), "0.0.0.0");
         boolean tls = !"false".equalsIgnoreCase(trimmed(p.getProperty("tls.enabled"), "true"));
         List<String> hostnames = new ArrayList<>();
-        for (String h : trimmed(p.getProperty("tls.hostnames"), "").split("[,;\\s]+")) if (!h.isEmpty()) hostnames.add(h);
+        for (String h : trimmed(p.getProperty("tls.hostnames"), "").split("[,;\\s]+"))
+            if (!h.isEmpty()) hostnames.add(h);
 
         TreeSet<String> ids = new TreeSet<>();
         for (String k : p.stringPropertyNames()) {
@@ -129,12 +111,21 @@ public final class LinkMonitorConfig {
             String hash = trimmed(p.getProperty(pre + "tokenHash"), "");
             String plain = trimmed(p.getProperty(pre + "token"), "");
             if (hash.isEmpty() && !plain.isEmpty()) {
-                if (plain.length() < 16) { problems.add("source " + id + ": token shorter than 16 characters, source ignored"); continue; }
+                if (plain.length() < 16) {
+                    problems.add("source " + id + ": token shorter than 16 characters, source ignored");
+                    continue;
+                }
                 hash = LinkTokens.hash(plain);
                 problems.add("source " + id + ": uses a plain-text token; regenerate it in Settings to store only its hash");
             }
-            if (hash.isEmpty()) { problems.add("source " + id + ": no token, source ignored"); continue; }
-            if (!hashes.add(hash)) { problems.add("source " + id + ": same token as another source, source ignored"); continue; }
+            if (hash.isEmpty()) {
+                problems.add("source " + id + ": no token, source ignored");
+                continue;
+            }
+            if (!hashes.add(hash)) {
+                problems.add("source " + id + ": same token as another source, source ignored");
+                continue;
+            }
             sources.add(new LinkMonitor.Source(id, trimmed(p.getProperty(pre + "label"), id),
                     !"false".equalsIgnoreCase(trimmed(p.getProperty(pre + "enabled"), "true")),
                     hash, trimmed(p.getProperty(pre + "prevTokenHash"), ""),
@@ -149,7 +140,63 @@ public final class LinkMonitorConfig {
                 trimmed(p.getProperty("tls.password"), null), hostnames, sources, problems);
     }
 
-    /** Writes the settings atomically (temp file, then rename), so the Daemon never reads half a file. */
+    private static int intOf(String s, int def) {
+        if (s == null) return def;
+        try {
+            return Integer.parseInt(s.trim());
+        } catch (NumberFormatException e) {
+            return def;
+        }
+    }
+
+    private static long longOf(String s, long def) {
+        if (s == null) return def;
+        try {
+            return Long.parseLong(s.trim());
+        } catch (NumberFormatException e) {
+            return def;
+        }
+    }
+
+    // ── Loading and saving ────────────────────────────────────────────────
+
+    private static String trimmed(String s, String def) {
+        if (s == null || s.trim().isEmpty()) return def;
+        return s.trim();
+    }
+
+    /**
+     * The monitor serves only when a port is set and at least one source is enabled.
+     */
+    public boolean enabled() {
+        if (port <= 0) return false;
+        for (LinkMonitor.Source s : sources) if (s.enabled()) return true;
+        return false;
+    }
+
+    /**
+     * Same listener settings (port, address, HTTPS)? A change means the endpoint must be restarted.
+     */
+    public boolean sameListener(LinkMonitorConfig o) {
+        return o != null && port == o.port && bind.equals(o.bind) && tlsEnabled == o.tlsEnabled
+                && java.util.Objects.equals(tlsKeystore, o.tlsKeystore)
+                && java.util.Objects.equals(tlsPassword, o.tlsPassword)
+                && tlsHostnames.equals(o.tlsHostnames);
+    }
+
+    // ── Changing sources (each returns the new settings; the caller saves) ─────
+
+    public LinkMonitorConfig withSources(List<LinkMonitor.Source> next) {
+        return new LinkMonitorConfig(port, bind, tlsEnabled, tlsKeystore, tlsPassword, tlsHostnames, next, problems);
+    }
+
+    public LinkMonitorConfig withEndpoint(int newPort, List<String> hostnames) {
+        return new LinkMonitorConfig(newPort, bind, tlsEnabled, tlsKeystore, tlsPassword, hostnames, sources, problems);
+    }
+
+    /**
+     * Writes the settings atomically (temp file, then rename), so the Daemon never reads half a file.
+     */
     public void save(File dataDir) throws IOException {
         Properties p = new Properties();
         p.setProperty("port", String.valueOf(port));
@@ -182,12 +229,9 @@ public final class LinkMonitorConfig {
         Files.move(tmp.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING);
     }
 
-    // ── Changing sources (each returns the new settings; the caller saves) ─────
-
-    /** A new settings object plus the token that was just issued (shown to the operator once, never stored). */
-    public record Issued(LinkMonitorConfig config, String sourceId, String token) {}
-
-    /** Lower-case letters, digits and dashes; made unique among existing sources. */
+    /**
+     * Lower-case letters, digits and dashes; made unique among existing sources.
+     */
     public String newSourceId(String label) {
         String base = label == null ? "" : label.toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9]+", "-").replaceAll("^-+|-+$", "");
         if (base.isEmpty()) base = "source";
@@ -207,7 +251,9 @@ public final class LinkMonitorConfig {
         return null;
     }
 
-    /** Adds a source with a freshly generated token. */
+    /**
+     * Adds a source with a freshly generated token.
+     */
     public Issued addSource(String label, int heartbeatSeconds, int silentAfterSeconds, int repeatMinutes,
                             int flapCount, int flapWindowMinutes, long now) {
         String id = newSourceId(label);
@@ -233,7 +279,9 @@ public final class LinkMonitorConfig {
         return new Issued(replace(fresh), id, token);
     }
 
-    /** Changes label, thresholds or the enabled flag; the token is untouched. */
+    /**
+     * Changes label, thresholds or the enabled flag; the token is untouched.
+     */
     public LinkMonitorConfig updateSource(String id, String label, boolean enabled, int heartbeatSeconds,
                                           int silentAfterSeconds, int repeatMinutes, int flapCount, int flapWindowMinutes) {
         LinkMonitor.Source old = source(id);
@@ -254,18 +302,9 @@ public final class LinkMonitorConfig {
         return withSources(next);
     }
 
-    private static int intOf(String s, int def) {
-        if (s == null) return def;
-        try { return Integer.parseInt(s.trim()); } catch (NumberFormatException e) { return def; }
-    }
-
-    private static long longOf(String s, long def) {
-        if (s == null) return def;
-        try { return Long.parseLong(s.trim()); } catch (NumberFormatException e) { return def; }
-    }
-
-    private static String trimmed(String s, String def) {
-        if (s == null || s.trim().isEmpty()) return def;
-        return s.trim();
+    /**
+     * A new settings object plus the token that was just issued (shown to the operator once, never stored).
+     */
+    public record Issued(LinkMonitorConfig config, String sourceId, String token) {
     }
 }

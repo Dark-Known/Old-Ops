@@ -25,9 +25,8 @@ import java.util.List;
  */
 public final class LinkSelfTest {
 
-    public record Result(boolean ok, List<String> lines, String presentedFingerprint) {}
-
-    private LinkSelfTest() { }
+    private LinkSelfTest() {
+    }
 
     public static Result run(String host, int port, boolean tls, File cerFile) {
         List<String> out = new ArrayList<>();
@@ -63,7 +62,10 @@ public final class LinkSelfTest {
                     .timeout(Duration.ofSeconds(5)).build(), HttpResponse.BodyHandlers.ofString());
             if (r.statusCode() == 200) out.add("OK    GET /socketLink/health -> 200 " + r.body().trim()
                     + (tls ? " (certificate trusted, name matches)" : ""));
-            else { out.add("FAIL  GET /socketLink/health -> " + r.statusCode()); ok = false; }
+            else {
+                out.add("FAIL  GET /socketLink/health -> " + r.statusCode());
+                ok = false;
+            }
         } catch (Exception e) {
             String m = String.valueOf(e.getMessage());
             out.add("FAIL  Health check failed: " + e.getClass().getSimpleName() + ": " + m);
@@ -75,14 +77,22 @@ public final class LinkSelfTest {
         return new Result(ok, out, presented);
     }
 
-    /** Opens a TLS connection that accepts any certificate only to read which one the server presents. */
+    /**
+     * Opens a TLS connection that accepts any certificate only to read which one the server presents.
+     */
     static String presentedFingerprint(String host, int port) throws Exception {
         SSLContext ctx = SSLContext.getInstance("TLS");
-        ctx.init(null, new TrustManager[] { new X509TrustManager() {
-            public void checkClientTrusted(X509Certificate[] c, String a) { }
-            public void checkServerTrusted(X509Certificate[] c, String a) { }
-            public X509Certificate[] getAcceptedIssuers() { return new X509Certificate[0]; }
-        } }, null);
+        ctx.init(null, new TrustManager[]{new X509TrustManager() {
+            public void checkClientTrusted(X509Certificate[] c, String a) {
+            }
+
+            public void checkServerTrusted(X509Certificate[] c, String a) {
+            }
+
+            public X509Certificate[] getAcceptedIssuers() {
+                return new X509Certificate[0];
+            }
+        }}, null);
         try (SSLSocket s = (SSLSocket) ctx.getSocketFactory().createSocket()) {
             s.connect(new InetSocketAddress(host, port), 5000);
             s.setSoTimeout(5000);
@@ -113,11 +123,19 @@ public final class LinkSelfTest {
         }
     }
 
-    /** Upper-case hex pairs separated by colons, the way certificate viewers show it. */
+    /**
+     * Upper-case hex pairs separated by colons, the way certificate viewers show it.
+     */
     static String sha256(byte[] der) throws Exception {
         byte[] d = MessageDigest.getInstance("SHA-256").digest(der);
         StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < d.length; i++) { if (i > 0) sb.append(':'); sb.append(String.format("%02X", d[i])); }
+        for (int i = 0; i < d.length; i++) {
+            if (i > 0) sb.append(':');
+            sb.append(String.format("%02X", d[i]));
+        }
         return sb.toString();
+    }
+
+    public record Result(boolean ok, List<String> lines, String presentedFingerprint) {
     }
 }

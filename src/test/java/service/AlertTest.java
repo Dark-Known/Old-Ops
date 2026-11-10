@@ -19,7 +19,8 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
-import static org.junit.Assert.*;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 
 public class AlertTest {
 
@@ -27,7 +28,44 @@ public class AlertTest {
         return AlertConfig.empty().with(true, url, AlertConfig.PROBLEMS, true, 15, "", "", 30);
     }
 
-    @Test public void theWebhookIsEncryptedOnDiskAndComesBack() throws Exception {
+    private static TeamsCard.Alert sample(boolean recovery) {
+        LocalDateTime t = LocalDateTime.of(2026, 10, 31, 9, 0, 0);
+        return new TeamsCard.Alert(EventKind.RUN_FAILED, recovery, "id1", "Orders \"nightly\"", "SFTP_TRANSFER", "FAILED",
+                "Upload failed: connection reset", "Line1\nLine2 with \"quotes\" and <tags>", "Check the server.", t, t.plusSeconds(30), 30_000,
+                "SCHEDULE", "run-1", "SERVER-C", "file:///C:/data/report.html", "C:\\data\\report.html", 2, t.plusSeconds(31));
+    }
+
+    private static TaskRunRecord rec(String id, String name, TaskRunRecord.Status st, String kind, String reason) {
+        TaskRunRecord r = new TaskRunRecord();
+        r.setTaskId(id);
+        r.setTaskName(name);
+        r.setTaskType("SFTP_TRANSFER");
+        r.setStatus(st);
+        r.setReason(reason);
+        r.setDetails(reason);
+        r.setStartedAt(LocalDateTime.now().minusSeconds(5));
+        r.setEndedAt(LocalDateTime.now());
+        r.setDurationMs(5000);
+        r.setEventKind(kind);
+        r.setRunKey("rk");
+        r.setTrigger("SCHEDULE");
+        return r;
+    }
+
+    private static void waitFor(java.util.function.BooleanSupplier c) throws Exception {
+        for (int i = 0; i < 100 && !c.getAsBoolean(); i++) Thread.sleep(50);
+    }
+
+    private static int queued(File dir) {
+        try (java.sql.Connection c = AppDb.open(dir); java.sql.Statement st = c.createStatement(); java.sql.ResultSet rs = st.executeQuery("SELECT count(*) FROM alert_queue")) {
+            return rs.next() ? rs.getInt(1) : -1;
+        } catch (java.sql.SQLException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    @Test
+    public void theWebhookIsEncryptedOnDiskAndComesBack() throws Exception {
         File dir = Files.createTempDirectory("alertcfg").toFile();
         String url = "https://prod-1.westeurope.logic.azure.com:443/workflows/abc?sig=SECRET123";
         AlertConfig c = enabled(url).withTask("t1", new AlertConfig.TaskRule(AlertConfig.Mode.OFF, java.util.Set.of()))
@@ -43,7 +81,10 @@ public class AlertTest {
         assertEquals(AlertConfig.Mode.INHERIT, back.ruleFor("other").mode());
     }
 
-    @Test public void whatProducesAnAlertForWhichTask() {
+    // ── Dispatcher with a fake Teams workflow ─────────────────────────────
+
+    @Test
+    public void whatProducesAnAlertForWhichTask() {
         AlertConfig c = enabled("http://x/y").withTask("off", new AlertConfig.TaskRule(AlertConfig.Mode.OFF, java.util.Set.of()))
                 .withTask("mine", new AlertConfig.TaskRule(AlertConfig.Mode.CUSTOM, EnumSet.of(EventKind.NO_FILES)));
         assertTrue(c.wants("a", EventKind.RUN_FAILED));
@@ -59,14 +100,8 @@ public class AlertTest {
         assertTrue("no webhook sends nothing", !c.with(true, "", AlertConfig.PROBLEMS, true, 15, "", "", 30).wants("a", EventKind.RUN_FAILED));
     }
 
-    private static TeamsCard.Alert sample(boolean recovery) {
-        LocalDateTime t = LocalDateTime.of(2026, 10, 31, 9, 0, 0);
-        return new TeamsCard.Alert(EventKind.RUN_FAILED, recovery, "id1", "Orders \"nightly\"", "SFTP_TRANSFER", "FAILED",
-                "Upload failed: connection reset", "Line1\nLine2 with \"quotes\" and <tags>", "Check the server.", t, t.plusSeconds(30), 30_000,
-                "SCHEDULE", "run-1", "SERVER-C", "file:///C:/data/report.html", "C:\\data\\report.html", 2, t.plusSeconds(31));
-    }
-
-    @Test public void theCardIsValidAdaptiveCardJsonWithAnOpenLogsButton() {
+    @Test
+    public void theCardIsValidAdaptiveCardJsonWithAnOpenLogsButton() {
         String json = TeamsCard.build(sample(false));
         Map<String, Object> msg = MiniJson.parseObject(json);       // throws on invalid JSON
         assertEquals("message", MiniJson.getString(msg, "type", ""));
@@ -83,7 +118,8 @@ public class AlertTest {
         MiniJson.parseObject(rec);
     }
 
-    @Test public void theReportIsOneOfflineHtmlFileAndEscapesEverything() {
+    @Test
+    public void theReportIsOneOfflineHtmlFileAndEscapesEverything() {
         List<String> lines = List.of("INFO started", "ERROR boom <script>alert(1)</script>", "WARN retry");
         String html = AlertReport.build(sample(false), lines, List.of(), List.of());
         assertTrue(html.contains("<script>(function()"));
@@ -95,39 +131,8 @@ public class AlertTest {
         assertTrue(html.contains("Task log (3)"));
     }
 
-    // ── Dispatcher with a fake Teams workflow ─────────────────────────────
-
-    private static final class Hook implements AutoCloseable {
-        final HttpServer server;
-        final List<String> bodies = new CopyOnWriteArrayList<>();
-        final AtomicInteger failFirst = new AtomicInteger();
-        Hook() throws Exception {
-            server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
-            server.createContext("/hook", ex -> {
-                bodies.add(new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
-                int code = failFirst.getAndDecrement() > 0 ? 500 : 202;
-                ex.sendResponseHeaders(code, -1);
-                ex.close();
-            });
-            server.start();
-        }
-        String url() { return "http://127.0.0.1:" + server.getAddress().getPort() + "/hook"; }
-        @Override public void close() { server.stop(0); }
-    }
-
-    private static TaskRunRecord rec(String id, String name, TaskRunRecord.Status st, String kind, String reason) {
-        TaskRunRecord r = new TaskRunRecord();
-        r.setTaskId(id); r.setTaskName(name); r.setTaskType("SFTP_TRANSFER"); r.setStatus(st); r.setReason(reason); r.setDetails(reason);
-        r.setStartedAt(LocalDateTime.now().minusSeconds(5)); r.setEndedAt(LocalDateTime.now()); r.setDurationMs(5000);
-        r.setEventKind(kind); r.setRunKey("rk"); r.setTrigger("SCHEDULE");
-        return r;
-    }
-
-    private static void waitFor(java.util.function.BooleanSupplier c) throws Exception {
-        for (int i = 0; i < 100 && !c.getAsBoolean(); i++) Thread.sleep(50);
-    }
-
-    @Test public void aFailureIsSentOnceAsACardWithAReportThenRecoveryWhenItSucceeds() throws Exception {
+    @Test
+    public void aFailureIsSentOnceAsACardWithAReportThenRecoveryWhenItSucceeds() throws Exception {
         File dir = Files.createTempDirectory("alertdisp").toFile();
         try (Hook hook = new Hook()) {
             enabled(hook.url()).save(dir);
@@ -182,7 +187,8 @@ public class AlertTest {
         }
     }
 
-    @Test public void aTaskSetToOffSendsNothingAndAFailingWebhookIsRetriedThenReported() throws Exception {
+    @Test
+    public void aTaskSetToOffSendsNothingAndAFailingWebhookIsRetriedThenReported() throws Exception {
         File dir = Files.createTempDirectory("alertdisp2").toFile();
         try (Hook hook = new Hook()) {
             hook.failFirst.set(2);
@@ -218,7 +224,8 @@ public class AlertTest {
         }
     }
 
-    @Test public void monitorsHaveTheirOwnRulesAndASocketSourceCanOverrideItsMonitor() {
+    @Test
+    public void monitorsHaveTheirOwnRulesAndASocketSourceCanOverrideItsMonitor() {
         AlertConfig c = enabled("http://x/y")
                 .withTask(AlertConfig.SERVICE, new AlertConfig.TaskRule(AlertConfig.Mode.OFF, java.util.Set.of()))
                 .withTask(AlertConfig.SOCKET, new AlertConfig.TaskRule(AlertConfig.Mode.CUSTOM, EnumSet.of(EventKind.LINK_DOWN)))
@@ -232,7 +239,8 @@ public class AlertTest {
         assertEquals(null, AlertConfig.areaOf(EventKind.RUN_FAILED));
     }
 
-    @Test public void theMailApiRaisesOneEventAfterThreeFailuresAndOneWhenItRecovers() throws Exception {
+    @Test
+    public void theMailApiRaisesOneEventAfterThreeFailuresAndOneWhenItRecovers() throws Exception {
         File dir = Files.createTempDirectory("monev").toFile();
         RunHistoryService history = new RunHistoryService(dir.getAbsolutePath());
         MonitorEvents me = new MonitorEvents(history);
@@ -240,15 +248,18 @@ public class AlertTest {
         try {
             GraphCallLog.configure(dir);
             java.net.URI u = java.net.URI.create("https://graph.microsoft.com/v1.0/users/ops%40corp.com/messages");
-            for (int i = 0; i < 5; i++) GraphCallLog.record("graph", "GET", u, "/users/ops%40corp.com", 500, 50, -1, "r" + i, 1, "boom");
+            for (int i = 0; i < 5; i++)
+                GraphCallLog.record("graph", "GET", u, "/users/ops%40corp.com", 500, 50, -1, "r" + i, 1, "boom");
             GraphCallLog.record("graph", "GET", u, "/users/ops%40corp.com", 200, 50, 10, "ok", 1, "");
             DaemonCallLog.configure(dir);
             DaemonCallLog.record("control", "POST", "/command", 500, 5, "CANCEL", "t1", "gui", "Task is not running");
             DaemonCallLog.record("control", "POST", "/command", 200, 5, "RUN_NOW", "t1", "gui", "OK");
             LocalDateTime a = LocalDateTime.now().minusHours(1), b = LocalDateTime.now().plusMinutes(1);
             List<String> kinds = new ArrayList<>();
-            for (TaskRunRecord r : history.queryActivityEvents(AlertConfig.OUTLOOK, a, b, 50)) kinds.add(r.getEventKind());
-            for (TaskRunRecord r : history.queryActivityEvents(AlertConfig.SERVICE, a, b, 50)) kinds.add(r.getEventKind());
+            for (TaskRunRecord r : history.queryActivityEvents(AlertConfig.OUTLOOK, a, b, 50))
+                kinds.add(r.getEventKind());
+            for (TaskRunRecord r : history.queryActivityEvents(AlertConfig.SERVICE, a, b, 50))
+                kinds.add(r.getEventKind());
             java.util.Collections.sort(kinds);
             assertEquals(List.of("GRAPH_FAILING", "GRAPH_RECOVERED", "SERVICE_COMMAND_FAILED"), kinds);
         } finally {
@@ -256,7 +267,8 @@ public class AlertTest {
         }
     }
 
-    @Test public void alertsWaitingWhenTheServiceStoppedAreSentAfterTheRestartAndOldOnesExpire() throws Exception {
+    @Test
+    public void alertsWaitingWhenTheServiceStoppedAreSentAfterTheRestartAndOldOnesExpire() throws Exception {
         File dir = Files.createTempDirectory("alertq").toFile();
         try (Hook hook = new Hook()) {
             enabled(hook.url()).save(dir);
@@ -274,24 +286,24 @@ public class AlertTest {
                 assertEquals("both rows are gone", 0, queued(dir));
                 List<String> kinds = new ArrayList<>();
                 waitFor(() -> history.queryActivityEvents("id1", LocalDateTime.now().minusHours(1), LocalDateTime.now().plusMinutes(1), 50).size() >= 3);
-                for (TaskRunRecord r : history.queryActivityEvents("id1", LocalDateTime.now().minusHours(1), LocalDateTime.now().plusMinutes(1), 50)) kinds.add(r.getEventKind());
+                for (TaskRunRecord r : history.queryActivityEvents("id1", LocalDateTime.now().minusHours(1), LocalDateTime.now().plusMinutes(1), 50))
+                    kinds.add(r.getEventKind());
                 assertTrue(kinds.toString(), kinds.contains("ALERT_QUEUED") && kinds.contains("ALERT_SENT") && kinds.contains("ALERT_FAILED"));
             }
         }
     }
 
-    private static int queued(File dir) {
-        try (java.sql.Connection c = AppDb.open(dir); java.sql.Statement st = c.createStatement(); java.sql.ResultSet rs = st.executeQuery("SELECT count(*) FROM alert_queue")) {
-            return rs.next() ? rs.getInt(1) : -1;
-        } catch (java.sql.SQLException e) { throw new RuntimeException(e); }
-    }
-
-    @Test public void settingsAndQueueFromOlderVersionsMoveIntoTheDatabase() throws Exception {
+    @Test
+    public void settingsAndQueueFromOlderVersionsMoveIntoTheDatabase() throws Exception {
         File dir = Files.createTempDirectory("alertmig").toFile();
         java.util.Properties p = new java.util.Properties();
-        p.setProperty("enabled", "true"); p.setProperty("throttleMinutes", "7");
-        try (java.io.OutputStream o = new java.io.FileOutputStream(new File(dir, AlertConfig.FILE_NAME))) { p.store(o, "old"); }
-        File q = new File(dir, AlertQueueStore.DIR); q.mkdirs();
+        p.setProperty("enabled", "true");
+        p.setProperty("throttleMinutes", "7");
+        try (java.io.OutputStream o = new java.io.FileOutputStream(new File(dir, AlertConfig.FILE_NAME))) {
+            p.store(o, "old");
+        }
+        File q = new File(dir, AlertQueueStore.DIR);
+        q.mkdirs();
         Files.writeString(new File(q, "1.json").toPath(), "{\"queuedAt\":\"5\",\"kind\":\"\",\"taskName\":\"Old\"}");
         AlertConfig c = AlertConfig.load(dir);
         assertEquals(7, c.throttleMinutes);
@@ -303,14 +315,19 @@ public class AlertTest {
         assertEquals("Old", store.load().get(0).alert().taskName());
     }
 
-    @Test public void aQueuedAlertIsSavedUntilItIsDelivered() throws Exception {
+    @Test
+    public void aQueuedAlertIsSavedUntilItIsDelivered() throws Exception {
         File dir = Files.createTempDirectory("alertq2").toFile();
         java.util.concurrent.CountDownLatch inPost = new java.util.concurrent.CountDownLatch(1), release = new java.util.concurrent.CountDownLatch(1);
         enabled("http://x/y").save(dir);
         RunHistoryService history = new RunHistoryService(dir.getAbsolutePath());
         AlertDispatcher.Poster slow = (url, json) -> {
             inPost.countDown();
-            try { release.await(5, java.util.concurrent.TimeUnit.SECONDS); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            try {
+                release.await(5, java.util.concurrent.TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
             return new AlertDispatcher.Result(202, "", null, 1);
         };
         try (AlertDispatcher d = new AlertDispatcher(dir, history, null, System::currentTimeMillis, slow, 0)) {
@@ -323,7 +340,8 @@ public class AlertTest {
         }
     }
 
-    @Test public void aTestCardIsAlsoRecordedInTheEventMonitor() throws Exception {
+    @Test
+    public void aTestCardIsAlsoRecordedInTheEventMonitor() throws Exception {
         File dir = Files.createTempDirectory("alerttest").toFile();
         try (Hook hook = new Hook()) {
             AlertConfig cfg = enabled(hook.url());
@@ -331,13 +349,15 @@ public class AlertTest {
             AlertDispatcher.Result r = AlertDispatcher.sendTest(dir, cfg, null, history);
             assertTrue(r.ok());
             List<String> kinds = new ArrayList<>();
-            for (TaskRunRecord e : history.queryActivityEvents("test", LocalDateTime.now().minusHours(1), LocalDateTime.now().plusMinutes(1), 20)) kinds.add(e.getEventKind());
+            for (TaskRunRecord e : history.queryActivityEvents("test", LocalDateTime.now().minusHours(1), LocalDateTime.now().plusMinutes(1), 20))
+                kinds.add(e.getEventKind());
             assertTrue(kinds.toString(), kinds.contains("ALERT_QUEUED") && kinds.contains("ALERT_SENT"));
             assertEquals(1, AlertCallLog.readRecent(dir, 5).size());
         }
     }
 
-    @Test public void reportsAreServedWithASignedLinkAndCanBeDownloaded() throws Exception {
+    @Test
+    public void reportsAreServedWithASignedLinkAndCanBeDownloaded() throws Exception {
         File dir = Files.createTempDirectory("alertsrv").toFile();
         java.nio.file.Path reports = new File(dir, "alert-reports").toPath();
         Files.createDirectories(reports);
@@ -371,7 +391,8 @@ public class AlertTest {
         }
     }
 
-    @Test public void theOpenLogsLinkPointsAtTheReportServerUnlessABaseAddressIsSet() throws Exception {
+    @Test
+    public void theOpenLogsLinkPointsAtTheReportServerUnlessABaseAddressIsSet() throws Exception {
         File dir = Files.createTempDirectory("alertlink").toFile();
         RunHistoryService history = new RunHistoryService(dir.getAbsolutePath());
         java.nio.file.Path f = new File(dir, "alert-reports/20261101-090000-orders-run_failed.html").toPath();
@@ -386,7 +407,8 @@ public class AlertTest {
         assertTrue("the report page has a download button", AlertReport.build(sample(false), List.of("x"), List.of(), List.of()).contains("id=\"dl\""));
     }
 
-    @Test public void reportRequestsAreRecordedInTheEventMonitor() throws Exception {
+    @Test
+    public void reportRequestsAreRecordedInTheEventMonitor() throws Exception {
         File dir = Files.createTempDirectory("alertrep").toFile();
         RunHistoryService history = new RunHistoryService(dir.getAbsolutePath());
         try (AlertDispatcher d = new AlertDispatcher(dir, history, null, System::currentTimeMillis, new AlertDispatcher.HttpPoster(), 0)) {
@@ -394,14 +416,16 @@ public class AlertTest {
             d.reportRequest("10.0.0.5", "r1.html", true, 200);
             d.reportRequest("10.0.0.9", "r1.html", false, 403);
             List<String> kinds = new ArrayList<>();
-            for (TaskRunRecord e : history.queryActivityEvents("", LocalDateTime.now().minusHours(1), LocalDateTime.now().plusMinutes(1), 20)) kinds.add(e.getEventKind());
+            for (TaskRunRecord e : history.queryActivityEvents("", LocalDateTime.now().minusHours(1), LocalDateTime.now().plusMinutes(1), 20))
+                kinds.add(e.getEventKind());
             java.util.Collections.sort(kinds);
             assertEquals(List.of("REPORT_DOWNLOADED", "REPORT_REJECTED", "REPORT_VIEWED"), kinds);
             assertTrue(!AlertConfig.empty().with(true, "http://x", AlertConfig.PROBLEMS, true, 15, "", "", 30).wants("", EventKind.REPORT_VIEWED));
         }
     }
 
-    @Test public void aWatchedFolderCanAlertOnNewFilesWithoutALaterRecoveredCard() throws Exception {
+    @Test
+    public void aWatchedFolderCanAlertOnNewFilesWithoutALaterRecoveredCard() throws Exception {
         File dir = Files.createTempDirectory("alertwatch").toFile();
         try (Hook hook = new Hook()) {
             enabled(hook.url()).withTask("w1", new AlertConfig.TaskRule(AlertConfig.Mode.CUSTOM, EnumSet.of(EventKind.FILES_DETECTED))).save(dir);
@@ -414,6 +438,32 @@ public class AlertTest {
                 Thread.sleep(300);
                 assertEquals("information is not a problem, so nothing 'recovers'", 1, hook.bodies.size());
             }
+        }
+    }
+
+    private static final class Hook implements AutoCloseable {
+        final HttpServer server;
+        final List<String> bodies = new CopyOnWriteArrayList<>();
+        final AtomicInteger failFirst = new AtomicInteger();
+
+        Hook() throws Exception {
+            server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+            server.createContext("/hook", ex -> {
+                bodies.add(new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+                int code = failFirst.getAndDecrement() > 0 ? 500 : 202;
+                ex.sendResponseHeaders(code, -1);
+                ex.close();
+            });
+            server.start();
+        }
+
+        String url() {
+            return "http://127.0.0.1:" + server.getAddress().getPort() + "/hook";
+        }
+
+        @Override
+        public void close() {
+            server.stop(0);
         }
     }
 }

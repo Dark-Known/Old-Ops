@@ -32,8 +32,10 @@ public class PillBadge extends JLabel {
         setOpaque(false); // we paint our own (rounded) background instead of JLabel's rectangular one
     }
 
-    /** Neutral variant — plain muted text, no pill background at all (for
-     *  "—" / not-applicable cells where a colored chip would be noise). */
+    /**
+     * Neutral variant — plain muted text, no pill background at all (for
+     * "—" / not-applicable cells where a colored chip would be noise).
+     */
     public static PillBadge neutral(String text, Color fg) {
         PillBadge b = new PillBadge(text, fg, null);
         return b;

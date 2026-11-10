@@ -36,30 +36,6 @@ import java.util.logging.Logger;
 public class CredentialDbService {
 
     private static final Logger log = Logger.getLogger(CredentialDbService.class.getName());
-
-    private final Connection conn;
-    private final File dataDir;
-    // Mirrors TaskDbService's connectionError — see its javadoc for why this
-    // is tracked instead of just logging once and moving on.
-    private final String connectionError;
-
-    /**
-     * Tunes this connection for a desktop app with three independent writers
-     * sharing one app.db file — see {@code TaskDbService#applyPragmas}'s
-     * javadoc for the full reasoning (WAL mode, synchronous=NORMAL, and a
-     * busy_timeout). PRAGMA journal_mode persists at the database-file level
-     * once set by any connection, but synchronous and busy_timeout are
-     * per-connection, so each of the three services opening their own
-     * connection to app.db needs to set these itself.
-     */
-    private static void applyPragmas(Connection c) throws SQLException {
-        try (Statement st = c.createStatement()) {
-            st.execute("PRAGMA journal_mode=WAL");
-            st.execute("PRAGMA synchronous=NORMAL");
-            st.execute("PRAGMA busy_timeout=5000");
-        }
-    }
-
     /**
      * A credential is identified by its <b>name</b>, which is unique (the same login username can exist on many
      * servers). Tasks refer to a credential by that name. Column order is the same as in older builds so a legacy
@@ -73,29 +49,18 @@ public class CredentialDbService {
             "password TEXT," +
             "os_type TEXT" +
             ")";
-
-    /** Marks a password column value as encrypted; anything else is legacy plaintext. */
-    private static final String ENC_PREFIX = "enc:";
-
     /**
-     * Encryption is on unless app-config.xml explicitly sets
-     * {@code <credentialEncryption>false</credentialEncryption>}. Reading always
-     * understands both forms, so flipping the setting never makes rows unreadable.
+     * Marks a password column value as encrypted; anything else is legacy plaintext.
      */
-    private static boolean encryptionEnabled() {
-        String v = AppConfig.readValue("credentialEncryption");
-        return v == null || !v.trim().equalsIgnoreCase("false");
-    }
-
-    private static String protect(String plain) {
-        if (plain == null || plain.isEmpty() || !encryptionEnabled()) return plain;
-        return ENC_PREFIX + CryptoUtil.encrypt(plain);
-    }
-
-    private static String reveal(String stored) {
-        if (stored == null || !stored.startsWith(ENC_PREFIX)) return stored; // legacy plaintext
-        return CryptoUtil.decrypt(stored.substring(ENC_PREFIX.length()));
-    }
+    private static final String ENC_PREFIX = "enc:";
+    private final Connection conn;
+    private final File dataDir;
+    // Mirrors TaskDbService's connectionError — see its javadoc for why this
+    // is tracked instead of just logging once and moving on.
+    private final String connectionError;
+    // See TaskDbService#lastSaveError for why this is tracked separately from
+    // connectionError.
+    private volatile String lastSaveError;
 
     public CredentialDbService(File dataDir) {
         this.dataDir = dataDir;
@@ -125,7 +90,56 @@ public class CredentialDbService {
         }
     }
 
-    /** One-time upgrade: re-writes any plaintext password rows in the encrypted form. */
+    /**
+     * Tunes this connection for a desktop app with three independent writers
+     * sharing one app.db file — see {@code TaskDbService#applyPragmas}'s
+     * javadoc for the full reasoning (WAL mode, synchronous=NORMAL, and a
+     * busy_timeout). PRAGMA journal_mode persists at the database-file level
+     * once set by any connection, but synchronous and busy_timeout are
+     * per-connection, so each of the three services opening their own
+     * connection to app.db needs to set these itself.
+     */
+    private static void applyPragmas(Connection c) throws SQLException {
+        try (Statement st = c.createStatement()) {
+            st.execute("PRAGMA journal_mode=WAL");
+            st.execute("PRAGMA synchronous=NORMAL");
+            st.execute("PRAGMA busy_timeout=5000");
+        }
+    }
+
+    /**
+     * Encryption is on unless app-config.xml explicitly sets
+     * {@code <credentialEncryption>false</credentialEncryption>}. Reading always
+     * understands both forms, so flipping the setting never makes rows unreadable.
+     */
+    private static boolean encryptionEnabled() {
+        String v = AppConfig.readValue("credentialEncryption");
+        return v == null || !v.trim().equalsIgnoreCase("false");
+    }
+
+    private static String protect(String plain) {
+        if (plain == null || plain.isEmpty() || !encryptionEnabled()) return plain;
+        return ENC_PREFIX + CryptoUtil.encrypt(plain);
+    }
+
+    private static String reveal(String stored) {
+        if (stored == null || !stored.startsWith(ENC_PREFIX)) return stored; // legacy plaintext
+        return CryptoUtil.decrypt(stored.substring(ENC_PREFIX.length()));
+    }
+
+    private static String clean(String s) {
+        return s == null ? "" : s.trim();
+    }
+
+    private static String text(org.w3c.dom.Element parent, String tag) {
+        org.w3c.dom.NodeList nl = parent.getElementsByTagName(tag);
+        if (nl.getLength() == 0) return null;
+        return nl.item(0).getTextContent();
+    }
+
+    /**
+     * One-time upgrade: re-writes any plaintext password rows in the encrypted form.
+     */
     private synchronized void encryptPlaintextRows() {
         if (!encryptionEnabled()) return;
         try {
@@ -153,13 +167,11 @@ public class CredentialDbService {
         }
     }
 
-    // See TaskDbService#lastSaveError for why this is tracked separately from
-    // connectionError.
-    private volatile String lastSaveError;
-
-    /** True if app.db's credentials table opened successfully AND the
-     *  connection is still alive right now — see TaskDbService#isConnected
-     *  for why this is checked live rather than from a startup snapshot. */
+    /**
+     * True if app.db's credentials table opened successfully AND the
+     * connection is still alive right now — see TaskDbService#isConnected
+     * for why this is checked live rather than from a startup snapshot.
+     */
     public boolean isConnected() {
         if (conn == null) return false;
         try {
@@ -169,18 +181,26 @@ public class CredentialDbService {
         }
     }
 
-    /** Short exception summary from the failed connection attempt, or null if connected fine. */
+    /**
+     * Short exception summary from the failed connection attempt, or null if connected fine.
+     */
     public String getConnectionError() {
         return connectionError;
     }
 
-    /** Lets the storage facade report a failure of a larger operation (a rename that could not update its tasks). */
-    void setLastSaveError(String message) { this.lastSaveError = message; }
-
-    /** Short exception summary from the most recent failed {@link #save}, or
-     *  null if the last save succeeded. See TaskDbService#getLastSaveError. */
+    /**
+     * Short exception summary from the most recent failed {@link #save}, or
+     * null if the last save succeeded. See TaskDbService#getLastSaveError.
+     */
     public String getLastSaveError() {
         return lastSaveError;
+    }
+
+    /**
+     * Lets the storage facade report a failure of a larger operation (a rename that could not update its tasks).
+     */
+    void setLastSaveError(String message) {
+        this.lastSaveError = message;
     }
 
     /**
@@ -219,15 +239,15 @@ public class CredentialDbService {
         }
     }
 
-    private static String clean(String s) { return s == null ? "" : s.trim(); }
-
-    /** Look up a credential by its name (exact match first, then ignoring case), or null if none is stored. */
+    /**
+     * Look up a credential by its name (exact match first, then ignoring case), or null if none is stored.
+     */
     public synchronized Credential loadByName(String name) {
         name = clean(name);
         if (conn == null || name.isEmpty()) return null;
         try {
             for (String sql : new String[]{"SELECT * FROM credentials WHERE name = ?",
-                                           "SELECT * FROM credentials WHERE name = ? COLLATE NOCASE"}) {
+                    "SELECT * FROM credentials WHERE name = ? COLLATE NOCASE"}) {
                 try (PreparedStatement ps = conn.prepareStatement(sql)) {
                     ps.setString(1, name);
                     try (ResultSet rs = ps.executeQuery()) {
@@ -241,7 +261,9 @@ public class CredentialDbService {
         return null;
     }
 
-    /** Look up a credential by its id, or null. */
+    /**
+     * Look up a credential by its id, or null.
+     */
     public synchronized Credential loadById(String id) {
         if (conn == null || id == null || id.isEmpty()) return null;
         try (PreparedStatement ps = conn.prepareStatement("SELECT * FROM credentials WHERE id = ?")) {
@@ -255,7 +277,9 @@ public class CredentialDbService {
         return null;
     }
 
-    /** True when another credential (not {@code exceptId}) already uses this name, ignoring case. */
+    /**
+     * True when another credential (not {@code exceptId}) already uses this name, ignoring case.
+     */
     public synchronized boolean isNameTaken(String name, String exceptId) {
         name = clean(name);
         if (conn == null || name.isEmpty()) return false;
@@ -308,9 +332,11 @@ public class CredentialDbService {
         }
     }
 
-    /** Deletes the credential with the given name, if any. Returns whether
-     *  it was actually removed — see TaskDbService#save's javadoc for why
-     *  this matters. */
+    /**
+     * Deletes the credential with the given name, if any. Returns whether
+     * it was actually removed — see TaskDbService#save's javadoc for why
+     * this matters.
+     */
     public synchronized boolean delete(String name) {
         if (conn == null || name == null || name.isEmpty()) return false;
         try (PreparedStatement ps = conn.prepareStatement("DELETE FROM credentials WHERE name = ?")) {
@@ -325,7 +351,9 @@ public class CredentialDbService {
         }
     }
 
-    /** All stored credentials. */
+    /**
+     * All stored credentials.
+     */
     public synchronized List<Credential> loadAll() {
         List<Credential> list = new ArrayList<>();
         if (conn == null) return list;
@@ -444,15 +472,12 @@ public class CredentialDbService {
         }
     }
 
-    private static String text(org.w3c.dom.Element parent, String tag) {
-        org.w3c.dom.NodeList nl = parent.getElementsByTagName(tag);
-        if (nl.getLength() == 0) return null;
-        return nl.item(0).getTextContent();
-    }
-
     public synchronized void close() {
         if (conn != null) {
-            try { conn.close(); } catch (SQLException ignored) {}
+            try {
+                conn.close();
+            } catch (SQLException ignored) {
+            }
         }
     }
 }

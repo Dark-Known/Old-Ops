@@ -2,26 +2,25 @@ package ui;
 
 import service.BackgroundJobs;
 
-import java.awt.AWTEvent;
-import java.awt.EventQueue;
-import java.awt.Toolkit;
+import java.awt.*;
 
-/** Logs any single EDT event that takes longer than a threshold, with the stack that was blocking it. */
+/**
+ * Logs any single EDT event that takes longer than a threshold, with the stack that was blocking it.
+ */
 public final class EdtWatchdog extends EventQueue {
     private final long fallbackMs;
     private volatile long startedAt;
     private volatile boolean busy;
     private volatile int depth;
-    /** A nested event loop ran inside this event, i.e. a modal dialog was open — time spent in it is not a stall. */
+    /**
+     * A nested event loop ran inside this event, i.e. a modal dialog was open — time spent in it is not a stall.
+     */
     private volatile boolean sawNestedLoop;
     private volatile StackTraceElement[] sample;
     private volatile Thread edt;
 
-    private EdtWatchdog(long fallbackMs) { this.fallbackMs = fallbackMs; }
-
-    /** The user's "report a UI stall after" setting, read live; the start argument is only the fallback. */
-    private long thresholdMs() {
-        try { return service.ActivityVisibility.uiStallMs(); } catch (RuntimeException e) { return fallbackMs; }
+    private EdtWatchdog(long fallbackMs) {
+        this.fallbackMs = fallbackMs;
     }
 
     public static void start(long thresholdMs) {
@@ -30,10 +29,26 @@ public final class EdtWatchdog extends EventQueue {
         service.Workers.service("edt-watchdog", q::watch);
     }
 
+    /**
+     * The user's "report a UI stall after" setting, read live; the start argument is only the fallback.
+     */
+    private long thresholdMs() {
+        try {
+            return service.ActivityVisibility.uiStallMs();
+        } catch (RuntimeException e) {
+            return fallbackMs;
+        }
+    }
+
     @Override
     protected void dispatchEvent(AWTEvent event) {
-        if (depth == 0) { edt = Thread.currentThread(); startedAt = System.nanoTime(); sample = null; sawNestedLoop = false; busy = true; }
-        else sawNestedLoop = true;
+        if (depth == 0) {
+            edt = Thread.currentThread();
+            startedAt = System.nanoTime();
+            sample = null;
+            sawNestedLoop = false;
+            busy = true;
+        } else sawNestedLoop = true;
         depth++;
         try {
             super.dispatchEvent(event);
@@ -65,7 +80,11 @@ public final class EdtWatchdog extends EventQueue {
 
     private void watch() {
         while (true) {
-            try { Thread.sleep(Math.max(20, thresholdMs() / 3)); } catch (InterruptedException e) { return; }
+            try {
+                Thread.sleep(Math.max(20, thresholdMs() / 3));
+            } catch (InterruptedException e) {
+                return;
+            }
             Thread t = edt;
             if (busy && !sawNestedLoop && t != null && (System.nanoTime() - startedAt) / 1_000_000 >= thresholdMs() / 2) {
                 sample = t.getStackTrace();

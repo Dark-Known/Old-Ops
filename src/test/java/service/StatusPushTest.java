@@ -1,14 +1,8 @@
 package service;
 
-import static org.junit.Assert.*;
-
 import org.junit.Before;
 import org.junit.Test;
-import service.queue.SchedulerStatusExporter;
-import service.queue.SchedulerStatusSnapshot;
-import service.queue.TaskDueEvent;
-import service.queue.TaskEventQueue;
-import service.queue.TaskWorkerPool;
+import service.queue.*;
 
 import java.io.File;
 import java.io.InputStream;
@@ -23,20 +17,15 @@ import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
 
-/** v3: the Daemon pushes status changes over a loopback stream; the status file is only the throttled fallback. */
+import static org.junit.Assert.*;
+
+/**
+ * v3: the Daemon pushes status changes over a loopback stream; the status file is only the throttled fallback.
+ */
 public class StatusPushTest {
 
-    private File dir;
     private final HttpClient http = HttpClient.newHttpClient();
-
-    @Before
-    public void setUp() throws Exception {
-        dir = Files.createTempDirectory("statuspush").toFile();
-    }
-
-    private SchedulerStatusExporter exporter(String label, long heartbeatMs) {
-        return new SchedulerStatusExporter(new File(dir, "scheduler-status-" + label + ".dat").toPath(), label, heartbeatMs);
-    }
+    private File dir;
 
     private static void export(SchedulerStatusExporter e, int pool, int active) {
         e.export(pool, active, List.<TaskDueEvent>of(), List.<TaskWorkerPool.ActivityEntry>of(),
@@ -51,6 +40,15 @@ public class StatusPushTest {
             Thread.sleep(25);
         }
         fail("timed out waiting for: " + what);
+    }
+
+    @Before
+    public void setUp() throws Exception {
+        dir = Files.createTempDirectory("statuspush").toFile();
+    }
+
+    private SchedulerStatusExporter exporter(String label, long heartbeatMs) {
+        return new SchedulerStatusExporter(new File(dir, "scheduler-status-" + label + ".dat").toPath(), label, heartbeatMs);
     }
 
     // ------------------------------------------------------------------ exporter
@@ -129,7 +127,8 @@ public class StatusPushTest {
 
         TaskEventQueue q2 = new TaskEventQueue();
         AtomicInteger poolChanges = new AtomicInteger();
-        TaskWorkerPool pool = new TaskWorkerPool(q2, 1, ev -> { });
+        TaskWorkerPool pool = new TaskWorkerPool(q2, 1, ev -> {
+        });
         pool.setChangeListener(poolChanges::incrementAndGet);
         pool.start();
         try {
@@ -141,20 +140,6 @@ public class StatusPushTest {
     }
 
     // ------------------------------------------------------------------ the live stream, end to end
-
-    private static final class Rig implements AutoCloseable {
-        final StatusBroadcaster bus = new StatusBroadcaster();
-        final DaemonControlServer server;
-        final DaemonStatusStream stream;
-        final SchedulerStatusExporter exporter;
-        Rig(File dir, long heartbeatMs) throws Exception {
-            exporter = new SchedulerStatusExporter(new File(dir, "scheduler-status-daemon.dat").toPath(), "daemon", 5000);
-            exporter.setListener(bus::publish);
-            server = DaemonControlServer.start(dir, (a, id, who) -> { }, bus, heartbeatMs);
-            stream = new DaemonStatusStream(dir).start();
-        }
-        @Override public void close() { stream.stop(); server.close(); }
-    }
 
     @Test
     public void changesArriveByPushQuicklyAndIdleIsSilent() throws Exception {
@@ -185,7 +170,8 @@ public class StatusPushTest {
         SchedulerStatusExporter e = exporter("daemon", 5000);
         e.setListener(bus::publish);
         export(e, 6, 1); // state exists BEFORE any client connects
-        try (DaemonControlServer s = DaemonControlServer.start(dir, (a, id, w) -> { }, bus, 300)) {
+        try (DaemonControlServer s = DaemonControlServer.start(dir, (a, id, w) -> {
+        }, bus, 300)) {
             DaemonStatusStream st = new DaemonStatusStream(dir).start();
             try {
                 awaitTrue("seeded state", 5000, () -> st.latestIfLive() != null);
@@ -209,7 +195,8 @@ public class StatusPushTest {
             // a restarted daemon (new port, new token) is picked up by the same client
             StatusBroadcaster bus2 = new StatusBroadcaster();
             r.exporter.setListener(bus2::publish);
-            try (DaemonControlServer s2 = DaemonControlServer.start(dir, (a, id, w) -> { }, bus2, 300)) {
+            try (DaemonControlServer s2 = DaemonControlServer.start(dir, (a, id, w) -> {
+            }, bus2, 300)) {
                 export(r.exporter, 9, 0);
                 awaitTrue("reconnected to the restarted daemon", 15000,
                         () -> r.stream.latestIfLive() != null && r.stream.latestIfLive().getPoolSize() == 9);
@@ -223,7 +210,8 @@ public class StatusPushTest {
     @Test
     public void statusEndpointsRequireTheTokenAndCapStreams() throws Exception {
         StatusBroadcaster bus = new StatusBroadcaster();
-        try (DaemonControlServer s = DaemonControlServer.start(dir, (a, id, w) -> { }, bus, 300)) {
+        try (DaemonControlServer s = DaemonControlServer.start(dir, (a, id, w) -> {
+        }, bus, 300)) {
             String base = "http://127.0.0.1:" + s.port();
 
             HttpResponse<String> noTok = http.send(HttpRequest.newBuilder(URI.create(base + "/status")).GET().build(),
@@ -246,7 +234,7 @@ public class StatusPushTest {
             try {
                 for (int i = 0; i < 4; i++) {
                     HttpResponse<InputStream> r = http.send(HttpRequest.newBuilder(URI.create(base + "/status/stream"))
-                            .header(DaemonControlServer.TOKEN_HEADER, s.token()).GET().build(),
+                                    .header(DaemonControlServer.TOKEN_HEADER, s.token()).GET().build(),
                             HttpResponse.BodyHandlers.ofInputStream());
                     assertEquals(200, r.statusCode());
                     open.add(r.body());
@@ -259,7 +247,12 @@ public class StatusPushTest {
                 // commands still work while all stream threads are busy
                 assertTrue(DaemonControlClient.send(dir, CommandQueueService.Action.REFRESH, "x", "t"));
             } finally {
-                for (InputStream in : open) { try { in.close(); } catch (Exception ignored) { } }
+                for (InputStream in : open) {
+                    try {
+                        in.close();
+                    } catch (Exception ignored) {
+                    }
+                }
             }
             awaitTrue("subscribers released when clients disconnect", 5000, () -> bus.subscriberCount() == 0);
         }
@@ -274,5 +267,26 @@ public class StatusPushTest {
         assertNull(sub.next(50));
         StatusBroadcaster.Subscription late = bus.subscribe(4);
         assertEquals("v999", late.next(100));
+    }
+
+    private static final class Rig implements AutoCloseable {
+        final StatusBroadcaster bus = new StatusBroadcaster();
+        final DaemonControlServer server;
+        final DaemonStatusStream stream;
+        final SchedulerStatusExporter exporter;
+
+        Rig(File dir, long heartbeatMs) throws Exception {
+            exporter = new SchedulerStatusExporter(new File(dir, "scheduler-status-daemon.dat").toPath(), "daemon", 5000);
+            exporter.setListener(bus::publish);
+            server = DaemonControlServer.start(dir, (a, id, who) -> {
+            }, bus, heartbeatMs);
+            stream = new DaemonStatusStream(dir).start();
+        }
+
+        @Override
+        public void close() {
+            stream.stop();
+            server.close();
+        }
     }
 }

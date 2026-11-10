@@ -14,9 +14,28 @@ final class WidthTrackingPanel extends JPanel implements Scrollable {
         super(layout);
     }
 
-    @Override public Dimension getPreferredScrollableViewportSize() { return getPreferredSize(); }
-    @Override public int getScrollableUnitIncrement(Rectangle r, int orientation, int direction) { return 14; }
-    @Override public int getScrollableBlockIncrement(Rectangle r, int orientation, int direction) { return Math.max(40, r.height - 40); }
-    @Override public boolean getScrollableTracksViewportWidth() { return true; }
-    @Override public boolean getScrollableTracksViewportHeight() { return false; }
+    @Override
+    public Dimension getPreferredScrollableViewportSize() {
+        return getPreferredSize();
+    }
+
+    @Override
+    public int getScrollableUnitIncrement(Rectangle r, int orientation, int direction) {
+        return 14;
+    }
+
+    @Override
+    public int getScrollableBlockIncrement(Rectangle r, int orientation, int direction) {
+        return Math.max(40, r.height - 40);
+    }
+
+    @Override
+    public boolean getScrollableTracksViewportWidth() {
+        return true;
+    }
+
+    @Override
+    public boolean getScrollableTracksViewportHeight() {
+        return false;
+    }
 }

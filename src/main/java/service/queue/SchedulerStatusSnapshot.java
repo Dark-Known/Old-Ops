@@ -14,7 +14,7 @@ import java.util.List;
 /**
  * A parsed, point-in-time snapshot of another process's scheduler state,
  * read back from the flat file written by {@link SchedulerStatusExporter}.
- *
+ * <p>
  * This is the cross-process half of the monitoring story: the in-process
  * GUI scheduler is observed directly via {@link service.TaskSchedulerService}'s
  * live accessors, but the headless Daemon runs in a separate JVM with its
@@ -32,73 +32,13 @@ public final class SchedulerStatusSnapshot {
      * writes every 2s (see {@code TaskSchedulerService#enableStatusExport}),
      * so anything past ~4x that interval most likely means the process died
      * mid-tick rather than just being between writes.
-     *
+     * <p>
      * Shared here so every consumer — {@code ui.MainWindow}'s scheduler
      * badge, {@code ui.EventMonitorWindow}'s worker chip, and
      * {@code ui.EventMonitorPanel}'s tabs — agrees on the same threshold
      * instead of each hard-coding its own copy.
      */
     public static final long DEFAULT_STALE_MS = 8_000L;
-
-    /**
-     * True if {@code file} holds a fresh (non-stale) snapshot right now —
-     * i.e. the process exporting it is alive and actively scheduling.
-     * Convenience wrapper around {@link #read} + {@link #isFresh} for
-     * callers that only care about the yes/no "is it alive" question.
-     */
-    public static boolean isAlive(Path file, long maxAgeMillis) {
-        SchedulerStatusSnapshot snap = read(file);
-        return snap != null && snap.isFresh(maxAgeMillis);
-    }
-
-    /** One task's pending occurrence, as exported. */
-    public record PendingEntry(String taskId, int attempt, LocalDateTime dueAt) {}
-
-    /** One handled event, as exported. */
-    public record ActivityEntry(String taskId, int attempt, LocalDateTime startedAt,
-                                 LocalDateTime finishedAt, boolean errored, String errorMessage) {}
-
-    /**
-     * One watcher-enabled task's current trigger mode, as exported by
-     * {@code TaskSchedulerService#getWatchStatus}. {@code mode} is the raw
-     * {@code TaskSchedulerService.WatchMode} enum name (e.g.
-     * {@code "NATIVE_WATCH"}, {@code "REMOTE_PUSH"}, {@code "POLLING_ONLY"}) —
-     * kept as a plain string here rather than referencing that enum directly
-     * so this package doesn't need a compile-time dependency on
-     * {@code service.TaskSchedulerService}. {@code detail} is the matching
-     * human-readable reason (e.g. "not yet attempted", "remote host has no
-     * inotifywait installed"), so a reader never has to show a bare mode name
-     * without being able to say why. Only tasks the exporting process
-     * actually considers watcher-eligible are included; a task absent from
-     * this list should be treated as "unknown to that process", not
-     * necessarily "not applicable".
-     */
-    public record WatchEntry(String taskId, String mode, String detail) {}
-
-    /** One observed push wake-up (a discrete "watch fired" event, not
-     *  current state — see {@link WatchEntry} for that). Exported so the
-     *  GUI's Event Monitor can stream the Daemon's own watch fires, not just
-     *  its own in-process ones. */
-    public record FireEntry(String taskId, LocalDateTime firedAt) {}
-
-    /**
-     * How many WinSCP/SFTP processes the exporting process currently has in
-     * flight for one task — the cross-process counterpart of
-     * {@code TransferService#getActiveSessionCount(String)}. Only tasks with
-     * a genuinely non-zero count are ever exported (see
-     * {@code TaskSchedulerService#exportStatus}), so this list is normally
-     * empty. Needed because a thin-client GUI never runs the transfers
-     * itself when the Daemon is the active scheduler (see {@code
-     * ui.MainWindow}'s "thin client" note) — its own in-process {@code
-     * TransferService} never sees the Daemon's WinSCP processes, so without
-     * this, the session badge always reads 0 no matter what the Daemon is
-     * actually doing.
-     */
-    public record SessionEntry(String taskId, int count) {}
-
-    /** A task a worker is executing right now: which task, on which worker thread, since when. */
-    public record InFlightEntry(String taskId, String thread, LocalDateTime startedAt) {}
-
     private final String processLabel;
     private final long pid;
     private final LocalDateTime writtenAt;
@@ -113,12 +53,11 @@ public final class SchedulerStatusSnapshot {
     private final List<InFlightEntry> inFlight;
     private final List<String> liveLines;
     private final int backgroundBusy;
-
     private SchedulerStatusSnapshot(String processLabel, long pid, LocalDateTime writtenAt, int poolSize,
-                                     int activeWorkers, List<PendingEntry> pending, List<ActivityEntry> activity,
-                                     List<WatchEntry> watchEntries, List<FireEntry> fireEntries,
-                                     List<String> runningTaskIds, List<SessionEntry> sessionEntries,
-                                     List<InFlightEntry> inFlight, List<String> liveLines, int backgroundBusy) {
+                                    int activeWorkers, List<PendingEntry> pending, List<ActivityEntry> activity,
+                                    List<WatchEntry> watchEntries, List<FireEntry> fireEntries,
+                                    List<String> runningTaskIds, List<SessionEntry> sessionEntries,
+                                    List<InFlightEntry> inFlight, List<String> liveLines, int backgroundBusy) {
         this.processLabel = processLabel;
         this.pid = pid;
         this.writtenAt = writtenAt;
@@ -135,41 +74,15 @@ public final class SchedulerStatusSnapshot {
         this.backgroundBusy = backgroundBusy;
     }
 
-    /** Worker threads busy outside the task pool (UI actions, feeds, transfers…) in that process; 0 from older versions. */
-    public int getBackgroundBusy() { return backgroundBusy; }
-
-    /** Tasks the process's workers are executing right now (empty for status files from older versions). */
-    public List<InFlightEntry> getInFlight() { return inFlight; }
-
-    /** Lane summary and running background jobs of that process, one line each (empty from older versions). */
-    public List<String> getLiveLines() { return liveLines; }
-
-    public String getProcessLabel() { return processLabel; }
-    public long getPid() { return pid; }
-    public LocalDateTime getWrittenAt() { return writtenAt; }
-    public int getPoolSize() { return poolSize; }
-    public int getActiveWorkers() { return activeWorkers; }
-    public List<PendingEntry> getPending() { return pending; }
-    public List<ActivityEntry> getActivity() { return activity; }
-    public List<WatchEntry> getWatchEntries() { return watchEntries; }
-    public List<FireEntry> getFireEntries() { return fireEntries; }
-    /** Task IDs currently executing in the exporting process, as of when this snapshot was written. */
-    public List<String> getRunningTaskIds() { return runningTaskIds; }
-    /** Per-task active WinSCP/SFTP session counts, exporting-process side. Only non-zero entries are ever included. */
-    public List<SessionEntry> getSessionEntries() { return sessionEntries; }
-
-    /** Convenience lookup: active session count for one task, 0 if not present (i.e. genuinely idle). */
-    public int getActiveSessionCount(String taskId) {
-        if (taskId == null) return 0;
-        for (SessionEntry s : sessionEntries) {
-            if (taskId.equals(s.taskId())) return s.count();
-        }
-        return 0;
-    }
-
-    /** Whether this snapshot is fresh enough to trust — i.e. the exporting process is still alive and running. */
-    public boolean isFresh(long maxAgeMillis) {
-        return java.time.Duration.between(writtenAt, LocalDateTime.now()).toMillis() <= maxAgeMillis;
+    /**
+     * True if {@code file} holds a fresh (non-stale) snapshot right now —
+     * i.e. the process exporting it is alive and actively scheduling.
+     * Convenience wrapper around {@link #read} + {@link #isFresh} for
+     * callers that only care about the yes/no "is it alive" question.
+     */
+    public static boolean isAlive(Path file, long maxAgeMillis) {
+        SchedulerStatusSnapshot snap = read(file);
+        return snap != null && snap.isFresh(maxAgeMillis);
     }
 
     /**
@@ -187,12 +100,16 @@ public final class SchedulerStatusSnapshot {
         }
     }
 
-    /** Parses the exporter's text format (what the status file and the push stream both carry). */
+    /**
+     * Parses the exporter's text format (what the status file and the push stream both carry).
+     */
     public static SchedulerStatusSnapshot parse(String text) {
         return text == null ? null : parse(java.util.Arrays.asList(text.split("\\R", -1)));
     }
 
-    /** Parses the exporter's lines. Returns {@code null} (never throws) for empty or unusable input. */
+    /**
+     * Parses the exporter's lines. Returns {@code null} (never throws) for empty or unusable input.
+     */
     public static SchedulerStatusSnapshot parse(List<String> lines) {
         try {
             if (lines == null || lines.isEmpty()) return null;
@@ -294,5 +211,156 @@ public final class SchedulerStatusSnapshot {
     private static String unescape(String s) {
         if (s == null) return "";
         return s.replace("\\p", "|").replace("\\\\", "\\");
+    }
+
+    /**
+     * Worker threads busy outside the task pool (UI actions, feeds, transfers…) in that process; 0 from older versions.
+     */
+    public int getBackgroundBusy() {
+        return backgroundBusy;
+    }
+
+    /**
+     * Tasks the process's workers are executing right now (empty for status files from older versions).
+     */
+    public List<InFlightEntry> getInFlight() {
+        return inFlight;
+    }
+
+    /**
+     * Lane summary and running background jobs of that process, one line each (empty from older versions).
+     */
+    public List<String> getLiveLines() {
+        return liveLines;
+    }
+
+    public String getProcessLabel() {
+        return processLabel;
+    }
+
+    public long getPid() {
+        return pid;
+    }
+
+    public LocalDateTime getWrittenAt() {
+        return writtenAt;
+    }
+
+    public int getPoolSize() {
+        return poolSize;
+    }
+
+    public int getActiveWorkers() {
+        return activeWorkers;
+    }
+
+    public List<PendingEntry> getPending() {
+        return pending;
+    }
+
+    public List<ActivityEntry> getActivity() {
+        return activity;
+    }
+
+    public List<WatchEntry> getWatchEntries() {
+        return watchEntries;
+    }
+
+    public List<FireEntry> getFireEntries() {
+        return fireEntries;
+    }
+
+    /**
+     * Task IDs currently executing in the exporting process, as of when this snapshot was written.
+     */
+    public List<String> getRunningTaskIds() {
+        return runningTaskIds;
+    }
+
+    /**
+     * Per-task active WinSCP/SFTP session counts, exporting-process side. Only non-zero entries are ever included.
+     */
+    public List<SessionEntry> getSessionEntries() {
+        return sessionEntries;
+    }
+
+    /**
+     * Convenience lookup: active session count for one task, 0 if not present (i.e. genuinely idle).
+     */
+    public int getActiveSessionCount(String taskId) {
+        if (taskId == null) return 0;
+        for (SessionEntry s : sessionEntries) {
+            if (taskId.equals(s.taskId())) return s.count();
+        }
+        return 0;
+    }
+
+    /**
+     * Whether this snapshot is fresh enough to trust — i.e. the exporting process is still alive and running.
+     */
+    public boolean isFresh(long maxAgeMillis) {
+        return java.time.Duration.between(writtenAt, LocalDateTime.now()).toMillis() <= maxAgeMillis;
+    }
+
+    /**
+     * One task's pending occurrence, as exported.
+     */
+    public record PendingEntry(String taskId, int attempt, LocalDateTime dueAt) {
+    }
+
+    /**
+     * One handled event, as exported.
+     */
+    public record ActivityEntry(String taskId, int attempt, LocalDateTime startedAt,
+                                LocalDateTime finishedAt, boolean errored, String errorMessage) {
+    }
+
+    /**
+     * One watcher-enabled task's current trigger mode, as exported by
+     * {@code TaskSchedulerService#getWatchStatus}. {@code mode} is the raw
+     * {@code TaskSchedulerService.WatchMode} enum name (e.g.
+     * {@code "NATIVE_WATCH"}, {@code "REMOTE_PUSH"}, {@code "POLLING_ONLY"}) —
+     * kept as a plain string here rather than referencing that enum directly
+     * so this package doesn't need a compile-time dependency on
+     * {@code service.TaskSchedulerService}. {@code detail} is the matching
+     * human-readable reason (e.g. "not yet attempted", "remote host has no
+     * inotifywait installed"), so a reader never has to show a bare mode name
+     * without being able to say why. Only tasks the exporting process
+     * actually considers watcher-eligible are included; a task absent from
+     * this list should be treated as "unknown to that process", not
+     * necessarily "not applicable".
+     */
+    public record WatchEntry(String taskId, String mode, String detail) {
+    }
+
+    /**
+     * One observed push wake-up (a discrete "watch fired" event, not
+     * current state — see {@link WatchEntry} for that). Exported so the
+     * GUI's Event Monitor can stream the Daemon's own watch fires, not just
+     * its own in-process ones.
+     */
+    public record FireEntry(String taskId, LocalDateTime firedAt) {
+    }
+
+    /**
+     * How many WinSCP/SFTP processes the exporting process currently has in
+     * flight for one task — the cross-process counterpart of
+     * {@code TransferService#getActiveSessionCount(String)}. Only tasks with
+     * a genuinely non-zero count are ever exported (see
+     * {@code TaskSchedulerService#exportStatus}), so this list is normally
+     * empty. Needed because a thin-client GUI never runs the transfers
+     * itself when the Daemon is the active scheduler (see {@code
+     * ui.MainWindow}'s "thin client" note) — its own in-process {@code
+     * TransferService} never sees the Daemon's WinSCP processes, so without
+     * this, the session badge always reads 0 no matter what the Daemon is
+     * actually doing.
+     */
+    public record SessionEntry(String taskId, int count) {
+    }
+
+    /**
+     * A task a worker is executing right now: which task, on which worker thread, since when.
+     */
+    public record InFlightEntry(String taskId, String thread, LocalDateTime startedAt) {
     }
 }

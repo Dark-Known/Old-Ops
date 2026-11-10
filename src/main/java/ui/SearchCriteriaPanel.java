@@ -1,6 +1,5 @@
 package ui;
 
-import util.ImapSearchCriteria;
 import util.ImapSearchCriteria.*;
 
 import javax.swing.*;
@@ -8,8 +7,9 @@ import javax.swing.border.EmptyBorder;
 import java.awt.*;
 import java.awt.event.ActionListener;
 import java.text.SimpleDateFormat;
-import java.util.*;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -19,7 +19,7 @@ import java.util.regex.Pattern;
  * - Additional criteria type selection
  * - Argument input fields
  * - Display of selected criteria as removable tags
- *
+ * <p>
  * NOTE: the criteria strings this panel builds use IMAP RFC 3501 tokens
  * (FROM/SUBJECT/SINCE/etc.) for continuity with the existing type/value
  * builder below, but they are consumed by GraphMailService's best-effort
@@ -31,6 +31,7 @@ import java.util.regex.Pattern;
  */
 public class SearchCriteriaPanel extends JPanel {
 
+    private static final SimpleDateFormat IMAP_DATE_FMT = new SimpleDateFormat("dd-MMM-yyyy", Locale.ENGLISH);
     private JComboBox<SimpleCriteria> cbSimpleCriteria;
     private JComboBox<Object> cbAdvancedType;
     private JTextField tfArgument;
@@ -38,7 +39,6 @@ public class SearchCriteriaPanel extends JPanel {
     private JPanel pnlCriteria;
     private List<CriterionTag> selectedCriteria = new ArrayList<>();
     private ActionListener onCriteriaChanged;
-
     // ── Date range ("between") filter ───────────────────────────────────────
     // The single-date DateCriteria (BEFORE/SINCE/ON) can't express "give me
     // everything between two dates" without the user manually adding two
@@ -47,7 +47,6 @@ public class SearchCriteriaPanel extends JPanel {
     private JSpinner spDateRangeFrom;
     private JSpinner spDateRangeTo;
     private JComboBox<String> cbDateRangeBasis;
-    private static final SimpleDateFormat IMAP_DATE_FMT = new SimpleDateFormat("dd-MMM-yyyy", Locale.ENGLISH);
 
     public SearchCriteriaPanel() {
         setLayout(new BorderLayout(5, 5));
@@ -183,19 +182,31 @@ public class SearchCriteriaPanel extends JPanel {
         String value = tfArgument.getText().trim();
 
         if (selected instanceof TextCriteria) {
-            if (value.isEmpty()) { showError("Please enter a text value"); return; }
+            if (value.isEmpty()) {
+                showError("Please enter a text value");
+                return;
+            }
             TextCriteria tc = (TextCriteria) selected;
             addCriteriaTag(tc.getCriterion() + " \"" + escapeQuotes(value) + "\"", tc.getDescription() + ": " + value);
         } else if (selected instanceof DateCriteria) {
-            if (value.isEmpty()) { showError("Please enter a date value"); return; }
+            if (value.isEmpty()) {
+                showError("Please enter a date value");
+                return;
+            }
             DateCriteria dc = (DateCriteria) selected;
             addCriteriaTag(dc.getCriterion() + " " + value, dc.getDescription() + ": " + value);
         } else if (selected instanceof SizeCriteria) {
-            if (value.isEmpty()) { showError("Please enter a size value"); return; }
+            if (value.isEmpty()) {
+                showError("Please enter a size value");
+                return;
+            }
             SizeCriteria sc = (SizeCriteria) selected;
             addCriteriaTag(sc.getCriterion() + " " + value, sc.getDescription() + ": " + value);
         } else if (selected instanceof AdvancedCriteria) {
-            if (value.isEmpty()) { showError("Please enter a value"); return; }
+            if (value.isEmpty()) {
+                showError("Please enter a value");
+                return;
+            }
             AdvancedCriteria ac = (AdvancedCriteria) selected;
             addCriteriaTag(ac.getCriterion() + " " + value, ac.getDescription() + ": " + value);
         } else {
@@ -393,7 +404,7 @@ public class SearchCriteriaPanel extends JPanel {
             setLayout(new BoxLayout(this, BoxLayout.X_AXIS));
             setBorder(BorderFactory.createLineBorder(AppTheme.EARTH_SIENNA, 1));
             setBackground(new Color(0xF3E3D6)); // pale sienna — this chip stays pale regardless
-                                                 // of app theme, so its text must stay dark too
+            // of app theme, so its text must stay dark too
             setOpaque(true);
 
             JLabel lbl = new JLabel(display);

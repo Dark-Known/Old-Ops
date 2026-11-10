@@ -37,36 +37,52 @@
 #Requires -RunAsAdministrator
 
 $ErrorActionPreference = "Stop"
-$ProgressPreference    = "SilentlyContinue"
+$ProgressPreference = "SilentlyContinue"
 
-$ScriptRoot = if ($PSCommandPath) {
+$ScriptRoot = if ($PSCommandPath)
+{
     Split-Path -Parent $PSCommandPath
-} elseif ($PSScriptRoot) {
+}
+elseif ($PSScriptRoot)
+{
     $PSScriptRoot
-} elseif ($MyInvocation.MyCommand.Path) {
+}
+elseif ($MyInvocation.MyCommand.Path)
+{
     Split-Path -Parent $MyInvocation.MyCommand.Path
-} else {
+}
+else
+{
     Get-Location
 }
 $StepsDir = Join-Path $ScriptRoot "packaging\steps"
 
-function Log($msg) {
-    $line = "$(Get-Date -Format 'HH:mm:ss')  $msg"
+function Log($msg)
+{
+    $line = "$( Get-Date -Format 'HH:mm:ss' )  $msg"
     Write-Host $line
     Add-Content -Path $LogFile -Value $line
 }
 
-function Step($msg) {
+function Step($msg)
+{
     Write-Host ""
     Write-Host "------------------------------------------" -ForegroundColor DarkGray
     Write-Host "  $msg" -ForegroundColor Cyan
     Write-Host "------------------------------------------" -ForegroundColor DarkGray
 }
 
-function OK($msg)   { Write-Host "  v  $msg" -ForegroundColor Green }
-function SKIP($msg) { Write-Host "  -  $msg" -ForegroundColor Yellow }
+function OK($msg)
+{
+    Write-Host "  v  $msg" -ForegroundColor Green
+}
+function SKIP($msg)
+{
+    Write-Host "  -  $msg" -ForegroundColor Yellow
+}
 
-function FAIL($msg) {
+function FAIL($msg)
+{
     Write-Host ""
     Write-Host "  x  ERROR: $msg" -ForegroundColor Red
     Write-Host "     See log: $LogFile"
@@ -81,48 +97,83 @@ function FAIL($msg) {
 # reads the same as a failure in this file itself. $StepArgs only needs
 # to contain overrides; every step script fills in everything else itself
 # from app-config.xml or its own project defaults.
-function Invoke-Step {
-    param([string]$ScriptPath, [hashtable]$StepArgs = @{})
-    if (-not (Test-Path $ScriptPath)) {
+function Invoke-Step
+{
+    param([string]$ScriptPath, [hashtable]$StepArgs = @{ })
+    if (-not (Test-Path $ScriptPath))
+    {
         FAIL "$ScriptPath not found - re-download the packaging folder alongside setup.ps1."
     }
-    try {
+    try
+    {
         return & $ScriptPath @StepArgs -LogFile $LogFile
-    } catch {
-        $errorMessage = if ($_.Exception) { $_.Exception.Message } else { $_.ToString() }
-        FAIL "$(Split-Path $ScriptPath -Leaf) failed: $errorMessage"
+    }
+    catch
+    {
+        $errorMessage = if ($_.Exception)
+        {
+            $_.Exception.Message
+        }
+        else
+        {
+            $_.ToString()
+        }
+        FAIL "$( Split-Path $ScriptPath -Leaf ) failed: $errorMessage"
     }
 }
 
-$LogDir  = Join-Path $ScriptRoot "logs"
-if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
-$LogFile = Join-Path $LogDir "opstool-setup_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+$LogDir = Join-Path $ScriptRoot "logs"
+if (-not (Test-Path $LogDir))
+{
+    New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+}
+$LogFile = Join-Path $LogDir "opstool-setup_$( Get-Date -Format 'yyyyMMdd_HHmmss' ).log"
 
 # Only read here for the banner text and the final summary/daemon-skip
 # decision below - every step script reads app-config.xml itself too, so
 # nothing computed here actually needs to be passed down to them.
 $xmlConfig = $null
 $configFile = Join-Path $ScriptRoot "app-config.xml"
-if (Test-Path $configFile) {
-    try { [xml]$xmlConfig = Get-Content $configFile; Log "Loaded configuration from: $configFile" }
-    catch { Log "WARNING: Failed to parse app-config.xml: $_" }
-} else {
+if (Test-Path $configFile)
+{
+    try
+    {
+        [xml]$xmlConfig = Get-Content $configFile; Log "Loaded configuration from: $configFile"
+    }
+    catch
+    {
+        Log "WARNING: Failed to parse app-config.xml: $_"
+    }
+}
+else
+{
     Log "WARNING: app-config.xml not found next to setup.ps1. Every step will use its own built-in defaults."
 }
-function Get-ConfigValue([string]$xpath, [string]$defaultValue) {
-    if ($null -eq $xmlConfig) { return $defaultValue }
-    try {
+function Get-ConfigValue([string]$xpath, [string]$defaultValue)
+{
+    if ($null -eq $xmlConfig)
+    {
+        return $defaultValue
+    }
+    try
+    {
         $node = $xmlConfig.SelectSingleNode($xpath)
-        if ($node -and -not [string]::IsNullOrEmpty($node.InnerText)) { return $node.InnerText }
-    } catch {}
+        if ($node -and -not [string]::IsNullOrEmpty($node.InnerText))
+        {
+            return $node.InnerText
+        }
+    }
+    catch
+    {
+    }
     return $defaultValue
 }
 
-$InstallDir    = Get-ConfigValue "/application/installation/installDir" "C:\OpsTools"
-$JarName       = Get-ConfigValue "/application/installation/jarName" "Monitoring-Tool.jar"
-$dataDir       = Get-ConfigValue "/application/installation/dataDir" "C:\OpsTools\Data"
+$InstallDir = Get-ConfigValue "/application/installation/installDir" "C:\OpsTools"
+$JarName = Get-ConfigValue "/application/installation/jarName" "Monitoring-Tool.jar"
+$dataDir = Get-ConfigValue "/application/installation/dataDir" "C:\OpsTools\Data"
 $daemonEnabled = Get-ConfigValue "/application/daemon/enabled" "true"
-$taskName      = Get-ConfigValue "/application/daemon/taskName" "Monitoring-Tool-Daemon"
+$taskName = Get-ConfigValue "/application/daemon/taskName" "Monitoring-Tool-Daemon"
 
 Clear-Host
 Write-Host ""
@@ -138,7 +189,10 @@ Write-Host ""
 Write-Host "  Log: $LogFile"
 Write-Host ""
 $confirm = Read-Host "Continue? [Y/n]"
-if ($confirm -match "^[Nn]") { exit 0 }
+if ($confirm -match "^[Nn]")
+{
+    exit 0
+}
 
 # ── Step 1: Prerequisites (Java + WinSCP) ───────────────────────────────
 Step "Step 1/3: Prerequisites (Java + WinSCP)"
@@ -151,9 +205,12 @@ $destJar = $deployResult.DestJar
 
 # ── Step 3: Daemon registration ─────────────────────────────────────────
 Step "Step 3/3: Daemon registration"
-if ($daemonEnabled -ne "true") {
+if ($daemonEnabled -ne "true")
+{
     SKIP "Daemon registration disabled in configuration"
-} else {
+}
+else
+{
     # Delegates entirely to packaging\install-service.ps1, which registers
     # the daemon as a real Windows Service (via WinSW) instead of a
     # Scheduled Task, and removes any existing Scheduled Task registration
@@ -164,9 +221,12 @@ if ($daemonEnabled -ne "true") {
     $installServiceScript = Join-Path $ScriptRoot "packaging\install-service.ps1"
     $winSwExe = Join-Path $InstallDir "daemon-service.exe"
 
-    if (-not (Test-Path $installServiceScript)) {
+    if (-not (Test-Path $installServiceScript))
+    {
         Log "WARNING: packaging\install-service.ps1 not found next to this script - skipping daemon registration."
-    } elseif (-not (Test-Path $winSwExe)) {
+    }
+    elseif (-not (Test-Path $winSwExe))
+    {
         # Same "optional local prerequisite" convention as rcedit.exe above:
         # this isn't fatal, since offline installs may not have fetched
         # WinSW yet - just tell the operator exactly what to do next.
@@ -174,18 +234,33 @@ if ($daemonEnabled -ne "true") {
         Log "Download WinSW-x64.exe from https://github.com/winsw/winsw/releases,"
         Log "rename it to 'daemon-service.exe', place it in $InstallDir, and re-run setup"
         Log "(or run packaging\install-service.ps1 directly) to register the daemon."
-    } else {
-        try {
+    }
+    else
+    {
+        try
+        {
             Log "Registering daemon as a Windows Service via install-service.ps1..."
             & $installServiceScript -InstallDir $InstallDir -DataDir $dataDir `
                 -WinSwPath $winSwExe -JarPath $destJar -ExistingScheduledTaskName $taskName
-            if ($LASTEXITCODE -ne 0 -and $null -ne $LASTEXITCODE) {
+            if ($LASTEXITCODE -ne 0 -and $null -ne $LASTEXITCODE)
+            {
                 Log "WARNING: install-service.ps1 exited with code $LASTEXITCODE - check the output above."
-            } else {
+            }
+            else
+            {
                 OK "Daemon registered as Windows Service (see output above for status)."
             }
-        } catch {
-            $errorMessage = if ($_.Exception) { $_.Exception.Message } else { $_.ToString() }
+        }
+        catch
+        {
+            $errorMessage = if ($_.Exception)
+            {
+                $_.Exception.Message
+            }
+            else
+            {
+                $_.ToString()
+            }
             Log "WARNING: Could not register daemon service: $errorMessage"
             Log "You can register manually later via: packaging\install-service.ps1 -InstallDir `"$InstallDir`""
         }
@@ -193,11 +268,11 @@ if ($daemonEnabled -ne "true") {
 }
 
 Write-Host ""
-Write-Host "  v Java JDK installed/verified: $($prereqResult.JavaBin)"
-Write-Host "  v WinSCP installed/verified: $($prereqResult.WinScpComPath)"
+Write-Host "  v Java JDK installed/verified: $( $prereqResult.JavaBin )"
+Write-Host "  v WinSCP installed/verified: $( $prereqResult.WinScpComPath )"
 Write-Host "  v JAR deployed to: $destJar"
-Write-Host "  v Desktop shortcut -> $($deployResult.DesktopLink)"
-Write-Host "  v Start Menu entry -> $($deployResult.StartMenuLink)"
+Write-Host "  v Desktop shortcut -> $( $deployResult.DesktopLink )"
+Write-Host "  v Start Menu entry -> $( $deployResult.StartMenuLink )"
 Write-Host "  [OK] Daemon registered (if available)"
 Write-Host ""
 Write-Host "  Launch the application:"

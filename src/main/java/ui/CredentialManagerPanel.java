@@ -1,7 +1,6 @@
 package ui;
 
 import model.Credential;
-import model.TaskRunRecord;
 import service.RunHistoryService;
 import service.XmlStorageService;
 import ui.components.IconTile;
@@ -20,7 +19,7 @@ import java.util.UUID;
  * Displays all stored server credentials (see {@link service.CredentialDbService},
  * a small SQLite database at {@code <dataDir>/credentials.db}).
  * Passwords are shown and stored as plain text.
- *
+ * <p>
  * Admins can add / edit / delete credentials here directly.
  * The ops team can also manage them implicitly via the Task Dialog.
  *
@@ -38,13 +37,13 @@ public class CredentialManagerPanel extends JPanel {
     // normal MainWindow flow (if any ever exists) shouldn't have to wire one
     // up just to compile.
     private final RunHistoryService auditLog;
-    private DefaultListModel<Credential> listModel;
-    private JList<Credential> credList;
     // taskId-using-count doesn't live on Credential itself — populated once
     // per refresh() (a DB count query per credential) and looked up by the
     // row renderer, same "compute once, render many" split TaskManagerPanel
     // uses for its own per-row daemon-derived fields.
     private final Map<String, Integer> usageByName = new HashMap<>();
+    private DefaultListModel<Credential> listModel;
+    private JList<Credential> credList;
 
     public CredentialManagerPanel(XmlStorageService storage, RunHistoryService auditLog) {
         this.storage = storage;
@@ -71,9 +70,9 @@ public class CredentialManagerPanel extends JPanel {
         // Only "Add Credential" is accent-styled — same one-primary-action
         // restraint as TaskManagerPanel's toolbar; Delete keeps a red-tinted
         // label as its only distinguishing mark instead of a loud gradient.
-        JButton btnAdd     = new GradientButton("Add Credential");
-        JButton btnEdit    = new JButton("Edit");
-        JButton btnDelete  = new JButton("Delete");
+        JButton btnAdd = new GradientButton("Add Credential");
+        JButton btnEdit = new JButton("Edit");
+        JButton btnDelete = new JButton("Delete");
         JButton btnRefresh = new JButton("Refresh");
 
         styleButton(btnAdd, AppTheme.EARTH_MOSS);
@@ -82,23 +81,29 @@ public class CredentialManagerPanel extends JPanel {
         btnAdd.addActionListener(e -> showDialog(null));
         btnEdit.addActionListener(e -> {
             Credential c = credList.getSelectedValue();
-            if (c == null) { JOptionPane.showMessageDialog(this, "Select a credential to edit."); return; }
+            if (c == null) {
+                JOptionPane.showMessageDialog(this, "Select a credential to edit.");
+                return;
+            }
             showDialog(c);
         });
         btnDelete.addActionListener(e -> {
             Credential c = credList.getSelectedValue();
-            if (c == null) { JOptionPane.showMessageDialog(this, "Select a credential to delete."); return; }
+            if (c == null) {
+                JOptionPane.showMessageDialog(this, "Select a credential to delete.");
+                return;
+            }
             String username = c.getName();   // credentials are identified by name
             int inUse = storage.countTasksUsingCredential(username);
             String warning = inUse > 0
-                ? "\n\nWarning: " + inUse + " task" + (inUse == 1 ? " is" : "s are")
+                    ? "\n\nWarning: " + inUse + " task" + (inUse == 1 ? " is" : "s are")
                     + " currently configured to use this credential.\n"
                     + "Deleting it will make " + (inUse == 1 ? "that task" : "those tasks") + " fail at their next run."
-                : "";
+                    : "";
             int ok = JOptionPane.showConfirmDialog(this,
-                "Delete credential \"" + username + "\" (" + c.getUsername() + "@" + c.getHost() + ")?" + warning,
-                "Confirm Delete", JOptionPane.YES_NO_OPTION,
-                inUse > 0 ? JOptionPane.WARNING_MESSAGE : JOptionPane.QUESTION_MESSAGE);
+                    "Delete credential \"" + username + "\" (" + c.getUsername() + "@" + c.getHost() + ")?" + warning,
+                    "Confirm Delete", JOptionPane.YES_NO_OPTION,
+                    inUse > 0 ? JOptionPane.WARNING_MESSAGE : JOptionPane.QUESTION_MESSAGE);
             if (ok == JOptionPane.YES_OPTION) {
                 boolean deleted = storage.deleteCredential(username);
                 if (!deleted) {
@@ -132,7 +137,7 @@ public class CredentialManagerPanel extends JPanel {
                 logActivity("Credential deleted", "Deleted credential " + username + " (login " + c.getUsername() + ")"
                         + " (host: " + c.getHost() + ", OS type: " + c.getOsType() + ")"
                         + (inUse > 0 ? " — was in use by " + inUse + " task" + (inUse == 1 ? "" : "s")
-                                + ", which will fail at their next run" : ""));
+                        + ", which will fail at their next run" : ""));
                 refresh();
             }
         });
@@ -144,9 +149,9 @@ public class CredentialManagerPanel extends JPanel {
         btnPanel.add(btnDelete);
         btnPanel.add(btnRefresh);
 
-        add(banner,    BorderLayout.NORTH);
-        add(scroll,    BorderLayout.CENTER);
-        add(btnPanel,  BorderLayout.SOUTH);
+        add(banner, BorderLayout.NORTH);
+        add(scroll, BorderLayout.CENTER);
+        add(btnPanel, BorderLayout.SOUTH);
 
         refresh();
     }
@@ -165,8 +170,6 @@ public class CredentialManagerPanel extends JPanel {
             return new Loaded(creds, usage);
         }, this::applyLoaded, e -> System.err.println("Credential refresh failed: " + e));
     }
-
-    private record Loaded(List<Credential> creds, Map<String, Integer> usage) {}
 
     private void applyLoaded(Loaded loaded) {
         Credential selected = credList.getSelectedValue();
@@ -187,91 +190,6 @@ public class CredentialManagerPanel extends JPanel {
         }
     }
 
-    /** Card row: OS-type icon tile, display name + "username · host · OS type"
-     *  meta line, and a trailing pill for in-use vs unused. */
-    private class CredentialRowRenderer extends JPanel implements ListCellRenderer<Credential> {
-        private final JLabel nameLabel = new JLabel();
-        private final JLabel metaLabel = new JLabel();
-        private final PillBadge usagePill = new PillBadge("", AppTheme.NEUTRAL_FG, null);
-        private IconTile currentIcon;
-
-        CredentialRowRenderer() {
-            setLayout(new BorderLayout(10, 0));
-            setBorder(new EmptyBorder(6, 10, 6, 10));
-
-            nameLabel.setFont(nameLabel.getFont().deriveFont(Font.BOLD, 13f));
-            metaLabel.setFont(metaLabel.getFont().deriveFont(Font.PLAIN, 11f));
-            metaLabel.setForeground(new Color(0x8A8378));
-
-            JPanel textBlock = new JPanel();
-            textBlock.setOpaque(false);
-            textBlock.setLayout(new BoxLayout(textBlock, BoxLayout.Y_AXIS));
-            nameLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
-            metaLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
-            textBlock.add(nameLabel);
-            textBlock.add(metaLabel);
-            add(textBlock, BorderLayout.CENTER);
-
-            JPanel right = new JPanel(new GridBagLayout());
-            right.setOpaque(false);
-            right.add(usagePill);
-            add(right, BorderLayout.EAST);
-        }
-
-        @Override
-        public Component getListCellRendererComponent(JList<? extends Credential> list, Credential c,
-                                                        int index, boolean isSelected, boolean cellHasFocus) {
-            nameLabel.setText(c.getName() != null && !c.getName().isBlank()
-                    ? c.getName() : c.getUsername() + "@" + c.getHost());
-            metaLabel.setText(c.getUsername() + "  \u00b7  " + c.getHost()
-                    + "  \u00b7  " + (c.getOsType() != null ? c.getOsType() : "?"));
-
-            boolean windows = "WINDOWS".equalsIgnoreCase(c.getOsType());
-            String glyph = windows ? "W" : "L";
-            Color tileBg = windows ? AppTheme.EARTH_TEAL : AppTheme.EARTH_OCHRE;
-            if (currentIcon != null) remove(currentIcon);
-            currentIcon = new IconTile(glyph, Color.WHITE, tileBg);
-            add(currentIcon, BorderLayout.WEST);
-
-            int inUse = usageByName.getOrDefault(c.getName(), 0);
-            if (inUse > 0) {
-                usagePill.setText(inUse + (inUse == 1 ? " task" : " tasks"));
-                usagePill.setColors(AppTheme.SUCCESS_FG, AppTheme.SUCCESS_BG);
-            } else {
-                usagePill.setText("Unused");
-                usagePill.setColors(AppTheme.NEUTRAL_FG, null);
-            }
-
-            if (isSelected) {
-                // Same fix as TaskManagerPanel's row renderer: the pale
-                // (fg, bg) pairs above are tuned for the row's normal
-                // background, not the selection highlight — force
-                // high-contrast selection colors instead of leaving text/pill
-                // colors fixed regardless of what's now behind them.
-                nameLabel.setForeground(list.getSelectionForeground());
-                metaLabel.setForeground(list.getSelectionForeground());
-                usagePill.setColors(list.getSelectionForeground(), null);
-            } else {
-                nameLabel.setForeground(UIManager.getColor("List.foreground"));
-                metaLabel.setForeground(new Color(0x8A8378));
-            }
-
-            setBackground(isSelected ? list.getSelectionBackground()
-                    : (index % 2 == 0 ? list.getBackground() : AppTheme.surface2()));
-            setOpaque(true);
-            revalidate();
-            return this;
-        }
-    }
-
-    /**
-     * Records an application-activity note (credential added/edited/deleted)
-     * into the Event Monitor's activity feed — see
-     * {@link RunHistoryService#recordActivityEvent}. Uses the fixed
-     * pseudo-task-id "CREDENTIALS" since these aren't tied to any one
-     * scheduled task. No-op if this panel was constructed without an audit
-     * log reference.
-     */
     /**
      * Builds a field-level "what actually changed" description for the event
      * feed, instead of a generic "Credential edited" with no detail — the
@@ -282,8 +200,8 @@ public class CredentialManagerPanel extends JPanel {
      * all an operator needs to know here).
      */
     private String buildCredentialChangeDetail(boolean isAdd, String name, String oldName, String user, String oldUser,
-            String host, String oldHost, String newHost, String oldPassword, String newPassword,
-            String oldOsType, String newOsType) {
+                                               String host, String oldHost, String newHost, String oldPassword, String newPassword,
+                                               String oldOsType, String newOsType) {
         String target = "\"" + name + "\" (" + user + "@" + host + ")";
         if (isAdd) {
             return "Added credential " + target + " (OS type: " + newOsType + ").";
@@ -324,8 +242,19 @@ public class CredentialManagerPanel extends JPanel {
         });
     }
 
-    /** Same as {@link #logActivity} but marks the event FAILED, so it renders
-     *  as a failure (red, "Failed: ...") in the feed instead of a neutral note. */
+    /**
+     * Records an application-activity note (credential added/edited/deleted)
+     * into the Event Monitor's activity feed — see
+     * {@link RunHistoryService#recordActivityEvent}. Uses the fixed
+     * pseudo-task-id "CREDENTIALS" since these aren't tied to any one
+     * scheduled task. No-op if this panel was constructed without an audit
+     * log reference.
+     */
+
+    /**
+     * Same as {@link #logActivity} but marks the event FAILED, so it renders
+     * as a failure (red, "Failed: ...") in the feed instead of a neutral note.
+     */
     private void logActivityFailed(String title, String detail) {
         if (auditLog == null) return;
         LocalDateTime now = LocalDateTime.now();
@@ -343,8 +272,8 @@ public class CredentialManagerPanel extends JPanel {
 
     private void showDialog(Credential existing) {
         JDialog dlg = new JDialog(
-            (Frame) SwingUtilities.getWindowAncestor(this),
-            existing == null ? "Add Credential" : "Edit Credential", true);
+                (Frame) SwingUtilities.getWindowAncestor(this),
+                existing == null ? "Add Credential" : "Edit Credential", true);
         dlg.setSize(480, 420);
         dlg.setLocationRelativeTo(this);
         dlg.setLayout(new BorderLayout(10, 10));
@@ -352,10 +281,10 @@ public class CredentialManagerPanel extends JPanel {
         JPanel form = new JPanel(new GridBagLayout());
         form.setBorder(new EmptyBorder(15, 15, 5, 15));
 
-        JTextField    tfName = new JTextField(existing != null ? existing.getName()     : "", 22);
+        JTextField tfName = new JTextField(existing != null ? existing.getName() : "", 22);
         tfName.setToolTipText("A unique name for this credential, e.g. \"Server A admin\". Tasks refer to it by this name.");
-        JTextField    tfHost = new JTextField(existing != null ? existing.getHost()     : "", 22);
-        JTextField    tfUser = new JTextField(existing != null ? existing.getUsername() : "", 22);
+        JTextField tfHost = new JTextField(existing != null ? existing.getHost() : "", 22);
+        JTextField tfUser = new JTextField(existing != null ? existing.getUsername() : "", 22);
         JPasswordField tfPass = new JPasswordField(22);
         if (existing != null && existing.getPassword() != null)
             tfPass.setText(existing.getPassword());
@@ -364,9 +293,9 @@ public class CredentialManagerPanel extends JPanel {
 
         addFormRow(form, "Credential name *", tfName, 0);
         addFormRow(form, "Hostname / IP *", tfHost, 1);
-        addFormRow(form, "Username *",       tfUser, 2);
-        addFormRow(form, "Password *",  tfPass, 3);
-        addFormRow(form, "OS Type *",   cbOs,   4);
+        addFormRow(form, "Username *", tfUser, 2);
+        addFormRow(form, "Password *", tfPass, 3);
+        addFormRow(form, "OS Type *", cbOs, 4);
 
         JButton btnTest = new JButton("Test Connection");
         btnTest.setToolTipText("Opens a real SFTP session with the fields above to verify they work");
@@ -399,10 +328,10 @@ public class CredentialManagerPanel extends JPanel {
         addFormRow(form, "", testRow, 5);
 
         addFormRow(form, "",
-            new JLabel("<html><i style='color:#888'>Renaming updates the tasks that use this credential."
-                + " Passwords are stored encrypted.</i></html>"), 6);
+                new JLabel("<html><i style='color:#888'>Renaming updates the tasks that use this credential."
+                        + " Passwords are stored encrypted.</i></html>"), 6);
 
-        JButton btnSave   = new GradientButton("Save");
+        JButton btnSave = new GradientButton("Save");
         JButton btnCancel = new JButton("Cancel");
         styleButton(btnSave, AppTheme.EARTH_SIENNA);
         btnCancel.addActionListener(e -> dlg.dispose());
@@ -411,7 +340,8 @@ public class CredentialManagerPanel extends JPanel {
             String user = tfUser.getText().trim();
             String pass = new String(tfPass.getPassword());
             if (host.isEmpty() || user.isEmpty()) {
-                JOptionPane.showMessageDialog(dlg, "Host and Username are required."); return;
+                JOptionPane.showMessageDialog(dlg, "Host and Username are required.");
+                return;
             }
             String credName = tfName.getText().trim().isEmpty() ? user + "@" + host : tfName.getText().trim();
             if (storage.isCredentialNameTaken(credName, existing != null ? existing.getId() : null)) {
@@ -422,7 +352,8 @@ public class CredentialManagerPanel extends JPanel {
                 return;
             }
             if (pass.isEmpty()) {
-                JOptionPane.showMessageDialog(dlg, "Password is required."); return;
+                JOptionPane.showMessageDialog(dlg, "Password is required.");
+                return;
             }
             Credential c = existing != null ? existing : new Credential();
             // Existing is the SAME object we're about to mutate below, so the old
@@ -482,26 +413,113 @@ public class CredentialManagerPanel extends JPanel {
         btnRow.add(btnCancel);
         btnRow.add(btnSave);
 
-        dlg.add(form,   BorderLayout.CENTER);
+        dlg.add(form, BorderLayout.CENTER);
         dlg.add(btnRow, BorderLayout.SOUTH);
         dlg.setVisible(true);
     }
 
     private void addFormRow(JPanel p, String label, JComponent field, int row) {
         GridBagConstraints lc = new GridBagConstraints();
-        lc.gridx = 0; lc.gridy = row;
+        lc.gridx = 0;
+        lc.gridy = row;
         lc.anchor = GridBagConstraints.WEST;
         lc.insets = new Insets(6, 0, 6, 10);
         GridBagConstraints fc = new GridBagConstraints();
-        fc.gridx = 1; fc.gridy = row;
-        fc.fill = GridBagConstraints.HORIZONTAL; fc.weightx = 1;
+        fc.gridx = 1;
+        fc.gridy = row;
+        fc.fill = GridBagConstraints.HORIZONTAL;
+        fc.weightx = 1;
         fc.insets = new Insets(6, 0, 6, 0);
         p.add(new JLabel(label), lc);
         p.add(field, fc);
     }
 
     private void styleButton(JButton btn, Color bg) {
-        btn.setBackground(bg); btn.setForeground(Color.WHITE);
-        btn.setFocusPainted(false); btn.setBorderPainted(false);
+        btn.setBackground(bg);
+        btn.setForeground(Color.WHITE);
+        btn.setFocusPainted(false);
+        btn.setBorderPainted(false);
+    }
+
+    private record Loaded(List<Credential> creds, Map<String, Integer> usage) {
+    }
+
+    /**
+     * Card row: OS-type icon tile, display name + "username · host · OS type"
+     * meta line, and a trailing pill for in-use vs unused.
+     */
+    private class CredentialRowRenderer extends JPanel implements ListCellRenderer<Credential> {
+        private final JLabel nameLabel = new JLabel();
+        private final JLabel metaLabel = new JLabel();
+        private final PillBadge usagePill = new PillBadge("", AppTheme.NEUTRAL_FG, null);
+        private IconTile currentIcon;
+
+        CredentialRowRenderer() {
+            setLayout(new BorderLayout(10, 0));
+            setBorder(new EmptyBorder(6, 10, 6, 10));
+
+            nameLabel.setFont(nameLabel.getFont().deriveFont(Font.BOLD, 13f));
+            metaLabel.setFont(metaLabel.getFont().deriveFont(Font.PLAIN, 11f));
+            metaLabel.setForeground(new Color(0x8A8378));
+
+            JPanel textBlock = new JPanel();
+            textBlock.setOpaque(false);
+            textBlock.setLayout(new BoxLayout(textBlock, BoxLayout.Y_AXIS));
+            nameLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+            metaLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+            textBlock.add(nameLabel);
+            textBlock.add(metaLabel);
+            add(textBlock, BorderLayout.CENTER);
+
+            JPanel right = new JPanel(new GridBagLayout());
+            right.setOpaque(false);
+            right.add(usagePill);
+            add(right, BorderLayout.EAST);
+        }
+
+        @Override
+        public Component getListCellRendererComponent(JList<? extends Credential> list, Credential c,
+                                                      int index, boolean isSelected, boolean cellHasFocus) {
+            nameLabel.setText(c.getName() != null && !c.getName().isBlank()
+                    ? c.getName() : c.getUsername() + "@" + c.getHost());
+            metaLabel.setText(c.getUsername() + "  \u00b7  " + c.getHost()
+                    + "  \u00b7  " + (c.getOsType() != null ? c.getOsType() : "?"));
+
+            boolean windows = "WINDOWS".equalsIgnoreCase(c.getOsType());
+            String glyph = windows ? "W" : "L";
+            Color tileBg = windows ? AppTheme.EARTH_TEAL : AppTheme.EARTH_OCHRE;
+            if (currentIcon != null) remove(currentIcon);
+            currentIcon = new IconTile(glyph, Color.WHITE, tileBg);
+            add(currentIcon, BorderLayout.WEST);
+
+            int inUse = usageByName.getOrDefault(c.getName(), 0);
+            if (inUse > 0) {
+                usagePill.setText(inUse + (inUse == 1 ? " task" : " tasks"));
+                usagePill.setColors(AppTheme.SUCCESS_FG, AppTheme.SUCCESS_BG);
+            } else {
+                usagePill.setText("Unused");
+                usagePill.setColors(AppTheme.NEUTRAL_FG, null);
+            }
+
+            if (isSelected) {
+                // Same fix as TaskManagerPanel's row renderer: the pale
+                // (fg, bg) pairs above are tuned for the row's normal
+                // background, not the selection highlight — force
+                // high-contrast selection colors instead of leaving text/pill
+                // colors fixed regardless of what's now behind them.
+                nameLabel.setForeground(list.getSelectionForeground());
+                metaLabel.setForeground(list.getSelectionForeground());
+                usagePill.setColors(list.getSelectionForeground(), null);
+            } else {
+                nameLabel.setForeground(UIManager.getColor("List.foreground"));
+                metaLabel.setForeground(new Color(0x8A8378));
+            }
+
+            setBackground(isSelected ? list.getSelectionBackground()
+                    : (index % 2 == 0 ? list.getBackground() : AppTheme.surface2()));
+            setOpaque(true);
+            revalidate();
+            return this;
+        }
     }
 }

@@ -91,27 +91,35 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$ScriptRoot          = $null,
-    [string]$InstallDir          = $null,
-    [string]$SourceJar           = $null,
-    [string]$ConfigXmlSource     = $null,
-    [string]$IconSource          = $null,
-    [string]$GuiExeName          = "MonitoringTool.exe",
-    [string]$ShortcutName        = $null,
+    [string]$ScriptRoot = $null,
+    [string]$InstallDir = $null,
+    [string]$SourceJar = $null,
+    [string]$ConfigXmlSource = $null,
+    [string]$IconSource = $null,
+    [string]$GuiExeName = "MonitoringTool.exe",
+    [string]$ShortcutName = $null,
     [string]$StartMenuFolderName = "Ops Tools",
-    [string]$RceditPath          = $null,
-    [string]$LogFile             = $null
+    [string]$RceditPath = $null,
+    [string]$LogFile = $null
 )
 
 $ErrorActionPreference = "Stop"
 
-function Log([string]$msg) {
+function Log([string]$msg)
+{
     $line = "[deploy-application] $msg"
     Write-Host "  $line"
-    if ($LogFile) { Add-Content -Path $LogFile -Value "$(Get-Date -Format 'HH:mm:ss')  $line" }
+    if ($LogFile)
+    {
+        Add-Content -Path $LogFile -Value "$( Get-Date -Format 'HH:mm:ss' )  $line"
+    }
 }
-function OK([string]$msg) { Write-Host "  v  $msg" -ForegroundColor Green; Log $msg }
-function FailStep([string]$msg) {
+function OK([string]$msg)
+{
+    Write-Host "  v  $msg" -ForegroundColor Green; Log $msg
+}
+function FailStep([string]$msg)
+{
     Write-Host ""
     Write-Host "  x  ERROR: $msg" -ForegroundColor Red
     Log "ERROR: $msg"
@@ -119,104 +127,179 @@ function FailStep([string]$msg) {
 }
 
 $currentPrincipal = New-Object Security.Principal.WindowsPrincipal(
-    [Security.Principal.WindowsIdentity]::GetCurrent())
-if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+[Security.Principal.WindowsIdentity]::GetCurrent())
+if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))
+{
     FailStep "This script must be run as Administrator (deploying files + writing all-users shortcuts)."
 }
 
 # ── Resolve ScriptRoot + app-config.xml (best-effort) ──────────────────────
-if (-not $ScriptRoot) {
+if (-not $ScriptRoot)
+{
     $candidate1 = (Get-Location).Path
-    $candidate2 = if ($PSScriptRoot) { Split-Path (Split-Path $PSScriptRoot -Parent) -Parent } else { $null }
-    if (Test-Path (Join-Path $candidate1 "app-config.xml")) { $ScriptRoot = $candidate1 }
-    elseif ($candidate2 -and (Test-Path (Join-Path $candidate2 "app-config.xml"))) { $ScriptRoot = $candidate2 }
-    else { $ScriptRoot = $candidate1 }
+    $candidate2 = if ($PSScriptRoot)
+    {
+        Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
+    }
+    else
+    {
+        $null
+    }
+    if (Test-Path (Join-Path $candidate1 "app-config.xml"))
+    {
+        $ScriptRoot = $candidate1
+    }
+    elseif ($candidate2 -and (Test-Path (Join-Path $candidate2 "app-config.xml")))
+    {
+        $ScriptRoot = $candidate2
+    }
+    else
+    {
+        $ScriptRoot = $candidate1
+    }
 }
 
 $xmlConfig = $null
 $defaultConfigFile = Join-Path $ScriptRoot "app-config.xml"
-if (Test-Path $defaultConfigFile) {
-    try { [xml]$xmlConfig = Get-Content $defaultConfigFile } catch { Log "WARNING: Failed to parse app-config.xml: $_" }
+if (Test-Path $defaultConfigFile)
+{
+    try
+    {
+        [xml]$xmlConfig = Get-Content $defaultConfigFile
+    }
+    catch
+    {
+        Log "WARNING: Failed to parse app-config.xml: $_"
+    }
 }
-function Get-ConfigValue([string]$xpath, [string]$defaultValue) {
-    if ($null -eq $xmlConfig) { return $defaultValue }
-    try {
+function Get-ConfigValue([string]$xpath, [string]$defaultValue)
+{
+    if ($null -eq $xmlConfig)
+    {
+        return $defaultValue
+    }
+    try
+    {
         $node = $xmlConfig.SelectSingleNode($xpath)
-        if ($node -and -not [string]::IsNullOrEmpty($node.InnerText)) { return $node.InnerText }
-    } catch {}
+        if ($node -and -not [string]::IsNullOrEmpty($node.InnerText))
+        {
+            return $node.InnerText
+        }
+    }
+    catch
+    {
+    }
     return $defaultValue
 }
 
-if (-not $InstallDir)   { $InstallDir   = Get-ConfigValue "/application/installation/installDir" "C:\OpsTools" }
-if (-not $ShortcutName) { $ShortcutName = Get-ConfigValue "/application/metadata/appName" "Monitoring tool" }
+if (-not $InstallDir)
+{
+    $InstallDir = Get-ConfigValue "/application/installation/installDir" "C:\OpsTools"
+}
+if (-not $ShortcutName)
+{
+    $ShortcutName = Get-ConfigValue "/application/metadata/appName" "Monitoring tool"
+}
 $jarName = Get-ConfigValue "/application/installation/jarName" "Monitoring-Tool.jar"
 
-if (-not $SourceJar) {
+if (-not $SourceJar)
+{
     $SourceJar = Join-Path $ScriptRoot $jarName
-    if (-not (Test-Path $SourceJar)) {
+    if (-not (Test-Path $SourceJar))
+    {
         $foundJar = Get-ChildItem -Path $ScriptRoot -Filter "*.jar" -File -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($foundJar) { $SourceJar = $foundJar.FullName }
+        if ($foundJar)
+        {
+            $SourceJar = $foundJar.FullName
+        }
     }
 }
-if (-not $ConfigXmlSource) { $ConfigXmlSource = $defaultConfigFile }
+if (-not $ConfigXmlSource)
+{
+    $ConfigXmlSource = $defaultConfigFile
+}
 
 $iconName = Get-ConfigValue "/application/installation/iconName" "Icon.ico"
-if (-not $IconSource) {
+if (-not $IconSource)
+{
     $candidateIcon = Join-Path $ScriptRoot $iconName
-    if (Test-Path $candidateIcon) {
+    if (Test-Path $candidateIcon)
+    {
         $IconSource = $candidateIcon
-    } else {
+    }
+    else
+    {
         $foundIcon = Get-ChildItem -Path $ScriptRoot -Filter "*.ico" -File -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($foundIcon) { $IconSource = $foundIcon.FullName }
+        if ($foundIcon)
+        {
+            $IconSource = $foundIcon.FullName
+        }
     }
 }
 
-if (-not (Test-Path $SourceJar)) {
+if (-not (Test-Path $SourceJar))
+{
     FailStep "No JAR found. Looked for '$jarName' (and any *.jar) in: $ScriptRoot`n     Pass -SourceJar explicitly, or place the built jar next to this script."
 }
 
 # ── Deploy files ─────────────────────────────────────────────────────────
-if (-not (Test-Path $InstallDir)) {
+if (-not (Test-Path $InstallDir))
+{
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
     Log "Created directory: $InstallDir"
 }
 
 $destJar = Join-Path $InstallDir $jarName
-try {
+try
+{
     Copy-Item -Path $SourceJar -Destination $destJar -Force
     $jarSize = (Get-Item $destJar).Length
     OK "Deployed: $destJar ($jarSize bytes)"
-} catch {
+}
+catch
+{
     FailStep "Failed to deploy JAR: $_"
 }
 
 $destConfigXml = $null
-if ($ConfigXmlSource -and (Test-Path $ConfigXmlSource)) {
+if ($ConfigXmlSource -and (Test-Path $ConfigXmlSource))
+{
     $destConfigXml = Join-Path $InstallDir "app-config.xml"
-    try {
+    try
+    {
         Copy-Item -Path $ConfigXmlSource -Destination $destConfigXml -Force
         OK "Deployed: $destConfigXml"
-    } catch {
+    }
+    catch
+    {
         Log "WARNING: Failed to copy app-config.xml to ${InstallDir}: $_"
         $destConfigXml = $null
     }
-} else {
+}
+else
+{
     Log "WARNING: app-config.xml not found - runtime settings will use hardcoded defaults."
 }
 
 $installedIcon = $null
-$iconLocation  = "C:\Windows\System32\imageres.dll,19"
-if ($IconSource -and (Test-Path $IconSource)) {
+$iconLocation = "C:\Windows\System32\imageres.dll,19"
+if ($IconSource -and (Test-Path $IconSource))
+{
     $installedIcon = Join-Path $InstallDir $iconName
-    try {
+    try
+    {
         Copy-Item -Path $IconSource -Destination $installedIcon -Force
         OK "Deployed icon: $installedIcon"
         $iconLocation = "$installedIcon,0"
-    } catch {
+    }
+    catch
+    {
         Log "WARNING: Could not copy custom icon: $_. Falling back to default system icon."
         $installedIcon = $null
     }
-} else {
+}
+else
+{
     Log "No icon source found. Falling back to default system icon."
 }
 
@@ -228,51 +311,77 @@ if ($IconSource -and (Test-Path $IconSource)) {
 #    javaw.exe can't just be dropped into an arbitrary folder.
 $runtimeScript = Join-Path $PSScriptRoot "New-PrivateRuntime.ps1"
 $javawExe = $null
-if (Test-Path $runtimeScript) {
-    try {
+if (Test-Path $runtimeScript)
+{
+    try
+    {
         $runtimeArgs = @{ InstallDir = $InstallDir }
-        if ($LogFile) { $runtimeArgs.LogFile = $LogFile }
+        if ($LogFile)
+        {
+            $runtimeArgs.LogFile = $LogFile
+        }
         $runtimeResult = & $runtimeScript @runtimeArgs
         $javawExe = $runtimeResult.Javaw
-    } catch {
+    }
+    catch
+    {
         Log "WARNING: Could not build private runtime: $_ - falling back to the system javaw.exe (shortcuts will still work, just without a private, self-contained runtime)."
     }
 }
-if (-not $javawExe) {
+if (-not $javawExe)
+{
     # Fallback only: same detection Install-Prerequisites.ps1 uses. A
     # shortcut built from this still launches fine, it just points at the
     # shared system JDK instead of a private runtime, and (per
     # Brand-Executable.ps1's own same-directory rule) any branding ends up
     # placed inside the system JDK's bin\ rather than -InstallDir - not
     # what was asked for, but better than no shortcut at all.
-    if ($env:JAVA_HOME -and (Test-Path (Join-Path $env:JAVA_HOME "bin\javaw.exe"))) {
+    if ($env:JAVA_HOME -and (Test-Path (Join-Path $env:JAVA_HOME "bin\javaw.exe")))
+    {
         $javawExe = Join-Path $env:JAVA_HOME "bin\javaw.exe"
-    } else {
+    }
+    else
+    {
         $jc = Get-Command javaw.exe -ErrorAction SilentlyContinue
-        if ($jc) { $javawExe = $jc.Source }
+        if ($jc)
+        {
+            $javawExe = $jc.Source
+        }
     }
 }
 
-$guiExePath    = $null
+$guiExePath = $null
 $guiExeBranded = $false
-if (-not $javawExe) {
+if (-not $javawExe)
+{
     Log "WARNING: javaw.exe not found - shortcuts will not be created. Run Install-Prerequisites.ps1 first, or ensure Java is on PATH."
-} else {
+}
+else
+{
     $brandScript = Join-Path $PSScriptRoot "Brand-Executable.ps1"
-    if ($installedIcon -and (Test-Path $brandScript)) {
+    if ($installedIcon -and (Test-Path $brandScript))
+    {
         $brandArgs = @{
-            SourceExe   = $javawExe
-            DestExe     = $GuiExeName
-            IconPath    = $installedIcon
+            SourceExe = $javawExe
+            DestExe = $GuiExeName
+            IconPath = $installedIcon
             Description = $ShortcutName
-            SearchDir   = $ScriptRoot
+            SearchDir = $ScriptRoot
         }
-        if ($RceditPath) { $brandArgs.RceditPath = $RceditPath }
-        if ($LogFile)     { $brandArgs.LogFile     = $LogFile }
+        if ($RceditPath)
+        {
+            $brandArgs.RceditPath = $RceditPath
+        }
+        if ($LogFile)
+        {
+            $brandArgs.LogFile = $LogFile
+        }
         $brandResult = & $brandScript @brandArgs
-        $guiExePath    = $brandResult.ExePath
+        $guiExePath = $brandResult.ExePath
         $guiExeBranded = $brandResult.Branded
-    } else {
+    }
+    else
+    {
         Log "No icon deployed - launching via plain javaw.exe (shortcut will show the default Java icon)."
         $guiExePath = $javawExe
     }
@@ -282,41 +391,45 @@ if (-not $javawExe) {
 #    no wrapper batch file or PowerShell hop ────────────────────────────────
 $desktopLink = $null
 $startMenuLink = $null
-if ($guiExePath) {
+if ($guiExePath)
+{
     $shortcutArgs = "-jar `"$destJar`""
     $WshShell = New-Object -ComObject WScript.Shell
 
     $desktopPath = [Environment]::GetFolderPath("CommonDesktopDirectory")
     $desktopLink = Join-Path $desktopPath "$ShortcutName.lnk"
     $shortcut = $WshShell.CreateShortcut($desktopLink)
-    $shortcut.TargetPath       = $guiExePath
-    $shortcut.Arguments        = $shortcutArgs
+    $shortcut.TargetPath = $guiExePath
+    $shortcut.Arguments = $shortcutArgs
     $shortcut.WorkingDirectory = $InstallDir
-    $shortcut.Description      = $ShortcutName
-    $shortcut.IconLocation     = $iconLocation
+    $shortcut.Description = $ShortcutName
+    $shortcut.IconLocation = $iconLocation
     $shortcut.Save()
     OK "Desktop shortcut created: $desktopLink -> $guiExePath"
 
     $startMenuDir = Join-Path ([Environment]::GetFolderPath("CommonPrograms")) $StartMenuFolderName
-    if (-not (Test-Path $startMenuDir)) { New-Item -ItemType Directory -Path $startMenuDir | Out-Null }
+    if (-not (Test-Path $startMenuDir))
+    {
+        New-Item -ItemType Directory -Path $startMenuDir | Out-Null
+    }
     $startMenuLink = Join-Path $startMenuDir "$ShortcutName.lnk"
     $shortcut = $WshShell.CreateShortcut($startMenuLink)
-    $shortcut.TargetPath       = $guiExePath
-    $shortcut.Arguments        = $shortcutArgs
+    $shortcut.TargetPath = $guiExePath
+    $shortcut.Arguments = $shortcutArgs
     $shortcut.WorkingDirectory = $InstallDir
-    $shortcut.Description      = $ShortcutName
-    $shortcut.IconLocation     = $iconLocation
+    $shortcut.Description = $ShortcutName
+    $shortcut.IconLocation = $iconLocation
     $shortcut.Save()
     OK "Start Menu shortcut created: $startMenuLink -> $guiExePath"
 }
 
 [pscustomobject]@{
-    DestJar       = $destJar
+    DestJar = $destJar
     DestConfigXml = $destConfigXml
     InstalledIcon = $installedIcon
-    IconLocation  = $iconLocation
-    GuiExePath    = $guiExePath
+    IconLocation = $iconLocation
+    GuiExePath = $guiExePath
     GuiExeBranded = $guiExeBranded
-    DesktopLink   = $desktopLink
+    DesktopLink = $desktopLink
     StartMenuLink = $startMenuLink
 }

@@ -37,10 +37,11 @@ final class ActivityEventPopup {
 
     private static final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("HH:mm:ss");
 
-    private ActivityEventPopup() {}
+    private ActivityEventPopup() {
+    }
 
     static void show(Component invoker, Point screenLocation, QueueMonitorView.ActivityRow row,
-                      Map<String, ScheduledTask> byId, RunHistoryService runHistoryService) {
+                     Map<String, ScheduledTask> byId, RunHistoryService runHistoryService) {
         JWindow popup = new JWindow(SwingUtilities.getWindowAncestor(invoker));
         popup.setType(Window.Type.POPUP);
         popup.setAlwaysOnTop(true);
@@ -52,8 +53,8 @@ final class ActivityEventPopup {
         ScheduledTask task = byId != null ? byId.get(row.taskId()) : null;
         TaskRunRecord run = runHistoryService == null ? null
                 : row.source() == QueueMonitorView.RunSource.ACTIVITY
-                        ? runHistoryService.getActivityEventById(row.runId())
-                        : runHistoryService.getRunById(row.runId());
+                ? runHistoryService.getActivityEventById(row.runId())
+                : runHistoryService.getRunById(row.runId());
 
         // A detection/started activity row is still logged against a
         // FILE_TRANSFER task, so task.getTaskType() alone can't tell these
@@ -153,7 +154,10 @@ final class ActivityEventPopup {
         popup.setLocation(loc);
 
         popup.addWindowFocusListener(new java.awt.event.WindowAdapter() {
-            @Override public void windowLostFocus(java.awt.event.WindowEvent e) { popup.dispose(); }
+            @Override
+            public void windowLostFocus(java.awt.event.WindowEvent e) {
+                popup.dispose();
+            }
         });
         content.registerKeyboardAction(e -> popup.dispose(),
                 KeyStroke.getKeyStroke(java.awt.event.KeyEvent.VK_ESCAPE, 0),
@@ -188,7 +192,11 @@ final class ActivityEventPopup {
             String name = bar > 0 ? rest.substring(0, bar).trim() : rest;
             String sizePart = rest.substring(rest.indexOf("size=") + 5).trim();
             long sizeBytes;
-            try { sizeBytes = Long.parseLong(sizePart); } catch (NumberFormatException nfe) { sizeBytes = -1; }
+            try {
+                sizeBytes = Long.parseLong(sizePart);
+            } catch (NumberFormatException nfe) {
+                sizeBytes = -1;
+            }
             files.add(name + (sizeBytes >= 0 ? "  \u2014  " + RunLogSummarizer.formatBytes(sizeBytes) : ""));
         }
         if (files.isEmpty()) return;
@@ -208,7 +216,8 @@ final class ActivityEventPopup {
         if (s.destPath() != null) sb.append("Destination folder: ").append(s.destPath()).append('\n');
         sb.append('\n');
         sb.append("Files transferred: ").append(s.fileCount()).append('\n');
-        if (s.totalBytesFormatted() != null) sb.append("Total bytes:        ").append(s.totalBytesFormatted()).append('\n');
+        if (s.totalBytesFormatted() != null)
+            sb.append("Total bytes:        ").append(s.totalBytesFormatted()).append('\n');
         sb.append("Batches:            ").append(s.batchCount() > 0 ? s.batchCount() : 1).append('\n');
         sb.append("WinSCP/SFTP sessions: ").append(s.sessionCount() > 0 ? s.sessionCount() : 1).append('\n');
         sb.append("Worker threads used: ").append(s.workerThreads() > 0 ? s.workerThreads() : 1).append('\n');
@@ -228,7 +237,7 @@ final class ActivityEventPopup {
     }
 
     private static void appendGenericDetail(StringBuilder sb, ScheduledTask task, TaskRunRecord run,
-                                             QueueMonitorView.ActivityRow row, boolean errored) {
+                                            QueueMonitorView.ActivityRow row, boolean errored) {
         sb.append('\n');
         if (run != null && run.getReason() != null && !run.getReason().isBlank()) {
             sb.append(errored ? "Failure reason:\n" : "Summary:\n").append(run.getReason()).append('\n');

@@ -1,8 +1,5 @@
 package service.sftp;
 
-import static org.junit.Assert.*;
-import static org.junit.Assume.assumeTrue;
-
 import org.junit.BeforeClass;
 import org.junit.Test;
 import util.SshAuth;
@@ -10,7 +7,12 @@ import util.SshAuth;
 import java.io.IOException;
 import java.nio.file.Files;
 
-/** Key login against a real server: -Dopstool.sftp.port, -Dopstool.sftp.keyDir (holds client_plain.pem / client_pass.pem). */
+import static org.junit.Assert.*;
+import static org.junit.Assume.assumeTrue;
+
+/**
+ * Key login against a real server: -Dopstool.sftp.port, -Dopstool.sftp.keyDir (holds client_plain.pem / client_pass.pem).
+ */
 public class SftpKeyAuthIT {
 
     private static int port;
@@ -49,7 +51,8 @@ public class SftpKeyAuthIT {
         try {
             connect("key:" + keyDir + "/client_pass.pem|wrong").close();
             fail();
-        } catch (IOException expected) { }
+        } catch (IOException expected) {
+        }
     }
 
     @Test

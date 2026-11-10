@@ -18,10 +18,10 @@ import java.util.Map;
  */
 public final class EventClassifier {
 
-    private EventClassifier() {}
-
-    private static final String STARTED_PREFIX  = "Started \u2014";
+    private static final String STARTED_PREFIX = "Started \u2014";
     private static final String DETECTED_PREFIX = "Detected ";
+    private EventClassifier() {
+    }
 
     public static MonitorEvent classify(TaskRunRecord r, MonitorEvent.Table table,
                                         Map<String, ScheduledTask> tasksById) {
@@ -50,12 +50,12 @@ public final class EventClassifier {
         if (table == MonitorEvent.Table.RUN) {
             return switch (r.getStatus()) {
                 case SUCCESS -> EventKind.RUN_SUCCEEDED;
-                case FAILED  -> EventKind.RUN_FAILED;
+                case FAILED -> EventKind.RUN_FAILED;
                 case SKIPPED -> EventKind.RUN_SKIPPED;
             };
         }
         String reason = r.getReason() != null ? r.getReason() : "";
-        if (reason.startsWith(STARTED_PREFIX))  return EventKind.RUN_STARTED;
+        if (reason.startsWith(STARTED_PREFIX)) return EventKind.RUN_STARTED;
         if (reason.startsWith(DETECTED_PREFIX)) return EventKind.FILES_DETECTED;
         String id = r.getTaskId() != null ? r.getTaskId() : "";
         if (id.equals("HEALTH")) return EventKind.HEALTH;
@@ -66,7 +66,9 @@ public final class EventClassifier {
         return r.getStatus() == TaskRunRecord.Status.FAILED ? EventKind.SYSTEM_ERROR : EventKind.CONFIG_CHANGE;
     }
 
-    /** Drops the scheduler's own lead-in text where the kind column already says it. */
+    /**
+     * Drops the scheduler's own lead-in text where the kind column already says it.
+     */
     static String cleanSummary(EventKind kind, String reason) {
         if (reason == null) return "";
         String s = reason.strip();

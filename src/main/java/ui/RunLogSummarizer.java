@@ -1,11 +1,6 @@
 package ui;
 
-import java.util.ArrayList;
-import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
+import java.util.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -26,43 +21,24 @@ import java.util.regex.Pattern;
  */
 public final class RunLogSummarizer {
 
-    private RunLogSummarizer() {}
-
-    /** One file this run touched — the name it was detected/queued under, and
-     *  its size formatted the same way the rest of the app formats sizes
-     *  (e.g. "4.2 MB"), or {@code null} if a size was never captured for it. */
-    public record FileEntry(String name, String sizeFormatted) {}
-
-    /** Structured view of one FILE_TRANSFER run, or {@code null} if the log
-     *  text doesn't look like a file-transfer run at all (e.g. captured before
-     *  the transfer even started, or from a non-transfer task type). */
-    public record FileTransferSummary(
-            String direction,           // "OUTBOUND" / "INBOUND", or null if not found
-            String sourcePath,
-            String destPath,
-            List<FileEntry> files,      // best-effort; empty for non-watcher batched transfers (not logged per-file)
-            int fileCount,
-            String totalBytesFormatted, // e.g. "4.2 MB"; null if not found
-            int batchCount,
-            int sessionCount,
-            int workerThreads) {}
-
-    private static final Pattern DIRECTION  = Pattern.compile("^\\[INFO\\] Transfer direction : (\\w+)$");
-    private static final Pattern LOCAL_SRC  = Pattern.compile("^\\[INFO\\] Local source path\\s*: (.+)$");
+    private static final Pattern DIRECTION = Pattern.compile("^\\[INFO\\] Transfer direction : (\\w+)$");
+    private static final Pattern LOCAL_SRC = Pattern.compile("^\\[INFO\\] Local source path\\s*: (.+)$");
     private static final Pattern REMOTE_TGT = Pattern.compile("^\\[INFO\\] Remote target path\\s*: (.+)$");
     private static final Pattern REMOTE_SRC = Pattern.compile("^\\[INFO\\] Remote/source path\\s*: (.+)$");
-    private static final Pattern LOCAL_DST  = Pattern.compile("^\\[INFO\\] Local destination\\s*: (.+)$");
+    private static final Pattern LOCAL_DST = Pattern.compile("^\\[INFO\\] Local destination\\s*: (.+)$");
     // "Watcher found N new/updated file(s):" detection listing — the actual
     // moment a file was detected, before any transfer attempt; raw byte size.
-    private static final Pattern DETECTED    = Pattern.compile(
+    private static final Pattern DETECTED = Pattern.compile(
             "^\\[INFO\\]\\s{2,}(.+?) \\| lastModified=(.+?) \\| size=(\\d+)$");
     // "Queued outbound/inbound: local → remote (123ms, 4.2 MB)" — logged when
     // the transfer actually starts moving that file; size already formatted.
-    private static final Pattern QUEUED     = Pattern.compile(
+    private static final Pattern QUEUED = Pattern.compile(
             "^\\[INFO\\] Queued (?:outbound|inbound): (.+?) \u2192 (.+?)(?: \\(\\d+ms, (.+?)\\))?$");
-    private static final Pattern SUMMARY    = Pattern.compile(
+    private static final Pattern SUMMARY = Pattern.compile(
             "^\\[INFO\\] Transfer summary: (\\d+) file\\(s\\), (.+?) total, (\\d+) batch\\(es\\), "
                     + "(\\d+) session\\(s\\), (\\d+) worker thread\\(s\\)\\.$");
+    private RunLogSummarizer() {
+    }
 
     public static FileTransferSummary parse(String detailsText) {
         if (detailsText == null || detailsText.isBlank()) return null;
@@ -131,8 +107,10 @@ public final class RunLogSummarizer {
                 fileCount, totalBytesFormatted, batchCount, sessionCount, workerThreads);
     }
 
-    /** Matches the app's own byte-formatting convention closely enough for
-     *  display purposes (binary/1024-based units, one decimal place). */
+    /**
+     * Matches the app's own byte-formatting convention closely enough for
+     * display purposes (binary/1024-based units, one decimal place).
+     */
     public static String formatBytes(long bytes) {
         if (bytes < 1024) return bytes + " B";
         String[] units = {"KB", "MB", "GB", "TB"};
@@ -143,5 +121,30 @@ public final class RunLogSummarizer {
             unit++;
         }
         return String.format("%.1f %s", value, units[unit]);
+    }
+
+    /**
+     * One file this run touched — the name it was detected/queued under, and
+     * its size formatted the same way the rest of the app formats sizes
+     * (e.g. "4.2 MB"), or {@code null} if a size was never captured for it.
+     */
+    public record FileEntry(String name, String sizeFormatted) {
+    }
+
+    /**
+     * Structured view of one FILE_TRANSFER run, or {@code null} if the log
+     * text doesn't look like a file-transfer run at all (e.g. captured before
+     * the transfer even started, or from a non-transfer task type).
+     */
+    public record FileTransferSummary(
+            String direction,           // "OUTBOUND" / "INBOUND", or null if not found
+            String sourcePath,
+            String destPath,
+            List<FileEntry> files,      // best-effort; empty for non-watcher batched transfers (not logged per-file)
+            int fileCount,
+            String totalBytesFormatted, // e.g. "4.2 MB"; null if not found
+            int batchCount,
+            int sessionCount,
+            int workerThreads) {
     }
 }

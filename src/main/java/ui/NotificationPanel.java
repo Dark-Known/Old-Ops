@@ -10,8 +10,10 @@ import javax.swing.*;
 import javax.swing.border.EmptyBorder;
 import java.awt.*;
 import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
-import java.util.*;
+import java.util.Map;
 
 /**
  * The Health Feed — "what needs my attention, in the order it happened" —
@@ -75,7 +77,7 @@ public class NotificationPanel extends JPanel {
     }
 
     public NotificationPanel(XmlStorageService storage, TaskSchedulerService scheduler,
-                              WatchStatusMonitor watchStatusMonitor, StatusStrip healthBar) {
+                             WatchStatusMonitor watchStatusMonitor, StatusStrip healthBar) {
         this.storage = storage;
         this.scheduler = scheduler;
         this.watchStatusMonitor = watchStatusMonitor;
@@ -87,9 +89,51 @@ public class NotificationPanel extends JPanel {
         refresh();
     }
 
-    /** No-op — kept only so older, currently-unwired experiments that predate
-     *  the unified feed (a single view has nothing to select between) still
-     *  compile without modification. */
+    private static JLabel chip(String text, Color bg) {
+        JLabel l = new JLabel(text);
+        l.setOpaque(true);
+        l.setFont(l.getFont().deriveFont(Font.BOLD, 9.5f));
+        l.setForeground(Color.WHITE);
+        l.setBackground(bg);
+        l.setBorder(new EmptyBorder(1, 6, 1, 6));
+        return l;
+    }
+
+    private static String timeAgo(LocalDateTime when) {
+        if (when == null || when == LocalDateTime.MIN) return "";
+        long minutes = java.time.Duration.between(when, LocalDateTime.now()).toMinutes();
+        if (minutes < 1) return "just now";
+        if (minutes < 60) return minutes + " min ago";
+        long hours = minutes / 60;
+        if (hours < 24) return hours + "h ago";
+        return (hours / 24) + "d ago";
+    }
+
+    private static String prettyMode(String rawWatchModeName) {
+        if (rawWatchModeName == null) return "?";
+        return switch (rawWatchModeName) {
+            case "NATIVE_WATCH" -> "Live (native)";
+            case "REMOTE_PUSH" -> "Live (push)";
+            case "POLLING_ONLY_UNSUPPORTED" -> "Polling (unsupported)";
+            case "POLLING_ONLY" -> "Polling";
+            default -> rawWatchModeName;
+        };
+    }
+
+    private static String escape(String s) {
+        return s == null ? "" : s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
+    }
+
+    // ------------------------------------------------------------------
+    // Snooze — delegates to the owning StatusStrip when there is one (the
+    // real app always provides one; see class javadoc).
+    // ------------------------------------------------------------------
+
+    /**
+     * No-op — kept only so older, currently-unwired experiments that predate
+     * the unified feed (a single view has nothing to select between) still
+     * compile without modification.
+     */
     public void selectTab(int index) { /* intentionally does nothing */ }
 
     private Component buildHeader() {
@@ -144,11 +188,6 @@ public class NotificationPanel extends JPanel {
         return actions;
     }
 
-    // ------------------------------------------------------------------
-    // Snooze — delegates to the owning StatusStrip when there is one (the
-    // real app always provides one; see class javadoc).
-    // ------------------------------------------------------------------
-
     private boolean isSnoozed(String groupKey) {
         if (healthBar != null) return healthBar.isSnoozed(groupKey);
         purgeExpiredLocalSnoozes();
@@ -176,9 +215,15 @@ public class NotificationPanel extends JPanel {
         });
     }
 
-    /** Same as {@link #logActivity} but marks the event FAILED, logged under
-     *  "TASKS" rather than "HEALTH" since a retry failure is about the task
-     *  being retried, not about the health feed itself. */
+    // ------------------------------------------------------------------
+    // Feed assembly
+    // ------------------------------------------------------------------
+
+    /**
+     * Same as {@link #logActivity} but marks the event FAILED, logged under
+     * "TASKS" rather than "HEALTH" since a retry failure is about the task
+     * being retried, not about the health feed itself.
+     */
     private void logActivityFailed(String title, String detail) {
         if (scheduler == null || scheduler.getRunHistoryService() == null) return;
         LocalDateTime now = LocalDateTime.now();
@@ -213,15 +258,6 @@ public class NotificationPanel extends JPanel {
         localSnoozedUntil.entrySet().removeIf(e -> !e.getValue().isAfter(now));
     }
 
-    // ------------------------------------------------------------------
-    // Feed assembly
-    // ------------------------------------------------------------------
-
-    /** One row in the merged feed — just enough to sort everything by time and render it. */
-    private record FeedItem(LocalDateTime timestamp, boolean snoozed, JPanel card) {}
-
-    private record Loaded(List<TaskRunRecord> failures, List<ScheduledTask> tasks) {}
-
     private void refresh() {
         // SQLite + task-store reads happen off the EDT (summary rows only: the
         // full run log is fetched on demand when "view log" is clicked).
@@ -239,6 +275,13 @@ public class NotificationPanel extends JPanel {
             return new Loaded(failures, storage.loadTasks());
         }, this::applyLoaded, e -> System.err.println("Health feed refresh failed: " + e));
     }
+
+    // ------------------------------------------------------------------
+    // Card builders — one per kind of feed entry. Each is a left-accent-bar
+    // + content row, matching the same visual language (severity chip, small
+    // muted timestamp) across all three kinds so the feed reads as one thing
+    // rather than three bolted-together widgets.
+    // ------------------------------------------------------------------
 
     private void applyLoaded(Loaded loaded) {
         feedList.removeAll();
@@ -319,13 +362,6 @@ public class NotificationPanel extends JPanel {
         return card;
     }
 
-    // ------------------------------------------------------------------
-    // Card builders — one per kind of feed entry. Each is a left-accent-bar
-    // + content row, matching the same visual language (severity chip, small
-    // muted timestamp) across all three kinds so the feed reads as one thing
-    // rather than three bolted-together widgets.
-    // ------------------------------------------------------------------
-
     private JPanel accentCard(Color accent, boolean dimmed) {
         JPanel card = new JPanel(new BorderLayout(10, 0));
         card.setBorder(BorderFactory.createCompoundBorder(
@@ -335,26 +371,6 @@ public class NotificationPanel extends JPanel {
         card.setBackground(AppTheme.isDark() ? new Color(0x24273A) : new Color(0xFAFAFC));
         card.setOpaque(true);
         return card;
-    }
-
-    private static JLabel chip(String text, Color bg) {
-        JLabel l = new JLabel(text);
-        l.setOpaque(true);
-        l.setFont(l.getFont().deriveFont(Font.BOLD, 9.5f));
-        l.setForeground(Color.WHITE);
-        l.setBackground(bg);
-        l.setBorder(new EmptyBorder(1, 6, 1, 6));
-        return l;
-    }
-
-    private static String timeAgo(LocalDateTime when) {
-        if (when == null || when == LocalDateTime.MIN) return "";
-        long minutes = java.time.Duration.between(when, LocalDateTime.now()).toMinutes();
-        if (minutes < 1) return "just now";
-        if (minutes < 60) return minutes + " min ago";
-        long hours = minutes / 60;
-        if (hours < 24) return hours + "h ago";
-        return (hours / 24) + "d ago";
     }
 
     private JPanel buildFailureCard(String groupKey, List<TaskRunRecord> records, boolean snoozed) {
@@ -494,28 +510,12 @@ public class NotificationPanel extends JPanel {
         return card;
     }
 
-    private static String prettyMode(String rawWatchModeName) {
-        if (rawWatchModeName == null) return "?";
-        return switch (rawWatchModeName) {
-            case "NATIVE_WATCH" -> "Live (native)";
-            case "REMOTE_PUSH" -> "Live (push)";
-            case "POLLING_ONLY_UNSUPPORTED" -> "Polling (unsupported)";
-            case "POLLING_ONLY" -> "Polling";
-            default -> rawWatchModeName;
-        };
-    }
-
-    private static String escape(String s) {
-        return s == null ? "" : s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
-    }
-
-    // ------------------------------------------------------------------
-    // Actions
-    // ------------------------------------------------------------------
-
     private void showRunDetail(TaskRunRecord record) {
         var history = scheduler != null ? scheduler.getRunHistoryService() : null;
-        if (history == null) { showRunDetailDialog(record, record.getDetails()); return; }
+        if (history == null) {
+            showRunDetailDialog(record, record.getDetails());
+            return;
+        }
         // The list rows carry no run log; fetch the full one for just this run, off the EDT.
         Async.call(() -> {
             TaskRunRecord full = history.getRunById(record.getId());
@@ -533,6 +533,10 @@ public class NotificationPanel extends JPanel {
         scroll.setPreferredSize(new Dimension(560, 320));
         JOptionPane.showMessageDialog(this, scroll, record.getTaskName() + " \u2014 run detail", JOptionPane.PLAIN_MESSAGE);
     }
+
+    // ------------------------------------------------------------------
+    // Actions
+    // ------------------------------------------------------------------
 
     private void retryTask(String taskId, String taskName) {
         if (taskId == null) return;
@@ -556,7 +560,9 @@ public class NotificationPanel extends JPanel {
         refresh();
     }
 
-    /** Returns whether the status change actually persisted — see retryTask(). */
+    /**
+     * Returns whether the status change actually persisted — see retryTask().
+     */
     private boolean restartTask(ScheduledTask task) {
         ScheduledTask.TaskStatus oldStatus = task.getStatus();
         task.setStatus(ScheduledTask.TaskStatus.PENDING);
@@ -567,7 +573,7 @@ public class NotificationPanel extends JPanel {
             logActivityFailed("Task restart failed",
                     "Could not retry task \"" + task.getName() + "\""
                             + (storage.isConnected() ? " — database connected, but this write failed"
-                                    : " — database not connected")
+                            : " — database not connected")
                             + (detail != null ? ": " + detail : "."));
             return false;
         }
@@ -593,7 +599,8 @@ public class NotificationPanel extends JPanel {
             if (task.getStatus() == ScheduledTask.TaskStatus.FAILED
                     || task.getStatus() == ScheduledTask.TaskStatus.RETRYING
                     || task.getStatus() == ScheduledTask.TaskStatus.RUNNING) {
-                if (restartTask(task)) succeeded++; else failed++;
+                if (restartTask(task)) succeeded++;
+                else failed++;
             }
         }
         String msg = succeeded + " failed task(s) restarted" + (failed > 0 ? ", " + failed + " could not be"
@@ -601,5 +608,14 @@ public class NotificationPanel extends JPanel {
         JOptionPane.showMessageDialog(this, msg, failed > 0 ? "Partially Restarted" : "Restarted",
                 failed > 0 ? JOptionPane.WARNING_MESSAGE : JOptionPane.INFORMATION_MESSAGE);
         refresh();
+    }
+
+    /**
+     * One row in the merged feed — just enough to sort everything by time and render it.
+     */
+    private record FeedItem(LocalDateTime timestamp, boolean snoozed, JPanel card) {
+    }
+
+    private record Loaded(List<TaskRunRecord> failures, List<ScheduledTask> tasks) {
     }
 }

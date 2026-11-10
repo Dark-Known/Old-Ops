@@ -1,7 +1,5 @@
 package service;
 
-import static org.junit.Assert.*;
-
 import org.junit.Test;
 
 import java.io.File;
@@ -12,6 +10,8 @@ import java.net.http.HttpResponse;
 import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.List;
+
+import static org.junit.Assert.*;
 
 public class DaemonControlTest {
 
@@ -29,7 +29,9 @@ public class DaemonControlTest {
     @Test
     public void executorFailureMeansNotDelivered() throws Exception {
         File dir = Files.createTempDirectory("opstool-ctl").toFile();
-        try (DaemonControlServer s = DaemonControlServer.start(dir, (a, id, who) -> { throw new IllegalStateException("boom"); })) {
+        try (DaemonControlServer s = DaemonControlServer.start(dir, (a, id, who) -> {
+            throw new IllegalStateException("boom");
+        })) {
             assertFalse(DaemonControlClient.send(dir, CommandQueueService.Action.CANCEL, "t", "bob"));
         }
     }
@@ -62,7 +64,8 @@ public class DaemonControlTest {
         File dir = Files.createTempDirectory("opstool-ctl").toFile();
         assertFalse(DaemonControlClient.send(dir, CommandQueueService.Action.REFRESH, "", "gui")); // no control file
         File dead;
-        try (DaemonControlServer s = DaemonControlServer.start(dir, (a, id, who) -> { })) {
+        try (DaemonControlServer s = DaemonControlServer.start(dir, (a, id, who) -> {
+        })) {
             dead = new File(dir, DaemonControlServer.FILE_NAME);
             java.nio.file.Files.copy(dead.toPath(), new File(dir, "copy.json").toPath());
         }

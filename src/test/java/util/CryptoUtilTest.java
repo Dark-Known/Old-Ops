@@ -1,7 +1,5 @@
 package util;
 
-import static org.junit.Assert.*;
-
 import org.junit.BeforeClass;
 import org.junit.Test;
 
@@ -15,6 +13,8 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.security.SecureRandom;
 import java.util.Base64;
+
+import static org.junit.Assert.*;
 
 public class CryptoUtilTest {
 
@@ -71,7 +71,10 @@ public class CryptoUtilTest {
         String machine = System.getenv("COMPUTERNAME");
         if (machine == null || machine.isEmpty()) machine = System.getenv("HOSTNAME");
         if (machine == null || machine.isEmpty()) {
-            try { machine = java.net.InetAddress.getLocalHost().getHostName(); } catch (Exception ignored) {}
+            try {
+                machine = java.net.InetAddress.getLocalHost().getHostName();
+            } catch (Exception ignored) {
+            }
         }
         if (machine == null || machine.isEmpty()) machine = "unknown-host";
         byte[] keyBytes = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(new PBEKeySpec(

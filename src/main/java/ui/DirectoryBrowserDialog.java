@@ -25,51 +25,34 @@ import java.util.List;
  */
 public final class DirectoryBrowserDialog {
 
-    /** One entry (always a directory — this browser is folder-only) shown in the list. */
-    public static final class Item {
-        public final String name;
-        public Item(String name) { this.name = name; }
+    private DirectoryBrowserDialog() {
     }
-
-    /** Abstracts local-filesystem vs remote-SFTP directory listing behind one navigation API. */
-    public interface Provider {
-        List<Item> list(String path) throws Exception;
-        String initialPath();
-        String parentOf(String path);
-        String join(String dir, String name);
-        /** Shortcut paths shown as quick-access chips (drives, home dir, root, etc). */
-        List<String> quickAccess();
-        /** Released when the dialog closes (e.g. disconnects the SFTP session). No-op for local. */
-        void close();
-    }
-
-    private DirectoryBrowserDialog() {}
 
     /**
-     * @param label   what's being browsed, shown in the title (e.g. "This Computer" or "prod-01 (10.0.0.5)")
-     * @param osType  "WINDOWS" or "LINUX" — purely cosmetic, picks the Explorer vs terminal skin
+     * @param label  what's being browsed, shown in the title (e.g. "This Computer" or "prod-01 (10.0.0.5)")
+     * @param osType "WINDOWS" or "LINUX" — purely cosmetic, picks the Explorer vs terminal skin
      * @return the chosen folder path, or {@code null} if cancelled
      */
     public static String show(Component parent, String label, String osType, Provider provider) {
         boolean windows = !"LINUX".equalsIgnoreCase(osType == null ? "" : osType);
 
         // ── Palette ──────────────────────────────────────────────────────────
-        Color bg          = windows ? new Color(0xFFFFFF) : new Color(0x1E1E1E);
-        Color panelBg     = windows ? new Color(0xFAF7F2) : new Color(0x25231F);
-        Color toolbarBg   = windows ? new Color(0xF7F3EC) : new Color(0x2D2A25);
-        Color text        = windows ? new Color(0x1B1B1B) : new Color(0xD4D4D4);
-        Color accent      = windows ? new Color(0xA0522D) : new Color(0x8FA876);
-        Color muted       = windows ? new Color(0x6B6B6B) : new Color(0x808080);
-        Color selectBg    = windows ? new Color(0xEAD9C9) : new Color(0x3B4A32);
-        Color hoverBg     = windows ? new Color(0xF2E9DD) : new Color(0x322F28);
-        Color border      = windows ? new Color(0xE3DACC) : new Color(0x3C3730);
-        Color errColor    = windows ? new Color(0xA54A3F) : new Color(0xE0836F);
-        Font baseFont     = windows
+        Color bg = windows ? new Color(0xFFFFFF) : new Color(0x1E1E1E);
+        Color panelBg = windows ? new Color(0xFAF7F2) : new Color(0x25231F);
+        Color toolbarBg = windows ? new Color(0xF7F3EC) : new Color(0x2D2A25);
+        Color text = windows ? new Color(0x1B1B1B) : new Color(0xD4D4D4);
+        Color accent = windows ? new Color(0xA0522D) : new Color(0x8FA876);
+        Color muted = windows ? new Color(0x6B6B6B) : new Color(0x808080);
+        Color selectBg = windows ? new Color(0xEAD9C9) : new Color(0x3B4A32);
+        Color hoverBg = windows ? new Color(0xF2E9DD) : new Color(0x322F28);
+        Color border = windows ? new Color(0xE3DACC) : new Color(0x3C3730);
+        Color errColor = windows ? new Color(0xA54A3F) : new Color(0xE0836F);
+        Font baseFont = windows
                 ? new Font("Segoe UI", Font.PLAIN, 13)
                 : new Font(Font.MONOSPACED, Font.PLAIN, 13);
-        Font crumbFont    = baseFont.deriveFont(windows ? Font.PLAIN : Font.BOLD, 12.5f);
-        Icon folderIcon   = new FolderIcon(windows ? new Color(0xD9A441) : accent, windows);
-        Icon homeIcon     = new HomeIcon(windows ? new Color(0xA0522D) : accent);
+        Font crumbFont = baseFont.deriveFont(windows ? Font.PLAIN : Font.BOLD, 12.5f);
+        Icon folderIcon = new FolderIcon(windows ? new Color(0xD9A441) : accent, windows);
+        Icon homeIcon = new HomeIcon(windows ? new Color(0xA0522D) : accent);
         String windowTitle = windows
                 ? "File Explorer - " + label
                 : "Browse - " + label;
@@ -88,8 +71,8 @@ public final class DirectoryBrowserDialog {
                 new EmptyBorder(9, 12, 9, 12)));
 
         JButton btnBack = navButton(new BackArrowIcon(text), windows);
-        JButton btnFwd  = navButton(new FwdArrowIcon(text), windows);
-        JButton btnUp   = navButton(new UpArrowIcon(text), windows);
+        JButton btnFwd = navButton(new FwdArrowIcon(text), windows);
+        JButton btnUp = navButton(new UpArrowIcon(text), windows);
         JButton btnRefresh = navButton(new RefreshIcon(text), windows);
         JButton btnHome = navButton(homeIcon, windows);
         btnBack.setToolTipText("Back");
@@ -156,8 +139,9 @@ public final class DirectoryBrowserDialog {
         quickList.setSelectionForeground(text);
         quickList.setFixedCellHeight(28);
         quickList.setCellRenderer(new DefaultListCellRenderer() {
-            @Override public Component getListCellRendererComponent(JList<?> list, Object value, int index,
-                    boolean isSelected, boolean cellHasFocus) {
+            @Override
+            public Component getListCellRendererComponent(JList<?> list, Object value, int index,
+                                                          boolean isSelected, boolean cellHasFocus) {
                 JLabel c = (JLabel) super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus);
                 c.setText(String.valueOf(value));
                 c.setIcon(homeIcon);
@@ -189,10 +173,11 @@ public final class DirectoryBrowserDialog {
         folderList.setSelectionForeground(text);
         folderList.setFixedCellHeight(windows ? 28 : 24);
         folderList.setVisibleRowCount(-1);
-        int[] hoveredIndex = { -1 };
+        int[] hoveredIndex = {-1};
         folderList.setCellRenderer(new DefaultListCellRenderer() {
-            @Override public Component getListCellRendererComponent(JList<?> list, Object value, int index,
-                    boolean isSelected, boolean cellHasFocus) {
+            @Override
+            public Component getListCellRendererComponent(JList<?> list, Object value, int index,
+                                                          boolean isSelected, boolean cellHasFocus) {
                 JLabel c = (JLabel) super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus);
                 c.setText(String.valueOf(value));
                 c.setIcon(folderIcon);
@@ -207,13 +192,21 @@ public final class DirectoryBrowserDialog {
             }
         });
         folderList.addMouseMotionListener(new java.awt.event.MouseMotionAdapter() {
-            @Override public void mouseMoved(java.awt.event.MouseEvent e) {
+            @Override
+            public void mouseMoved(java.awt.event.MouseEvent e) {
                 int idx = folderList.locationToIndex(e.getPoint());
-                if (idx != hoveredIndex[0]) { hoveredIndex[0] = idx; folderList.repaint(); }
+                if (idx != hoveredIndex[0]) {
+                    hoveredIndex[0] = idx;
+                    folderList.repaint();
+                }
             }
         });
         folderList.addMouseListener(new java.awt.event.MouseAdapter() {
-            @Override public void mouseExited(java.awt.event.MouseEvent e) { hoveredIndex[0] = -1; folderList.repaint(); }
+            @Override
+            public void mouseExited(java.awt.event.MouseEvent e) {
+                hoveredIndex[0] = -1;
+                folderList.repaint();
+            }
         });
         JScrollPane listScroll = new JScrollPane(folderList);
         listScroll.setBorder(BorderFactory.createEmptyBorder());
@@ -279,9 +272,9 @@ public final class DirectoryBrowserDialog {
         dlg.setLocationRelativeTo(parent);
 
         // ── Navigation state: history for Back/Forward, breadcrumb builder ──
-        String[] result = { null };
+        String[] result = {null};
         List<String> history = new ArrayList<>();
-        int[] historyIndex = { -1 };
+        int[] historyIndex = {-1};
 
         @SuppressWarnings("unchecked")
         java.util.function.Consumer<String>[] navigateRef = new java.util.function.Consumer[1];
@@ -329,7 +322,10 @@ public final class DirectoryBrowserDialog {
         // navigate(): pushes to history + applies. Back/Forward move historyIndex and call applyPath directly.
         java.util.function.Consumer<String> navigate = path -> {
             String cur = historyIndex[0] >= 0 && historyIndex[0] < history.size() ? history.get(historyIndex[0]) : null;
-            if (path.equals(cur)) { applyPath.accept(path); return; }
+            if (path.equals(cur)) {
+                applyPath.accept(path);
+                return;
+            }
             while (history.size() > historyIndex[0] + 1) history.remove(history.size() - 1);
             history.add(path);
             historyIndex[0] = history.size() - 1;
@@ -364,13 +360,15 @@ public final class DirectoryBrowserDialog {
             if (!typed.isEmpty()) navigate.accept(typed);
         });
         address.addKeyListener(new KeyAdapter() {
-            @Override public void keyPressed(KeyEvent e) {
+            @Override
+            public void keyPressed(KeyEvent e) {
                 if (e.getKeyCode() == KeyEvent.VK_ENTER) btnGo.doClick();
                 if (e.getKeyCode() == KeyEvent.VK_ESCAPE) addressCards.show(addressContainer, "crumbs");
             }
         });
         breadcrumbBar.addMouseListener(new java.awt.event.MouseAdapter() {
-            @Override public void mouseClicked(java.awt.event.MouseEvent e) {
+            @Override
+            public void mouseClicked(java.awt.event.MouseEvent e) {
                 if (e.getSource() == breadcrumbBar) { // clicked empty space, not a chip
                     addressCards.show(addressContainer, "edit");
                     address.requestFocusInWindow();
@@ -379,7 +377,8 @@ public final class DirectoryBrowserDialog {
             }
         });
         address.addFocusListener(new java.awt.event.FocusAdapter() {
-            @Override public void focusLost(java.awt.event.FocusEvent e) {
+            @Override
+            public void focusLost(java.awt.event.FocusEvent e) {
                 addressCards.show(addressContainer, "crumbs");
             }
         });
@@ -390,7 +389,8 @@ public final class DirectoryBrowserDialog {
             }
         });
         folderList.addMouseListener(new java.awt.event.MouseAdapter() {
-            @Override public void mouseClicked(java.awt.event.MouseEvent e) {
+            @Override
+            public void mouseClicked(java.awt.event.MouseEvent e) {
                 if (e.getClickCount() == 2) {
                     String name = folderList.getSelectedValue();
                     if (name != null) navigate.accept(provider.join(currentPathOf(history, historyIndex), name));
@@ -398,7 +398,8 @@ public final class DirectoryBrowserDialog {
             }
         });
         folderList.addKeyListener(new KeyAdapter() {
-            @Override public void keyPressed(KeyEvent e) {
+            @Override
+            public void keyPressed(KeyEvent e) {
                 if (e.getKeyCode() == KeyEvent.VK_ENTER) {
                     String name = folderList.getSelectedValue();
                     if (name != null) navigate.accept(provider.join(currentPathOf(history, historyIndex), name));
@@ -414,7 +415,10 @@ public final class DirectoryBrowserDialog {
         });
         btnCancel.addActionListener(e -> dlg.dispose());
         dlg.addWindowListener(new java.awt.event.WindowAdapter() {
-            @Override public void windowClosed(java.awt.event.WindowEvent e) { provider.close(); }
+            @Override
+            public void windowClosed(java.awt.event.WindowEvent e) {
+                provider.close();
+            }
         });
 
         btnBack.setEnabled(false);
@@ -441,7 +445,9 @@ public final class DirectoryBrowserDialog {
         return b;
     }
 
-    /** Splits a path into clickable {label, cumulativePath} breadcrumb segments. */
+    /**
+     * Splits a path into clickable {label, cumulativePath} breadcrumb segments.
+     */
     private static List<String[]> buildCrumbs(String path) {
         List<String[]> out = new ArrayList<>();
         if (path == null || path.isEmpty()) return out;
@@ -468,11 +474,47 @@ public final class DirectoryBrowserDialog {
         return out;
     }
 
+    /**
+     * Abstracts local-filesystem vs remote-SFTP directory listing behind one navigation API.
+     */
+    public interface Provider {
+        List<Item> list(String path) throws Exception;
+
+        String initialPath();
+
+        String parentOf(String path);
+
+        String join(String dir, String name);
+
+        /**
+         * Shortcut paths shown as quick-access chips (drives, home dir, root, etc).
+         */
+        List<String> quickAccess();
+
+        /**
+         * Released when the dialog closes (e.g. disconnects the SFTP session). No-op for local.
+         */
+        void close();
+    }
+
+    /**
+     * One entry (always a directory — this browser is folder-only) shown in the list.
+     */
+    public static final class Item {
+        public final String name;
+
+        public Item(String name) {
+            this.name = name;
+        }
+    }
+
     // ─────────────────────────────────────────────────────────────────────
     // Built-in providers
     // ─────────────────────────────────────────────────────────────────────
 
-    /** Browses the local filesystem this app is running on. */
+    /**
+     * Browses the local filesystem this app is running on.
+     */
     public static final class LocalProvider implements Provider {
         private final String initial;
 
@@ -481,7 +523,8 @@ public final class DirectoryBrowserDialog {
                     ? startPath.trim() : System.getProperty("user.home");
         }
 
-        @Override public List<Item> list(String path) {
+        @Override
+        public List<Item> list(String path) {
             File dir = new File(path);
             File[] files = dir.listFiles();
             List<Item> out = new ArrayList<>();
@@ -494,17 +537,25 @@ public final class DirectoryBrowserDialog {
             return out;
         }
 
-        @Override public String initialPath() { return initial; }
+        @Override
+        public String initialPath() {
+            return initial;
+        }
 
-        @Override public String parentOf(String path) {
+        @Override
+        public String parentOf(String path) {
             File f = new File(path);
             String p = f.getParent();
             return p != null ? p : path;
         }
 
-        @Override public String join(String dir, String name) { return new File(dir, name).getPath(); }
+        @Override
+        public String join(String dir, String name) {
+            return new File(dir, name).getPath();
+        }
 
-        @Override public List<String> quickAccess() {
+        @Override
+        public List<String> quickAccess() {
             List<String> out = new ArrayList<>();
             String home = System.getProperty("user.home");
             if (home != null) out.add(home);
@@ -512,10 +563,13 @@ public final class DirectoryBrowserDialog {
             return out;
         }
 
-        @Override public void close() { /* nothing to release */ }
+        @Override
+        public void close() { /* nothing to release */ }
     }
 
-    /** Browses a remote server over an already-open SFTP session. */
+    /**
+     * Browses a remote server over an already-open SFTP session.
+     */
     public static final class RemoteProvider implements Provider {
         private final service.SftpBrowseService sftp;
         private final String initial;
@@ -525,7 +579,8 @@ public final class DirectoryBrowserDialog {
             this.initial = (initial != null && !initial.trim().isEmpty()) ? initial.trim() : "/";
         }
 
-        @Override public List<Item> list(String path) throws Exception {
+        @Override
+        public List<Item> list(String path) throws Exception {
             List<Item> out = new ArrayList<>();
             for (service.SftpBrowseService.Entry e : sftp.list(path)) {
                 if (e.directory) out.add(new Item(e.name));
@@ -533,20 +588,26 @@ public final class DirectoryBrowserDialog {
             return out;
         }
 
-        @Override public String initialPath() { return initial; }
+        @Override
+        public String initialPath() {
+            return initial;
+        }
 
-        @Override public String parentOf(String path) {
+        @Override
+        public String parentOf(String path) {
             if (path == null || path.isEmpty() || "/".equals(path)) return "/";
             String p = path.endsWith("/") && path.length() > 1 ? path.substring(0, path.length() - 1) : path;
             int idx = p.lastIndexOf('/');
             return idx <= 0 ? "/" : p.substring(0, idx);
         }
 
-        @Override public String join(String dir, String name) {
+        @Override
+        public String join(String dir, String name) {
             return dir.endsWith("/") ? dir + name : dir + "/" + name;
         }
 
-        @Override public List<String> quickAccess() {
+        @Override
+        public List<String> quickAccess() {
             List<String> out = new ArrayList<>();
             out.add("/");
             try {
@@ -556,7 +617,10 @@ public final class DirectoryBrowserDialog {
             return out;
         }
 
-        @Override public void close() { sftp.close(); }
+        @Override
+        public void close() {
+            sftp.close();
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -567,7 +631,9 @@ public final class DirectoryBrowserDialog {
     // every platform with zero font dependency.
     // ─────────────────────────────────────────────────────────────────────
 
-    /** A small filled folder shape, colored per theme. */
+    /**
+     * A small filled folder shape, colored per theme.
+     */
     private static final class FolderIcon implements Icon {
         private final Color color;
         private final boolean windows;
@@ -577,10 +643,18 @@ public final class DirectoryBrowserDialog {
             this.windows = windows;
         }
 
-        @Override public int getIconWidth() { return 16; }
-        @Override public int getIconHeight() { return 14; }
+        @Override
+        public int getIconWidth() {
+            return 16;
+        }
 
-        @Override public void paintIcon(Component c, Graphics g, int x, int y) {
+        @Override
+        public int getIconHeight() {
+            return 14;
+        }
+
+        @Override
+        public void paintIcon(Component c, Graphics g, int x, int y) {
             Graphics2D g2 = (Graphics2D) g.create();
             g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
             if (windows) {
@@ -602,16 +676,28 @@ public final class DirectoryBrowserDialog {
         }
     }
 
-    /** A small upward chevron/arrow, used on the "Up" navigation button. */
+    /**
+     * A small upward chevron/arrow, used on the "Up" navigation button.
+     */
     private static final class UpArrowIcon implements Icon {
         private final Color color;
 
-        UpArrowIcon(Color color) { this.color = color; }
+        UpArrowIcon(Color color) {
+            this.color = color;
+        }
 
-        @Override public int getIconWidth() { return 10; }
-        @Override public int getIconHeight() { return 10; }
+        @Override
+        public int getIconWidth() {
+            return 10;
+        }
 
-        @Override public void paintIcon(Component c, Graphics g, int x, int y) {
+        @Override
+        public int getIconHeight() {
+            return 10;
+        }
+
+        @Override
+        public void paintIcon(Component c, Graphics g, int x, int y) {
             Graphics2D g2 = (Graphics2D) g.create();
             g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
             g2.setColor(color);
@@ -624,13 +710,28 @@ public final class DirectoryBrowserDialog {
         }
     }
 
-    /** A left-pointing chevron, used on the Back button. */
+    /**
+     * A left-pointing chevron, used on the Back button.
+     */
     private static final class BackArrowIcon implements Icon {
         private final Color color;
-        BackArrowIcon(Color color) { this.color = color; }
-        @Override public int getIconWidth() { return 10; }
-        @Override public int getIconHeight() { return 10; }
-        @Override public void paintIcon(Component c, Graphics g, int x, int y) {
+
+        BackArrowIcon(Color color) {
+            this.color = color;
+        }
+
+        @Override
+        public int getIconWidth() {
+            return 10;
+        }
+
+        @Override
+        public int getIconHeight() {
+            return 10;
+        }
+
+        @Override
+        public void paintIcon(Component c, Graphics g, int x, int y) {
             Graphics2D g2 = (Graphics2D) g.create();
             g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
             g2.setColor(color);
@@ -641,13 +742,28 @@ public final class DirectoryBrowserDialog {
         }
     }
 
-    /** A right-pointing chevron, used on the Forward button. */
+    /**
+     * A right-pointing chevron, used on the Forward button.
+     */
     private static final class FwdArrowIcon implements Icon {
         private final Color color;
-        FwdArrowIcon(Color color) { this.color = color; }
-        @Override public int getIconWidth() { return 10; }
-        @Override public int getIconHeight() { return 10; }
-        @Override public void paintIcon(Component c, Graphics g, int x, int y) {
+
+        FwdArrowIcon(Color color) {
+            this.color = color;
+        }
+
+        @Override
+        public int getIconWidth() {
+            return 10;
+        }
+
+        @Override
+        public int getIconHeight() {
+            return 10;
+        }
+
+        @Override
+        public void paintIcon(Component c, Graphics g, int x, int y) {
             Graphics2D g2 = (Graphics2D) g.create();
             g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
             g2.setColor(color);
@@ -658,13 +774,28 @@ public final class DirectoryBrowserDialog {
         }
     }
 
-    /** A circular refresh arrow. */
+    /**
+     * A circular refresh arrow.
+     */
     private static final class RefreshIcon implements Icon {
         private final Color color;
-        RefreshIcon(Color color) { this.color = color; }
-        @Override public int getIconWidth() { return 12; }
-        @Override public int getIconHeight() { return 12; }
-        @Override public void paintIcon(Component c, Graphics g, int x, int y) {
+
+        RefreshIcon(Color color) {
+            this.color = color;
+        }
+
+        @Override
+        public int getIconWidth() {
+            return 12;
+        }
+
+        @Override
+        public int getIconHeight() {
+            return 12;
+        }
+
+        @Override
+        public void paintIcon(Component c, Graphics g, int x, int y) {
             Graphics2D g2 = (Graphics2D) g.create();
             g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
             g2.setColor(color);
@@ -676,13 +807,28 @@ public final class DirectoryBrowserDialog {
         }
     }
 
-    /** A simple house shape, used for the Home button and sidebar entries. */
+    /**
+     * A simple house shape, used for the Home button and sidebar entries.
+     */
     private static final class HomeIcon implements Icon {
         private final Color color;
-        HomeIcon(Color color) { this.color = color; }
-        @Override public int getIconWidth() { return 14; }
-        @Override public int getIconHeight() { return 13; }
-        @Override public void paintIcon(Component c, Graphics g, int x, int y) {
+
+        HomeIcon(Color color) {
+            this.color = color;
+        }
+
+        @Override
+        public int getIconWidth() {
+            return 14;
+        }
+
+        @Override
+        public int getIconHeight() {
+            return 13;
+        }
+
+        @Override
+        public void paintIcon(Component c, Graphics g, int x, int y) {
             Graphics2D g2 = (Graphics2D) g.create();
             g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
             g2.setColor(color);
@@ -696,13 +842,28 @@ public final class DirectoryBrowserDialog {
         }
     }
 
-    /** A right-pointing "go" arrow (used on the address-bar Go button). */
+    /**
+     * A right-pointing "go" arrow (used on the address-bar Go button).
+     */
     private static final class GoArrowIcon implements Icon {
         private final Color color;
-        GoArrowIcon(Color color) { this.color = color; }
-        @Override public int getIconWidth() { return 12; }
-        @Override public int getIconHeight() { return 12; }
-        @Override public void paintIcon(Component c, Graphics g, int x, int y) {
+
+        GoArrowIcon(Color color) {
+            this.color = color;
+        }
+
+        @Override
+        public int getIconWidth() {
+            return 12;
+        }
+
+        @Override
+        public int getIconHeight() {
+            return 12;
+        }
+
+        @Override
+        public void paintIcon(Component c, Graphics g, int x, int y) {
             Graphics2D g2 = (Graphics2D) g.create();
             g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
             g2.setColor(color);

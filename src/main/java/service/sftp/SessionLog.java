@@ -16,20 +16,26 @@ public final class SessionLog {
     private final StringBuilder sb = new StringBuilder();
     private boolean full;
 
-    /** Starts a fresh log for the session this thread is about to open. */
+    /**
+     * Starts a fresh log for the session this thread is about to open.
+     */
     public static SessionLog begin() {
         SessionLog l = new SessionLog();
         CURRENT.set(l);
         return l;
     }
 
-    /** The log begun on this thread, or a new stand-alone one. */
+    /**
+     * The log begun on this thread, or a new stand-alone one.
+     */
     public static SessionLog currentOrNew() {
         SessionLog l = CURRENT.get();
         return l != null ? l : new SessionLog();
     }
 
-    /** Returns the text of the log begun on this thread and forgets it; null if there was none. */
+    /**
+     * Returns the text of the log begun on this thread and forgets it; null if there was none.
+     */
     public static String take() {
         SessionLog l = CURRENT.get();
         CURRENT.remove();
@@ -47,11 +53,18 @@ public final class SessionLog {
         sb.append(String.format("+%d.%03ds  ", ms / 1000, ms % 1000)).append(line.strip()).append('\n');
     }
 
-    /** A JSch logger writing protocol messages (banner, key exchange, authentication) into this transcript. */
+    /**
+     * A JSch logger writing protocol messages (banner, key exchange, authentication) into this transcript.
+     */
     public com.jcraft.jsch.Logger jschLogger() {
         return new com.jcraft.jsch.Logger() {
-            @Override public boolean isEnabled(int level) { return level >= com.jcraft.jsch.Logger.INFO; }
-            @Override public void log(int level, String message) {
+            @Override
+            public boolean isEnabled(int level) {
+                return level >= com.jcraft.jsch.Logger.INFO;
+            }
+
+            @Override
+            public void log(int level, String message) {
                 // JSch's reader thread reports a harmless NPE when WE close the session; that is not an incident.
                 if (message != null && message.contains("leaving main loop due to Cannot invoke")) return;
                 add(message);
@@ -59,5 +72,7 @@ public final class SessionLog {
         };
     }
 
-    public synchronized String text() { return sb.toString().stripTrailing(); }
+    public synchronized String text() {
+        return sb.toString().stripTrailing();
+    }
 }

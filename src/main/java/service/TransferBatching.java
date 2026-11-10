@@ -4,10 +4,13 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.function.ToLongFunction;
 
-/** Size-based batching for large transfers, split out of {@link TransferService} so the rules can be tested alone. */
+/**
+ * Size-based batching for large transfers, split out of {@link TransferService} so the rules can be tested alone.
+ */
 public final class TransferBatching {
 
-    private TransferBatching() { }
+    private TransferBatching() {
+    }
 
     /**
      * Splits {@code items} into consecutive batches of at most {@code maxBytes} each. An item bigger than the

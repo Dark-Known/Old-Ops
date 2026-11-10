@@ -75,20 +75,24 @@ public class RemotePushWatcher {
     // detected-to-started budget.
     private static final long SETTLE_MILLIS = 1200L;
     private static final String UNAVAILABLE_MARKER = "__WATCH_UNAVAILABLE__";
-    /** Keep-alive line the remote script prints every few seconds; ignored here. Its real job is
-     *  to make the remote process fail a write (and exit) once the SSH channel is gone. */
+    /**
+     * Keep-alive line the remote script prints every few seconds; ignored here. Its real job is
+     * to make the remote process fail a write (and exit) once the SSH channel is gone.
+     */
     private static final String HEARTBEAT = "__HB__";
-    /** Final line of the Windows listener: "__END__<why>". */
+    /**
+     * Final line of the Windows listener: "__END__<why>".
+     */
     private static final String END_PREFIX = "__END__";
-
+    /**
+     * Connection attempts before giving up and letting the scheduler fall back to polling.
+     */
+    private static final int MAX_RECONNECTS = 3;
+    private static final long[] RECONNECT_DELAYS_MS = {2_000, 5_000, 15_000};
     private final XmlStorageService storage;
     // taskId, changedFileNames -> wake the task up now, naming exactly the file(s)
     // inotifywait/FileSystemWatcher reported.
     private final BiConsumer<String, Set<String>> onSettled;
-
-    private ExecutorService listenerExecutor;
-    private ScheduledExecutorService debounceExecutor;
-
     private final Map<String, ListenerHandle> activeByTaskId = new ConcurrentHashMap<>();
     private final Map<String, Long> unsupportedUntil = new ConcurrentHashMap<>();
     // Filenames accumulated for a task's pending fire, merged across every
@@ -104,11 +108,83 @@ public class RemotePushWatcher {
     // attempted" vs. "tried and failed, here's why" vs. "connected and
     // listening" are otherwise indistinguishable from the UI's point of view.
     private final Map<String, String> reasonByTaskId = new ConcurrentHashMap<>();
+    private ExecutorService listenerExecutor;
+    private ScheduledExecutorService debounceExecutor;
     private volatile boolean running = false;
 
     public RemotePushWatcher(XmlStorageService storage, BiConsumer<String, Set<String>> onSettled) {
         this.storage = storage;
         this.onSettled = onSettled;
+    }
+
+    /**
+     * Windows PowerShell writes progress and errors to stderr as CLIXML; keep only the error text, drop progress records.
+     */
+    static String plainStderr(String raw) {
+        if (raw == null || !raw.startsWith("#< CLIXML")) return raw == null ? "" : raw;
+        StringBuilder sb = new StringBuilder();
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("<S S=\"Error\">(.*?)</S>", java.util.regex.Pattern.DOTALL).matcher(raw);
+        while (m.find())
+            sb.append(m.group(1).replace("_x000D__x000A_", " ").replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&").trim()).append(' ');
+        return sb.toString().trim();
+    }
+
+    private static RemoteOs resolveOs(Credential cred) {
+        if (cred == null || cred.getOsType() == null) return null;
+        String os = cred.getOsType().trim().toUpperCase(Locale.ROOT);
+        if (os.equals("LINUX")) return RemoteOs.LINUX;
+        if (os.equals("WINDOWS")) return RemoteOs.WINDOWS;
+        return null;
+    }
+
+    /**
+     * POSIX-style path for the Linux/inotifywait branch (mirrors
+     * RemoteFileMetadataServiceFactory's SFTP path normalization).
+     */
+    private static String normalizeLinuxPath(String path) {
+        if (path == null) return "/";
+        String normalized = path.trim().replace("\\", "/").replaceAll("/+", "/");
+        if (normalized.matches("^[A-Za-z]:/.*")) normalized = "/" + normalized;
+        if (normalized.endsWith("*")) normalized = normalized.substring(0, normalized.lastIndexOf('/') + 1);
+        return normalized.isEmpty() ? "/" : normalized;
+    }
+
+    /**
+     * Native Windows-style path (backslashes, drive letter as-is — NOT the
+     * SFTP-subsystem "/C:/..." form the Linux/SFTP paths use) for the
+     * PowerShell branch, since this runs as a plain shell command, not
+     * through the sftp subsystem.
+     *
+     * <p>Critically, {@code task.getTargetPath()} is very likely already in
+     * that SFTP-subsystem form — the "Browse..." button in the task dialog
+     * goes through {@code SftpBrowseService}, which talks to the remote
+     * over the sftp subsystem, and Win32-OpenSSH's sftp-server represents
+     * Windows paths with a leading slash before the drive letter
+     * ("/C:/Daily Changes"), matching what
+     * {@code RemoteFileMetadataServiceFactory} already normalizes to for
+     * real transfers. A plain PowerShell command isn't going through the
+     * sftp subsystem, so that leading slash has to come back off first —
+     * otherwise "/C:/Daily Changes" becomes the invalid "\C:\Daily Changes"
+     * after the slash-to-backslash conversion below, {@code Test-Path}
+     * correctly reports it doesn't exist, and every single Windows INBOUND
+     * watcher task ends up POLLING_ONLY_UNSUPPORTED regardless of whether
+     * the directory is real.
+     */
+    private static String normalizeWindowsPath(String path) {
+        if (path == null) return "";
+        String normalized = path.trim();
+        if (normalized.matches("^/[A-Za-z]:(/.*)?$")) {
+            normalized = normalized.substring(1); // drop the sftp-subsystem leading slash
+        }
+        normalized = normalized.replace("/", "\\").replaceAll("\\\\+", "\\\\");
+        if (normalized.endsWith("*")) {
+            int idx = normalized.lastIndexOf('\\');
+            normalized = idx >= 0 ? normalized.substring(0, idx) : normalized;
+        }
+        if (normalized.length() > 3 && normalized.endsWith("\\")) {
+            normalized = normalized.substring(0, normalized.length() - 1);
+        }
+        return normalized;
     }
 
     public synchronized void start() {
@@ -131,8 +207,10 @@ public class RemotePushWatcher {
         pendingFires.clear();
     }
 
-    /** Same reconcile-driven pattern as {@link LocalWatchManager}: cheap,
-     *  idempotent, call on every scheduler reconcile sweep. */
+    /**
+     * Same reconcile-driven pattern as {@link LocalWatchManager}: cheap,
+     * idempotent, call on every scheduler reconcile sweep.
+     */
     public void sync(List<ScheduledTask> tasks) {
         if (!running) return;
 
@@ -161,26 +239,32 @@ public class RemotePushWatcher {
         }
     }
 
-    /** True if this task currently has a live remote listener streaming
-     *  change events (i.e. it's getting push notifications from the remote
-     *  host, not just polling), regardless of remote OS. */
+    /**
+     * True if this task currently has a live remote listener streaming
+     * change events (i.e. it's getting push notifications from the remote
+     * host, not just polling), regardless of remote OS.
+     */
     public boolean isPushActive(String taskId) {
         return activeByTaskId.containsKey(taskId);
     }
 
-    /** True if this task was recently found unsupported (missing tool, exec
-     *  refused, connection failure, etc.) and is in its backoff window —
-     *  useful for the UI to distinguish "not attempted" from "tried and failed". */
+    /**
+     * True if this task was recently found unsupported (missing tool, exec
+     * refused, connection failure, etc.) and is in its backoff window —
+     * useful for the UI to distinguish "not attempted" from "tried and failed".
+     */
     public boolean isRecentlyUnsupported(String taskId) {
         Long retryAt = unsupportedUntil.get(taskId);
         return retryAt != null && System.currentTimeMillis() < retryAt;
     }
 
-    /** Short human-readable reason for this task's current state — e.g.
-     *  "connected, streaming remote change events", "remote host has no
-     *  inotifywait", or an SSH/connection exception message. {@code null} if
-     *  this task has never been evaluated (not eligible, or sync() hasn't run
-     *  yet — e.g. right after the task was created). */
+    /**
+     * Short human-readable reason for this task's current state — e.g.
+     * "connected, streaming remote change events", "remote host has no
+     * inotifywait", or an SSH/connection exception message. {@code null} if
+     * this task has never been evaluated (not eligible, or sync() hasn't run
+     * yet — e.g. right after the task was created).
+     */
     public String getReason(String taskId) {
         return reasonByTaskId.get(taskId);
     }
@@ -220,7 +304,7 @@ public class RemotePushWatcher {
             reasonByTaskId.put(task.getId(), cred == null
                     ? "no credential resolved for this task's target username/credential"
                     : "remote OS type must be LINUX or WINDOWS (currently: "
-                        + (cred.getOsType() == null ? "unset" : cred.getOsType()) + ")");
+                    + (cred.getOsType() == null ? "unset" : cred.getOsType()) + ")");
             return;
         }
         startListener(task, cred, os);
@@ -234,6 +318,8 @@ public class RemotePushWatcher {
         pendingNamesByTaskId.remove(taskId);
     }
 
+    // ─── Command builders ───────────────────────────────────────────────────
+
     private void startListener(ScheduledTask task, Credential cred, RemoteOs os) {
         stopListener(task.getId());
         ListenerHandle handle = new ListenerHandle(task.getId(), task.getTargetPath());
@@ -241,10 +327,6 @@ public class RemotePushWatcher {
         reasonByTaskId.put(task.getId(), "connecting (" + os + ")...");
         listenerExecutor.submit(() -> runListener(task.getId(), cred, task.getTargetPath(), os, handle));
     }
-
-    /** Connection attempts before giving up and letting the scheduler fall back to polling. */
-    private static final int MAX_RECONNECTS = 3;
-    private static final long[] RECONNECT_DELAYS_MS = {2_000, 5_000, 15_000};
 
     /**
      * Runs the listener and, if its stream ends on its own (network blip, server restart, remote process
@@ -259,8 +341,12 @@ public class RemotePushWatcher {
                 if (!retry || handle.closed || attempt >= MAX_RECONNECTS) break;
                 reasonByTaskId.put(taskId, "connection lost - reconnecting (attempt " + (attempt + 1) + " of "
                         + MAX_RECONNECTS + ")...");
-                try { Thread.sleep(RECONNECT_DELAYS_MS[attempt]); }
-                catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
+                try {
+                    Thread.sleep(RECONNECT_DELAYS_MS[attempt]);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
                 attempt++;
             }
         } finally {
@@ -268,7 +354,9 @@ public class RemotePushWatcher {
         }
     }
 
-    /** One connection of the listener. Returns true if it ended unexpectedly and is worth retrying. */
+    /**
+     * One connection of the listener. Returns true if it ended unexpectedly and is worth retrying.
+     */
     private boolean runListenerOnce(String taskId, Credential cred, String rawTargetPath, RemoteOs os,
                                     ListenerHandle handle, int attempt) {
         Session session = null;
@@ -315,7 +403,8 @@ public class RemotePushWatcher {
             sl.add("Starting remote change listener: " + (remoteCommand.length() > 300
                     ? remoteCommand.substring(0, 300) + "\u2026" : remoteCommand));
             channel.setCommand(remoteCommand);
-            if (os != RemoteOs.WINDOWS) channel.setInputStream(handle.lease); // Linux: a byte every 10 s, end-of-input when we close; the Windows script does not read stdin
+            if (os != RemoteOs.WINDOWS)
+                channel.setInputStream(handle.lease); // Linux: a byte every 10 s, end-of-input when we close; the Windows script does not read stdin
             channel.setErrStream(errBuf);       // what the remote process complained about, shown if the stream ends
 
             InputStream in = channel.getInputStream();
@@ -334,7 +423,10 @@ public class RemotePushWatcher {
                 sawAnyLine = true;
                 lastOutputAt[0] = System.currentTimeMillis();
                 if (line.equals(HEARTBEAT)) continue;
-                if (line.startsWith(END_PREFIX)) { endNote = line.substring(END_PREFIX.length()); continue; }
+                if (line.startsWith(END_PREFIX)) {
+                    endNote = line.substring(END_PREFIX.length());
+                    continue;
+                }
                 if (line.contains(UNAVAILABLE_MARKER)) {
                     // Windows side now appends ":<real PS error text>" after the
                     // marker (path-not-found message, or $_.Exception.Message
@@ -380,8 +472,8 @@ public class RemotePushWatcher {
                 if (err.length() > 600) err = err.substring(0, 600) + "\u2026";
                 endReason = "the remote listener ended after " + (up / 1000) + " s (last output " + (quiet / 1000) + " s ago, "
                         + (exit >= 0 ? "exit status " + exit
-                           : session.isConnected() ? "no exit status yet, but the SSH session is still connected, so the listener stopped by itself"
-                           : "no exit status - the connection was cut")
+                        : session.isConnected() ? "no exit status yet, but the SSH session is still connected, so the listener stopped by itself"
+                        : "no exit status - the connection was cut")
                         + (endNote == null ? "" : ", the listener's last words: \"" + endNote + "\"")
                         + (err.isEmpty() ? "" : ", it said: " + err) + ")";
                 sl.add("Stream ended: " + endReason + "; session " + (session.isConnected() ? "still connected" : "disconnected"));
@@ -396,7 +488,7 @@ public class RemotePushWatcher {
                 String reason = "remote exec (" + os + ") produced no output within " + (upNow / 1000) + " s"
                         + (exit0 >= 0 ? " (exit status " + exit0 + ")" : "")
                         + (err0.isEmpty() ? " and wrote nothing to stderr - the SSH server may have refused the exec channel (some SFTP-only servers do)"
-                                          : "; the remote shell said: " + err0);
+                        : "; the remote shell said: " + err0);
                 log.info("Watcher task " + taskId + ": " + reason + "; falling back to scheduled polling only.");
                 sl.add(reason);
                 markUnsupported(taskId, reason);
@@ -424,7 +516,7 @@ public class RemotePushWatcher {
                         (handle.closed ? "watcher stopped or reconfigured"
                                 : endReason != null ? endReason : "remote side ended the stream")
                                 + (retry && !handle.closed && attempt < MAX_RECONNECTS
-                                        ? " \u2014 reconnecting (attempt " + (attempt + 1) + " of " + MAX_RECONNECTS + ")" : ""),
+                                ? " \u2014 reconnecting (attempt " + (attempt + 1) + " of " + MAX_RECONNECTS + ")" : ""),
                         System.currentTimeMillis() - openedAt, sl.text());
             }
         }
@@ -436,25 +528,18 @@ public class RemotePushWatcher {
         return until != null && System.currentTimeMillis() < until;
     }
 
-    // ─── Command builders ───────────────────────────────────────────────────
-
-    /** Linux: guarded single command (see {@code resources/scripts/watcher/linux/listener.sh}). */
+    /**
+     * Linux: guarded single command (see {@code resources/scripts/watcher/linux/listener.sh}).
+     */
     private String buildLinuxCommand(String rawTargetPath) {
         return ListenerScripts.linux(normalizeLinuxPath(rawTargetPath), HEARTBEAT, UNAVAILABLE_MARKER);
     }
 
-    /** Windows: PowerShell around System.IO.FileSystemWatcher, sent with -EncodedCommand (see {@code resources/scripts/watcher/windows/}). */
+    /**
+     * Windows: PowerShell around System.IO.FileSystemWatcher, sent with -EncodedCommand (see {@code resources/scripts/watcher/windows/}).
+     */
     private String buildWindowsCommand(String rawTargetPath) {
         return ListenerScripts.windows(normalizeWindowsPath(rawTargetPath), HEARTBEAT, END_PREFIX, UNAVAILABLE_MARKER);
-    }
-
-    /** Windows PowerShell writes progress and errors to stderr as CLIXML; keep only the error text, drop progress records. */
-    static String plainStderr(String raw) {
-        if (raw == null || !raw.startsWith("#< CLIXML")) return raw == null ? "" : raw;
-        StringBuilder sb = new StringBuilder();
-        java.util.regex.Matcher m = java.util.regex.Pattern.compile("<S S=\"Error\">(.*?)</S>", java.util.regex.Pattern.DOTALL).matcher(raw);
-        while (m.find()) sb.append(m.group(1).replace("_x000D__x000A_", " ").replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&").trim()).append(' ');
-        return sb.toString().trim();
     }
 
     private void markUnsupported(String taskId, String reason) {
@@ -490,6 +575,8 @@ public class RemotePushWatcher {
         });
     }
 
+    // ─── Path helpers ───────────────────────────────────────────────────────
+
     private Credential resolveCredential(ScheduledTask task) {
         String uname = task.getTargetUsername();
         if (uname != null && !uname.isEmpty()) {
@@ -503,75 +590,25 @@ public class RemotePushWatcher {
         return null;
     }
 
-    private enum RemoteOs { LINUX, WINDOWS }
+    private enum RemoteOs {LINUX, WINDOWS}
 
-    private static RemoteOs resolveOs(Credential cred) {
-        if (cred == null || cred.getOsType() == null) return null;
-        String os = cred.getOsType().trim().toUpperCase(Locale.ROOT);
-        if (os.equals("LINUX")) return RemoteOs.LINUX;
-        if (os.equals("WINDOWS")) return RemoteOs.WINDOWS;
-        return null;
-    }
-
-    // ─── Path helpers ───────────────────────────────────────────────────────
-
-    /** POSIX-style path for the Linux/inotifywait branch (mirrors
-     *  RemoteFileMetadataServiceFactory's SFTP path normalization). */
-    private static String normalizeLinuxPath(String path) {
-        if (path == null) return "/";
-        String normalized = path.trim().replace("\\", "/").replaceAll("/+", "/");
-        if (normalized.matches("^[A-Za-z]:/.*")) normalized = "/" + normalized;
-        if (normalized.endsWith("*")) normalized = normalized.substring(0, normalized.lastIndexOf('/') + 1);
-        return normalized.isEmpty() ? "/" : normalized;
-    }
-
-    /** Native Windows-style path (backslashes, drive letter as-is — NOT the
-     *  SFTP-subsystem "/C:/..." form the Linux/SFTP paths use) for the
-     *  PowerShell branch, since this runs as a plain shell command, not
-     *  through the sftp subsystem.
-     *
-     *  <p>Critically, {@code task.getTargetPath()} is very likely already in
-     *  that SFTP-subsystem form — the "Browse..." button in the task dialog
-     *  goes through {@code SftpBrowseService}, which talks to the remote
-     *  over the sftp subsystem, and Win32-OpenSSH's sftp-server represents
-     *  Windows paths with a leading slash before the drive letter
-     *  ("/C:/Daily Changes"), matching what
-     *  {@code RemoteFileMetadataServiceFactory} already normalizes to for
-     *  real transfers. A plain PowerShell command isn't going through the
-     *  sftp subsystem, so that leading slash has to come back off first —
-     *  otherwise "/C:/Daily Changes" becomes the invalid "\C:\Daily Changes"
-     *  after the slash-to-backslash conversion below, {@code Test-Path}
-     *  correctly reports it doesn't exist, and every single Windows INBOUND
-     *  watcher task ends up POLLING_ONLY_UNSUPPORTED regardless of whether
-     *  the directory is real. */
-    private static String normalizeWindowsPath(String path) {
-        if (path == null) return "";
-        String normalized = path.trim();
-        if (normalized.matches("^/[A-Za-z]:(/.*)?$")) {
-            normalized = normalized.substring(1); // drop the sftp-subsystem leading slash
-        }
-        normalized = normalized.replace("/", "\\").replaceAll("\\\\+", "\\\\");
-        if (normalized.endsWith("*")) {
-            int idx = normalized.lastIndexOf('\\');
-            normalized = idx >= 0 ? normalized.substring(0, idx) : normalized;
-        }
-        if (normalized.length() > 3 && normalized.endsWith("\\")) {
-            normalized = normalized.substring(0, normalized.length() - 1);
-        }
-        return normalized;
-    }
-
-
-
-    /** The remote listener's stdin: one newline every 10 s (its lease), then end-of-input once closed. */
+    /**
+     * The remote listener's stdin: one newline every 10 s (its lease), then end-of-input once closed.
+     */
     static final class LeaseStream extends InputStream {
         private final Object lock = new Object();
         private volatile boolean ended;
 
-        @Override public int read(byte[] b, int off, int len) {
+        @Override
+        public int read(byte[] b, int off, int len) {
             synchronized (lock) {
                 if (!ended) {
-                    try { lock.wait(10_000); } catch (InterruptedException e) { Thread.currentThread().interrupt(); return -1; }
+                    try {
+                        lock.wait(10_000);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return -1;
+                    }
                 }
             }
             if (ended) return -1;
@@ -579,22 +616,28 @@ public class RemotePushWatcher {
             return 1;
         }
 
-        @Override public int read() {
+        @Override
+        public int read() {
             byte[] one = new byte[1];
             int n = read(one, 0, 1);
             return n < 0 ? -1 : one[0];
         }
 
-        void end() { synchronized (lock) { ended = true; lock.notifyAll(); } }
+        void end() {
+            synchronized (lock) {
+                ended = true;
+                lock.notifyAll();
+            }
+        }
     }
 
     private static final class ListenerHandle {
         final String taskId;
         final String path;
+        final LeaseStream lease = new LeaseStream();
         volatile boolean closed = false;
         volatile Session session;
         volatile ChannelExec channel;
-        final LeaseStream lease = new LeaseStream();
 
         ListenerHandle(String taskId, String path) {
             this.taskId = taskId;
@@ -614,13 +657,17 @@ public class RemotePushWatcher {
             try {
                 long until = System.currentTimeMillis() + 1500;
                 while (channel != null && !channel.isClosed() && System.currentTimeMillis() < until) Thread.sleep(50);
-            } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            }
             try {
                 if (channel != null && channel.isConnected()) channel.disconnect();
-            } catch (Exception ignored) {}
+            } catch (Exception ignored) {
+            }
             try {
                 if (session != null && session.isConnected()) session.disconnect();
-            } catch (Exception ignored) {}
+            } catch (Exception ignored) {
+            }
         }
     }
 }

@@ -1,11 +1,7 @@
 package service;
 
 import java.io.File;
-import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.ResultSet;
-import java.sql.SQLException;
-import java.sql.Statement;
+import java.sql.*;
 import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
@@ -45,29 +41,9 @@ import java.util.logging.Logger;
  */
 public final class DbChangeMonitor {
 
-    public enum Topic { APP, TASKS, RUNS, BGLOG }
-
     private static final Logger log = Logger.getLogger(DbChangeMonitor.class.getName());
     private static final long POLL_MS = 500;
-
     private static final ConcurrentHashMap<String, DbChangeMonitor> INSTANCES = new ConcurrentHashMap<>();
-
-    /** The shared monitor for a data directory (created and started on first use). */
-    public static DbChangeMonitor forDataDir(File dataDir) {
-        String key = dataDir.getAbsoluteFile().toPath().normalize().toString();
-        return INSTANCES.computeIfAbsent(key, k -> new DbChangeMonitor(dataDir).start());
-    }
-
-    /** One watched file: its dedicated connection and the last data_version it reported. */
-    private static final class Watch {
-        final File file;
-        final Topic topic;
-        Connection conn;
-        long lastVersion = Long.MIN_VALUE;
-        boolean baselined;
-        Watch(File file, Topic topic) { this.file = file; this.topic = topic; }
-    }
-
     private final Watch[] watches;
     private final Map<Topic, AtomicLong> generations = new EnumMap<>(Topic.class);
     private final Map<Topic, List<Runnable>> listeners = new EnumMap<>(Topic.class);
@@ -79,19 +55,56 @@ public final class DbChangeMonitor {
     private volatile long lastPollMs;
     private volatile boolean started;
     private ScheduledExecutorService ticker;
-
     private DbChangeMonitor(File dataDir) {
         for (Topic t : Topic.values()) {
             generations.put(t, new AtomicLong());
             fired.put(t, new LongAdder());
             listeners.put(t, new CopyOnWriteArrayList<>());
         }
-        watches = new Watch[] {
+        watches = new Watch[]{
                 new Watch(new File(dataDir, "app.db"), Topic.APP),
                 new Watch(new File(dataDir, "run_history.db"), Topic.RUNS),
                 new Watch(new File(dataDir, BackgroundLogService.FILE_NAME), Topic.BGLOG),
         };
     }
+
+    /**
+     * The shared monitor for a data directory (created and started on first use).
+     */
+    public static DbChangeMonitor forDataDir(File dataDir) {
+        String key = dataDir.getAbsoluteFile().toPath().normalize().toString();
+        return INSTANCES.computeIfAbsent(key, k -> new DbChangeMonitor(dataDir).start());
+    }
+
+    /**
+     * Version counter the {@code tasks} triggers maintain; -1 if the table is not there (older database).
+     */
+    private static long readTasksVersion(Connection c) {
+        try {
+            return readLong(c, "SELECT ver FROM change_log WHERE topic='tasks'");
+        } catch (SQLException e) {
+            return -1;
+        }
+    }
+
+    private static long readLong(Connection c, String sql) throws SQLException {
+        try (Statement st = c.createStatement(); ResultSet rs = st.executeQuery(sql)) {
+            return rs.next() ? rs.getLong(1) : -1;
+        }
+    }
+
+    private static void closeQuietly(Watch w) {
+        if (w.conn != null) {
+            try {
+                w.conn.close();
+            } catch (SQLException ignored) {
+            }
+        }
+        w.conn = null;
+        w.lastVersion = Long.MIN_VALUE; // after a reconnect the next reading always counts as a change (we may have missed one)
+    }
+
+    // ------------------------------------------------------------------ public API
 
     private DbChangeMonitor start() {
         if (started) return this;
@@ -101,15 +114,23 @@ public final class DbChangeMonitor {
         return this;
     }
 
-    // ------------------------------------------------------------------ public API
+    /**
+     * Monotonic counter for a topic; compare against a remembered value to detect change.
+     */
+    public long generation(Topic topic) {
+        return generations.get(topic).get();
+    }
 
-    /** Monotonic counter for a topic; compare against a remembered value to detect change. */
-    public long generation(Topic topic) { return generations.get(topic).get(); }
+    /**
+     * Epoch-millis of the last completed poll (0 = never). Lets callers judge whether the signal is alive.
+     */
+    public long lastPollMillis() {
+        return lastPollMs;
+    }
 
-    /** Epoch-millis of the last completed poll (0 = never). Lets callers judge whether the signal is alive. */
-    public long lastPollMillis() { return lastPollMs; }
-
-    /** One-line summary for logs: poll count, signals per topic, reconnects. */
+    /**
+     * One-line summary for logs: poll count, signals per topic, reconnects.
+     */
     public String describe() {
         return "polls=" + polls.sum()
                 + " signals[app=" + fired.get(Topic.APP).sum() + " tasks=" + fired.get(Topic.TASKS).sum()
@@ -117,15 +138,23 @@ public final class DbChangeMonitor {
                 + " reconnects=" + reconnects.sum() + " listenerErrors=" + listenerErrors.sum();
     }
 
-    /** Total signals fired for a topic since start (for tests and diagnostics). */
-    public long signalCount(Topic topic) { return fired.get(topic).sum(); }
+    /**
+     * Total signals fired for a topic since start (for tests and diagnostics).
+     */
+    public long signalCount(Topic topic) {
+        return fired.get(topic).sum();
+    }
 
-    /** Runs {@code onChange} (on the monitor thread) whenever the topic changes. Returns an unsubscribe action. */
+    /**
+     * Runs {@code onChange} (on the monitor thread) whenever the topic changes. Returns an unsubscribe action.
+     */
     public Runnable subscribe(Topic topic, Runnable onChange) {
         List<Runnable> l = listeners.get(topic);
         l.add(onChange);
         return () -> l.remove(onChange);
     }
+
+    // ------------------------------------------------------------------ polling
 
     /**
      * Blocks until {@code topic}'s generation differs from {@code seen}, or {@code timeoutMs} elapses.
@@ -146,8 +175,6 @@ public final class DbChangeMonitor {
         return generation(topic);
     }
 
-    // ------------------------------------------------------------------ polling
-
     private void pollOnce() {
         try {
             polls.increment();
@@ -165,7 +192,9 @@ public final class DbChangeMonitor {
             if (w.conn == null) {
                 Class.forName("org.sqlite.JDBC");
                 w.conn = DriverManager.getConnection("jdbc:sqlite:" + w.file.getAbsolutePath());
-                try (Statement st = w.conn.createStatement()) { st.execute("PRAGMA busy_timeout=2000"); }
+                try (Statement st = w.conn.createStatement()) {
+                    st.execute("PRAGMA busy_timeout=2000");
+                }
             }
             long v = readLong(w.conn, "PRAGMA data_version");
             if (v == w.lastVersion) return;
@@ -180,7 +209,10 @@ public final class DbChangeMonitor {
             fire(w.topic);
             if (w.topic == Topic.APP) {
                 long tv = readTasksVersion(w.conn);
-                if (tv != lastTasksVer) { lastTasksVer = tv; fire(Topic.TASKS); }
+                if (tv != lastTasksVer) {
+                    lastTasksVer = tv;
+                    fire(Topic.TASKS);
+                }
             }
         } catch (SQLException | ClassNotFoundException e) {
             // Busy or briefly unreadable: drop the connection and retry next tick. A missed beat only delays.
@@ -192,27 +224,34 @@ public final class DbChangeMonitor {
     private void fire(Topic topic) {
         generations.get(topic).incrementAndGet();
         fired.get(topic).increment();
-        synchronized (wake) { wake.notifyAll(); }
+        synchronized (wake) {
+            wake.notifyAll();
+        }
         for (Runnable r : listeners.get(topic)) {
-            try { r.run(); } catch (Throwable t) { listenerErrors.increment(); log.log(Level.WARNING, "change listener failed", t); }
+            try {
+                r.run();
+            } catch (Throwable t) {
+                listenerErrors.increment();
+                log.log(Level.WARNING, "change listener failed", t);
+            }
         }
     }
 
-    /** Version counter the {@code tasks} triggers maintain; -1 if the table is not there (older database). */
-    private static long readTasksVersion(Connection c) {
-        try { return readLong(c, "SELECT ver FROM change_log WHERE topic='tasks'"); }
-        catch (SQLException e) { return -1; }
-    }
+    public enum Topic {APP, TASKS, RUNS, BGLOG}
 
-    private static long readLong(Connection c, String sql) throws SQLException {
-        try (Statement st = c.createStatement(); ResultSet rs = st.executeQuery(sql)) {
-            return rs.next() ? rs.getLong(1) : -1;
+    /**
+     * One watched file: its dedicated connection and the last data_version it reported.
+     */
+    private static final class Watch {
+        final File file;
+        final Topic topic;
+        Connection conn;
+        long lastVersion = Long.MIN_VALUE;
+        boolean baselined;
+
+        Watch(File file, Topic topic) {
+            this.file = file;
+            this.topic = topic;
         }
-    }
-
-    private static void closeQuietly(Watch w) {
-        if (w.conn != null) { try { w.conn.close(); } catch (SQLException ignored) { } }
-        w.conn = null;
-        w.lastVersion = Long.MIN_VALUE; // after a reconnect the next reading always counts as a change (we may have missed one)
     }
 }

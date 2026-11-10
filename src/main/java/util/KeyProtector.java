@@ -16,31 +16,25 @@ import java.util.concurrent.TimeUnit;
  */
 public interface KeyProtector {
 
-    byte[] protect(byte[] plain) throws IOException;
-
-    byte[] unprotect(byte[] protectedBytes) throws IOException;
-
-    /** The protector for this operating system, or null if there is none (non-Windows). */
+    /**
+     * The protector for this operating system, or null if there is none (non-Windows).
+     */
     static KeyProtector system() {
         return System.getProperty("os.name", "").toLowerCase().contains("windows") ? new WindowsDpapi() : null;
     }
 
-    /** DPAPI via the PowerShell that ships with every supported Windows. Data goes through stdin/stdout only. */
+    byte[] protect(byte[] plain) throws IOException;
+
+    byte[] unprotect(byte[] protectedBytes) throws IOException;
+
+    /**
+     * DPAPI via the PowerShell that ships with every supported Windows. Data goes through stdin/stdout only.
+     */
     final class WindowsDpapi implements KeyProtector {
 
         // Both scripts read one base64 line from stdin and write one base64 line to stdout (resources/scripts/dpapi.ps1).
         static final String PROTECT_SCRIPT = Scripts.oneLine("security/dpapi.ps1", "OPERATION", "Protect");
         static final String UNPROTECT_SCRIPT = Scripts.oneLine("security/dpapi.ps1", "OPERATION", "Unprotect");
-
-        @Override
-        public byte[] protect(byte[] plain) throws IOException {
-            return run(PROTECT_SCRIPT, plain);
-        }
-
-        @Override
-        public byte[] unprotect(byte[] protectedBytes) throws IOException {
-            return run(UNPROTECT_SCRIPT, protectedBytes);
-        }
 
         private static byte[] run(String script, byte[] input) throws IOException {
             Process p = new ProcessBuilder("powershell.exe", "-NoProfile", "-NonInteractive",
@@ -65,6 +59,16 @@ public interface KeyProtector {
             } finally {
                 p.destroy();
             }
+        }
+
+        @Override
+        public byte[] protect(byte[] plain) throws IOException {
+            return run(PROTECT_SCRIPT, plain);
+        }
+
+        @Override
+        public byte[] unprotect(byte[] protectedBytes) throws IOException {
+            return run(UNPROTECT_SCRIPT, protectedBytes);
         }
     }
 }

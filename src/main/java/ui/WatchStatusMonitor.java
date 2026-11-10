@@ -32,18 +32,12 @@ import java.util.function.Consumer;
  */
 public class WatchStatusMonitor {
 
-    /** One observed fallback (or newly-confirmed-unsupported) transition. */
-    public record Event(String taskId, String taskName, String fromMode, String toMode,
-                         String detail, LocalDateTime at) {}
-
     private static final int POLL_INTERVAL_MS = 5000;
     private static final int MAX_EVENTS = 100;
-
     private final XmlStorageService storage;
     private final TaskSchedulerService scheduler;
     private final Path daemonStatusFile;
     private final Consumer<Event> onNotableTransition;
-
     // taskId -> last-seen mode name (raw TaskSchedulerService.WatchMode#name()).
     // Not persisted across restarts — a task's mode is simply "not yet known"
     // on first poll after launch, which is intentionally NOT treated as a
@@ -52,9 +46,12 @@ public class WatchStatusMonitor {
     private final Map<String, String> lastKnownMode = new HashMap<>();
     private final Deque<Event> recentEvents = new ArrayDeque<>();
     private final Timer timer;
+    private final java.util.concurrent.atomic.AtomicBoolean polling = new java.util.concurrent.atomic.AtomicBoolean();
+    private Runnable streamUnsub = () -> {
+    };
 
     public WatchStatusMonitor(XmlStorageService storage, TaskSchedulerService scheduler,
-                               Consumer<Event> onNotableTransition) {
+                              Consumer<Event> onNotableTransition) {
         this.storage = storage;
         this.scheduler = scheduler;
         this.daemonStatusFile = storage.getDataDir().toPath().resolve("scheduler-status-daemon.dat");
@@ -62,8 +59,6 @@ public class WatchStatusMonitor {
         this.timer = new Timer(POLL_INTERVAL_MS, e -> poll());
         this.timer.setInitialDelay(3000);
     }
-
-    private Runnable streamUnsub = () -> { };
 
     public void start() {
         timer.start();
@@ -79,7 +74,9 @@ public class WatchStatusMonitor {
         streamUnsub.run();
     }
 
-    /** Most-recent-first list of recent fallback transitions, for display in NotificationPanel. */
+    /**
+     * Most-recent-first list of recent fallback transitions, for display in NotificationPanel.
+     */
     public synchronized List<Event> getRecentEvents() {
         return new ArrayList<>(recentEvents);
     }
@@ -88,17 +85,19 @@ public class WatchStatusMonitor {
         return recentEvents.size();
     }
 
-    /** Clears the recorded event history (and so the bell badge's contribution
-     *  from it) — does not affect live watch/push state, only this local
-     *  record of past transitions. Called from the Watcher tab's "Clear"
-     *  button once the operator has seen and dealt with the fallbacks. */
+    /**
+     * Clears the recorded event history (and so the bell badge's contribution
+     * from it) — does not affect live watch/push state, only this local
+     * record of past transitions. Called from the Watcher tab's "Clear"
+     * button once the operator has seen and dealt with the fallbacks.
+     */
     public synchronized void clearEvents() {
         recentEvents.clear();
     }
 
-    private final java.util.concurrent.atomic.AtomicBoolean polling = new java.util.concurrent.atomic.AtomicBoolean();
-
-    /** Runs the (file + storage) poll off the EDT, then reports notable transitions on the EDT. */
+    /**
+     * Runs the (file + storage) poll off the EDT, then reports notable transitions on the EDT.
+     */
     private void poll() {
         if (!polling.compareAndSet(false, true)) return; // previous poll still running
         Async.run(() -> {
@@ -156,14 +155,23 @@ public class WatchStatusMonitor {
         return notable;
     }
 
-    /** True for "was actively pushing, now polling" and for "just confirmed
-     *  unsupported" — the two transitions worth interrupting the operator for.
-     *  Plain POLLING_ONLY -&gt; POLLING_ONLY re-evaluations, and the very first
-     *  observation of any task's mode, are not notable. */
+    /**
+     * True for "was actively pushing, now polling" and for "just confirmed
+     * unsupported" — the two transitions worth interrupting the operator for.
+     * Plain POLLING_ONLY -&gt; POLLING_ONLY re-evaluations, and the very first
+     * observation of any task's mode, are not notable.
+     */
     private boolean isNotable(String prev, String cur) {
         boolean wasPushing = prev.equals("NATIVE_WATCH") || prev.equals("REMOTE_PUSH");
         boolean nowPolling = cur.equals("POLLING_ONLY") || cur.equals("POLLING_ONLY_UNSUPPORTED");
         boolean newlyUnsupported = cur.equals("POLLING_ONLY_UNSUPPORTED") && !prev.equals("POLLING_ONLY_UNSUPPORTED");
         return (wasPushing && nowPolling) || newlyUnsupported;
+    }
+
+    /**
+     * One observed fallback (or newly-confirmed-unsupported) transition.
+     */
+    public record Event(String taskId, String taskName, String fromMode, String toMode,
+                        String detail, LocalDateTime at) {
     }
 }

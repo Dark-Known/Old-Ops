@@ -13,10 +13,14 @@ import java.util.List;
  */
 public interface SftpClient extends AutoCloseable {
 
-    /** Entries of a remote directory (without "." and ".."). */
+    /**
+     * Entries of a remote directory (without "." and "..").
+     */
     List<RemoteEntry> list(String remoteDir) throws IOException;
 
-    /** Size/mtime of one remote path, or null if it does not exist. */
+    /**
+     * Size/mtime of one remote path, or null if it does not exist.
+     */
     RemoteEntry stat(String remotePath) throws IOException;
 
     /**
@@ -32,10 +36,14 @@ public interface SftpClient extends AutoCloseable {
      */
     void upload(File local, String remotePath) throws IOException;
 
-    /** Creates the directory and any missing parents. No error if it already exists. */
+    /**
+     * Creates the directory and any missing parents. No error if it already exists.
+     */
     void mkdirs(String remoteDir) throws IOException;
 
-    /** Deletes a remote file. Returns false if it did not exist. */
+    /**
+     * Deletes a remote file. Returns false if it did not exist.
+     */
     boolean delete(String remotePath) throws IOException;
 
     /**
@@ -44,7 +52,9 @@ public interface SftpClient extends AutoCloseable {
      */
     void rename(String from, String to) throws IOException;
 
-    /** Aborts whatever is running and closes the connection. Safe to call more than once. */
+    /**
+     * Aborts whatever is running and closes the connection. Safe to call more than once.
+     */
     void cancel();
 
     @Override

@@ -1,10 +1,11 @@
 package ui;
 
+import model.ScheduledTask;
+
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
 import javax.swing.table.DefaultTableCellRenderer;
 import javax.swing.table.DefaultTableModel;
-import model.ScheduledTask;
 import java.awt.*;
 import java.time.Duration;
 import java.time.LocalDateTime;
@@ -34,37 +35,25 @@ import java.util.function.BiConsumer;
  */
 public class QueueMonitorView extends JPanel {
 
-    public record PendingRow(String taskName, String scheduleType, int attempt, LocalDateTime dueAt) {}
-
-    /** Which table (see service.RunHistoryService) an ActivityRow's runId refers to — the two tables have independent autoincrement id sequences, so this is required to look the exact row back up (see ActivityEventPopup). */
-    public enum RunSource { RUN_HISTORY, ACTIVITY }
-
-    public record ActivityRow(long runId, RunSource source, String taskId, String taskName, int attempt,
-                               LocalDateTime startedAt, LocalDateTime finishedAt, boolean errored, String errorMessage,
-                               String taskType, ScheduledTask.TransferDirection direction) {}
-
     private static final Color COLOR_OVERDUE = new Color(0xFBF3E3); // pale wheat
     private static final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("HH:mm:ss");
     private static final int HIGHLIGHT_MILLIS = 1400;
-
-    private final CardLayout cards = new CardLayout();
-    private final JPanel cardHost = new JPanel(cards);
     private static final String CARD_CONTENT = "content";
     private static final String CARD_OFFLINE = "offline";
-
+    private final CardLayout cards = new CardLayout();
+    private final JPanel cardHost = new JPanel(cards);
+    private final Set<String> highlightedKeys = new HashSet<>();
     private DefaultTableModel pendingModel;
     private JTable pendingTable;
     private DefaultListModel<ActivityRow> activityListModel;
     private JList<ActivityRow> activityList;
     private JLabel offlineLabel;
     private BiConsumer<ActivityRow, Point> activityClickListener;
-
     // Keys (run id) seen in the previous update() call — anything new this
     // time gets a brief highlight. Keys currently mid-highlight, so the
     // renderer knows to paint them differently until their Timer clears
     // them back out.
     private Set<String> previousKeys = new HashSet<>();
-    private final Set<String> highlightedKeys = new HashSet<>();
     // False until the first update() call completes — see update() below:
     // without this, every row already present the moment the panel opens
     // looks "new" (previousKeys starts empty), so the entire list flashes
@@ -77,6 +66,38 @@ public class QueueMonitorView extends JPanel {
         cardHost.add(buildContent(), CARD_CONTENT);
         cardHost.add(buildOfflineCard(), CARD_OFFLINE);
         add(cardHost, BorderLayout.CENTER);
+    }
+
+    /**
+     * Uniquely identifies one run-history row — the DB row id, once every
+     * {@link ActivityRow} carries its true {@code runId} rather than being
+     * derived from task id + started-at (which could collide: SQLite
+     * timestamps here are second-precision, so two rows for the same task
+     * starting within the same second previously looked identical).
+     */
+    private static String keyOf(ActivityRow row) {
+        return String.valueOf(row.runId());
+    }
+
+    static String formatCountdown(LocalDateTime dueAt, LocalDateTime now) {
+        Duration d = Duration.between(now, dueAt);
+        if (d.isNegative()) return "overdue " + formatDuration(d.abs());
+        return "in " + formatDuration(d);
+    }
+
+    static String formatDuration(Duration d) {
+        long totalSeconds = Math.max(0, d.getSeconds());
+        long h = totalSeconds / 3600;
+        long m = (totalSeconds % 3600) / 60;
+        long s = totalSeconds % 60;
+        if (h > 0) return h + "h " + m + "m";
+        if (m > 0) return m + "m " + s + "s";
+        return s + "s";
+    }
+
+    private static String shorten(String s, int max) {
+        if (s == null) return "";
+        return s.length() <= max ? s : s.substring(0, max - 1) + "…";
     }
 
     private JComponent buildContent() {
@@ -102,7 +123,10 @@ public class QueueMonitorView extends JPanel {
         panel.add(sectionHeader("Pending Events — soonest due first"), BorderLayout.NORTH);
 
         pendingModel = new DefaultTableModel(new Object[]{"Task", "Schedule", "Attempt", "Due At", "In"}, 0) {
-            @Override public boolean isCellEditable(int row, int col) { return false; }
+            @Override
+            public boolean isCellEditable(int row, int col) {
+                return false;
+            }
         };
         pendingTable = new JTable(pendingModel);
         pendingTable.setRowHeight(24);
@@ -111,7 +135,7 @@ public class QueueMonitorView extends JPanel {
         pendingTable.setDefaultRenderer(Object.class, new DefaultTableCellRenderer() {
             @Override
             public Component getTableCellRendererComponent(JTable table, Object value, boolean isSelected,
-                                                             boolean hasFocus, int row, int col) {
+                                                           boolean hasFocus, int row, int col) {
                 Component c = super.getTableCellRendererComponent(table, value, isSelected, hasFocus, row, col);
                 if (!isSelected) {
                     Object inCol = table.getValueAt(row, 4);
@@ -141,7 +165,8 @@ public class QueueMonitorView extends JPanel {
         // already a lightweight "just tell me what happened" glance rather
         // than a big detail dialog. See setActivityRowClickListener.
         activityList.addMouseListener(new java.awt.event.MouseAdapter() {
-            @Override public void mouseClicked(java.awt.event.MouseEvent e) {
+            @Override
+            public void mouseClicked(java.awt.event.MouseEvent e) {
                 if (activityClickListener == null) return;
                 int index = activityList.locationToIndex(e.getPoint());
                 if (index < 0 || !activityList.getCellBounds(index, index).contains(e.getPoint())) return;
@@ -158,26 +183,21 @@ public class QueueMonitorView extends JPanel {
         return l;
     }
 
-    /** Shows the offline/unavailable placeholder instead of the tables. */
+    /**
+     * Shows the offline/unavailable placeholder instead of the tables.
+     */
     public void showUnavailable(String message) {
         offlineLabel.setText(message);
         cards.show(cardHost, CARD_OFFLINE);
     }
 
-    /** Uniquely identifies one run-history row — the DB row id, once every
-     *  {@link ActivityRow} carries its true {@code runId} rather than being
-     *  derived from task id + started-at (which could collide: SQLite
-     *  timestamps here are second-precision, so two rows for the same task
-     *  starting within the same second previously looked identical). */
-    private static String keyOf(ActivityRow row) {
-        return String.valueOf(row.runId());
-    }
-
-    /** Pushes a fresh snapshot into the tables. {@code poolSize}/{@code activeWorkers} are
-     *  currently unused by this view (the Active Scheduler table they used to feed was
-     *  removed — the panel/tab title now conveys which scheduler is active instead — kept
-     *  as parameters so callers don't need to change) but reserved in case a future compact
-     *  "N/M workers busy" indicator is added back in a less redundant form. */
+    /**
+     * Pushes a fresh snapshot into the tables. {@code poolSize}/{@code activeWorkers} are
+     * currently unused by this view (the Active Scheduler table they used to feed was
+     * removed — the panel/tab title now conveys which scheduler is active instead — kept
+     * as parameters so callers don't need to change) but reserved in case a future compact
+     * "N/M workers busy" indicator is added back in a less redundant form.
+     */
     public void update(int poolSize, int activeWorkers, List<PendingRow> pending, List<ActivityRow> activity) {
         cards.show(cardHost, CARD_CONTENT);
 
@@ -253,6 +273,19 @@ public class QueueMonitorView extends JPanel {
     }
 
     /**
+     * Which table (see service.RunHistoryService) an ActivityRow's runId refers to — the two tables have independent autoincrement id sequences, so this is required to look the exact row back up (see ActivityEventPopup).
+     */
+    public enum RunSource {RUN_HISTORY, ACTIVITY}
+
+    public record PendingRow(String taskName, String scheduleType, int attempt, LocalDateTime dueAt) {
+    }
+
+    public record ActivityRow(long runId, RunSource source, String taskId, String taskName, int attempt,
+                              LocalDateTime startedAt, LocalDateTime finishedAt, boolean errored, String errorMessage,
+                              String taskType, ScheduledTask.TransferDirection direction) {
+    }
+
+    /**
      * One compact line per event: a kind symbol, task name, outcome, and
      * timing — density over the two-line card look used elsewhere, since
      * this is a live stream meant to be scanned quickly, not browsed.
@@ -284,7 +317,9 @@ public class QueueMonitorView extends JPanel {
             add(time, BorderLayout.EAST);
         }
 
-        /** Symbol for the kind of event this row represents — see the class doc above. */
+        /**
+         * Symbol for the kind of event this row represents — see the class doc above.
+         */
         private String symbolFor(ActivityRow row) {
             boolean isDetection = row.errorMessage() != null && row.errorMessage().startsWith("Detected ");
             boolean isStarted = row.errorMessage() != null && row.errorMessage().startsWith("Started \u2014");
@@ -300,14 +335,14 @@ public class QueueMonitorView extends JPanel {
 
         @Override
         public Component getListCellRendererComponent(JList<? extends ActivityRow> list, ActivityRow row,
-                                                        int index, boolean isSelected, boolean cellHasFocus) {
+                                                      int index, boolean isSelected, boolean cellHasFocus) {
             String key = keyOf(row);
             boolean highlighted = highlightedKeys.contains(key);
 
             Duration d = Duration.between(row.startedAt(), row.finishedAt());
             String outcome = row.errored() ? "Failed: " + shorten(row.errorMessage(), 70)
                     : (row.errorMessage() != null && !row.errorMessage().isBlank()
-                            ? shorten(row.errorMessage(), 70) : "Succeeded");
+                    ? shorten(row.errorMessage(), 70) : "Succeeded");
 
             text.setText(row.taskName() + (row.attempt() > 0 ? " (retry " + row.attempt() + ")" : "")
                     + "  \u2014  " + outcome);
@@ -340,26 +375,5 @@ public class QueueMonitorView extends JPanel {
             setOpaque(true);
             return this;
         }
-    }
-
-    static String formatCountdown(LocalDateTime dueAt, LocalDateTime now) {
-        Duration d = Duration.between(now, dueAt);
-        if (d.isNegative()) return "overdue " + formatDuration(d.abs());
-        return "in " + formatDuration(d);
-    }
-
-    static String formatDuration(Duration d) {
-        long totalSeconds = Math.max(0, d.getSeconds());
-        long h = totalSeconds / 3600;
-        long m = (totalSeconds % 3600) / 60;
-        long s = totalSeconds % 60;
-        if (h > 0) return h + "h " + m + "m";
-        if (m > 0) return m + "m " + s + "s";
-        return s + "s";
-    }
-
-    private static String shorten(String s, int max) {
-        if (s == null) return "";
-        return s.length() <= max ? s : s.substring(0, max - 1) + "…";
     }
 }

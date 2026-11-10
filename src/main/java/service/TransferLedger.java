@@ -4,12 +4,7 @@ import model.FileSelection.SentPolicy;
 
 import java.io.File;
 import java.io.IOException;
-import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
-import java.sql.SQLException;
-import java.sql.Statement;
+import java.sql.*;
 import java.util.Collection;
 import java.util.HashSet;
 import java.util.Set;
@@ -34,40 +29,23 @@ public final class TransferLedger {
 
     public static final String FILE_NAME = "transfer_ledger.db";
     public static final int RETENTION_DAYS = 180;
-
-    /** One sent file as seen on the source side. */
-    public record Entry(String name, long size, long mtimeMillis) {}
-
-    /** Everything remembered for one task, loaded once per run so checking a file costs nothing. */
-    public static final class Snapshot {
-        private final Set<String> names = new HashSet<>();
-        private final Set<String> exact = new HashSet<>();
-
-        private static String key(String name, long size, long mtime) { return name + '\u0000' + size + '\u0000' + mtime; }
-
-        /** Whether this file counts as already sent under {@code policy}. */
-        public boolean wasSent(String name, long size, long mtimeMillis, SentPolicy policy) {
-            if (policy == SentPolicy.ANY_NAME) return names.contains(name);
-            if (policy == SentPolicy.UNCHANGED) return exact.contains(key(name, size, mtimeMillis));
-            return false;
-        }
-
-        /** Number of remembered files (distinct name/size/time combinations). */
-        public int size() { return exact.size(); }
-    }
-
     private final File dbFile;
     private final LongSupplier clock;
 
-    public TransferLedger(File dataDir) { this(dataDir, System::currentTimeMillis); }
-
-    /** For tests: a clock that can be moved to check the retention. */
+    public TransferLedger(File dataDir) {
+        this(dataDir, System::currentTimeMillis);
+    }
+    /**
+     * For tests: a clock that can be moved to check the retention.
+     */
     public TransferLedger(File dataDir, LongSupplier clockMillis) {
         this.dbFile = new File(dataDir, FILE_NAME);
         this.clock = clockMillis;
     }
 
-    /** What is remembered for {@code taskId} right now. */
+    /**
+     * What is remembered for {@code taskId} right now.
+     */
     public Snapshot snapshot(String taskId) throws IOException {
         Snapshot s = new Snapshot();
         try (Connection c = open();
@@ -86,7 +64,9 @@ public final class TransferLedger {
         return s;
     }
 
-    /** Remembers these files as sent now. Safe to call again for the same file (it just refreshes the time). */
+    /**
+     * Remembers these files as sent now. Safe to call again for the same file (it just refreshes the time).
+     */
     public void record(String taskId, Collection<Entry> entries) throws IOException {
         if (entries == null || entries.isEmpty()) return;
         long now = clock.getAsLong();
@@ -106,7 +86,10 @@ public final class TransferLedger {
                 ps.executeBatch();
                 c.commit();
             } catch (SQLException ex) {
-                try { c.rollback(); } catch (SQLException ignored) { }
+                try {
+                    c.rollback();
+                } catch (SQLException ignored) {
+                }
                 throw ex;
             }
         } catch (SQLException e) {
@@ -114,7 +97,9 @@ public final class TransferLedger {
         }
     }
 
-    /** How many files are remembered for the task. */
+    /**
+     * How many files are remembered for the task.
+     */
     public int count(String taskId) throws IOException {
         try (Connection c = open();
              PreparedStatement ps = c.prepareStatement("SELECT COUNT(*) FROM sent_files WHERE task_id = ?")) {
@@ -127,7 +112,9 @@ public final class TransferLedger {
         }
     }
 
-    /** Forgets everything remembered for the task; returns how many entries were removed. */
+    /**
+     * Forgets everything remembered for the task; returns how many entries were removed.
+     */
     public int clear(String taskId) throws IOException {
         try (Connection c = open();
              PreparedStatement ps = c.prepareStatement("DELETE FROM sent_files WHERE task_id = ?")) {
@@ -137,11 +124,6 @@ public final class TransferLedger {
             throw new IOException("Cannot clear the sent-files memory (" + dbFile + "): " + e.getMessage(), e);
         }
     }
-
-    // ── "No new files" tracking ──────────────────────────────────────
-
-    /** When files last arrived for a task, when we started watching it, and when we last alerted (0 = never). */
-    public record State(long lastFilesAt, long watchingSince, long lastAlertAt) {}
 
     public State state(String taskId) throws IOException {
         try (Connection c = open();
@@ -156,7 +138,9 @@ public final class TransferLedger {
         }
     }
 
-    /** Starts the "watching since" clock for a task, if it has not started yet. */
+    /**
+     * Starts the "watching since" clock for a task, if it has not started yet.
+     */
     public void startWatching(String taskId) throws IOException {
         try (Connection c = open();
              PreparedStatement ps = c.prepareStatement(
@@ -170,7 +154,11 @@ public final class TransferLedger {
         }
     }
 
-    /** Files arrived now. Returns true when a "no new files" alert was outstanding (so a "files are back" note is due). */
+    // ── "No new files" tracking ──────────────────────────────────────
+
+    /**
+     * Files arrived now. Returns true when a "no new files" alert was outstanding (so a "files are back" note is due).
+     */
     public boolean markFilesTransferred(String taskId) throws IOException {
         long now = clock.getAsLong();
         try (Connection c = open()) {
@@ -179,7 +167,9 @@ public final class TransferLedger {
                 boolean wasSilent = false;
                 try (PreparedStatement ps = c.prepareStatement("SELECT last_alert_at FROM task_state WHERE task_id = ?")) {
                     ps.setString(1, taskId);
-                    try (ResultSet rs = ps.executeQuery()) { wasSilent = rs.next() && rs.getLong(1) > 0; }
+                    try (ResultSet rs = ps.executeQuery()) {
+                        wasSilent = rs.next() && rs.getLong(1) > 0;
+                    }
                 }
                 try (PreparedStatement ps = c.prepareStatement(
                         "INSERT INTO task_state (task_id, last_files_at, watching_since, last_alert_at) VALUES (?, ?, ?, 0) "
@@ -192,7 +182,10 @@ public final class TransferLedger {
                 c.commit();
                 return wasSilent;
             } catch (SQLException ex) {
-                try { c.rollback(); } catch (SQLException ignored) { }
+                try {
+                    c.rollback();
+                } catch (SQLException ignored) {
+                }
                 throw ex;
             }
         } catch (SQLException e) {
@@ -220,9 +213,9 @@ public final class TransferLedger {
         }
     }
 
-    // ── internals ────────────────────────────────────────────────────
-
-    /** Opens the file (creating it and the table on first use) and drops entries past the retention. */
+    /**
+     * Opens the file (creating it and the table on first use) and drops entries past the retention.
+     */
     private Connection open() throws SQLException {
         File dir = dbFile.getAbsoluteFile().getParentFile();
         if (dir != null && !dir.exists() && !dir.mkdirs() && !dir.exists()) {
@@ -257,5 +250,47 @@ public final class TransferLedger {
             throw e;
         }
         return c;
+    }
+
+    /**
+     * One sent file as seen on the source side.
+     */
+    public record Entry(String name, long size, long mtimeMillis) {
+    }
+
+    /**
+     * Everything remembered for one task, loaded once per run so checking a file costs nothing.
+     */
+    public static final class Snapshot {
+        private final Set<String> names = new HashSet<>();
+        private final Set<String> exact = new HashSet<>();
+
+        private static String key(String name, long size, long mtime) {
+            return name + '\u0000' + size + '\u0000' + mtime;
+        }
+
+        /**
+         * Whether this file counts as already sent under {@code policy}.
+         */
+        public boolean wasSent(String name, long size, long mtimeMillis, SentPolicy policy) {
+            if (policy == SentPolicy.ANY_NAME) return names.contains(name);
+            if (policy == SentPolicy.UNCHANGED) return exact.contains(key(name, size, mtimeMillis));
+            return false;
+        }
+
+        /**
+         * Number of remembered files (distinct name/size/time combinations).
+         */
+        public int size() {
+            return exact.size();
+        }
+    }
+
+    // ── internals ────────────────────────────────────────────────────
+
+    /**
+     * When files last arrived for a task, when we started watching it, and when we last alerted (0 = never).
+     */
+    public record State(long lastFilesAt, long watchingSince, long lastAlertAt) {
     }
 }

@@ -1,6 +1,7 @@
 package ui.monitor;
 
 import ui.AppTheme;
+import ui.EventMonitorPanel;
 
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
@@ -22,18 +23,11 @@ import java.util.List;
  */
 public class QueuePanel extends JPanel {
 
-    public record RunningRow(String taskName, String glyph, LocalDateTime startedAt, String note) {}
-    public record PendingRow(String taskName, String glyph, LocalDateTime dueAt, int attempt, boolean immediate) {}
-    /** {@code state}: INSTANT, POLLING or UNSUPPORTED. */
-    public record WatchRow(String taskName, String glyph, String state, String detail) {}
-
     private static final int MAX_RUNNING = 6, MAX_PENDING = 6, MAX_WATCH = 8;
-
     private final Section<RunningRow> running = new Section<>("Running now", new String[]{"Task", "For"}, new int[]{0, 70});
     private final Section<PendingRow> pending = new Section<>("Up next", new String[]{"Task", "Due"}, new int[]{0, 90});
     private final Section<WatchRow> watchers = new Section<>("Watchers", new String[]{"Task", "Trigger"}, new int[]{0, 96});
     private final JLabel footnote = new JLabel(" ");
-
     public QueuePanel() {
         setLayout(new BorderLayout());
         JPanel stack = new JPanel();
@@ -60,13 +54,18 @@ public class QueuePanel extends JPanel {
         running.setRenderer((row, col, now) -> col == 0 ? row.glyph() + row.taskName()
                 : MonitorStyle.duration(java.time.Duration.between(row.startedAt() != null ? row.startedAt() : now, now)), null);
         pending.setRenderer((row, col, now) -> {
-            if (col == 0) return row.glyph() + row.taskName() + (row.attempt() > 0 ? "  (retry " + row.attempt() + ")" : "");
+            if (col == 0)
+                return row.glyph() + row.taskName() + (row.attempt() > 0 ? "  (retry " + row.attempt() + ")" : "");
             long ms = java.time.Duration.between(now, row.dueAt()).toMillis();
             if (row.immediate() && ms <= 1500) return "now";
             return ms < 0 ? "overdue " + MonitorStyle.duration(-ms) : "in " + MonitorStyle.duration(ms);
         }, (row, now) -> java.time.Duration.between(now, row.dueAt()).toMillis() < -2000 ? AppTheme.SKIPPED_FG : null);
         watchers.setRenderer((row, col, now) -> col == 0 ? row.glyph() + row.taskName()
-                : switch (row.state()) { case "INSTANT" -> "\u25CF Instant"; case "UNSUPPORTED" -> "\u25CF Unsupported"; default -> "\u25CF Polling"; },
+                        : switch (row.state()) {
+                    case "INSTANT" -> "\u25CF Instant";
+                    case "UNSUPPORTED" -> "\u25CF Unsupported";
+                    default -> "\u25CF Polling";
+                },
                 (row, now) -> "INSTANT".equals(row.state()) ? AppTheme.SUCCESS_FG : AppTheme.SKIPPED_FG);
         watchers.setTooltip((row, col) -> row.detail() == null || row.detail().isBlank() ? null
                 : "<html><body style='width:300px'>" + MonitorStyle.htmlEscape(row.detail()) + "</body></html>");
@@ -84,12 +83,31 @@ public class QueuePanel extends JPanel {
         watchers.setCount(watch.size() == 0 ? "" : (watch.size() - polling) + " instant" + (polling > 0 ? " \u00b7 " + polling + " polling" : ""));
         footnote.setText(note == null || note.isBlank() ? " " : "<html><body style='width:260px'>" + MonitorStyle.htmlEscape(note) + "</body></html>");
     }
+    private interface CellText<T> {
+        String text(T row, int col, LocalDateTime now);
+    }
+
+    private interface CellColor<T> {
+        Color color(T row, LocalDateTime now);
+    }
+
+    private interface CellTip<T> {
+        String tip(T row, int col);
+    }
 
     // ── One titled mini-table ────────────────────────────────────────
 
-    private interface CellText<T> { String text(T row, int col, LocalDateTime now); }
-    private interface CellColor<T> { Color color(T row, LocalDateTime now); }
-    private interface CellTip<T> { String tip(T row, int col); }
+    public record RunningRow(String taskName, String glyph, LocalDateTime startedAt, String note) {
+    }
+
+    public record PendingRow(String taskName, String glyph, LocalDateTime dueAt, int attempt, boolean immediate) {
+    }
+
+    /**
+     * {@code state}: INSTANT, POLLING or UNSUPPORTED.
+     */
+    public record WatchRow(String taskName, String glyph, String state, String detail) {
+    }
 
     private static final class Section<T> extends JPanel {
         private final JLabel heading = new JLabel();
@@ -121,7 +139,8 @@ public class QueuePanel extends JPanel {
 
             model = new Model(cols);
             table = new JTable(model) {
-                @Override public String getToolTipText(java.awt.event.MouseEvent e) {
+                @Override
+                public String getToolTipText(java.awt.event.MouseEvent e) {
                     int r = rowAtPoint(e.getPoint()), c = columnAtPoint(e.getPoint());
                     return r >= 0 && r < rows.size() ? tip.tip(rows.get(r), c) : null;
                 }
@@ -141,7 +160,8 @@ public class QueuePanel extends JPanel {
                 }
             }
             table.setDefaultRenderer(Object.class, new DefaultTableCellRenderer() {
-                @Override public Component getTableCellRendererComponent(JTable t, Object v, boolean s, boolean f, int r, int c) {
+                @Override
+                public Component getTableCellRendererComponent(JTable t, Object v, boolean s, boolean f, int r, int c) {
                     super.getTableCellRendererComponent(t, v, false, false, r, c);
                     setBorder(new EmptyBorder(0, 2, 0, 2));
                     setOpaque(false);
@@ -162,9 +182,19 @@ public class QueuePanel extends JPanel {
             heading.setText(title);
         }
 
-        void setRenderer(CellText<T> t, CellColor<T> c) { this.text = t; if (c != null) this.color = c; }
-        void setTooltip(CellTip<T> t)                    { this.tip = t; }
-        void setCount(String s)                          { this.extra = s; refreshCount(); }
+        void setRenderer(CellText<T> t, CellColor<T> c) {
+            this.text = t;
+            if (c != null) this.color = c;
+        }
+
+        void setTooltip(CellTip<T> t) {
+            this.tip = t;
+        }
+
+        void setCount(String s) {
+            this.extra = s;
+            refreshCount();
+        }
 
         void set(List<T> all, int max, String emptyText, LocalDateTime now) {
             this.now = now;
@@ -188,12 +218,32 @@ public class QueuePanel extends JPanel {
 
         private final class Model extends AbstractTableModel {
             private final String[] cols;
-            Model(String[] cols) { this.cols = cols; }
-            void fire() { fireTableDataChanged(); }
-            @Override public int getRowCount()    { return rows.size() + (overflow > 0 ? 1 : 0); }
-            @Override public int getColumnCount() { return cols.length; }
-            @Override public String getColumnName(int c) { return cols[c]; }
-            @Override public Object getValueAt(int r, int c) {
+
+            Model(String[] cols) {
+                this.cols = cols;
+            }
+
+            void fire() {
+                fireTableDataChanged();
+            }
+
+            @Override
+            public int getRowCount() {
+                return rows.size() + (overflow > 0 ? 1 : 0);
+            }
+
+            @Override
+            public int getColumnCount() {
+                return cols.length;
+            }
+
+            @Override
+            public String getColumnName(int c) {
+                return cols[c];
+            }
+
+            @Override
+            public Object getValueAt(int r, int c) {
                 if (r >= rows.size()) return c == 0 ? "+ " + overflow + " more" : "";
                 return text.text(rows.get(r), c, now);
             }

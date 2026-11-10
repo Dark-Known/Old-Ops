@@ -1,7 +1,5 @@
 package service;
 
-import static org.junit.Assert.*;
-
 import model.FileSelection.AfterAction;
 import org.junit.Test;
 import service.TransferCleanup.LocalOriginal;
@@ -12,15 +10,14 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.LocalDateTime;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
+import java.util.*;
+
+import static org.junit.Assert.*;
 
 public class TransferCleanupTest {
 
     private static final LocalDateTime NOW = LocalDateTime.of(2026, 10, 26, 10, 15, 0);
+    private static final List<String> LOG = new ArrayList<>();
 
     private static Path dir() throws Exception {
         Path d = Files.createTempDirectory("opstool-cleanup");
@@ -38,32 +35,39 @@ public class TransferCleanupTest {
         return new LocalOriginal(p, Files.size(p), Files.getLastModifiedTime(p).toMillis());
     }
 
-    private static String text(Path p) throws Exception { return new String(Files.readAllBytes(p), StandardCharsets.UTF_8); }
+    private static String text(Path p) throws Exception {
+        return new String(Files.readAllBytes(p), StandardCharsets.UTF_8);
+    }
 
-    private static final List<String> LOG = new ArrayList<>();
-    private static void log(String s) { LOG.add(s); }
+    private static void log(String s) {
+        LOG.add(s);
+    }
 
     // ── naming ───────────────────────────────────────────────────────
 
-    @Test public void aFreeNameIsKeptAndATakenNameGetsATimestamp() {
+    @Test
+    public void aFreeNameIsKeptAndATakenNameGetsATimestamp() {
         Set<String> taken = new HashSet<>(Arrays.asList("a.csv"));
         assertEquals("b.csv", TransferCleanup.archiveName("b.csv", taken, NOW));
         assertEquals("a_20261026_101500.csv", TransferCleanup.archiveName("a.csv", taken, NOW));
     }
 
-    @Test public void ifEvenTheTimestampedNameIsTakenANumberIsAdded() {
+    @Test
+    public void ifEvenTheTimestampedNameIsTakenANumberIsAdded() {
         Set<String> taken = new HashSet<>(Arrays.asList("a.csv", "a_20261026_101500.csv", "a_20261026_101500_2.csv"));
         assertEquals("a_20261026_101500_3.csv", TransferCleanup.archiveName("a.csv", taken, NOW));
     }
 
-    @Test public void onlyTheLastDotCountsAsTheExtension() {
+    @Test
+    public void onlyTheLastDotCountsAsTheExtension() {
         Set<String> taken = new HashSet<>(Arrays.asList("x.tar.gz", "noext", ".env"));
         assertEquals("x.tar_20261026_101500.gz", TransferCleanup.archiveName("x.tar.gz", taken, NOW));
         assertEquals("noext_20261026_101500", TransferCleanup.archiveName("noext", taken, NOW));
         assertEquals(".env_20261026_101500", TransferCleanup.archiveName(".env", taken, NOW));
     }
 
-    @Test public void remotePlanAvoidsExistingNamesAndNamesChosenWithinTheSameBatch() {
+    @Test
+    public void remotePlanAvoidsExistingNamesAndNamesChosenWithinTheSameBatch() {
         Set<String> existing = new HashSet<>(Arrays.asList("a.csv"));
         List<RemoteMove> plan = TransferCleanup.planRemoteMoves(
                 Arrays.asList("/in/a.csv", "/in/b.csv", "/other/b.csv"), "/archive", existing, NOW);
@@ -79,7 +83,8 @@ public class TransferCleanupTest {
 
     // ── safety check for downloads ───────────────────────────────────
 
-    @Test public void aDownloadedCopyMustExistAtTheRightSize() throws Exception {
+    @Test
+    public void aDownloadedCopyMustExistAtTheRightSize() throws Exception {
         Path d = dir();
         Path p = file(d, "a.txt", "12345");
         assertTrue(TransferCleanup.copyIsComplete(p, 5));
@@ -92,7 +97,8 @@ public class TransferCleanupTest {
 
     // ── local delete ─────────────────────────────────────────────────
 
-    @Test public void deleteRemovesTheOriginals() throws Exception {
+    @Test
+    public void deleteRemovesTheOriginals() throws Exception {
         Path d = dir();
         Path a = file(d, "a.txt", "A"), b = file(d, "b.txt", "B");
         Result r = TransferCleanup.cleanupLocal(Arrays.asList(listed(a), listed(b)), AfterAction.DELETE, null, TransferCleanupTest::log, NOW);
@@ -102,7 +108,8 @@ public class TransferCleanupTest {
         assertFalse(Files.exists(b));
     }
 
-    @Test public void keepTouchesNothing() throws Exception {
+    @Test
+    public void keepTouchesNothing() throws Exception {
         Path d = dir();
         Path a = file(d, "a.txt", "A");
         Result r = TransferCleanup.cleanupLocal(Arrays.asList(listed(a)), AfterAction.KEEP, null, TransferCleanupTest::log, NOW);
@@ -110,7 +117,8 @@ public class TransferCleanupTest {
         assertTrue(Files.exists(a));
     }
 
-    @Test public void aFileThatChangedAfterItWasListedIsKept() throws Exception {
+    @Test
+    public void aFileThatChangedAfterItWasListedIsKept() throws Exception {
         Path d = dir();
         Path a = file(d, "a.txt", "first");
         LocalOriginal seen = listed(a);
@@ -123,7 +131,8 @@ public class TransferCleanupTest {
         assertTrue(LOG.toString(), LOG.stream().anyMatch(l -> l.contains("changed after it was listed")));
     }
 
-    @Test public void aFileThatIsAlreadyGoneIsNotAFailure() throws Exception {
+    @Test
+    public void aFileThatIsAlreadyGoneIsNotAFailure() throws Exception {
         Path d = dir();
         Path a = file(d, "a.txt", "A");
         LocalOriginal seen = listed(a);
@@ -134,7 +143,8 @@ public class TransferCleanupTest {
 
     // ── local move ───────────────────────────────────────────────────
 
-    @Test public void moveCreatesTheFolderAndMovesTheFile() throws Exception {
+    @Test
+    public void moveCreatesTheFolderAndMovesTheFile() throws Exception {
         Path d = dir();
         Path a = file(d, "a.txt", "A");
         Path archive = d.resolve("archive").resolve("2026");     // does not exist yet, nested
@@ -144,7 +154,8 @@ public class TransferCleanupTest {
         assertEquals("A", text(archive.resolve("a.txt")));
     }
 
-    @Test public void moveNeverOverwritesAnArchivedFile() throws Exception {
+    @Test
+    public void moveNeverOverwritesAnArchivedFile() throws Exception {
         Path d = dir();
         Path archive = d.resolve("archive");
         Files.createDirectories(archive);
@@ -157,7 +168,8 @@ public class TransferCleanupTest {
         assertFalse(Files.exists(a));
     }
 
-    @Test public void twoOriginalsWithTheSameNameBothSurviveInTheArchive() throws Exception {
+    @Test
+    public void twoOriginalsWithTheSameNameBothSurviveInTheArchive() throws Exception {
         Path d = dir();
         Path one = Files.createDirectories(d.resolve("one"));
         Path two = Files.createDirectories(d.resolve("two"));
@@ -169,7 +181,8 @@ public class TransferCleanupTest {
         assertEquals("TWO", text(archive.resolve("a_20261026_101500.txt")));
     }
 
-    @Test public void ifTheArchiveFolderCannotBeUsedTheOriginalsStayPut() throws Exception {
+    @Test
+    public void ifTheArchiveFolderCannotBeUsedTheOriginalsStayPut() throws Exception {
         Path d = dir();
         Path a = file(d, "a.txt", "A");
         Path notAFolder = file(d, "archive", "I am a file, not a folder");
@@ -181,7 +194,8 @@ public class TransferCleanupTest {
         assertTrue(LOG.toString(), LOG.stream().anyMatch(l -> l.contains("still in place")));
     }
 
-    @Test public void oneFailureDoesNotStopTheRestOfTheCleanup() throws Exception {
+    @Test
+    public void oneFailureDoesNotStopTheRestOfTheCleanup() throws Exception {
         Path d = dir();
         Path a = file(d, "a.txt", "A");
         Path b = file(d, "b.txt", "B");

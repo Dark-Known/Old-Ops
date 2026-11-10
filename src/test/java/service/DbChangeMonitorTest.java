@@ -1,7 +1,5 @@
 package service;
 
-import static org.junit.Assert.*;
-
 import model.ScheduledTask;
 import model.TaskRunRecord;
 import org.junit.Before;
@@ -16,12 +14,24 @@ import java.sql.Statement;
 import java.time.LocalDateTime;
 import java.util.List;
 
-/** Covers the v1 event-driven plumbing: cross-connection change signals, the task snapshot cache and the command Poller. */
+import static org.junit.Assert.*;
+
+/**
+ * Covers the v1 event-driven plumbing: cross-connection change signals, the task snapshot cache and the command Poller.
+ */
 public class DbChangeMonitorTest {
 
     private File dir;
     private XmlStorageService storage;
     private DbChangeMonitor monitor;
+
+    private static ScheduledTask task(String name) {
+        ScheduledTask t = new ScheduledTask();
+        t.setName(name);
+        t.setTaskType(ScheduledTask.TaskType.FILE_TRANSFER);
+        t.setStatus(ScheduledTask.TaskStatus.PENDING);
+        return t;
+    }
 
     @Before
     public void setUp() throws Exception {
@@ -33,16 +43,10 @@ public class DbChangeMonitorTest {
 
     private Connection raw(String file) throws Exception {
         Connection c = DriverManager.getConnection("jdbc:sqlite:" + new File(dir, file).getAbsolutePath());
-        try (Statement st = c.createStatement()) { st.execute("PRAGMA busy_timeout=5000"); }
+        try (Statement st = c.createStatement()) {
+            st.execute("PRAGMA busy_timeout=5000");
+        }
         return c;
-    }
-
-    private static ScheduledTask task(String name) {
-        ScheduledTask t = new ScheduledTask();
-        t.setName(name);
-        t.setTaskType(ScheduledTask.TaskType.FILE_TRANSFER);
-        t.setStatus(ScheduledTask.TaskStatus.PENDING);
-        return t;
     }
 
     @Test

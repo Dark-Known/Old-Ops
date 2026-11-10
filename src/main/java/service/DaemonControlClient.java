@@ -14,19 +14,21 @@ import java.util.logging.Logger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-/** GUI side of {@link DaemonControlServer}. Returns false whenever the caller should use the database queue instead. */
+/**
+ * GUI side of {@link DaemonControlServer}. Returns false whenever the caller should use the database queue instead.
+ */
 public final class DaemonControlClient {
 
     private static final Logger log = Logger.getLogger(DaemonControlClient.class.getName());
     private static final Pattern PORT = Pattern.compile("\"port\"\\s*:\\s*(\\d+)");
     private static final Pattern TOKEN = Pattern.compile("\"token\"\\s*:\\s*\"([0-9a-f]+)\"");
 
-    private DaemonControlClient() {}
+    private DaemonControlClient() {
+    }
 
-    /** Where to reach the Daemon's control endpoint (from {@code daemon-control.json}); both fields come from that file. */
-    public record Control(int port, String token) {}
-
-    /** Reads the control file, or returns {@code null} if the Daemon is not running / has the API disabled. */
+    /**
+     * Reads the control file, or returns {@code null} if the Daemon is not running / has the API disabled.
+     */
     public static Control readControl(File dataDir) {
         try {
             File f = new File(dataDir, DaemonControlServer.FILE_NAME);
@@ -77,5 +79,13 @@ public final class DaemonControlClient {
         }
     }
 
-    private static String enc(String s) { return URLEncoder.encode(s, StandardCharsets.UTF_8); }
+    private static String enc(String s) {
+        return URLEncoder.encode(s, StandardCharsets.UTF_8);
+    }
+
+    /**
+     * Where to reach the Daemon's control endpoint (from {@code daemon-control.json}); both fields come from that file.
+     */
+    public record Control(int port, String token) {
+    }
 }

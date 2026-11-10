@@ -38,23 +38,19 @@ public final class DaemonControlServer implements AutoCloseable {
 
     public static final String FILE_NAME = "daemon-control.json";
     public static final String TOKEN_HEADER = "X-Opstool-Token";
-    private static final Logger log = Logger.getLogger(DaemonControlServer.class.getName());
-
-    /** Runs a command; throws to report failure back to the caller. */
-    public interface Executor {
-        void execute(CommandQueueService.Action action, String taskId, String requestedBy) throws Exception;
-    }
-
-    /** A heartbeat comment goes out this often so clients can tell "idle" from "daemon gone". */
+    /**
+     * A heartbeat comment goes out this often so clients can tell "idle" from "daemon gone".
+     */
     static final long DEFAULT_HEARTBEAT_MS = 5_000;
-    /** Cap on concurrent status streams (one per GUI window is plenty; each holds a server thread). */
+    private static final Logger log = Logger.getLogger(DaemonControlServer.class.getName());
+    /**
+     * Cap on concurrent status streams (one per GUI window is plenty; each holds a server thread).
+     */
     private static final int MAX_STREAMS = 4;
-
     private final HttpServer server;
     private final File controlFile;
     private final String token;
     private final StatusBroadcaster bus;
-
     private DaemonControlServer(HttpServer server, File controlFile, String token, StatusBroadcaster bus) {
         this.server = server;
         this.controlFile = controlFile;
@@ -71,7 +67,9 @@ public final class DaemonControlServer implements AutoCloseable {
         return start(dataDir, executor, new StatusBroadcaster(), DEFAULT_HEARTBEAT_MS);
     }
 
-    /** As above, and also serves {@code GET /status} and the push stream {@code GET /status/stream} from {@code bus}. */
+    /**
+     * As above, and also serves {@code GET /status} and the push stream {@code GET /status/stream} from {@code bus}.
+     */
     public static DaemonControlServer start(File dataDir, Executor executor, StatusBroadcaster bus) throws IOException {
         return start(dataDir, executor, bus, DEFAULT_HEARTBEAT_MS);
     }
@@ -113,7 +111,8 @@ public final class DaemonControlServer implements AutoCloseable {
         try {
             if (!"POST".equals(ex.getRequestMethod())) {
                 DaemonCallLog.record("control", ex.getRequestMethod(), "/command", 405, 0, "", "", "", "POST only");
-                reply(ex, 405, "POST only"); return;
+                reply(ex, 405, "POST only");
+                return;
             }
             if (!authorized(ex, token)) {
                 DaemonCallLog.record("control", "POST", "/command", 403, 0, "", "", "", "bad token");
@@ -153,19 +152,27 @@ public final class DaemonControlServer implements AutoCloseable {
                 given.getBytes(StandardCharsets.UTF_8), token.getBytes(StandardCharsets.UTF_8));
     }
 
-    /** {@code GET /status}: the latest status text once (204 if the scheduler has not exported yet). */
+    /**
+     * {@code GET /status}: the latest status text once (204 if the scheduler has not exported yet).
+     */
     private static void status(HttpExchange ex, String token, StatusBroadcaster bus) throws IOException {
         try {
             if (!"GET".equals(ex.getRequestMethod())) {
                 DaemonCallLog.record("control", ex.getRequestMethod(), "/status", 405, 0, "", "", "", "GET only");
-                reply(ex, 405, "GET only"); return;
+                reply(ex, 405, "GET only");
+                return;
             }
             if (!authorized(ex, token)) {
                 DaemonCallLog.record("control", "GET", "/status", 403, 0, "", "", "", "bad token");
-                reply(ex, 403, "bad token"); return;
+                reply(ex, 403, "bad token");
+                return;
             }
             String text = bus.latest();
-            if (text == null) { DaemonCallLog.recordStatusPoll(204); ex.sendResponseHeaders(204, -1); return; }
+            if (text == null) {
+                DaemonCallLog.recordStatusPoll(204);
+                ex.sendResponseHeaders(204, -1);
+                return;
+            }
             DaemonCallLog.recordStatusPoll(200);
             reply(ex, 200, text);
         } finally {
@@ -185,15 +192,20 @@ public final class DaemonControlServer implements AutoCloseable {
         int events = 0;
         boolean streaming = false;
         try {
-            if (!"GET".equals(ex.getRequestMethod())) { reply(ex, 405, "GET only"); return; }
+            if (!"GET".equals(ex.getRequestMethod())) {
+                reply(ex, 405, "GET only");
+                return;
+            }
             if (!authorized(ex, token)) {
                 DaemonCallLog.record("control", "GET", "/status/stream", 403, 0, "", "", "", "bad token");
-                reply(ex, 403, "bad token"); return;
+                reply(ex, 403, "bad token");
+                return;
             }
             sub = bus.subscribe(MAX_STREAMS);
             if (sub == null) {
                 DaemonCallLog.record("control", "GET", "/status/stream", 503, 0, "", "", "", "too many status streams");
-                reply(ex, 503, "too many status streams"); return;
+                reply(ex, 503, "too many status streams");
+                return;
             }
             streaming = true;
             DaemonCallLog.record("control", "GET", "/status/stream", 200, 0, "", "", "", "stream opened");
@@ -214,13 +226,16 @@ public final class DaemonControlServer implements AutoCloseable {
             // client disconnected or server closing: normal end of a stream
         } finally {
             if (sub != null) sub.close();
-            if (streaming) DaemonCallLog.record("control", "GET", "/status/stream", 200, System.currentTimeMillis() - opened, "", "", "",
-                    "stream closed after " + events + " status events");
+            if (streaming)
+                DaemonCallLog.record("control", "GET", "/status/stream", 200, System.currentTimeMillis() - opened, "", "", "",
+                        "stream closed after " + events + " status events");
             ex.close();
         }
     }
 
-    /** One SSE event: {@code event: status} then one {@code data:} line per status line, ended by a blank line. */
+    /**
+     * One SSE event: {@code event: status} then one {@code data:} line per status line, ended by a blank line.
+     */
     static String toSseEvent(String statusText) {
         String body = statusText.endsWith("\n") ? statusText.substring(0, statusText.length() - 1) : statusText;
         StringBuilder sb = new StringBuilder(body.length() + 64).append("event: status\n");
@@ -246,13 +261,25 @@ public final class DaemonControlServer implements AutoCloseable {
         ex.getResponseBody().write(b);
     }
 
-    public int port() { return server.getAddress().getPort(); }
-    public String token() { return token; }
+    public int port() {
+        return server.getAddress().getPort();
+    }
+
+    public String token() {
+        return token;
+    }
 
     @Override
     public void close() {
         bus.close(); // lets open status streams finish within one heartbeat
         server.stop(0);
         controlFile.delete();
+    }
+
+    /**
+     * Runs a command; throws to report failure back to the caller.
+     */
+    public interface Executor {
+        void execute(CommandQueueService.Action action, String taskId, String requestedBy) throws Exception;
     }
 }

@@ -1,6 +1,9 @@
 package export;
 
-import java.io.*;
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
@@ -19,8 +22,6 @@ import java.util.List;
  */
 public final class PdfTableWriter {
 
-    private PdfTableWriter() {}
-
     private static final float PAGE_W = 792f; // Letter landscape
     private static final float PAGE_H = 612f;
     private static final float MARGIN = 30f;
@@ -28,9 +29,11 @@ public final class PdfTableWriter {
     private static final float BODY_FONT_SIZE = 8f;
     private static final float LINE_HEIGHT = 10.5f;
     private static final float ROW_PADDING = 3f;
+    private PdfTableWriter() {
+    }
 
     public static void write(File outFile, String title, String[] headers, float[] columnWidthPts,
-            List<String[]> rows, List<String> rowFillHex) throws IOException {
+                             List<String[]> rows, List<String> rowFillHex) throws IOException {
 
         float tableWidth = 0;
         for (float w : columnWidthPts) tableWidth += w;
@@ -78,7 +81,7 @@ public final class PdfTableWriter {
     }
 
     private static float drawRow(StringBuilder content, String[] values, float[] widths, float startX, float y,
-            String fillHex, String font, float fontSize, boolean bold) {
+                                 String fillHex, String font, float fontSize, boolean bold) {
         float rowHeight = LINE_HEIGHT + ROW_PADDING * 2;
         if (fillHex != null) content.append(rectOp(startX, y - rowHeight, sum(widths), rowHeight, fillHex));
         float x = startX;
@@ -90,7 +93,7 @@ public final class PdfTableWriter {
     }
 
     private static float drawWrappedRow(StringBuilder content, List<List<String>> wrappedCols, float[] widths,
-            float startX, float y, String fillHex, int maxLines) {
+                                        float startX, float y, String fillHex, int maxLines) {
         float rowHeight = maxLines * LINE_HEIGHT + ROW_PADDING * 2;
         if (fillHex != null) content.append(rectOp(startX, y - rowHeight, sum(widths), rowHeight, fillHex));
         float x = startX;
@@ -106,23 +109,39 @@ public final class PdfTableWriter {
         return y - rowHeight;
     }
 
-    private static float sum(float[] a) { float s = 0; for (float v : a) s += v; return s; }
+    private static float sum(float[] a) {
+        float s = 0;
+        for (float v : a) s += v;
+        return s;
+    }
 
-    /** Very rough Helvetica average-char-width wrap (no AFM metrics table — good enough for pagination purposes). */
+    /**
+     * Very rough Helvetica average-char-width wrap (no AFM metrics table — good enough for pagination purposes).
+     */
     private static List<String> wrap(String text, float widthPts, float fontSize) {
         List<String> lines = new ArrayList<>();
-        if (text == null || text.isEmpty()) { lines.add(""); return lines; }
+        if (text == null || text.isEmpty()) {
+            lines.add("");
+            return lines;
+        }
         float avgCharWidth = fontSize * 0.52f;
         int maxChars = Math.max(4, (int) ((widthPts - 6) / avgCharWidth));
         for (String raw : text.split("\n", -1)) {
             String remaining = raw;
-            if (remaining.isEmpty()) { lines.add(""); continue; }
+            if (remaining.isEmpty()) {
+                lines.add("");
+                continue;
+            }
             while (remaining.length() > maxChars) {
                 int breakAt = remaining.lastIndexOf(' ', maxChars);
                 if (breakAt < maxChars / 2) breakAt = maxChars; // no good space — hard break
                 lines.add(remaining.substring(0, breakAt).trim());
                 remaining = remaining.substring(breakAt).trim();
-                if (lines.size() > 20) { lines.add(remaining + " …(truncated)"); remaining = ""; break; }
+                if (lines.size() > 20) {
+                    lines.add(remaining + " …(truncated)");
+                    remaining = "";
+                    break;
+                }
             }
             if (!remaining.isEmpty() || lines.isEmpty()) lines.add(remaining);
         }
@@ -152,7 +171,9 @@ public final class PdfTableWriter {
                 font, size, x, y, pdfEscape(text));
     }
 
-    /** PDF literal-string escaping + best-effort ISO-8859-1 fallback for characters outside Latin-1 (no embedded Unicode font here). */
+    /**
+     * PDF literal-string escaping + best-effort ISO-8859-1 fallback for characters outside Latin-1 (no embedded Unicode font here).
+     */
     private static String pdfEscape(String s) {
         if (s == null) return "";
         StringBuilder sb = new StringBuilder(s.length());
@@ -160,7 +181,10 @@ public final class PdfTableWriter {
             char c = s.charAt(i);
             if (c > 255) c = '?';
             if (c == '(' || c == ')' || c == '\\') sb.append('\\');
-            if (c == '\n' || c == '\r') { sb.append(' '); continue; }
+            if (c == '\n' || c == '\r') {
+                sb.append(' ');
+                continue;
+            }
             sb.append(c);
         }
         return sb.toString();
@@ -215,8 +239,8 @@ public final class PdfTableWriter {
             offsetByObjNum[pageObj] = buf.size();
             write(buf, obj(pageObj,
                     "<< /Type /Page /Parent " + pagesObj + " 0 R /MediaBox [0 0 " + (int) PAGE_W + " " + (int) PAGE_H + "] " +
-                    "/Resources << /Font << /F1 " + fontRegularObj + " 0 R /F2 " + fontBoldObj + " 0 R >> >> " +
-                    "/Contents " + contentObj + " 0 R >>"));
+                            "/Resources << /Font << /F1 " + fontRegularObj + " 0 R /F2 " + fontBoldObj + " 0 R >> >> " +
+                            "/Contents " + contentObj + " 0 R >>"));
 
             offsetByObjNum[contentObj] = buf.size();
             write(buf, "" + contentObj + " 0 obj\n<< /Length " + streamBytes.length + " >>\nstream\n");

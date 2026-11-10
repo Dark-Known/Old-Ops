@@ -1,28 +1,27 @@
 package ui;
 
-import ui.monitor.TaskChangeView;
 import model.ScheduledTask;
+import model.ScheduledTask.TaskStatus;
+import model.ScheduledTask.TaskType;
+import model.ScheduledTask.TransferDirection;
 import service.TaskSchedulerService;
-import service.TransferService;
 import service.XmlStorageService;
-import model.ScheduledTask.*;
 import ui.components.IconTile;
 import ui.components.PillBadge;
 import ui.components.StatCard;
+import ui.monitor.TaskChangeView;
 
 import javax.swing.*;
+import javax.swing.Timer;
 import javax.swing.border.EmptyBorder;
 import java.awt.*;
-import java.time.format.DateTimeFormatter;
+import java.time.DayOfWeek;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
-import java.time.DayOfWeek;
+import java.time.format.DateTimeFormatter;
 import java.time.temporal.TemporalAdjusters;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.LinkedHashMap;
+import java.util.*;
 import java.util.List;
-import java.util.Map;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
 public class TaskManagerPanel extends JPanel {
@@ -32,7 +31,18 @@ public class TaskManagerPanel extends JPanel {
     // Status colors now live centrally on AppTheme (RUNNING_FG/BG, FAILED_FG/BG,
     // SUCCESS_FG/BG, SKIPPED_FG/BG) — PillBadge uses those directly, so the
     // per-panel constants that used to live here are gone.
-
+    private static final long DAEMON_STALE_MS = service.queue.SchedulerStatusSnapshot.DEFAULT_STALE_MS;
+    // Cap how much log text we retain per task so long-running listings
+    // (e.g. `ls` over huge remote directories) don't grow memory unboundedly.
+    // Oldest text is trimmed off once a task's log exceeds this.
+    private static final int MAX_LOG_CHARS_PER_TASK = 500_000; // ~500 KB per task
+    private static final int FULL_VIEW_LINES = 5000;
+    private static final TaskRowInfo FALLBACK_ROW_INFO =
+            new TaskRowInfo("", "", "", "");
+    // Human-readable labels for the fields captured by snapshotTaskFields(),
+    // in the order they should read in a created/edited-task event detail.
+    // Shared with the Event Monitor, which reads this text back (see ui.monitor.TaskChangeView).
+    private static final Map<String, String> TASK_FIELD_LABELS = TaskChangeView.LABELS;
     private final XmlStorageService storage;
     private final TaskSchedulerService scheduler;
     // Same cross-process pattern EventMonitorPanel/MainWindow already use:
@@ -43,9 +53,18 @@ public class TaskManagerPanel extends JPanel {
     // reality regardless of whether the GUI or the Daemon is actually
     // running the task.
     private final java.nio.file.Path daemonStatusFile;
-    /** Last daemon status read by the background feed; never touches disk on the EDT. */
+    // taskId -> accumulated in-memory log
+    private final Map<String, StringBuilder> taskLogs = new HashMap<>();
+    // Log lines arrive on a background (scheduler) thread. Instead of scheduling
+    // one SwingUtilities.invokeLater(...) per line — which floods the EDT queue
+    // and makes every append+getText() call redo work against a huge document —
+    // we queue lines here and drain/coalesce them on a timer.
+    private final ConcurrentLinkedQueue<String[]> pendingLogLines = new ConcurrentLinkedQueue<>();
+    private final Map<String, TaskRowInfo> rowInfoByTaskId = new HashMap<>();
+    /**
+     * Last daemon status read by the background feed; never touches disk on the EDT.
+     */
     private volatile AppFeeds.Daemon daemonState = AppFeeds.Daemon.OFFLINE;
-    private static final long DAEMON_STALE_MS = service.queue.SchedulerStatusSnapshot.DEFAULT_STALE_MS;
     private DefaultListModel<ScheduledTask> listModel;
     private JList<ScheduledTask> taskList;
     // Full, unfiltered snapshot from the last refresh() — the filter box
@@ -62,36 +81,33 @@ public class TaskManagerPanel extends JPanel {
     private JScrollPane logScrollPane;
     private JLabel lblSelectedTask;
     private JLabel lblActiveSessions;
-
     // ── Watcher fingerprint status bar ────────────────────────────────────────
     // Surfaces the epoch + size baseline for the selected task.
     // Refreshed on selection change AND after every log line (which fires after
     // a run completes and the service may have persisted a new baseline).
     private JLabel lblWatcherFingerprint;
     private JPanel watcherBar; // kept as a field so refresh() can reach it directly
-
-    // taskId -> accumulated in-memory log
-    private final Map<String, StringBuilder> taskLogs = new HashMap<>();
-
-    // Cap how much log text we retain per task so long-running listings
-    // (e.g. `ls` over huge remote directories) don't grow memory unboundedly.
-    // Oldest text is trimmed off once a task's log exceeds this.
-    private static final int MAX_LOG_CHARS_PER_TASK = 500_000; // ~500 KB per task
-
-    // Log lines arrive on a background (scheduler) thread. Instead of scheduling
-    // one SwingUtilities.invokeLater(...) per line — which floods the EDT queue
-    // and makes every append+getText() call redo work against a huge document —
-    // we queue lines here and drain/coalesce them on a timer.
-    private final ConcurrentLinkedQueue<String[]> pendingLogLines = new ConcurrentLinkedQueue<>();
+    private volatile LogMode logMode = LogMode.FULL;
+    /**
+     * Identity of what is on screen (task + mode + file stamp); an unchanged key skips the re-read.
+     */
+    private volatile String shownLogKey;
+    // Which of the two log views (full vs latest-50) was last requested for
+    // the currently selected row — so refreshSelectedTaskLogIfChanged() below
+    // re-reads with the matching one instead of always comparing against the
+    // full log (which would never match a "latest 50" view and just fight it
+    // on every tick).
+    private volatile boolean showingLatestOnly = false;
 
     public TaskManagerPanel(XmlStorageService storage, TaskSchedulerService scheduler) {
-        this.storage   = storage;
+        this.storage = storage;
         this.scheduler = scheduler;
         this.daemonStatusFile = storage.getDataDir().toPath().resolve("scheduler-status-daemon.dat");
         DataFeed<AppFeeds.Daemon> daemonFeed = AppFeeds.daemon(daemonStatusFile);
         if (daemonFeed.latest() != null) daemonState = daemonFeed.latest();
         daemonFeed.subscribe(d -> daemonState = d);
-        AppFeeds.tasks(storage).subscribe(t -> { });
+        AppFeeds.tasks(storage).subscribe(t -> {
+        });
         setLayout(new BorderLayout(8, 8));
         setBorder(new EmptyBorder(10, 10, 10, 10));
         buildUI();
@@ -144,32 +160,31 @@ public class TaskManagerPanel extends JPanel {
         liveLogPollTimer.start();
     }
 
+    private static String toHex(Color c) {
+        return String.format("#%02X%02X%02X", c.getRed(), c.getGreen(), c.getBlue());
+    }
+
+    private static String str(Object o) {
+        return o == null ? null : o.toString();
+    }
+
+    private static String yesNo(boolean b) {
+        return b ? "Yes" : "No";
+    }
+
+    private static boolean isBlank(String s) {
+        return s == null || s.isEmpty() || "0".equals(s) || "null".equals(s);
+    }
+
+    // ── Watcher fingerprint bar ────────────────────────────────────────────────
+
+    private void refreshSelectedTaskLogIfChanged() {
+        loadLogView(false);
+    }
+
     /**
-     * Re-reads the selected task's on-disk log and refreshes {@code logArea}
-     * only if it actually changed — so this can run on a timer without
-     * fighting the user's scroll position or selection on every tick. Scroll
-     * position is preserved unless the view was already pinned to the
-     * bottom, in which case it stays pinned as new lines arrive.
+     * Reloads the selected task's log off the EDT; {@code force} also replaces a placeholder / scrolls to the end.
      */
-    // ── Log view ─────────────────────────────────────────────────────────────
-    // The on-disk task log (current file plus rotated archives) is the single source of truth for
-    // what the panel shows. It used to be fed from two places in two different formats: live
-    // callback lines ("HH:mm:ss  line", unfiltered) appended as they arrived, and the disk file
-    // ("[date time] line", filtered by log level) swapped in by a 1.5 s poll that never matched
-    // the live text — so the view kept being replaced by just the tail of the current, freshly
-    // rotated file. Now live lines only trigger an (off-EDT, change-gated) reload from disk.
-
-    private enum LogMode { FULL, LATEST, ARCHIVE }
-    private volatile LogMode logMode = LogMode.FULL;
-    /** Identity of what is on screen (task + mode + file stamp); an unchanged key skips the re-read. */
-    private volatile String shownLogKey;
-    private static final int FULL_VIEW_LINES = 5000;
-
-    private record LogView(String taskId, LogMode mode, String key, String text) {}
-
-    private void refreshSelectedTaskLogIfChanged() { loadLogView(false); }
-
-    /** Reloads the selected task's log off the EDT; {@code force} also replaces a placeholder / scrolls to the end. */
     private void loadLogView(boolean force) {
         if (logMode == LogMode.ARCHIVE) return; // an archive the user opened is never swapped out underneath them
         ScheduledTask t = getSelectedTask();
@@ -185,7 +200,8 @@ public class TaskManagerPanel extends JPanel {
             List<String> lines = logs.getTaskLogsRecent(id, name, mode == LogMode.LATEST ? 50 : FULL_VIEW_LINES);
             return new LogView(id, mode, key, String.join("\n", lines));
         }, v -> {
-            if (v == null || logMode != v.mode() || !v.taskId().equals(getSelectedTaskId())) return; // selection moved on
+            if (v == null || logMode != v.mode() || !v.taskId().equals(getSelectedTaskId()))
+                return; // selection moved on
             shownLogKey = v.key();
             if (v.text().isEmpty()) {
                 if (force) {
@@ -230,6 +246,8 @@ public class TaskManagerPanel extends JPanel {
                 ? "● " + count + " session" + (count == 1 ? "" : "s") + " open"
                 : " ");
     }
+
+    // ── Legend ────────────────────────────────────────────────────────────────
 
     private void flushPendingLogLines() {
         if (pendingLogLines.isEmpty()) return;
@@ -292,15 +310,15 @@ public class TaskManagerPanel extends JPanel {
         // in five directions at once. Delete keeps a red-tinted label as its
         // only distinguishing mark — enough to read as destructive without a
         // loud color block sitting one click from "Run Now".
-        JButton btnNew        = new GradientButton("New Task");
-        JButton btnEdit       = new JButton("Edit");
-        JButton btnDelete     = new JButton("Delete");
-        JButton btnRunNow     = new JButton("Run Now");
-        JButton btnRestart    = new JButton("Restart Task");
-        JButton btnEnable     = new JButton("Enable/Disable");
-        JButton btnViewLogs   = new JButton("View Logs");
+        JButton btnNew = new GradientButton("New Task");
+        JButton btnEdit = new JButton("Edit");
+        JButton btnDelete = new JButton("Delete");
+        JButton btnRunNow = new JButton("Run Now");
+        JButton btnRestart = new JButton("Restart Task");
+        JButton btnEnable = new JButton("Enable/Disable");
+        JButton btnViewLogs = new JButton("View Logs");
         JButton btnLatestLogs = new JButton("Latest Logs");
-        JButton btnRefresh    = new JButton();
+        JButton btnRefresh = new JButton();
         btnRefresh.setIcon(null);
         btnRefresh.setText("\u21BB"); // ↻ — compact icon-style refresh, no label needed in a toolbar this size
         btnRefresh.setToolTipText("Refresh");
@@ -309,22 +327,27 @@ public class TaskManagerPanel extends JPanel {
         styleBtn(btnNew, AppTheme.EARTH_MOSS);
         btnDelete.setForeground(AppTheme.EARTH_RUST);
 
-        btnNew.addActionListener(e        -> newTask());
-        btnEdit.addActionListener(e       -> editTask());
-        btnDelete.addActionListener(e     -> deleteTask());
-        btnRunNow.addActionListener(e     -> runNow());
-        btnRestart.addActionListener(e    -> restartTask());
-        btnEnable.addActionListener(e     -> toggleEnable());
-        btnRefresh.addActionListener(e    -> refresh());
-        btnViewLogs.addActionListener(e   -> showLogForSelected());
+        btnNew.addActionListener(e -> newTask());
+        btnEdit.addActionListener(e -> editTask());
+        btnDelete.addActionListener(e -> deleteTask());
+        btnRunNow.addActionListener(e -> runNow());
+        btnRestart.addActionListener(e -> restartTask());
+        btnEnable.addActionListener(e -> toggleEnable());
+        btnRefresh.addActionListener(e -> refresh());
+        btnViewLogs.addActionListener(e -> showLogForSelected());
         btnLatestLogs.addActionListener(e -> showLatestLogsForSelected());
 
         JPanel toolbar = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
-        toolbar.add(btnNew);    toolbar.add(btnEdit);    toolbar.add(btnDelete);
+        toolbar.add(btnNew);
+        toolbar.add(btnEdit);
+        toolbar.add(btnDelete);
         toolbar.add(new JSeparator(JSeparator.VERTICAL));
-        toolbar.add(btnRunNow); toolbar.add(btnRestart); toolbar.add(btnEnable);
+        toolbar.add(btnRunNow);
+        toolbar.add(btnRestart);
+        toolbar.add(btnEnable);
         toolbar.add(new JSeparator(JSeparator.VERTICAL));
-        toolbar.add(btnViewLogs); toolbar.add(btnLatestLogs);
+        toolbar.add(btnViewLogs);
+        toolbar.add(btnLatestLogs);
 
         // ── Filter box ───────────────────────────────────────────────────────
         // Filters the table live by name or type — cheap to add now that
@@ -335,9 +358,20 @@ public class TaskManagerPanel extends JPanel {
         txtFilter = new JTextField(16);
         txtFilter.setToolTipText("Filter by task name or type");
         txtFilter.getDocument().addDocumentListener(new javax.swing.event.DocumentListener() {
-            @Override public void insertUpdate(javax.swing.event.DocumentEvent e)  { applyFilter(); }
-            @Override public void removeUpdate(javax.swing.event.DocumentEvent e)  { applyFilter(); }
-            @Override public void changedUpdate(javax.swing.event.DocumentEvent e) { applyFilter(); }
+            @Override
+            public void insertUpdate(javax.swing.event.DocumentEvent e) {
+                applyFilter();
+            }
+
+            @Override
+            public void removeUpdate(javax.swing.event.DocumentEvent e) {
+                applyFilter();
+            }
+
+            @Override
+            public void changedUpdate(javax.swing.event.DocumentEvent e) {
+                applyFilter();
+            }
         });
 
         // ── Legend ───────────────────────────────────────────────────────────
@@ -363,9 +397,9 @@ public class TaskManagerPanel extends JPanel {
         banner.setBorder(new EmptyBorder(0, 0, 8, 0));
 
         // ── Summary strip ────────────────────────────────────────────────────
-        cardTotal       = new StatCard("Tasks", "0", null);
-        cardRunning     = new StatCard("Running", "0", AppTheme.RUNNING_FG);
-        cardFailed      = new StatCard("Failed", "0", AppTheme.FAILED_FG);
+        cardTotal = new StatCard("Tasks", "0", null);
+        cardRunning = new StatCard("Running", "0", AppTheme.RUNNING_FG);
+        cardFailed = new StatCard("Failed", "0", AppTheme.FAILED_FG);
         cardSuccessRate = new StatCard("Success rate", "—", AppTheme.SUCCESS_FG);
         JPanel statsRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
         statsRow.setOpaque(false);
@@ -407,7 +441,8 @@ public class TaskManagerPanel extends JPanel {
         // Non-watcher rows are unaffected; this is purely additive on top of
         // the existing selection-driven log/fingerprint-bar behavior above.
         taskList.addMouseListener(new java.awt.event.MouseAdapter() {
-            @Override public void mouseClicked(java.awt.event.MouseEvent e) {
+            @Override
+            public void mouseClicked(java.awt.event.MouseEvent e) {
                 int index = taskList.locationToIndex(e.getPoint());
                 if (index < 0 || !taskList.getCellBounds(index, index).contains(e.getPoint())) return;
                 ScheduledTask task = listModel.getElementAt(index);
@@ -443,9 +478,9 @@ public class TaskManagerPanel extends JPanel {
             if (id != null) taskLogs.remove(id);
         });
 
-        JButton btnExportLog    = new JButton("Export");
+        JButton btnExportLog = new JButton("Export");
         JButton btnViewArchives = new JButton("Archives");
-        btnExportLog.addActionListener(e    -> exportLogsForSelected());
+        btnExportLog.addActionListener(e -> exportLogsForSelected());
         btnViewArchives.addActionListener(e -> viewLogArchives());
 
         JPanel logButtonPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT, 4, 0));
@@ -483,8 +518,8 @@ public class TaskManagerPanel extends JPanel {
         watcherBar = new JPanel(new BorderLayout());
         watcherBar.setBackground(new Color(0xFBF3E3));
         watcherBar.setBorder(BorderFactory.createCompoundBorder(
-            BorderFactory.createMatteBorder(1, 0, 1, 0, new Color(0xD9A441)),
-            new EmptyBorder(3, 6, 3, 6)));
+                BorderFactory.createMatteBorder(1, 0, 1, 0, new Color(0xD9A441)),
+                new EmptyBorder(3, 6, 3, 6)));
         watcherBar.add(lblWatcherFingerprint, BorderLayout.WEST);
         watcherBar.setVisible(false);
 
@@ -497,7 +532,7 @@ public class TaskManagerPanel extends JPanel {
         btnBarReset.setContentAreaFilled(false);
         btnBarReset.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
         btnBarReset.setToolTipText(
-            "Clears the stored epoch and size so the next watcher run treats everything as new.");
+                "Clears the stored epoch and size so the next watcher run treats everything as new.");
         btnBarReset.addActionListener(e -> resetBaselineForSelected());
         watcherBar.add(btnBarReset, BorderLayout.EAST);
 
@@ -509,8 +544,8 @@ public class TaskManagerPanel extends JPanel {
         logTop.add(logHeader, BorderLayout.NORTH);
         logTop.add(watcherBar, BorderLayout.SOUTH);
 
-        logPanel.add(logTop,      BorderLayout.NORTH);
-        logPanel.add(logScrollPane,   BorderLayout.CENTER);
+        logPanel.add(logTop, BorderLayout.NORTH);
+        logPanel.add(logScrollPane, BorderLayout.CENTER);
 
         logScrollPane.setPreferredSize(new Dimension(900, 200));
 
@@ -522,25 +557,23 @@ public class TaskManagerPanel extends JPanel {
         refresh();
     }
 
-    // ── Watcher fingerprint bar ────────────────────────────────────────────────
-
     /**
      * Refreshes the watcher fingerprint bar for the currently selected task.
-     *
+     * <p>
      * Visible only when:
-     *   taskType == FILE_TRANSFER AND direction == INBOUND AND watcherEnabled.
-     *
+     * taskType == FILE_TRANSFER AND direction == INBOUND AND watcherEnabled.
+     * <p>
      * Three states (matching TaskDialog and TaskManagerPanel original implementation):
-     *
-     *   epoch == 0 (no baseline):
-     *     Grey — "Watcher: no baseline stored — first run will always transfer."
-     *
-     *   epoch > 0, size >= 0 (healthy):
-     *     Green — "Watcher baseline: last seen YYYY-MM-DD HH:mm:ss | size: N bytes"
-     *
-     *   epoch > 0, size == -1 (legacy — size not tracked):
-     *     Amber — prompts the operator to open Edit → Reset Baseline.
-     *
+     * <p>
+     * epoch == 0 (no baseline):
+     * Grey — "Watcher: no baseline stored — first run will always transfer."
+     * <p>
+     * epoch > 0, size >= 0 (healthy):
+     * Green — "Watcher baseline: last seen YYYY-MM-DD HH:mm:ss | size: N bytes"
+     * <p>
+     * epoch > 0, size == -1 (legacy — size not tracked):
+     * Amber — prompts the operator to open Edit → Reset Baseline.
+     * <p>
      * This is reloaded from storage on every call so it reflects the latest epoch
      * persisted by TransferService after each successful watcher run.
      */
@@ -565,7 +598,7 @@ public class TaskManagerPanel extends JPanel {
         }
 
         long epoch = task.getLastKnownRemoteFileEpoch();
-        long size  = task.getLastKnownRemoteFileSize();
+        long size = task.getLastKnownRemoteFileSize();
 
         String html;
         if (epoch <= 0) {
@@ -593,6 +626,8 @@ public class TaskManagerPanel extends JPanel {
         watcherBar.revalidate();
         watcherBar.repaint();
     }
+
+    // ── Status color mapping ──────────────────────────────────────────────────
 
     /**
      * Small trailing HTML fragment (no surrounding &lt;html&gt; tags) showing
@@ -623,14 +658,25 @@ public class TaskManagerPanel extends JPanel {
                 mode = TaskSchedulerService.WatchMode.NOT_APPLICABLE; // forward-compat: unknown mode name
             }
             switch (mode) {
-                case NATIVE_WATCH -> { label = "\u26A1 Live (native watch) \u2022 daemon"; color = "#2E7D32"; }
-                case REMOTE_PUSH -> { label = "\u26A1 Live (remote push) \u2022 daemon"; color = "#2E7D32"; }
+                case NATIVE_WATCH -> {
+                    label = "\u26A1 Live (native watch) \u2022 daemon";
+                    color = "#2E7D32";
+                }
+                case REMOTE_PUSH -> {
+                    label = "\u26A1 Live (remote push) \u2022 daemon";
+                    color = "#2E7D32";
+                }
                 case POLLING_ONLY_UNSUPPORTED -> {
                     label = "Polling only \u2014 remote push unavailable on this host \u2022 daemon";
                     color = "#E65100";
                 }
-                case POLLING_ONLY -> { label = "Polling only \u2022 daemon"; color = "#757575"; }
-                default -> { return ""; }
+                case POLLING_ONLY -> {
+                    label = "Polling only \u2022 daemon";
+                    color = "#757575";
+                }
+                default -> {
+                    return "";
+                }
             }
             return "&nbsp;&nbsp;&nbsp;<b style='color:" + color + "'>" + label + "</b>";
         }
@@ -639,17 +685,30 @@ public class TaskManagerPanel extends JPanel {
         // process's own scheduler (correct when the GUI itself is primary).
         TaskSchedulerService.WatchMode mode = scheduler.getWatchMode(task);
         switch (mode) {
-            case NATIVE_WATCH -> { label = "\u26A1 Live (native watch)"; color = "#2E7D32"; }
-            case REMOTE_PUSH -> { label = "\u26A1 Live (remote push)"; color = "#2E7D32"; }
+            case NATIVE_WATCH -> {
+                label = "\u26A1 Live (native watch)";
+                color = "#2E7D32";
+            }
+            case REMOTE_PUSH -> {
+                label = "\u26A1 Live (remote push)";
+                color = "#2E7D32";
+            }
             case POLLING_ONLY_UNSUPPORTED -> {
                 label = "Polling only \u2014 remote push unavailable on this host";
                 color = "#E65100";
             }
-            case POLLING_ONLY -> { label = "Polling only"; color = "#757575"; }
-            default -> { return ""; }
+            case POLLING_ONLY -> {
+                label = "Polling only";
+                color = "#757575";
+            }
+            default -> {
+                return "";
+            }
         }
         return "&nbsp;&nbsp;&nbsp;<b style='color:" + color + "'>" + label + "</b>";
     }
+
+    // ── Row view-model / renderer ─────────────────────────────────────────────
 
     /**
      * Returns the raw {@code TaskSchedulerService.WatchMode} name the Daemon
@@ -676,211 +735,104 @@ public class TaskManagerPanel extends JPanel {
         if (id == null) return;
 
         storage.loadTasks().stream()
-            .filter(t -> t.getId().equals(id))
-            .findFirst()
-            .ifPresent(task -> {
-                int ok = JOptionPane.showConfirmDialog(this,
-                    "Reset watcher baseline for \"" + task.getName() + "\"?\n\n"
-                    + "The next watcher run will treat all files in the source directory as new "
-                    + "and transfer everything it finds.",
-                    "Reset Watcher Baseline", JOptionPane.YES_NO_OPTION,
-                    JOptionPane.WARNING_MESSAGE);
-                if (ok != JOptionPane.YES_OPTION) return;
+                .filter(t -> t.getId().equals(id))
+                .findFirst()
+                .ifPresent(task -> {
+                    int ok = JOptionPane.showConfirmDialog(this,
+                            "Reset watcher baseline for \"" + task.getName() + "\"?\n\n"
+                                    + "The next watcher run will treat all files in the source directory as new "
+                                    + "and transfer everything it finds.",
+                            "Reset Watcher Baseline", JOptionPane.YES_NO_OPTION,
+                            JOptionPane.WARNING_MESSAGE);
+                    if (ok != JOptionPane.YES_OPTION) return;
 
-                long oldEpoch = task.getLastKnownRemoteFileEpoch();
-                long oldSize = task.getLastKnownRemoteFileSize();
-                task.setLastKnownRemoteFileEpoch(0L);
-                task.setLastKnownRemoteFileSize(-1L);
-                if (!storage.saveTask(task)) {
-                    // This button had NO event logging at all before — not even on
-                    // success — so a failure here was completely invisible: the
-                    // dialog would still say "Baseline cleared" even though nothing
-                    // was written, and the next watcher run would behave as if
-                    // nothing had changed.
-                    String detail = storage.isConnected()
-                            ? storage.getLastTaskSaveError() : storage.getConnectionError();
-                    logActivityFailed("Watcher baseline reset failed",
-                            "Could not reset watcher baseline for \"" + task.getName() + "\""
-                                    + (storage.isConnected() ? " — database connected, but this write failed"
-                                            : " — database not connected")
-                                    + (detail != null ? ": " + detail : "."));
+                    long oldEpoch = task.getLastKnownRemoteFileEpoch();
+                    long oldSize = task.getLastKnownRemoteFileSize();
+                    task.setLastKnownRemoteFileEpoch(0L);
+                    task.setLastKnownRemoteFileSize(-1L);
+                    if (!storage.saveTask(task)) {
+                        // This button had NO event logging at all before — not even on
+                        // success — so a failure here was completely invisible: the
+                        // dialog would still say "Baseline cleared" even though nothing
+                        // was written, and the next watcher run would behave as if
+                        // nothing had changed.
+                        String detail = storage.isConnected()
+                                ? storage.getLastTaskSaveError() : storage.getConnectionError();
+                        logActivityFailed("Watcher baseline reset failed",
+                                "Could not reset watcher baseline for \"" + task.getName() + "\""
+                                        + (storage.isConnected() ? " — database connected, but this write failed"
+                                        : " — database not connected")
+                                        + (detail != null ? ": " + detail : "."));
+                        JOptionPane.showMessageDialog(this,
+                                "Could not reset the baseline — the write did not persist"
+                                        + (detail != null ? (":\n" + detail) : ".") + "\n\nTry again.",
+                                "Baseline Reset Failed", JOptionPane.ERROR_MESSAGE);
+                        return;
+                    }
+                    logActivity("Watcher baseline reset", "Reset watcher baseline for \"" + task.getName()
+                            + "\" — last known remote file epoch: " + oldEpoch + " \u2192 0; last known "
+                            + "remote file size: " + oldSize + " \u2192 -1 (next watcher run treats all "
+                            + "files as new).");
+                    updateWatcherFingerprintBar();
                     JOptionPane.showMessageDialog(this,
-                            "Could not reset the baseline — the write did not persist"
-                                    + (detail != null ? (":\n" + detail) : ".") + "\n\nTry again.",
-                            "Baseline Reset Failed", JOptionPane.ERROR_MESSAGE);
-                    return;
-                }
-                logActivity("Watcher baseline reset", "Reset watcher baseline for \"" + task.getName()
-                        + "\" — last known remote file epoch: " + oldEpoch + " \u2192 0; last known "
-                        + "remote file size: " + oldSize + " \u2192 -1 (next watcher run treats all "
-                        + "files as new).");
-                updateWatcherFingerprintBar();
-                JOptionPane.showMessageDialog(this,
-                    "Baseline cleared. The next watcher run will start fresh.",
-                    "Baseline Reset", JOptionPane.INFORMATION_MESSAGE);
-            });
+                            "Baseline cleared. The next watcher run will start fresh.",
+                            "Baseline Reset", JOptionPane.INFORMATION_MESSAGE);
+                });
     }
 
-    // ── Legend ────────────────────────────────────────────────────────────────
-
-    /** HTML shown as the "?" button's tooltip — the same status key that used
-     *  to be a permanently-visible row of swatches, now reference material
-     *  you check occasionally rather than something the layout pays rent for
-     *  permanently. Uses the same paired tokens {@link PillBadge} paints
-     *  status pills with, so the key always matches what's actually shown. */
+    /**
+     * HTML shown as the "?" button's tooltip — the same status key that used
+     * to be a permanently-visible row of swatches, now reference material
+     * you check occasionally rather than something the layout pays rent for
+     * permanently. Uses the same paired tokens {@link PillBadge} paints
+     * status pills with, so the key always matches what's actually shown.
+     */
     private String legendTooltipHtml() {
         return "<html><b>Status colors</b><br>"
-            + legendRow(AppTheme.RUNNING_FG, AppTheme.RUNNING_BG, "Running")
-            + legendRow(AppTheme.SUCCESS_FG, AppTheme.SUCCESS_BG, "Success")
-            + legendRow(AppTheme.SKIPPED_FG, AppTheme.SKIPPED_BG, "Skipped (no new file)")
-            + legendRow(AppTheme.FAILED_FG, AppTheme.FAILED_BG, "Failed")
-            + legendRow(AppTheme.NEUTRAL_FG, null, "Disabled")
-            + "</html>";
+                + legendRow(AppTheme.RUNNING_FG, AppTheme.RUNNING_BG, "Running")
+                + legendRow(AppTheme.SUCCESS_FG, AppTheme.SUCCESS_BG, "Success")
+                + legendRow(AppTheme.SKIPPED_FG, AppTheme.SKIPPED_BG, "Skipped (no new file)")
+                + legendRow(AppTheme.FAILED_FG, AppTheme.FAILED_BG, "Failed")
+                + legendRow(AppTheme.NEUTRAL_FG, null, "Disabled")
+                + "</html>";
     }
 
     private String legendRow(Color fg, Color bg, String label) {
         String swatch = bg != null
-            ? "<span style='background:" + toHex(bg) + ";color:" + toHex(fg) + "'>&nbsp;&nbsp;&nbsp;&nbsp;</span>"
-            : "<span style='color:" + toHex(fg) + "'>\u25CF</span>";
+                ? "<span style='background:" + toHex(bg) + ";color:" + toHex(fg) + "'>&nbsp;&nbsp;&nbsp;&nbsp;</span>"
+                : "<span style='color:" + toHex(fg) + "'>\u25CF</span>";
         return swatch + "&nbsp;" + label + "<br>";
     }
 
-    private static String toHex(Color c) {
-        return String.format("#%02X%02X%02X", c.getRed(), c.getGreen(), c.getBlue());
-    }
-
-    // ── Status color mapping ──────────────────────────────────────────────────
-
-    /** {fg, bg} pair for a status pill — {@code bg} may be {@code null}, meaning
-     *  "plain muted text, no pill background" (e.g. Disabled) rather than a
-     *  colored chip, since a chip for every single status (including neutral
-     *  ones) would be noise, not signal. */
-    private Color[] statusColors(String status, String lastResult) {
-        if (status == null) return new Color[]{ AppTheme.NEUTRAL_FG, null };
-        switch (status) {
-            case "RUNNING":  return new Color[]{ AppTheme.RUNNING_FG, AppTheme.RUNNING_BG };
-            case "FAILED":   return new Color[]{ AppTheme.FAILED_FG, AppTheme.FAILED_BG };
-            case "DISABLED": return new Color[]{ AppTheme.NEUTRAL_FG, null };
-            case "SUCCESS":
-                if (lastResult != null && lastResult.contains("SKIPPED")) {
-                    return new Color[]{ AppTheme.SKIPPED_FG, AppTheme.SKIPPED_BG };
-                }
-                return new Color[]{ AppTheme.SUCCESS_FG, AppTheme.SUCCESS_BG };
-            default:
-                if (lastResult != null && lastResult.contains("SKIPPED")) {
-                    return new Color[]{ AppTheme.SKIPPED_FG, AppTheme.SKIPPED_BG };
-                }
-                return new Color[]{ AppTheme.NEUTRAL_FG, null };
-        }
-    }
-
-    // ── Row view-model / renderer ─────────────────────────────────────────────
-
-    /** Precomputed per-task display strings, refreshed once per {@link #refresh()}
-     *  cycle rather than recomputed on every single row repaint — in particular
-     *  the watcher-live-vs-polling determination reads the Daemon's exported
-     *  status file, which is cheap once per refresh but not something to redo
-     *  on every JList repaint. */
-    private record TaskRowInfo(String typeCell, String scheduleCell, String lastRunCell, String resultLine) {}
-
-    private final Map<String, TaskRowInfo> rowInfoByTaskId = new HashMap<>();
-
-    private static final TaskRowInfo FALLBACK_ROW_INFO =
-            new TaskRowInfo("", "", "", "");
+    // ── Refresh / list population ─────────────────────────────────────────────
 
     /**
-     * Card-style row renderer: an {@link IconTile} (task type/direction glyph),
-     * a two-line text block (name + meta line), and a status {@link PillBadge}
-     * on the trailing edge. Reused across rows (standard {@code ListCellRenderer}
-     * pattern) — only the icon tile is rebuilt per call, since its colors
-     * depend on per-row data and it has no public setter for that; the text
-     * labels and badge are mutated in place.
+     * {fg, bg} pair for a status pill — {@code bg} may be {@code null}, meaning
+     * "plain muted text, no pill background" (e.g. Disabled) rather than a
+     * colored chip, since a chip for every single status (including neutral
+     * ones) would be noise, not signal.
      */
-    private class TaskRowRenderer extends JPanel implements ListCellRenderer<ScheduledTask> {
-        private final JLabel nameLabel = new JLabel();
-        private final JLabel metaLabel = new JLabel();
-        private final PillBadge statusBadge = new PillBadge("", AppTheme.NEUTRAL_FG, null);
-        private IconTile currentIcon;
-
-        TaskRowRenderer() {
-            setLayout(new BorderLayout(10, 0));
-            setBorder(new EmptyBorder(6, 10, 6, 10));
-
-            nameLabel.setFont(nameLabel.getFont().deriveFont(Font.BOLD, 13f));
-            metaLabel.setFont(metaLabel.getFont().deriveFont(Font.PLAIN, 11f));
-            metaLabel.setForeground(new Color(0x8A8378));
-
-            JPanel textBlock = new JPanel();
-            textBlock.setOpaque(false);
-            textBlock.setLayout(new BoxLayout(textBlock, BoxLayout.Y_AXIS));
-            nameLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
-            metaLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
-            textBlock.add(nameLabel);
-            textBlock.add(metaLabel);
-            add(textBlock, BorderLayout.CENTER);
-
-            JPanel right = new JPanel(new GridBagLayout());
-            right.setOpaque(false);
-            right.add(statusBadge);
-            add(right, BorderLayout.EAST);
-        }
-
-        @Override
-        public Component getListCellRendererComponent(JList<? extends ScheduledTask> list, ScheduledTask t,
-                                                        int index, boolean isSelected, boolean cellHasFocus) {
-            nameLabel.setText(t.getName());
-
-            String glyph;
-            Color tileBg;
-            if (t.getTaskType() == TaskType.FILE_TRANSFER) {
-                glyph = t.getTransferDirection() == TransferDirection.INBOUND ? "\u2B07" : "\u2B06";
-                tileBg = AppTheme.EARTH_SIENNA;
-            } else if (t.getTaskType() == TaskType.OUTLOOK_MAIL) {
-                glyph = "\u2709";
-                tileBg = AppTheme.EARTH_TEAL;
-            } else {
-                glyph = "\u21BB";
-                tileBg = AppTheme.EARTH_OCHRE;
-            }
-            if (currentIcon != null) remove(currentIcon);
-            currentIcon = new IconTile(glyph, Color.WHITE, tileBg);
-            add(currentIcon, BorderLayout.WEST);
-
-            TaskRowInfo info = rowInfoByTaskId.getOrDefault(t.getId(), FALLBACK_ROW_INFO);
-            metaLabel.setText(info.typeCell() + "  \u00b7  " + info.scheduleCell()
-                    + "  \u00b7  Last run: " + info.lastRunCell() + info.resultLine());
-
-            statusBadge.setText(t.getStatus().name());
-            String lastResult = t.getLastRunResult();
-            Color[] colors = statusColors(t.getStatus().name(), lastResult);
-            statusBadge.setColors(colors[0], colors[1]);
-
-            if (isSelected) {
-                // The pale (fg, bg) pairs above are tuned for the row's normal
-                // background — against the selection highlight they can read
-                // as low-contrast or even blend in outright ("text mixes with
-                // highlight color"). Force high-contrast selection colors for
-                // everything, same as JList's own default selected-row
-                // handling, rather than leaving badge/label colors fixed
-                // regardless of what's now behind them.
-                nameLabel.setForeground(list.getSelectionForeground());
-                metaLabel.setForeground(list.getSelectionForeground());
-                statusBadge.setColors(list.getSelectionForeground(), null);
-            } else {
-                nameLabel.setForeground(UIManager.getColor("List.foreground"));
-                metaLabel.setForeground(new Color(0x8A8378));
-                // colors[] already applied above for the unselected case
-            }
-
-            setBackground(isSelected ? list.getSelectionBackground()
-                    : (index % 2 == 0 ? list.getBackground() : AppTheme.surface2()));
-            setOpaque(true);
-            revalidate();
-            return this;
+    private Color[] statusColors(String status, String lastResult) {
+        if (status == null) return new Color[]{AppTheme.NEUTRAL_FG, null};
+        switch (status) {
+            case "RUNNING":
+                return new Color[]{AppTheme.RUNNING_FG, AppTheme.RUNNING_BG};
+            case "FAILED":
+                return new Color[]{AppTheme.FAILED_FG, AppTheme.FAILED_BG};
+            case "DISABLED":
+                return new Color[]{AppTheme.NEUTRAL_FG, null};
+            case "SUCCESS":
+                if (lastResult != null && lastResult.contains("SKIPPED")) {
+                    return new Color[]{AppTheme.SKIPPED_FG, AppTheme.SKIPPED_BG};
+                }
+                return new Color[]{AppTheme.SUCCESS_FG, AppTheme.SUCCESS_BG};
+            default:
+                if (lastResult != null && lastResult.contains("SKIPPED")) {
+                    return new Color[]{AppTheme.SKIPPED_FG, AppTheme.SKIPPED_BG};
+                }
+                return new Color[]{AppTheme.NEUTRAL_FG, null};
         }
     }
-
-    // ── Refresh / list population ─────────────────────────────────────────────
 
     public void refresh() {
         String selectedId = getSelectedTaskId();
@@ -909,7 +861,7 @@ public class TaskManagerPanel extends JPanel {
         int runningCount = 0, failedCount = 0, totalRunCount = 0, successCount = 0;
 
         for (ScheduledTask t : tasks) {
-            String schedDesc  = buildScheduleDescription(t);
+            String schedDesc = buildScheduleDescription(t);
             String lastResult = t.getLastRunResult() != null ? t.getLastRunResult() : "";
 
             // Type/Direction/Mode merged into one line — almost always short
@@ -984,6 +936,8 @@ public class TaskManagerPanel extends JPanel {
         updateWatcherFingerprintBar();
     }
 
+    // ── Schedule description / next-run calculation ───────────────────────────
+
     /**
      * Rebuilds {@code listModel}'s contents from {@code allTasksCache} filtered
      * by the current filter box text (matched against name or type, case
@@ -1016,19 +970,26 @@ public class TaskManagerPanel extends JPanel {
         }
     }
 
-    // ── Schedule description / next-run calculation ───────────────────────────
-
     private String buildScheduleDescription(ScheduledTask t) {
         switch (t.getScheduleType()) {
-            case RUN_NOW:          return "Run Now";
-            case ONCE:             return "Once @ " + (t.getScheduledAt() != null ? t.getScheduledAt().format(DT) : "?");
-            case DAILY:            return "Daily @ " + (t.getCronExpression() != null ? t.getCronExpression() : "?");
-            case WEEKLY:           return "Weekly " + (t.getCronExpression() != null ? t.getCronExpression() : "?");
-            case INTERVAL_MINUTES: return "Every " + t.getIntervalMinutes() + " min";
-            case INTERVAL_SECONDS: return "Every " + t.getIntervalSeconds() + " sec";
-            default:               return "?";
+            case RUN_NOW:
+                return "Run Now";
+            case ONCE:
+                return "Once @ " + (t.getScheduledAt() != null ? t.getScheduledAt().format(DT) : "?");
+            case DAILY:
+                return "Daily @ " + (t.getCronExpression() != null ? t.getCronExpression() : "?");
+            case WEEKLY:
+                return "Weekly " + (t.getCronExpression() != null ? t.getCronExpression() : "?");
+            case INTERVAL_MINUTES:
+                return "Every " + t.getIntervalMinutes() + " min";
+            case INTERVAL_SECONDS:
+                return "Every " + t.getIntervalSeconds() + " sec";
+            default:
+                return "?";
         }
     }
+
+    // ── Task actions ──────────────────────────────────────────────────────────
 
     private String calculateNextRun(ScheduledTask t) {
         if (t.getStatus() == TaskStatus.DISABLED) return "Disabled";
@@ -1044,19 +1005,21 @@ public class TaskManagerPanel extends JPanel {
                 if (t.getCronExpression() == null) return "Invalid";
                 try {
                     LocalTime target = LocalTime.parse(t.getCronExpression(),
-                        DateTimeFormatter.ofPattern("HH:mm"));
+                            DateTimeFormatter.ofPattern("HH:mm"));
                     LocalDateTime next = now.withHour(target.getHour())
-                        .withMinute(target.getMinute()).withSecond(0);
+                            .withMinute(target.getMinute()).withSecond(0);
                     if (!next.isAfter(now)) next = next.plusDays(1);
                     return next.format(DT);
-                } catch (Exception e) { return "Invalid"; }
+                } catch (Exception e) {
+                    return "Invalid";
+                }
             case WEEKLY:
                 if (t.getCronExpression() == null) return "Invalid";
                 try {
                     String[] parts = t.getCronExpression().split(" ");
                     if (parts.length < 2) return "Invalid";
                     LocalTime target = LocalTime.parse(parts[1],
-                        DateTimeFormatter.ofPattern("HH:mm"));
+                            DateTimeFormatter.ofPattern("HH:mm"));
                     DayOfWeek targetDay = null;
                     for (DayOfWeek dw : DayOfWeek.values()) {
                         if (dw.name().startsWith(parts[0].toUpperCase()
@@ -1067,27 +1030,28 @@ public class TaskManagerPanel extends JPanel {
                     }
                     if (targetDay == null) return "Invalid";
                     LocalDateTime next = now.with(TemporalAdjusters.next(targetDay))
-                        .withHour(target.getHour()).withMinute(target.getMinute()).withSecond(0);
+                            .withHour(target.getHour()).withMinute(target.getMinute()).withSecond(0);
                     if (now.getDayOfWeek() == targetDay) {
                         LocalDateTime today = now.withHour(target.getHour())
-                            .withMinute(target.getMinute()).withSecond(0);
+                                .withMinute(target.getMinute()).withSecond(0);
                         if (today.isAfter(now)) next = today;
                     }
                     return next.format(DT);
-                } catch (Exception e) { return "Invalid"; }
+                } catch (Exception e) {
+                    return "Invalid";
+                }
             case INTERVAL_MINUTES:
                 if (t.getIntervalMinutes() <= 0) return "Invalid";
                 return (t.getLastRunAt() != null
-                    ? t.getLastRunAt().plusMinutes(t.getIntervalMinutes()) : now).format(DT);
+                        ? t.getLastRunAt().plusMinutes(t.getIntervalMinutes()) : now).format(DT);
             case INTERVAL_SECONDS:
                 if (t.getIntervalSeconds() <= 0) return "Invalid";
                 return (t.getLastRunAt() != null
-                    ? t.getLastRunAt().plusSeconds(t.getIntervalSeconds()) : now).format(DT);
-            default: return "Unknown";
+                        ? t.getLastRunAt().plusSeconds(t.getIntervalSeconds()) : now).format(DT);
+            default:
+                return "Unknown";
         }
     }
-
-    // ── Task actions ──────────────────────────────────────────────────────────
 
     /**
      * Records an application-activity note (task created/edited/deleted)
@@ -1109,8 +1073,10 @@ public class TaskManagerPanel extends JPanel {
         });
     }
 
-    /** Same as {@link #logActivity} but marks the event FAILED, so it renders
-     *  as a failure (red, "Failed: ...") in the feed instead of a neutral note. */
+    /**
+     * Same as {@link #logActivity} but marks the event FAILED, so it renders
+     * as a failure (red, "Failed: ...") in the feed instead of a neutral note.
+     */
     private void logActivityFailed(String title, String detail) {
         // Audit writes go through a single background thread (in order) so a busy
         // SQLite connection can never freeze the UI on save.
@@ -1128,8 +1094,8 @@ public class TaskManagerPanel extends JPanel {
     private void newTask() {
         try {
             TaskDialog dlg = new TaskDialog(
-                (Frame) SwingUtilities.getWindowAncestor(this), storage, null,
-                scheduler.getRunHistoryService());
+                    (Frame) SwingUtilities.getWindowAncestor(this), storage, null,
+                    scheduler.getRunHistoryService());
             dlg.setVisible(true);
             if (dlg.getResult() != null) {
                 ScheduledTask created = dlg.getResult();
@@ -1139,53 +1105,51 @@ public class TaskManagerPanel extends JPanel {
             }
         } catch (Throwable ex) {
             JOptionPane.showMessageDialog(this,
-                "Failed to open New Task dialog:\n" + ex.getMessage(),
-                "Error", JOptionPane.ERROR_MESSAGE);
+                    "Failed to open New Task dialog:\n" + ex.getMessage(),
+                    "Error", JOptionPane.ERROR_MESSAGE);
             ex.printStackTrace();
         }
     }
 
     private void editTask() {
         String id = getSelectedTaskId();
-        if (id == null) { JOptionPane.showMessageDialog(this, "Select a task to edit."); return; }
+        if (id == null) {
+            JOptionPane.showMessageDialog(this, "Select a task to edit.");
+            return;
+        }
         storage.loadTasks().stream().filter(t -> t.getId().equals(id)).findFirst()
-            .ifPresentOrElse(t -> {
-                try {
-                    // TaskDialog.save() mutates this SAME object in place (existing != null
-                    // -> "t" is reused directly, not copied — see TaskDialog#save), so the
-                    // "before" state must be captured here, before the dialog even opens.
-                    // Without this, dlg.getResult() afterward is that same, already-mutated
-                    // object and there is no way to know what changed — which is exactly why
-                    // "Task edited" previously carried zero information beyond the name.
-                    Map<String, String> credLookup = buildCredentialNameLookup();
-                    Map<String, String> before = snapshotTaskFields(t, credLookup);
-                    TaskDialog dlg = new TaskDialog(
-                        (Frame) SwingUtilities.getWindowAncestor(this), storage, t,
-                        scheduler.getRunHistoryService());
-                    dlg.setVisible(true);
-                    if (dlg.getResult() != null) {
-                        // Reuses the same lookup from just above — a credential
-                        // can't have been added/renamed/deleted by anything else
-                        // in the few seconds this modal dialog was open.
-                        Map<String, String> after = snapshotTaskFields(dlg.getResult(), credLookup);
-                        logActivity("Task edited", "Edited task \"" + dlg.getResult().getName()
-                                + "\" — " + diffTaskFields(before, after));
-                        refresh();
+                .ifPresentOrElse(t -> {
+                    try {
+                        // TaskDialog.save() mutates this SAME object in place (existing != null
+                        // -> "t" is reused directly, not copied — see TaskDialog#save), so the
+                        // "before" state must be captured here, before the dialog even opens.
+                        // Without this, dlg.getResult() afterward is that same, already-mutated
+                        // object and there is no way to know what changed — which is exactly why
+                        // "Task edited" previously carried zero information beyond the name.
+                        Map<String, String> credLookup = buildCredentialNameLookup();
+                        Map<String, String> before = snapshotTaskFields(t, credLookup);
+                        TaskDialog dlg = new TaskDialog(
+                                (Frame) SwingUtilities.getWindowAncestor(this), storage, t,
+                                scheduler.getRunHistoryService());
+                        dlg.setVisible(true);
+                        if (dlg.getResult() != null) {
+                            // Reuses the same lookup from just above — a credential
+                            // can't have been added/renamed/deleted by anything else
+                            // in the few seconds this modal dialog was open.
+                            Map<String, String> after = snapshotTaskFields(dlg.getResult(), credLookup);
+                            logActivity("Task edited", "Edited task \"" + dlg.getResult().getName()
+                                    + "\" — " + diffTaskFields(before, after));
+                            refresh();
+                        }
+                    } catch (Throwable ex) {
+                        JOptionPane.showMessageDialog(this,
+                                "Failed to open Edit Task dialog:\n" + ex.getMessage(),
+                                "Error", JOptionPane.ERROR_MESSAGE);
+                        ex.printStackTrace();
                     }
-                } catch (Throwable ex) {
-                    JOptionPane.showMessageDialog(this,
-                        "Failed to open Edit Task dialog:\n" + ex.getMessage(),
-                        "Error", JOptionPane.ERROR_MESSAGE);
-                    ex.printStackTrace();
-                }
-            }, () -> JOptionPane.showMessageDialog(this,
-                "Selected task could not be found.", "Error", JOptionPane.ERROR_MESSAGE));
+                }, () -> JOptionPane.showMessageDialog(this,
+                        "Selected task could not be found.", "Error", JOptionPane.ERROR_MESSAGE));
     }
-
-    // Human-readable labels for the fields captured by snapshotTaskFields(),
-    // in the order they should read in a created/edited-task event detail.
-    // Shared with the Event Monitor, which reads this text back (see ui.monitor.TaskChangeView).
-    private static final Map<String, String> TASK_FIELD_LABELS = TaskChangeView.LABELS;
 
     /**
      * Captures every user-configurable field on a task as label-ready strings,
@@ -1203,9 +1167,12 @@ public class TaskManagerPanel extends JPanel {
      * SQLite from the Swing event thread a second time for the same single
      * action was pure wasted latency on every click.
      */
-    /** One full credentials-table read, shared across both snapshots of a
-     *  single edit (or the one snapshot a create/delete needs) — see
-     *  {@link #snapshotTaskFields} for why this is a separate call. */
+
+    /**
+     * One full credentials-table read, shared across both snapshots of a
+     * single edit (or the one snapshot a create/delete needs) — see
+     * {@link #snapshotTaskFields} for why this is a separate call.
+     */
     private Map<String, String> buildCredentialNameLookup() {
         Map<String, String> credNameById = new HashMap<>();
         for (model.Credential c : storage.loadAllCredentials()) {
@@ -1256,15 +1223,10 @@ public class TaskManagerPanel extends JPanel {
         return f;
     }
 
-    private static String str(Object o) { return o == null ? null : o.toString(); }
-    private static String yesNo(boolean b) { return b ? "Yes" : "No"; }
-
-    private static boolean isBlank(String s) {
-        return s == null || s.isEmpty() || "0".equals(s) || "null".equals(s);
-    }
-
-    /** Lists every non-blank field from a fresh task's snapshot — used for the
-     *  "Task created" event, since there's no "before" state to diff against. */
+    /**
+     * Lists every non-blank field from a fresh task's snapshot — used for the
+     * "Task created" event, since there's no "before" state to diff against.
+     */
     private String describeNonBlankFields(Map<String, String> fields) {
         List<String> parts = new ArrayList<>();
         for (Map.Entry<String, String> e : fields.entrySet()) {
@@ -1303,13 +1265,16 @@ public class TaskManagerPanel extends JPanel {
 
     private void deleteTask() {
         ScheduledTask selected = getSelectedTask();
-        if (selected == null) { JOptionPane.showMessageDialog(this, "Select a task to delete."); return; }
+        if (selected == null) {
+            JOptionPane.showMessageDialog(this, "Select a task to delete.");
+            return;
+        }
         String name = selected.getName();
-        String id   = selected.getId();
+        String id = selected.getId();
 
         int ok = JOptionPane.showConfirmDialog(this,
-            "Delete task \"" + name + "\"?",
-            "Confirm Delete", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
+                "Delete task \"" + name + "\"?",
+                "Confirm Delete", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
         if (ok == JOptionPane.YES_OPTION) {
             boolean deleted = storage.deleteTask(id);
             if (!deleted) {
@@ -1356,26 +1321,32 @@ public class TaskManagerPanel extends JPanel {
 
     private void runNow() {
         ScheduledTask selected = getSelectedTask();
-        if (selected == null) { JOptionPane.showMessageDialog(this, "Select a task to run."); return; }
-        String id   = selected.getId();
+        if (selected == null) {
+            JOptionPane.showMessageDialog(this, "Select a task to run.");
+            return;
+        }
+        String id = selected.getId();
         String name = selected.getName();
 
         int ok = JOptionPane.showConfirmDialog(this,
-            "Run task \"" + name + "\" immediately?",
-            "Confirm Run Now", JOptionPane.YES_NO_OPTION, JOptionPane.QUESTION_MESSAGE);
+                "Run task \"" + name + "\" immediately?",
+                "Confirm Run Now", JOptionPane.YES_NO_OPTION, JOptionPane.QUESTION_MESSAGE);
         if (ok == JOptionPane.YES_OPTION) {
             service.CommandQueueService.enqueue(storage.getDataDir(), id,
                     service.CommandQueueService.Action.RUN_NOW, "gui");
             logActivity("Task run requested", "Manually queued \"" + name + "\" for immediate execution.");
             JOptionPane.showMessageDialog(this,
-                "Task \"" + name + "\" queued for immediate execution.");
+                    "Task \"" + name + "\" queued for immediate execution.");
             refresh();
         }
     }
 
     private void toggleEnable() {
         String id = getSelectedTaskId();
-        if (id == null) { JOptionPane.showMessageDialog(this, "Select a task."); return; }
+        if (id == null) {
+            JOptionPane.showMessageDialog(this, "Select a task.");
+            return;
+        }
 
         storage.loadTasks().stream().filter(t -> t.getId().equals(id)).findFirst().ifPresent(t -> {
             // This button previously had NO event logging at all, success or
@@ -1391,7 +1362,7 @@ public class TaskManagerPanel extends JPanel {
                         "Could not " + (newStatus == TaskStatus.DISABLED ? "disable" : "enable")
                                 + " task \"" + t.getName() + "\""
                                 + (storage.isConnected() ? " — database connected, but this write failed"
-                                        : " — database not connected")
+                                : " — database not connected")
                                 + (detail != null ? ": " + detail : "."));
                 JOptionPane.showMessageDialog(this,
                         "Could not change this task's status — the write did not persist"
@@ -1413,17 +1384,23 @@ public class TaskManagerPanel extends JPanel {
 
     private void restartTask() {
         ScheduledTask selected = getSelectedTask();
-        if (selected == null) { JOptionPane.showMessageDialog(this, "Select a task to restart."); return; }
+        if (selected == null) {
+            JOptionPane.showMessageDialog(this, "Select a task to restart.");
+            return;
+        }
         String id = selected.getId();
         String name = selected.getName();
 
         ScheduledTask task = storage.loadTasks().stream()
-            .filter(t -> t.getId().equals(id)).findFirst().orElse(null);
-        if (task == null) { JOptionPane.showMessageDialog(this, "Selected task could not be found."); return; }
+                .filter(t -> t.getId().equals(id)).findFirst().orElse(null);
+        if (task == null) {
+            JOptionPane.showMessageDialog(this, "Selected task could not be found.");
+            return;
+        }
 
         int ok = JOptionPane.showConfirmDialog(this,
-            "Restart task \"" + name + "\" now?",
-            "Confirm Restart", JOptionPane.YES_NO_OPTION, JOptionPane.QUESTION_MESSAGE);
+                "Restart task \"" + name + "\" now?",
+                "Confirm Restart", JOptionPane.YES_NO_OPTION, JOptionPane.QUESTION_MESSAGE);
         if (ok != JOptionPane.YES_OPTION) return;
 
         // Same gap as toggleEnable() — previously no event logging at all here either.
@@ -1435,7 +1412,7 @@ public class TaskManagerPanel extends JPanel {
             logActivityFailed("Task restart failed",
                     "Could not restart task \"" + name + "\""
                             + (storage.isConnected() ? " — database connected, but this write failed"
-                                    : " — database not connected")
+                            : " — database not connected")
                             + (detail != null ? ": " + detail : "."));
             JOptionPane.showMessageDialog(this,
                     "Could not restart this task — the write did not persist"
@@ -1455,15 +1432,6 @@ public class TaskManagerPanel extends JPanel {
         refresh();
     }
 
-    // ── Log display ───────────────────────────────────────────────────────────
-
-    // Which of the two log views (full vs latest-50) was last requested for
-    // the currently selected row — so refreshSelectedTaskLogIfChanged() below
-    // re-reads with the matching one instead of always comparing against the
-    // full log (which would never match a "latest 50" view and just fight it
-    // on every tick).
-    private volatile boolean showingLatestOnly = false;
-
     private void showLogForSelected() {
         showingLatestOnly = false;
         logMode = LogMode.FULL;
@@ -1474,12 +1442,12 @@ public class TaskManagerPanel extends JPanel {
             return;
         }
         String name = selected.getName();
-        String id   = selected.getId();
+        String id = selected.getId();
 
         String lastResult = selected.getLastRunResult();
         if (lastResult != null && lastResult.contains("SKIPPED")) {
             lblSelectedTask.setText("Execution log: " + name
-                + "  ⏭ Last run was skipped (no new file detected)");
+                    + "  ⏭ Last run was skipped (no new file detected)");
             lblSelectedTask.setForeground(AppTheme.EARTH_OCHRE);
         } else {
             lblSelectedTask.setText("Execution log: " + name);
@@ -1496,10 +1464,11 @@ public class TaskManagerPanel extends JPanel {
         ScheduledTask selected = getSelectedTask();
         if (selected == null) {
             lblSelectedTask.setText("Select a task to view logs");
-            logArea.setText(""); return;
+            logArea.setText("");
+            return;
         }
         String name = selected.getName();
-        String id   = selected.getId();
+        String id = selected.getId();
         lblSelectedTask.setText("Latest 50 lines - Execution log: " + name);
         lblSelectedTask.setForeground(UIManager.getColor("Label.foreground"));
 
@@ -1507,16 +1476,15 @@ public class TaskManagerPanel extends JPanel {
         loadLogView(true);
     }
 
-    // ── Export / archives ─────────────────────────────────────────────────────
-
     private void exportLogsForSelected() {
         ScheduledTask selectedTask = getSelectedTask();
         if (selectedTask == null) {
             JOptionPane.showMessageDialog(this, "Please select a task first.",
-                "No Task Selected", JOptionPane.WARNING_MESSAGE); return;
+                    "No Task Selected", JOptionPane.WARNING_MESSAGE);
+            return;
         }
         String name = selectedTask.getName();
-        String id   = selectedTask.getId();
+        String id = selectedTask.getId();
 
         JFileChooser fc = new JFileChooser();
         fc.setSelectedFile(new java.io.File(name + "_logs.txt"));
@@ -1528,38 +1496,42 @@ public class TaskManagerPanel extends JPanel {
                     List<String> all = scheduler.getLogService().getTaskLogsRecent(id, name, Integer.MAX_VALUE);
                     java.nio.file.Files.write(selected.toPath(), all, java.nio.charset.StandardCharsets.UTF_8);
                     SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(this,
-                        "Logs exported to:\n" + selected.getAbsolutePath() + "\n(" + all.size() + " lines, including rotated files)",
-                        "Export Complete", JOptionPane.INFORMATION_MESSAGE));
+                            "Logs exported to:\n" + selected.getAbsolutePath() + "\n(" + all.size() + " lines, including rotated files)",
+                            "Export Complete", JOptionPane.INFORMATION_MESSAGE));
                 } catch (Exception e) {
                     SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(this,
-                        "Failed to export logs: " + e.getMessage(),
-                        "Export Error", JOptionPane.ERROR_MESSAGE));
+                            "Failed to export logs: " + e.getMessage(),
+                            "Export Error", JOptionPane.ERROR_MESSAGE));
                 }
             });
         }
     }
 
+    // ── Log display ───────────────────────────────────────────────────────────
+
     private void viewLogArchives() {
         ScheduledTask selectedTask = getSelectedTask();
         if (selectedTask == null) {
             JOptionPane.showMessageDialog(this, "Please select a task first.",
-                "No Task Selected", JOptionPane.WARNING_MESSAGE); return;
+                    "No Task Selected", JOptionPane.WARNING_MESSAGE);
+            return;
         }
         String name = selectedTask.getName();
-        String id   = selectedTask.getId();
+        String id = selectedTask.getId();
 
         List<java.io.File> archives = scheduler.getLogService().getTaskLogArchives(id, name);
         if (archives.isEmpty()) {
             JOptionPane.showMessageDialog(this,
-                "No archived logs found for this task.",
-                "No Archives", JOptionPane.INFORMATION_MESSAGE); return;
+                    "No archived logs found for this task.",
+                    "No Archives", JOptionPane.INFORMATION_MESSAGE);
+            return;
         }
 
         String[] archiveNames = archives.stream().map(java.io.File::getName).toArray(String[]::new);
         String selected = (String) JOptionPane.showInputDialog(this,
-            "Select an archived log file to view:", "View Log Archives",
-            JOptionPane.QUESTION_MESSAGE, null, archiveNames,
-            archiveNames.length > 0 ? archiveNames[0] : null);
+                "Select an archived log file to view:", "View Log Archives",
+                JOptionPane.QUESTION_MESSAGE, null, archiveNames,
+                archiveNames.length > 0 ? archiveNames[0] : null);
 
         if (selected != null) {
             final java.io.File archiveFile = archives.stream().filter(f -> f.getName().equals(selected))
@@ -1571,7 +1543,9 @@ public class TaskManagerPanel extends JPanel {
                 try {
                     return new String(java.nio.file.Files.readAllBytes(archiveFile.toPath()),
                             java.nio.charset.StandardCharsets.UTF_8);
-                } catch (java.io.IOException e) { throw new java.io.UncheckedIOException(e); }
+                } catch (java.io.IOException e) {
+                    throw new java.io.UncheckedIOException(e);
+                }
             }, text -> {
                 if (logMode != LogMode.ARCHIVE) return;
                 logArea.setText(text);
@@ -1581,12 +1555,12 @@ public class TaskManagerPanel extends JPanel {
         }
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
-
-    /** Currently selected task, or {@code null} if none — the JList's selected
-     *  value IS the task object directly, no row-index/taskIds lookup needed
-     *  (the JTable version needed one; binding the list straight to
-     *  ScheduledTask objects removes that bookkeeping entirely). */
+    /**
+     * Currently selected task, or {@code null} if none — the JList's selected
+     * value IS the task object directly, no row-index/taskIds lookup needed
+     * (the JTable version needed one; binding the list straight to
+     * ScheduledTask objects removes that bookkeeping entirely).
+     */
     private ScheduledTask getSelectedTask() {
         return taskList != null ? taskList.getSelectedValue() : null;
     }
@@ -1596,10 +1570,136 @@ public class TaskManagerPanel extends JPanel {
         return t != null ? t.getId() : null;
     }
 
+    // ── Export / archives ─────────────────────────────────────────────────────
+
     private void styleBtn(JButton b, Color bg) {
         b.setBackground(bg);
         b.setForeground(Color.WHITE);
         b.setFocusPainted(false);
         b.setBorderPainted(false);
+    }
+
+    /**
+     * Re-reads the selected task's on-disk log and refreshes {@code logArea}
+     * only if it actually changed — so this can run on a timer without
+     * fighting the user's scroll position or selection on every tick. Scroll
+     * position is preserved unless the view was already pinned to the
+     * bottom, in which case it stays pinned as new lines arrive.
+     */
+    // ── Log view ─────────────────────────────────────────────────────────────
+    // The on-disk task log (current file plus rotated archives) is the single source of truth for
+    // what the panel shows. It used to be fed from two places in two different formats: live
+    // callback lines ("HH:mm:ss  line", unfiltered) appended as they arrived, and the disk file
+    // ("[date time] line", filtered by log level) swapped in by a 1.5 s poll that never matched
+    // the live text — so the view kept being replaced by just the tail of the current, freshly
+    // rotated file. Now live lines only trigger an (off-EDT, change-gated) reload from disk.
+
+    private enum LogMode {FULL, LATEST, ARCHIVE}
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    private record LogView(String taskId, LogMode mode, String key, String text) {
+    }
+
+    /**
+     * Precomputed per-task display strings, refreshed once per {@link #refresh()}
+     * cycle rather than recomputed on every single row repaint — in particular
+     * the watcher-live-vs-polling determination reads the Daemon's exported
+     * status file, which is cheap once per refresh but not something to redo
+     * on every JList repaint.
+     */
+    private record TaskRowInfo(String typeCell, String scheduleCell, String lastRunCell, String resultLine) {
+    }
+
+    /**
+     * Card-style row renderer: an {@link IconTile} (task type/direction glyph),
+     * a two-line text block (name + meta line), and a status {@link PillBadge}
+     * on the trailing edge. Reused across rows (standard {@code ListCellRenderer}
+     * pattern) — only the icon tile is rebuilt per call, since its colors
+     * depend on per-row data and it has no public setter for that; the text
+     * labels and badge are mutated in place.
+     */
+    private class TaskRowRenderer extends JPanel implements ListCellRenderer<ScheduledTask> {
+        private final JLabel nameLabel = new JLabel();
+        private final JLabel metaLabel = new JLabel();
+        private final PillBadge statusBadge = new PillBadge("", AppTheme.NEUTRAL_FG, null);
+        private IconTile currentIcon;
+
+        TaskRowRenderer() {
+            setLayout(new BorderLayout(10, 0));
+            setBorder(new EmptyBorder(6, 10, 6, 10));
+
+            nameLabel.setFont(nameLabel.getFont().deriveFont(Font.BOLD, 13f));
+            metaLabel.setFont(metaLabel.getFont().deriveFont(Font.PLAIN, 11f));
+            metaLabel.setForeground(new Color(0x8A8378));
+
+            JPanel textBlock = new JPanel();
+            textBlock.setOpaque(false);
+            textBlock.setLayout(new BoxLayout(textBlock, BoxLayout.Y_AXIS));
+            nameLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+            metaLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+            textBlock.add(nameLabel);
+            textBlock.add(metaLabel);
+            add(textBlock, BorderLayout.CENTER);
+
+            JPanel right = new JPanel(new GridBagLayout());
+            right.setOpaque(false);
+            right.add(statusBadge);
+            add(right, BorderLayout.EAST);
+        }
+
+        @Override
+        public Component getListCellRendererComponent(JList<? extends ScheduledTask> list, ScheduledTask t,
+                                                      int index, boolean isSelected, boolean cellHasFocus) {
+            nameLabel.setText(t.getName());
+
+            String glyph;
+            Color tileBg;
+            if (t.getTaskType() == TaskType.FILE_TRANSFER) {
+                glyph = t.getTransferDirection() == TransferDirection.INBOUND ? "\u2B07" : "\u2B06";
+                tileBg = AppTheme.EARTH_SIENNA;
+            } else if (t.getTaskType() == TaskType.OUTLOOK_MAIL) {
+                glyph = "\u2709";
+                tileBg = AppTheme.EARTH_TEAL;
+            } else {
+                glyph = "\u21BB";
+                tileBg = AppTheme.EARTH_OCHRE;
+            }
+            if (currentIcon != null) remove(currentIcon);
+            currentIcon = new IconTile(glyph, Color.WHITE, tileBg);
+            add(currentIcon, BorderLayout.WEST);
+
+            TaskRowInfo info = rowInfoByTaskId.getOrDefault(t.getId(), FALLBACK_ROW_INFO);
+            metaLabel.setText(info.typeCell() + "  \u00b7  " + info.scheduleCell()
+                    + "  \u00b7  Last run: " + info.lastRunCell() + info.resultLine());
+
+            statusBadge.setText(t.getStatus().name());
+            String lastResult = t.getLastRunResult();
+            Color[] colors = statusColors(t.getStatus().name(), lastResult);
+            statusBadge.setColors(colors[0], colors[1]);
+
+            if (isSelected) {
+                // The pale (fg, bg) pairs above are tuned for the row's normal
+                // background — against the selection highlight they can read
+                // as low-contrast or even blend in outright ("text mixes with
+                // highlight color"). Force high-contrast selection colors for
+                // everything, same as JList's own default selected-row
+                // handling, rather than leaving badge/label colors fixed
+                // regardless of what's now behind them.
+                nameLabel.setForeground(list.getSelectionForeground());
+                metaLabel.setForeground(list.getSelectionForeground());
+                statusBadge.setColors(list.getSelectionForeground(), null);
+            } else {
+                nameLabel.setForeground(UIManager.getColor("List.foreground"));
+                metaLabel.setForeground(new Color(0x8A8378));
+                // colors[] already applied above for the unselected case
+            }
+
+            setBackground(isSelected ? list.getSelectionBackground()
+                    : (index % 2 == 0 ? list.getBackground() : AppTheme.surface2()));
+            setOpaque(true);
+            revalidate();
+            return this;
+        }
     }
 }

@@ -1,45 +1,27 @@
 package service;
 
 import com.jcraft.jsch.ChannelSftp;
-import model.Credential;
-import model.FileSelection;
-import model.RemoteFileException;
-import model.RemoteFileMetadata;
-import model.ScheduledTask;
+import model.*;
 import model.ScheduledTask.TransferDirection;
 import model.ScheduledTask.TransferMode;
-import service.RemoteFileMetadataServiceFactory.ManagedMetadataService;
 import service.watch.PersistentSftpConnectionManager;
-import util.MailFetchMode;
-import util.MiniJson;
-import util.AppConfig;
 import util.AppSettings;
+import util.MailFetchMode;
 
 import java.io.*;
 import java.net.InetAddress;
-import java.nio.file.*;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.Comparator;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Locale;
-import java.util.Map;
-import java.util.Set;
+import java.util.*;
+import java.util.concurrent.*;
 import java.util.function.Consumer;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.SynchronousQueue;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
@@ -67,7 +49,7 @@ import java.util.stream.Collectors;
  * {@link AppSettings#getTransferBatchMaxBytes()} — rather than a fixed file
  * count, with a configurable pause between batches
  * ({@link AppSettings#getTransferBatchIntervalSeconds()}).
- *
+ * <p>
  * In watcher mode an empty result throws {@link WatcherSkipException} so the
  * scheduler marks the run SKIPPED rather than FAILED.  On success the epoch
  * of the newest transferred file is persisted as the new baseline.
@@ -79,73 +61,8 @@ public class TransferService {
             "C:\\Program Files\\WinSCP\\WinSCP.com",
             "winscp.com"
     };
-
-    private final XmlStorageService storage;
-    /** LDM/MVT/PTM text handling for mail tasks (header block, routing codes, station lookup, message ids). */
-    private final MailTextProcessor mailText;
-    private final RemoteFileMetadataServiceFactory metadataServiceFactory;
-    private String winScpPath;
-
     // Outlook mail is read via Microsoft Graph (see class docs on executeImapMailTask).
     private static final String GRAPH_MAIL_SCOPE = "https://graph.microsoft.com/Mail.ReadWrite offline_access";
-    private final OAuth2TokenService oauthService;
-    private final GraphMailService graphMailService = new GraphMailService();
-
-    // Keyed by taskId. A Set rather than a single Process because, with
-    // AppSettings.getTransferBatchConcurrency() > 1, more than one WinSCP
-    // process can legitimately be in flight for the same task at once (one
-    // per concurrently-running batch).
-    private final ConcurrentMap<String, java.util.Set<Process>> activeProcesses = new ConcurrentHashMap<>();
-
-    // Kept-warm SFTP connections for watcher-triggered (LATEST_ONLY + watcher
-    // enabled) transfers only — see class javadoc on that path. Every other
-    // transfer mode still goes through WinSCP.com via runBatchedWinScpCommands,
-    // since those aren't on the "instant detection" latency-critical path.
-    private final PersistentSftpConnectionManager persistentSftp = new PersistentSftpConnectionManager();
-
-    // Optional hook: fired the moment a watcher fire's files are confirmed
-    // found — i.e. right as the "Watcher found N new/updated file(s)" log
-    // line is emitted — before any transfer attempt starts. Lets the caller
-    // (TaskSchedulerService) record the detection itself as its own
-    // run-history row, distinct from the transfer's own outcome row, so
-    // "files were seen" and "files were moved" are two separate, separately
-    // timestamped events in the Event Monitor rather than one merged one —
-    // deliberately a ThreadLocal rather than a widened executeTransfer(...)
-    // signature, since only TaskSchedulerService's single call site needs it
-    // and every other caller (backup mkdir/cleanup, etc.) is unaffected.
-    private final ThreadLocal<Consumer<List<RemoteFileMetadata>>> detectionCallback = new ThreadLocal<>();
-
-    /**
-     * The most specific classification available for the current thread's
-     * in-progress {@link #executeTransfer} call, if its outer catch blocks
-     * classified one — see {@link #getLastFailureClassification()}. Same
-     * ThreadLocal-per-call pattern as {@link #detectionCallback} just
-     * above, for the same reason: {@code executeTransfer} returns a plain
-     * {@code boolean}, so there's no return-value channel back to the
-     * caller for "and here's specifically why it failed" without either
-     * widening that return type everywhere it's used or threading an
-     * out-parameter through every call in the chain — a thread-local set
-     * right where the exception is still in hand is the smallest change
-     * that gets {@link TaskSchedulerService} a reliable classification
-     * instead of making it re-derive one from text after the fact.
-     */
-    private final ThreadLocal<model.TaskRunRecord> lastFailureClassification = new ThreadLocal<>();
-
-    /** Reliable (exception-type-based, not text-guessed) classification of the most recent failure on this thread, or null if the last {@link #executeTransfer} call didn't fail via a classified exception. */
-    public model.TaskRunRecord getLastFailureClassification() {
-        return lastFailureClassification.get();
-    }
-
-    /** Set on the current thread just before {@link #executeTransfer}; see {@link #detectionCallback}. */
-    public void setDetectionCallback(Consumer<List<RemoteFileMetadata>> callback) {
-        detectionCallback.set(callback);
-    }
-
-    /** Clears the callback set by {@link #setDetectionCallback} — always call in a {@code finally}. */
-    public void clearDetectionCallback() {
-        detectionCallback.remove();
-    }
-
     /**
      * The one and only pool of "extra" worker threads used to parallelize a
      * single watcher fire's files across multiple SFTP channels (see
@@ -180,38 +97,266 @@ public class TransferService {
      * degradation instead of unbounded thread growth.
      */
     private static final int BATCH_POOL_IDLE_SECONDS = 60;
+    private static final DateTimeFormatter RCV_LDM_PTM_TS_FMT = DateTimeFormatter.ofPattern("yyyyMMddHHmmss");
+    private static final String GRAPH_APP_ONLY_SCOPE = "https://graph.microsoft.com/.default";
+    // ── WinSCP runtime cap and cancel plumbing ──────────────────────────────
+    private static final java.util.concurrent.ScheduledExecutorService WATCHDOG =
+            java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "winscp-watchdog");
+                t.setDaemon(true);
+                return t;
+            });
+    private static final int SFTP_CONNECT_TIMEOUT_MS = 30_000;
+    // ── WinSCP password hand-off ────────────────────────────────────────────
+    // The password is NOT written to the script file. The script's open line refers to
+    // %OPSTOOL_SFTP_PW%, which WinSCP expands from the environment of the one process
+    // that runs that script (WinSCP resolves environment variables before parsing a command).
+    private static final String PW_ENV = "OPSTOOL_SFTP_PW";
+    private final XmlStorageService storage;
+    /**
+     * LDM/MVT/PTM text handling for mail tasks (header block, routing codes, station lookup, message ids).
+     */
+    private final MailTextProcessor mailText;
+    private final RemoteFileMetadataServiceFactory metadataServiceFactory;
+    private final OAuth2TokenService oauthService;
+    private final GraphMailService graphMailService = new GraphMailService();
+    // Keyed by taskId. A Set rather than a single Process because, with
+    // AppSettings.getTransferBatchConcurrency() > 1, more than one WinSCP
+    // process can legitimately be in flight for the same task at once (one
+    // per concurrently-running batch).
+    private final ConcurrentMap<String, java.util.Set<Process>> activeProcesses = new ConcurrentHashMap<>();
+    // Kept-warm SFTP connections for watcher-triggered (LATEST_ONLY + watcher
+    // enabled) transfers only — see class javadoc on that path. Every other
+    // transfer mode still goes through WinSCP.com via runBatchedWinScpCommands,
+    // since those aren't on the "instant detection" latency-critical path.
+    private final PersistentSftpConnectionManager persistentSftp = new PersistentSftpConnectionManager();
+    // Optional hook: fired the moment a watcher fire's files are confirmed
+    // found — i.e. right as the "Watcher found N new/updated file(s)" log
+    // line is emitted — before any transfer attempt starts. Lets the caller
+    // (TaskSchedulerService) record the detection itself as its own
+    // run-history row, distinct from the transfer's own outcome row, so
+    // "files were seen" and "files were moved" are two separate, separately
+    // timestamped events in the Event Monitor rather than one merged one —
+    // deliberately a ThreadLocal rather than a widened executeTransfer(...)
+    // signature, since only TaskSchedulerService's single call site needs it
+    // and every other caller (backup mkdir/cleanup, etc.) is unaffected.
+    private final ThreadLocal<Consumer<List<RemoteFileMetadata>>> detectionCallback = new ThreadLocal<>();
+    /**
+     * The most specific classification available for the current thread's
+     * in-progress {@link #executeTransfer} call, if its outer catch blocks
+     * classified one — see {@link #getLastFailureClassification()}. Same
+     * ThreadLocal-per-call pattern as {@link #detectionCallback} just
+     * above, for the same reason: {@code executeTransfer} returns a plain
+     * {@code boolean}, so there's no return-value channel back to the
+     * caller for "and here's specifically why it failed" without either
+     * widening that return type everywhere it's used or threading an
+     * out-parameter through every call in the chain — a thread-local set
+     * right where the exception is still in hand is the smallest change
+     * that gets {@link TaskSchedulerService} a reliable classification
+     * instead of making it re-derive one from text after the fact.
+     */
+    private final ThreadLocal<model.TaskRunRecord> lastFailureClassification = new ThreadLocal<>();
     private final ThreadPoolExecutor batchWorkerPool = new ThreadPoolExecutor(
             0, Math.max(1, AppSettings.getTransferBatchConcurrency()),
             BATCH_POOL_IDLE_SECONDS, TimeUnit.SECONDS,
             new SynchronousQueue<>(),
             Workers.factory(Workers.Lane.WATCH),
             new ThreadPoolExecutor.CallerRunsPolicy());
+    /**
+     * When each task was last alerted about missing files (this process only); cleared when a run transfers files again.
+     */
+    private final AlertThrottle noFilesAlerts = new AlertThrottle();
+    /**
+     * Guards "pick a free file name, then claim it" so concurrent workers never choose the same name.
+     */
+    private final Object rcvNameLock = new Object();
+    /**
+     * Real task id of the transfer running on this thread, so backup helper sessions can be cancelled.
+     */
+    private final ThreadLocal<String> realTaskId = new ThreadLocal<>();
+    private final ConcurrentHashMap<String, java.util.Set<service.sftp.SftpClient>> activeClients =
+            new ConcurrentHashMap<>();
+    private final java.util.concurrent.ConcurrentHashMap<String, String> scriptPasswords =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private String winScpPath;
+
+    // ─── Auto-detect source system ───────────────────────────────────────────
+    private volatile NoFilesListener noFilesListener;
+    private volatile MailEventListener mailEventListener;
+
+    // ─── Main entry point ────────────────────────────────────────────────────
 
     public TransferService(XmlStorageService storage) {
-        this.storage                = storage;
-        this.mailText               = new MailTextProcessor(storage::getDataDir);
+        this.storage = storage;
+        this.mailText = new MailTextProcessor(storage::getDataDir);
         this.metadataServiceFactory = new RemoteFileMetadataServiceFactory(storage);
-        this.winScpPath             = detectWinScp();
+        this.winScpPath = detectWinScp();
         // Shared dataDir-based path, NOT the per-user-home default — the
         // Daemon runs as SYSTEM (see app-config.xml <runAsSystem>) while the
         // GUI runs as the logged-in user, so a user-home-based token path
         // would put them in two different, mutually invisible directories.
-        this.oauthService           = new OAuth2TokenService(OAuth2TokenService.sharedTokenDir(storage.getDataDir()));
+        this.oauthService = new OAuth2TokenService(OAuth2TokenService.sharedTokenDir(storage.getDataDir()));
         GraphCallLog.configure(storage.getDataDir());
         DaemonCallLog.configure(storage.getDataDir());
     }
 
-    /** Exposed so the UI's "Authorize Mailbox" flow can enroll without duplicating OAuth logic. */
-    public OAuth2TokenService getOAuthService() { return oauthService; }
+    public static String getLocalHostname() {
+        try {
+            return InetAddress.getLocalHost().getHostName();
+        } catch (Exception e) {
+            return System.getenv("COMPUTERNAME");
+        }
+    }
 
-    public void   setWinScpPath(String path) { this.winScpPath = path; }
-    public String getWinScpPath()            { return winScpPath; }
+    public static String getLocalUsername() {
+        return System.getProperty("user.name", System.getenv("USERNAME"));
+    }
 
-    /** Closes and forgets any kept-warm watcher SFTP connection for this task —
-     *  call when a task is deleted, disabled, or its target credential changes. */
-    public void closeWatcherConnection(String taskId) { persistentSftp.close(taskId); }
+    // ─── Local file batch helper (used by Backup for a local source/destination) ──
 
-    /** Closes every kept-warm watcher SFTP connection — call on scheduler/app shutdown. */
+    static String humanReadableBytes(long bytes) {
+        if (bytes < 1024) return bytes + " B";
+        int exp = (int) (Math.log(bytes) / Math.log(1024));
+        String pre = "KMGTPE".charAt(exp - 1) + "";
+        return String.format(Locale.ROOT, "%.1f %sB", bytes / Math.pow(1024, exp), pre);
+    }
+
+    /**
+     * Milliseconds since {@code startNanos} (a {@code System.nanoTime()} reading) — for the timing breadcrumbs above.
+     */
+    private static long elapsedMs(long startNanos) {
+        return (System.nanoTime() - startNanos) / 1_000_000L;
+    }
+
+    /**
+     * Milliseconds between two {@code System.nanoTime()} readings.
+     */
+    private static long elapsedMs(long startNanos, long endNanos) {
+        return (endNanos - startNanos) / 1_000_000L;
+    }
+
+    private static String remoteListingDirFor(String remotePath) {
+        return TransferPaths.remoteListingDirFor(remotePath);
+    }
+
+    private static <T> List<List<T>> chunkBySize(
+            List<T> items, java.util.function.ToLongFunction<T> sizeOf, long maxBytes) {
+        return TransferBatching.chunkBySize(items, sizeOf, maxBytes);
+    }
+
+    private static List<List<Path>> chunkPathsBySize(List<Path> files) {
+        long maxBytes = AppSettings.getTransferBatchMaxBytes();
+        return chunkBySize(files, p -> {
+            try {
+                return Files.size(p);
+            } catch (IOException e) {
+                return 0L;
+            }
+        }, maxBytes);
+    }
+
+    /**
+     * app-config.xml {@code <graphAuthMode>CERTIFICATE</graphAuthMode>}; anything else = signed-in user (default).
+     */
+    private static boolean graphCertificateMode() {
+        String v = util.AppConfig.readValue("graphAuthMode");
+        return v != null && v.trim().equalsIgnoreCase("CERTIFICATE");
+    }
+
+    /**
+     * app-config.xml {@code <winscpMaxRuntimeMinutes>}; 0 or absent = no cap (default).
+     */
+    private static long winScpMaxRuntimeMinutes() {
+        try {
+            String v = util.AppConfig.readValue("winscpMaxRuntimeMinutes");
+            return v == null ? 0 : Math.max(0, Long.parseLong(v.trim()));
+        } catch (NumberFormatException e) {
+            return 0;
+        }
+    }
+
+    // ─── Watcher transfer — unified for INBOUND and OUTBOUND ─────────────────
+
+    private static boolean useSftpEngine() {
+        String v = util.AppConfig.readValue("transferEngine");
+        return v == null || !v.trim().equalsIgnoreCase("winscp");
+    }
+
+    /**
+     * One line saying why a script session was opened, from what the script does (shown as the session's purpose).
+     */
+    private static String describeScript(List<String> script, String taskId) {
+        int get = 0, put = 0, rm = 0, mv = 0, mkdir = 0;
+        for (String l : script) {
+            String t = l.trim().toLowerCase();
+            if (t.startsWith("get ")) get++;
+            else if (t.startsWith("put ")) put++;
+            else if (t.startsWith("rm ")) rm++;
+            else if (t.startsWith("mv ")) mv++;
+            else if (t.startsWith("mkdir ")) mkdir++;
+        }
+        List<String> parts = new ArrayList<>();
+        if (get > 0) parts.add("download " + get + " file(s)");
+        if (put > 0) parts.add("upload " + put + " file(s)");
+        if (rm > 0) parts.add("delete " + rm + " original(s)");
+        if (mv > 0) parts.add("move " + mv + " original(s)");
+        if (mkdir > 0) parts.add("create " + mkdir + " folder(s)");
+        String what = parts.isEmpty() ? "SFTP commands" : String.join(", ", parts);
+        boolean cleanup = taskId != null && taskId.equals("backup-cleanup");
+        return (cleanup ? "SFTP cleanup after a successful transfer: " : "SFTP: ") + what;
+    }
+
+    /**
+     * Reliable (exception-type-based, not text-guessed) classification of the most recent failure on this thread, or null if the last {@link #executeTransfer} call didn't fail via a classified exception.
+     */
+    public model.TaskRunRecord getLastFailureClassification() {
+        return lastFailureClassification.get();
+    }
+
+    /**
+     * Set on the current thread just before {@link #executeTransfer}; see {@link #detectionCallback}.
+     */
+    public void setDetectionCallback(Consumer<List<RemoteFileMetadata>> callback) {
+        detectionCallback.set(callback);
+    }
+
+    // ─── Outbound watcher watch-directory resolution ──────────────────────────
+
+    /**
+     * Clears the callback set by {@link #setDetectionCallback} — always call in a {@code finally}.
+     */
+    public void clearDetectionCallback() {
+        detectionCallback.remove();
+    }
+
+    /**
+     * Exposed so the UI's "Authorize Mailbox" flow can enroll without duplicating OAuth logic.
+     */
+    public OAuth2TokenService getOAuthService() {
+        return oauthService;
+    }
+
+    // ─── WinSCP outbound watcher transfer ────────────────────────────────────
+
+    public String getWinScpPath() {
+        return winScpPath;
+    }
+
+    public void setWinScpPath(String path) {
+        this.winScpPath = path;
+    }
+
+    /**
+     * Closes and forgets any kept-warm watcher SFTP connection for this task —
+     * call when a task is deleted, disabled, or its target credential changes.
+     */
+    public void closeWatcherConnection(String taskId) {
+        persistentSftp.close(taskId);
+    }
+
+    /**
+     * Closes every kept-warm watcher SFTP connection — call on scheduler/app shutdown.
+     */
     public void shutdownWatcherConnections() {
         persistentSftp.shutdown();
         batchWorkerPool.shutdownNow();
@@ -224,33 +369,22 @@ public class TransferService {
         return WINSCP_PATHS[0];
     }
 
-    // ─── Auto-detect source system ───────────────────────────────────────────
-
-    public static String getLocalHostname() {
-        try { return InetAddress.getLocalHost().getHostName(); }
-        catch (Exception e) { return System.getenv("COMPUTERNAME"); }
-    }
-
-    public static String getLocalUsername() {
-        return System.getProperty("user.name", System.getenv("USERNAME"));
-    }
-
-    // ─── Main entry point ────────────────────────────────────────────────────
-
     public boolean executeTransfer(ScheduledTask task, Consumer<String> logLine)
             throws WatcherSkipException {
         return executeTransfer(task, logLine, Collections.emptySet());
     }
 
+    // ─── Persistent-SFTP inbound watcher transfer ────────────────────────────
+
     /**
      * @param eventFileNames filenames the push-watch layer (LocalWatchManager /
-     *     RemotePushWatcher) actually observed changing for this run, or empty if
-     *     this is an ordinary scheduled/manual run or the watcher only knows
-     *     "something changed" without naming it (e.g. an OVERFLOW event). When
-     *     non-empty and the task is watcher-enabled LATEST_ONLY, {@link
-     *     #executeWatcherTransfer} transfers exactly these named files instead of
-     *     deriving the file list from a directory scan filtered against the stored
-     *     baseline — see that method's javadoc for why that distinction matters.
+     *                       RemotePushWatcher) actually observed changing for this run, or empty if
+     *                       this is an ordinary scheduled/manual run or the watcher only knows
+     *                       "something changed" without naming it (e.g. an OVERFLOW event). When
+     *                       non-empty and the task is watcher-enabled LATEST_ONLY, {@link
+     *                       #executeWatcherTransfer} transfers exactly these named files instead of
+     *                       deriving the file list from a directory scan filtered against the stored
+     *                       baseline — see that method's javadoc for why that distinction matters.
      */
     public boolean executeTransfer(ScheduledTask task, Consumer<String> logLine, Set<String> eventFileNames)
             throws WatcherSkipException {
@@ -261,6 +395,8 @@ public class TransferService {
             realTaskId.remove();
         }
     }
+
+    // ─── WinSCP script builder (non-watcher remote paths) ────────────────────
 
     private boolean executeTransferInner(ScheduledTask task, Consumer<String> logLine, Set<String> eventFileNames)
             throws WatcherSkipException {
@@ -327,10 +463,7 @@ public class TransferService {
         }
     }
 
-    // ─── Local file batch helper (used by Backup for a local source/destination) ──
-
-    /** Whether a local file batch operation copies (leaves original in place) or moves it. */
-    private enum LocalFileOp { COPY, MOVE }
+    // ─── Legacy WinSCP ls (non-watcher INBOUND LATEST_ONLY fallback) ─────────
 
     /**
      * Transfers {@code files} into {@code destDir} on the local filesystem, in
@@ -388,9 +521,11 @@ public class TransferService {
         return allOk;
     }
 
-    /** Original one-at-a-time behavior for a single batch — used when concurrency is 1 (default). */
+    /**
+     * Original one-at-a-time behavior for a single batch — used when concurrency is 1 (default).
+     */
     private boolean runLocalFileOpsSequentially(List<Path> batch, Path destDir, LocalFileOp op,
-            Consumer<String> logLine, int[] doneOut) {
+                                                Consumer<String> logLine, int[] doneOut) {
         boolean allOk = true;
         int done = 0;
         for (Path src : batch) {
@@ -412,7 +547,7 @@ public class TransferService {
      * the thread-safe logging callback.
      */
     private boolean runLocalFileOpsConcurrently(List<Path> batch, Path destDir, LocalFileOp op,
-            Consumer<String> logLine, int concurrency, int[] doneOut) {
+                                                Consumer<String> logLine, int concurrency, int[] doneOut) {
         java.util.concurrent.ExecutorService pool =
                 Workers.newPool(Workers.Lane.TRANSFER, Math.min(concurrency, batch.size()));
         java.util.concurrent.atomic.AtomicInteger done = new java.util.concurrent.atomic.AtomicInteger(0);
@@ -422,12 +557,12 @@ public class TransferService {
             for (Path src : batch) {
                 tasks.add(() -> {
                     try (BackgroundJobs.Job j = BackgroundJobs.begin((op == LocalFileOp.MOVE ? "Move " : "Copy ") + src.getFileName(), false)) {
-                    boolean ok = op == LocalFileOp.MOVE
-                            ? moveSingleFile(src, destDir.resolve(src.getFileName()), logLine)
-                            : copySingleFile(src, destDir.resolve(src.getFileName()), logLine);
-                    if (ok) done.incrementAndGet();
-                    if (!ok) j.fail("file operation reported failure");
-                    return ok;
+                        boolean ok = op == LocalFileOp.MOVE
+                                ? moveSingleFile(src, destDir.resolve(src.getFileName()), logLine)
+                                : copySingleFile(src, destDir.resolve(src.getFileName()), logLine);
+                        if (ok) done.incrementAndGet();
+                        if (!ok) j.fail("file operation reported failure");
+                        return ok;
                     }
                 });
             }
@@ -460,7 +595,9 @@ public class TransferService {
         return allOk;
     }
 
-    /** Copies a single file, replacing the destination if it already exists. */
+    /**
+     * Copies a single file, replacing the destination if it already exists.
+     */
     private boolean copySingleFile(Path src, Path dest, Consumer<String> logLine) {
         try {
             Files.copy(src, dest, StandardCopyOption.REPLACE_EXISTING);
@@ -472,7 +609,11 @@ public class TransferService {
         }
     }
 
-    /** Moves a single file, replacing the destination if it already exists. */
+    // ─── WinSCP process runner ────────────────────────────────────────────────
+
+    /**
+     * Moves a single file, replacing the destination if it already exists.
+     */
     private boolean moveSingleFile(Path src, Path dest, Consumer<String> logLine) {
         try {
             Files.move(src, dest, StandardCopyOption.REPLACE_EXISTING);
@@ -484,6 +625,18 @@ public class TransferService {
         }
     }
 
+    // ─── Batch splitting (any transfer mode, any direction) ──────────────────
+    //
+    // Batches are SIZE-based (total bytes) rather than file-count based: when
+    // a transfer or backup would move more total bytes than the configured
+    // cap in one go, it is split into sequential batches, each capped near
+    // AppSettings.getTransferBatchMaxBytes(), with a pause of
+    // AppSettings.getTransferBatchIntervalSeconds() between batches. A single
+    // file larger than the cap is still sent alone in its own batch — it is
+    // never split. Values are read live from AppSettings (app-settings.json,
+    // seeded from app-config.xml's <transfer> block) — editable from the
+    // Settings panel with no restart required.
+
     private void sleepBetweenBatches(int intervalSeconds, Consumer<String> logLine) {
         try {
             logLine.accept("[INFO] Pausing " + intervalSeconds + "s before next batch...");
@@ -492,15 +645,6 @@ public class TransferService {
             Thread.currentThread().interrupt();
         }
     }
-
-    static String humanReadableBytes(long bytes) {
-        if (bytes < 1024) return bytes + " B";
-        int exp = (int) (Math.log(bytes) / Math.log(1024));
-        String pre = "KMGTPE".charAt(exp - 1) + "";
-        return String.format(Locale.ROOT, "%.1f %sB", bytes / Math.pow(1024, exp), pre);
-    }
-
-    // ─── Watcher transfer — unified for INBOUND and OUTBOUND ─────────────────
 
     /**
      * Single watcher path used by both directions.
@@ -547,8 +691,8 @@ public class TransferService {
         logLine.accept("[INFO] Watcher enabled (LATEST_ONLY, "
                 + (isOutbound ? "OUTBOUND" : "INBOUND")
                 + "). " + (eventDriven
-                    ? "Event named " + eventFileNames.size() + " file(s) directly: " + eventFileNames
-                    : "Querying files modified after: " + modifiedAfter + " (epoch=" + lastKnownEpochMillis + ")"));
+                ? "Event named " + eventFileNames.size() + " file(s) directly: " + eventFileNames
+                : "Querying files modified after: " + modifiedAfter + " (epoch=" + lastKnownEpochMillis + ")"));
 
         List<RemoteFileMetadata> newFiles = null;
 
@@ -564,93 +708,93 @@ public class TransferService {
 
         final boolean namedByEvent = newFiles != null;
         if (newFiles == null) {
-        if (isOutbound) {
-            // OUTBOUND: always scan the LOCAL source directory
-            String watchDir = resolveOutboundWatchDirectory(task);
-            logLine.accept("[INFO] Metadata service: LOCAL | watch directory: " + watchDir);
+            if (isOutbound) {
+                // OUTBOUND: always scan the LOCAL source directory
+                String watchDir = resolveOutboundWatchDirectory(task);
+                logLine.accept("[INFO] Metadata service: LOCAL | watch directory: " + watchDir);
 
-            LocalFileMetadataService localService = new LocalFileMetadataService();
-            try {
-                if (lastKnownEpochMillis > 0 && task.getLastKnownRemoteFileSize() >= 0) {
-                    Instant modifiedAfterInclusive = Instant.ofEpochMilli(lastKnownEpochMillis - 1);
-                    List<RemoteFileMetadata> candidates =
-                            localService.getFilesModifiedAfter(watchDir, modifiedAfterInclusive);
-                    long baselineSize = task.getLastKnownRemoteFileSize();
-                    newFiles = candidates.stream()
-                            .filter(f -> f.lastModified().isAfter(modifiedAfter)
-                                    || (f.lastModified().equals(modifiedAfter) && f.size() != baselineSize))
-                            .collect(Collectors.toList());
-                } else {
-                    newFiles = localService.getFilesModifiedAfter(watchDir, modifiedAfter);
+                LocalFileMetadataService localService = new LocalFileMetadataService();
+                try {
+                    if (lastKnownEpochMillis > 0 && task.getLastKnownRemoteFileSize() >= 0) {
+                        Instant modifiedAfterInclusive = Instant.ofEpochMilli(lastKnownEpochMillis - 1);
+                        List<RemoteFileMetadata> candidates =
+                                localService.getFilesModifiedAfter(watchDir, modifiedAfterInclusive);
+                        long baselineSize = task.getLastKnownRemoteFileSize();
+                        newFiles = candidates.stream()
+                                .filter(f -> f.lastModified().isAfter(modifiedAfter)
+                                        || (f.lastModified().equals(modifiedAfter) && f.size() != baselineSize))
+                                .collect(Collectors.toList());
+                    } else {
+                        newFiles = localService.getFilesModifiedAfter(watchDir, modifiedAfter);
+                    }
+                } catch (RemoteFileException ex) {
+                    logLine.accept("[ERROR] Failed to list local source: " + ex.getMessage());
+                    return false;
                 }
-            } catch (RemoteFileException ex) {
-                logLine.accept("[ERROR] Failed to list local source: " + ex.getMessage());
-                return false;
-            }
 
-            newFiles = applySelectionToCandidates(task, newFiles, logLine); // before the first-run "newest only" cut
-            if (lastKnownEpochMillis <= 0 && newFiles != null && !newFiles.isEmpty()) {
-                long maxTs = newFiles.stream()
-                        .mapToLong(f -> f.lastModified().toEpochMilli()).max().orElse(0L);
-                List<RemoteFileMetadata> latestOnly = newFiles.stream()
-                        .filter(f -> f.lastModified().toEpochMilli() == maxTs)
-                        .collect(Collectors.toList());
-                logLine.accept("[INFO] Initial run: reduced watcher candidates to "
-                        + latestOnly.size() + " latest file(s) (ts=" + Instant.ofEpochMilli(maxTs) + ")");
-                newFiles = latestOnly;
-            }
-
-        } else {
-            // INBOUND: scan the remote source directory over SFTP, reusing the
-            // same kept-warm connection the transfer itself will use (see
-            // executeWinScpWatcherInbound / PersistentSftpConnectionManager)
-            // instead of opening-and-closing a brand-new SSH session just for
-            // this listing on every single watcher fire.
-            long listStart = System.nanoTime();
-            try {
-                long connStart = System.nanoTime();
-                ChannelSftp channel = persistentSftp.getChannel(task.getId(), target);
-                RemoteFileMetadataService svc = new SftpRemoteFileMetadataService(channel);
-                String watchDir = resolveRemoteWatchDirectoryFor(task);
-                logLine.accept("[INFO] Metadata service: SFTP (kept-warm connection, " + elapsedMs(connStart)
-                        + "ms) | watch directory: " + watchDir);
-
-                if (lastKnownEpochMillis > 0 && task.getLastKnownRemoteFileSize() >= 0) {
-                    Instant modifiedAfterInclusive = Instant.ofEpochMilli(lastKnownEpochMillis - 1);
-                    List<RemoteFileMetadata> candidates =
-                            svc.getFilesModifiedAfter(watchDir, modifiedAfterInclusive);
-                    long baselineSize = task.getLastKnownRemoteFileSize();
-                    newFiles = candidates.stream()
-                            .filter(f -> f.lastModified().isAfter(modifiedAfter)
-                                    || (f.lastModified().equals(modifiedAfter) && f.size() != baselineSize))
+                newFiles = applySelectionToCandidates(task, newFiles, logLine); // before the first-run "newest only" cut
+                if (lastKnownEpochMillis <= 0 && newFiles != null && !newFiles.isEmpty()) {
+                    long maxTs = newFiles.stream()
+                            .mapToLong(f -> f.lastModified().toEpochMilli()).max().orElse(0L);
+                    List<RemoteFileMetadata> latestOnly = newFiles.stream()
+                            .filter(f -> f.lastModified().toEpochMilli() == maxTs)
                             .collect(Collectors.toList());
-                } else {
-                    newFiles = svc.getFilesModifiedAfter(watchDir, modifiedAfter);
+                    logLine.accept("[INFO] Initial run: reduced watcher candidates to "
+                            + latestOnly.size() + " latest file(s) (ts=" + Instant.ofEpochMilli(maxTs) + ")");
+                    newFiles = latestOnly;
                 }
-                logLine.accept("[INFO] Remote directory listing took " + elapsedMs(listStart) + "ms.");
 
-            } catch (RemoteFileException ex) {
-                logLine.accept("[ERROR] Failed to query file metadata: " + ex.getMessage());
-                persistentSftp.close(task.getId());
-                return false;
-            } catch (Exception ex) {
-                logLine.accept("[ERROR] Unexpected error opening metadata service: " + ex.getMessage());
-                persistentSftp.close(task.getId());
-                return false;
-            }
+            } else {
+                // INBOUND: scan the remote source directory over SFTP, reusing the
+                // same kept-warm connection the transfer itself will use (see
+                // executeWinScpWatcherInbound / PersistentSftpConnectionManager)
+                // instead of opening-and-closing a brand-new SSH session just for
+                // this listing on every single watcher fire.
+                long listStart = System.nanoTime();
+                try {
+                    long connStart = System.nanoTime();
+                    ChannelSftp channel = persistentSftp.getChannel(task.getId(), target);
+                    RemoteFileMetadataService svc = new SftpRemoteFileMetadataService(channel);
+                    String watchDir = resolveRemoteWatchDirectoryFor(task);
+                    logLine.accept("[INFO] Metadata service: SFTP (kept-warm connection, " + elapsedMs(connStart)
+                            + "ms) | watch directory: " + watchDir);
 
-            newFiles = applySelectionToCandidates(task, newFiles, logLine); // before the first-run "newest only" cut
-            if (lastKnownEpochMillis <= 0 && newFiles != null && !newFiles.isEmpty()) {
-                long maxTs = newFiles.stream()
-                        .mapToLong(f -> f.lastModified().toEpochMilli()).max().orElse(0L);
-                List<RemoteFileMetadata> latestOnly = newFiles.stream()
-                        .filter(f -> f.lastModified().toEpochMilli() == maxTs)
-                        .collect(Collectors.toList());
-                logLine.accept("[INFO] Initial run: reduced watcher candidates to "
-                        + latestOnly.size() + " latest file(s) (ts=" + Instant.ofEpochMilli(maxTs) + ")");
-                newFiles = latestOnly;
+                    if (lastKnownEpochMillis > 0 && task.getLastKnownRemoteFileSize() >= 0) {
+                        Instant modifiedAfterInclusive = Instant.ofEpochMilli(lastKnownEpochMillis - 1);
+                        List<RemoteFileMetadata> candidates =
+                                svc.getFilesModifiedAfter(watchDir, modifiedAfterInclusive);
+                        long baselineSize = task.getLastKnownRemoteFileSize();
+                        newFiles = candidates.stream()
+                                .filter(f -> f.lastModified().isAfter(modifiedAfter)
+                                        || (f.lastModified().equals(modifiedAfter) && f.size() != baselineSize))
+                                .collect(Collectors.toList());
+                    } else {
+                        newFiles = svc.getFilesModifiedAfter(watchDir, modifiedAfter);
+                    }
+                    logLine.accept("[INFO] Remote directory listing took " + elapsedMs(listStart) + "ms.");
+
+                } catch (RemoteFileException ex) {
+                    logLine.accept("[ERROR] Failed to query file metadata: " + ex.getMessage());
+                    persistentSftp.close(task.getId());
+                    return false;
+                } catch (Exception ex) {
+                    logLine.accept("[ERROR] Unexpected error opening metadata service: " + ex.getMessage());
+                    persistentSftp.close(task.getId());
+                    return false;
+                }
+
+                newFiles = applySelectionToCandidates(task, newFiles, logLine); // before the first-run "newest only" cut
+                if (lastKnownEpochMillis <= 0 && newFiles != null && !newFiles.isEmpty()) {
+                    long maxTs = newFiles.stream()
+                            .mapToLong(f -> f.lastModified().toEpochMilli()).max().orElse(0L);
+                    List<RemoteFileMetadata> latestOnly = newFiles.stream()
+                            .filter(f -> f.lastModified().toEpochMilli() == maxTs)
+                            .collect(Collectors.toList());
+                    logLine.accept("[INFO] Initial run: reduced watcher candidates to "
+                            + latestOnly.size() + " latest file(s) (ts=" + Instant.ofEpochMilli(maxTs) + ")");
+                    newFiles = latestOnly;
+                }
             }
-        }
         }
 
         if (namedByEvent) newFiles = applySelectionToCandidates(task, newFiles, logLine);
@@ -772,10 +916,10 @@ public class TransferService {
      * always the safety net" pattern elsewhere.
      */
     private List<RemoteFileMetadata> resolveEventNamedFiles(ScheduledTask task,
-                                                             Credential target,
-                                                             boolean isOutbound,
-                                                             Set<String> names,
-                                                             Consumer<String> logLine) {
+                                                            Credential target,
+                                                            boolean isOutbound,
+                                                            Set<String> names,
+                                                            Consumer<String> logLine) {
         long statStart = System.nanoTime();
         try {
             List<RemoteFileMetadata> matched;
@@ -831,8 +975,8 @@ public class TransferService {
      * only a genuinely large burst of named files spins up extra channels.
      */
     private List<RemoteFileMetadata> statNamedFilesConcurrently(ScheduledTask task, Credential target,
-                                                                 String watchDir, Set<String> names,
-                                                                 Consumer<String> logLine) throws Exception {
+                                                                String watchDir, Set<String> names,
+                                                                Consumer<String> logLine) throws Exception {
         List<String> nameList = new ArrayList<>(names);
         int concurrency = computeWatcherConcurrency(nameList.size());
 
@@ -887,12 +1031,12 @@ public class TransferService {
                     (com.jcraft.jsch.ChannelSftp) session.openChannel("sftp");
             probe.connect();
 
-            String base        = rawPath.replace("\\", "/").replaceAll("/+$", "");
-            String noLead      = base.replaceFirst("^/", "");
-            String asIs        = base;
-            String withSlash   = "/" + noLead;
-            String noDrive     = base.replaceFirst("^[A-Za-z]:/", "/");
-            String cygwin      = base.replaceFirst("^([A-Za-z]):/", "/$1/");
+            String base = rawPath.replace("\\", "/").replaceAll("/+$", "");
+            String noLead = base.replaceFirst("^/", "");
+            String asIs = base;
+            String withSlash = "/" + noLead;
+            String noDrive = base.replaceFirst("^[A-Za-z]:/", "/");
+            String cygwin = base.replaceFirst("^([A-Za-z]):/", "/$1/");
             String doubleSlash = "//" + noLead;
 
             logLine.accept("[PROBE] pwd = " + probe.pwd());
@@ -914,8 +1058,6 @@ public class TransferService {
             logLine.accept("[PROBE] Could not open probe channel: " + e.getMessage());
         }
     }
-
-    // ─── Outbound watcher watch-directory resolution ──────────────────────────
 
     private String resolveOutboundWatchDirectory(ScheduledTask task) {
         String path = task.getSourcePath();
@@ -952,18 +1094,6 @@ public class TransferService {
         return path;
     }
 
-    // ─── WinSCP outbound watcher transfer ────────────────────────────────────
-
-    /** Milliseconds since {@code startNanos} (a {@code System.nanoTime()} reading) — for the timing breadcrumbs above. */
-    private static long elapsedMs(long startNanos) {
-        return (System.nanoTime() - startNanos) / 1_000_000L;
-    }
-
-    /** Milliseconds between two {@code System.nanoTime()} readings. */
-    private static long elapsedMs(long startNanos, long endNanos) {
-        return (endNanos - startNanos) / 1_000_000L;
-    }
-
     /**
      * How many worker threads/channel slots a watcher fire naming
      * {@code fileCount} files should use — scales with burst size rather
@@ -978,17 +1108,6 @@ public class TransferService {
     }
 
     /**
-     * A single file's transfer over an already-open {@link ChannelSftp} —
-     * the unit of work {@link #transferFilesConcurrently} spreads across
-     * however many worker threads/channel slots a given fire warrants.
-     * Returns bytes transferred (for the running total).
-     */
-    @FunctionalInterface
-    private interface PerFileTransfer {
-        long transfer(ChannelSftp channel, RemoteFileMetadata meta) throws Exception;
-    }
-
-    /**
      * Transfers {@code files} using {@code op}, spreading them across up to
      * {@link util.AppSettings#getTransferBatchConcurrency()} concurrent SFTP
      * channel slots on the task's single kept-warm session (see
@@ -999,7 +1118,7 @@ public class TransferService {
      * queued up to benefit from it.
      */
     private long transferFilesConcurrently(ScheduledTask task, Credential target, List<RemoteFileMetadata> files,
-                                            Consumer<String> logLine, PerFileTransfer op) throws Exception {
+                                           Consumer<String> logLine, PerFileTransfer op) throws Exception {
         int concurrency = computeWatcherConcurrency(files.size());
 
         if (concurrency <= 1) {
@@ -1044,7 +1163,8 @@ public class TransferService {
         // deadlocking or being rejected.
         List<java.util.concurrent.Future<Long>> results = batchWorkerPool.invokeAll(tasks);
         long total = 0L;
-        for (java.util.concurrent.Future<Long> f : results) total += f.get(); // rethrows the first worker's exception, if any
+        for (java.util.concurrent.Future<Long> f : results)
+            total += f.get(); // rethrows the first worker's exception, if any
         return total;
     }
 
@@ -1067,8 +1187,8 @@ public class TransferService {
         }
 
         String localSourceDir = resolveOutboundWatchDirectory(task);
-        String remotePath     = normalizeRemotePath(task.getTargetPath());
-        String remoteDir      = remotePath.endsWith("/") ? remotePath : remotePath + "/";
+        String remotePath = normalizeRemotePath(task.getTargetPath());
+        String remoteDir = remotePath.endsWith("/") ? remotePath : remotePath + "/";
         List<String> extraDestFolders = task.getAdditionalTargetPathList();
         if (!extraDestFolders.isEmpty()) {
             logLine.accept("[INFO] Also copying to " + extraDestFolders.size()
@@ -1092,7 +1212,7 @@ public class TransferService {
             long transferStart = System.nanoTime();
             long totalBytes = transferFilesConcurrently(task, target, files, logLine, (channel, meta) -> {
                 long fileStart = System.nanoTime();
-                String localFile  = normalizeLocalPath(
+                String localFile = normalizeLocalPath(
                         Paths.get(localSourceDir, meta.fileName()).toString());
                 String remoteFile = remoteDir + meta.fileName();
                 channel.put(localFile, remoteFile);
@@ -1131,16 +1251,16 @@ public class TransferService {
         }
     }
 
-    // ─── Persistent-SFTP inbound watcher transfer ────────────────────────────
-
-    /** INBOUND counterpart of {@link #executeWinScpWatcherOutbound} — see its javadoc. */
+    /**
+     * INBOUND counterpart of {@link #executeWinScpWatcherOutbound} — see its javadoc.
+     */
     private boolean executeWinScpWatcherInbound(ScheduledTask task,
                                                 Credential target,
                                                 List<RemoteFileMetadata> files,
                                                 Consumer<String> logLine) {
         String localDestDir = normalizeLocalPath(task.getSourcePath());
-        String remotePath   = normalizeRemotePath(task.getTargetPath());
-        String remoteDir    = remotePath.endsWith("/") ? remotePath : remotePath + "/";
+        String remotePath = normalizeRemotePath(task.getTargetPath());
+        String remoteDir = remotePath.endsWith("/") ? remotePath : remotePath + "/";
         List<String> extraDestFolders = task.getAdditionalTargetPathList();
 
         int connectsBefore = persistentSftp.getSessionCount(task.getId());
@@ -1158,7 +1278,7 @@ public class TransferService {
             long totalBytes = transferFilesConcurrently(task, target, files, logLine, (channel, meta) -> {
                 long fileStart = System.nanoTime();
                 String remoteFile = remoteDir + meta.fileName();
-                String destPath   = buildLocalDestinationPath(localDestDir, meta.fileName());
+                String destPath = buildLocalDestinationPath(localDestDir, meta.fileName());
                 Path destParent = Paths.get(destPath).getParent();
                 if (destParent != null) Files.createDirectories(destParent);
                 channel.get(remoteFile, destPath);
@@ -1190,8 +1310,6 @@ public class TransferService {
         }
     }
 
-    // ─── WinSCP script builder (non-watcher remote paths) ────────────────────
-
     /**
      * Builds a single-file WinSCP script. Only used for SPECIFIC_FILE mode —
      * ENTIRE_FOLDER and LATEST_ONLY go through {@link #executeBatchedRemoteTransfer}
@@ -1204,7 +1322,7 @@ public class TransferService {
         File tmpScript = File.createTempFile("opstool_", ".txt");
         secureTemp(tmpScript);
 
-        String localPath  = normalizeLocalPath(task.getSourcePath());
+        String localPath = normalizeLocalPath(task.getSourcePath());
         String remotePath = normalizeRemotePath(task.getTargetPath());
 
         logLine.accept("[INFO] Target OS: " + target.getOsType() + " | Protocol: SFTP");
@@ -1219,7 +1337,7 @@ public class TransferService {
 
             if (inbound) {
                 logLine.accept("[INFO] Mode: Specific file (INBOUND)");
-                String fname    = remotePath.substring(remotePath.lastIndexOf('/') + 1);
+                String fname = remotePath.substring(remotePath.lastIndexOf('/') + 1);
                 String destPath = buildLocalDestinationPath(localPath, fname);
                 pw.println("get " + escapeWinScpRemotePath(remotePath)
                         + " " + escapeWinScpPath(destPath));
@@ -1248,18 +1366,6 @@ public class TransferService {
             pw.println("exit");
         }
         return tmpScript;
-    }
-
-    // ─── Legacy WinSCP ls (non-watcher INBOUND LATEST_ONLY fallback) ─────────
-
-    /** A remote file's last-modified epoch (ms) and size (bytes), as parsed from `ls -l`. */
-    private static final class RemoteFileStat {
-        final long epochMillis;
-        final long size;
-        RemoteFileStat(long epochMillis, long size) {
-            this.epochMillis = epochMillis;
-            this.size = size;
-        }
     }
 
     private java.util.Map<String, RemoteFileStat> rawRemoteFileStats(
@@ -1311,15 +1417,26 @@ public class TransferService {
             if (lsOpenedAt != 0) SshSessionEvents.closed(null, "WinSCP listing", target.getHost(), target.getUsername(),
                     lsExit == 0 ? "finished" : "WinSCP exit code " + lsExit, System.currentTimeMillis() - lsOpenedAt);
             listScript.delete();
-            try { listLogFile.delete(); } catch (Exception ignored) {}
+            try {
+                listLogFile.delete();
+            } catch (Exception ignored) {
+            }
         }
         logLine.accept("[INFO] Received " + rawLines.size() + " lines from remote listing.");
 
         java.util.Map<String, Integer> MONTH_MAP = new java.util.HashMap<>();
-        MONTH_MAP.put("jan",1); MONTH_MAP.put("feb",2); MONTH_MAP.put("mar",3);
-        MONTH_MAP.put("apr",4); MONTH_MAP.put("may",5); MONTH_MAP.put("jun",6);
-        MONTH_MAP.put("jul",7); MONTH_MAP.put("aug",8); MONTH_MAP.put("sep",9);
-        MONTH_MAP.put("oct",10);MONTH_MAP.put("nov",11);MONTH_MAP.put("dec",12);
+        MONTH_MAP.put("jan", 1);
+        MONTH_MAP.put("feb", 2);
+        MONTH_MAP.put("mar", 3);
+        MONTH_MAP.put("apr", 4);
+        MONTH_MAP.put("may", 5);
+        MONTH_MAP.put("jun", 6);
+        MONTH_MAP.put("jul", 7);
+        MONTH_MAP.put("aug", 8);
+        MONTH_MAP.put("sep", 9);
+        MONTH_MAP.put("oct", 10);
+        MONTH_MAP.put("nov", 11);
+        MONTH_MAP.put("dec", 12);
 
         int currentYear = LocalDate.now().getYear();
         java.util.Map<String, RemoteFileStat> fileStats = new java.util.LinkedHashMap<>();
@@ -1331,17 +1448,25 @@ public class TransferService {
             if (parts.length < 9) continue;
 
             long sizeBytes;
-            try { sizeBytes = Long.parseLong(parts[4]); } catch (NumberFormatException e) { sizeBytes = 0L; }
+            try {
+                sizeBytes = Long.parseLong(parts[4]);
+            } catch (NumberFormatException e) {
+                sizeBytes = 0L;
+            }
 
-            String monthStr   = parts[5].toLowerCase(java.util.Locale.ENGLISH);
-            String dayStr     = parts[6].trim();
+            String monthStr = parts[5].toLowerCase(java.util.Locale.ENGLISH);
+            String dayStr = parts[6].trim();
             String timeOrYear = parts[7];
-            String fileName   = parts[8];
+            String fileName = parts[8];
 
             Integer monthNum = MONTH_MAP.get(monthStr);
             if (monthNum == null) continue;
             int dayNum;
-            try { dayNum = Integer.parseInt(dayStr); } catch (NumberFormatException e) { continue; }
+            try {
+                dayNum = Integer.parseInt(dayStr);
+            } catch (NumberFormatException e) {
+                continue;
+            }
 
             // NOTE: these timestamps are parsed as if `ls -l` reported them in this
             // JVM's local zone (java.time.ZoneId.systemDefault()) rather than UTC.
@@ -1380,7 +1505,9 @@ public class TransferService {
                     epochMillis = ld.atStartOfDay(java.time.ZoneId.systemDefault())
                             .toInstant().toEpochMilli();
                 }
-            } catch (Exception ex) { continue; }
+            } catch (Exception ex) {
+                continue;
+            }
 
             fileStats.put(dirPath + fileName, new RemoteFileStat(epochMillis, sizeBytes));
         }
@@ -1388,9 +1515,9 @@ public class TransferService {
         return fileStats;
     }
 
-    private static String remoteListingDirFor(String remotePath) { return TransferPaths.remoteListingDirFor(remotePath); }
-
-    /** Full remote file listing WITH sizes, keyed by full remote path — used for size-based batching. */
+    /**
+     * Full remote file listing WITH sizes, keyed by full remote path — used for size-based batching.
+     */
     private java.util.Map<String, RemoteFileStat> listAllRemoteFileStatsViaWinScp(
             Credential target, String password, String remotePath,
             Consumer<String> logLine) throws Exception {
@@ -1398,8 +1525,6 @@ public class TransferService {
         String dirPath = remoteListingDirFor(remotePath);
         return rawRemoteFileStats(target, password, dirPath, logLine);
     }
-
-    // ─── WinSCP process runner ────────────────────────────────────────────────
 
     private boolean runWinScpScript(File scriptFile, Consumer<String> logLine,
                                     String taskId) throws Exception {
@@ -1445,7 +1570,10 @@ public class TransferService {
             if (maxMin > 0) {
                 watchdog = WATCHDOG.schedule(() -> {
                     timedOut.set(true);
-                    try { watched.destroyForcibly(); } catch (Exception ignored) {}
+                    try {
+                        watched.destroyForcibly();
+                    } catch (Exception ignored) {
+                    }
                 }, maxMin, java.util.concurrent.TimeUnit.MINUTES);
             }
 
@@ -1455,7 +1583,10 @@ public class TransferService {
                 while ((line = br.readLine()) != null) {
                     logLine.accept(maskPasswords(line));
                     if (Thread.currentThread().isInterrupted()) {
-                        try { proc.destroyForcibly(); } catch (Exception ignored) {}
+                        try {
+                            proc.destroyForcibly();
+                        } catch (Exception ignored) {
+                        }
                         throw new InterruptedException("Transfer cancelled");
                     }
                 }
@@ -1478,7 +1609,10 @@ public class TransferService {
         } catch (InterruptedException ie) {
             sshEnd = "cancelled";
             logLine.accept("[INFO] Transfer interrupted: " + ie.getMessage());
-            if (proc != null) try { proc.destroyForcibly(); } catch (Exception ignored) {}
+            if (proc != null) try {
+                proc.destroyForcibly();
+            } catch (Exception ignored) {
+            }
             Thread.currentThread().interrupt();
             return false;
         } catch (Exception ex) {
@@ -1503,37 +1637,11 @@ public class TransferService {
                     if (set.isEmpty()) activeProcesses.remove(realTaskIdRegistered, set);
                 }
             }
-            try { logFile.delete(); } catch (Exception ignored) {}
+            try {
+                logFile.delete();
+            } catch (Exception ignored) {
+            }
         }
-    }
-
-    // ─── Batch splitting (any transfer mode, any direction) ──────────────────
-    //
-    // Batches are SIZE-based (total bytes) rather than file-count based: when
-    // a transfer or backup would move more total bytes than the configured
-    // cap in one go, it is split into sequential batches, each capped near
-    // AppSettings.getTransferBatchMaxBytes(), with a pause of
-    // AppSettings.getTransferBatchIntervalSeconds() between batches. A single
-    // file larger than the cap is still sent alone in its own batch — it is
-    // never split. Values are read live from AppSettings (app-settings.json,
-    // seeded from app-config.xml's <transfer> block) — editable from the
-    // Settings panel with no restart required.
-
-    /** A WinSCP command line ("put ..."/"get ...") paired with the transferred file's size, for size-based batching. */
-    private static final class SizedCommand {
-        final String command;
-        final long size;
-        SizedCommand(String command, long size) { this.command = command; this.size = size; }
-    }
-
-    private static <T> List<List<T>> chunkBySize(
-            List<T> items, java.util.function.ToLongFunction<T> sizeOf, long maxBytes) {
-        return TransferBatching.chunkBySize(items, sizeOf, maxBytes);
-    }
-
-    private static List<List<Path>> chunkPathsBySize(List<Path> files) {
-        long maxBytes = AppSettings.getTransferBatchMaxBytes();
-        return chunkBySize(files, p -> { try { return Files.size(p); } catch (IOException e) { return 0L; } }, maxBytes);
     }
 
     /**
@@ -1559,7 +1667,7 @@ public class TransferService {
      * waves rather than between every single batch.
      */
     private boolean runBatchedWinScpCommands(Credential target, String password,
-            List<SizedCommand> sizedCommands, Consumer<String> logLine, String taskId) throws Exception {
+                                             List<SizedCommand> sizedCommands, Consumer<String> logLine, String taskId) throws Exception {
 
         if (sizedCommands.isEmpty()) {
             logLine.accept("[WARN] Nothing to transfer.");
@@ -1594,9 +1702,11 @@ public class TransferService {
         return allOk;
     }
 
-    /** Original one-at-a-time behavior — used when concurrency is 1 (default) or there's only one batch. */
+    /**
+     * Original one-at-a-time behavior — used when concurrency is 1 (default) or there's only one batch.
+     */
     private boolean runBatchesSequentially(Credential target, String password, List<List<SizedCommand>> batches,
-            int intervalSeconds, Consumer<String> logLine, String taskId) throws Exception {
+                                           int intervalSeconds, Consumer<String> logLine, String taskId) throws Exception {
         boolean allOk = true;
         for (int i = 0; i < batches.size(); i++) {
             if (Thread.currentThread().isInterrupted()) {
@@ -1621,7 +1731,7 @@ public class TransferService {
      * letting each group's SFTP round trips overlap instead of queueing.
      */
     private boolean runBatchesConcurrently(Credential target, String password, List<List<SizedCommand>> batches,
-            int concurrency, int intervalSeconds, Consumer<String> logLine, String taskId) throws Exception {
+                                           int concurrency, int intervalSeconds, Consumer<String> logLine, String taskId) throws Exception {
         boolean allOk = true;
         int total = batches.size();
         java.util.concurrent.ExecutorService pool =
@@ -1669,9 +1779,11 @@ public class TransferService {
         return allOk;
     }
 
-    /** Builds and runs the WinSCP script for a single batch. Safe to call from multiple threads concurrently. */
+    /**
+     * Builds and runs the WinSCP script for a single batch. Safe to call from multiple threads concurrently.
+     */
     private boolean runOneBatch(Credential target, String password, List<SizedCommand> batch,
-            int index, int totalBatches, Consumer<String> logLine, String taskId) {
+                                int index, int totalBatches, Consumer<String> logLine, String taskId) {
         if (totalBatches > 1) {
             long batchBytes = batch.stream().mapToLong(sc -> sc.size).sum();
             logLine.accept("[INFO] Batch " + (index + 1) + "/" + totalBatches
@@ -1719,9 +1831,9 @@ public class TransferService {
      * remotely inside WinSCP itself, so it can't be split from our side).
      */
     private boolean executeBatchedRemoteTransfer(Credential target, ScheduledTask task,
-            Consumer<String> logLine) throws Exception {
+                                                 Consumer<String> logLine) throws Exception {
 
-        String localPath  = normalizeLocalPath(task.getSourcePath());
+        String localPath = normalizeLocalPath(task.getSourcePath());
         String remotePath = normalizeRemotePath(task.getTargetPath());
         boolean inbound = task.getTransferDirection() == TransferDirection.INBOUND;
         TransferMode mode = task.getTransferMode() != null ? task.getTransferMode() : TransferMode.ENTIRE_FOLDER;
@@ -1816,7 +1928,7 @@ public class TransferService {
             List<String> downloadedLocalPaths = new ArrayList<>();
             final boolean deleteInSession = selection.getAfterAction() == FileSelection.AfterAction.DELETE;
             for (String remoteFile : remoteFiles) {
-                String fname    = remoteFile.substring(remoteFile.lastIndexOf('/') + 1);
+                String fname = remoteFile.substring(remoteFile.lastIndexOf('/') + 1);
                 String destPath = buildLocalDestinationPath(localPath, fname);
                 RemoteFileStat stat = remoteStats.get(remoteFile);
                 long size = stat != null ? stat.size : 0L;
@@ -1969,18 +2081,9 @@ public class TransferService {
         throw new WatcherSkipException(msg);
     }
 
-    /** Receives the "no files found" alerts of runs whose task asked for them; the scheduler wires this to the Events feed. */
-    public interface NoFilesListener {
-        void noFiles(ScheduledTask task, String summary, String details);
-        /** Files are arriving again after a "no new files" alert. */
-        void resumed(ScheduledTask task, String summary, String details);
+    public void setNoFilesListener(NoFilesListener l) {
+        this.noFilesListener = l;
     }
-
-    private volatile NoFilesListener noFilesListener;
-    public void setNoFilesListener(NoFilesListener l) { this.noFilesListener = l; }
-
-    /** When each task was last alerted about missing files (this process only); cleared when a run transfers files again. */
-    private final AlertThrottle noFilesAlerts = new AlertThrottle();
 
     /**
      * A run found nothing to send or receive. If the task asked for it (File Selection → Alerts), raises one alert
@@ -2016,7 +2119,11 @@ public class TransferService {
         }
     }
 
-    /** Files were just transferred: restarts the "no new files" clock and, if an alert was outstanding, says files are back. */
+    // ─── Exception type ───────────────────────────────────────────────────────
+
+    /**
+     * Files were just transferred: restarts the "no new files" clock and, if an alert was outstanding, says files are back.
+     */
     private void markArrival(ScheduledTask task, FileSelection selection, Consumer<String> logLine) {
         if (selection.getSilenceMinutes() <= 0) return;
         try {
@@ -2032,7 +2139,31 @@ public class TransferService {
         }
     }
 
-    /** Every file that matched was sent before: a normal, quiet skip (not a failure). */
+
+    // ─── Backup (retention-based archiving; local or remote, either side) ────
+    //
+    // "D" = today. backupRetentionDays files are KEPT in place at the source:
+    // D, D-1, ..., D-(retentionDays-1). Everything older is a backup
+    // candidate. Unlike previous versions, a run archives EVERY eligible file
+    // in one go — there is no more day-bucket/"batch days" limit. A large
+    // backlog is instead worked through using the same SIZE-based batching as
+    // file transfers (AppSettings.getTransferBatchMaxBytes()), pausing
+    // AppSettings.getTransferBatchIntervalSeconds() between batches, so a
+    // huge one-time backlog doesn't hammer the link or block for a long
+    // unbroken stretch.
+    //
+    // Either side (source or destination) may be LOCAL or REMOTE:
+    //   - LOCAL  side: backupSource/DestinationUsername is blank; the path is
+    //     a plain filesystem folder.
+    //   - REMOTE side: backupSource/DestinationUsername is set, and the path
+    //     is resolved over SFTP using that username's stored credential (the
+    //     same creds_<username>.xml mechanism File Transfer tasks use).
+    // Both sides being remote at once is not supported (would require a
+    // double SFTP hop) and is rejected with a clear error.
+
+    /**
+     * Every file that matched was sent before: a normal, quiet skip (not a failure).
+     */
     private boolean nothingNew(ScheduledTask task, FileSelection selection, String where, int matched,
                                Consumer<String> logLine) throws WatcherSkipException {
         String msg = "Nothing new to send in " + where + ": all " + matched + " matching file(s) were already sent ("
@@ -2043,7 +2174,9 @@ public class TransferService {
         throw new WatcherSkipException(msg);
     }
 
-    /** Remembers what this run sent. The transfer already happened, so a failure here is only a warning. */
+    /**
+     * Remembers what this run sent. The transfer already happened, so a failure here is only a warning.
+     */
     private void recordSent(TransferLedger ledger, ScheduledTask task, List<TransferLedger.Entry> entries,
                             Consumer<String> logLine) {
         if (ledger == null || entries.isEmpty()) return;
@@ -2056,7 +2189,9 @@ public class TransferService {
         }
     }
 
-    /** Local originals (uploads): delete or move them. Never throws; the run stays a success. */
+    /**
+     * Local originals (uploads): delete or move them. Never throws; the run stays a success.
+     */
     private void cleanupLocalOriginals(FileSelection selection, List<TransferCleanup.LocalOriginal> originals,
                                        Consumer<String> logLine) {
         if (!selection.hasAfterAction() || originals.isEmpty()) return;
@@ -2079,7 +2214,8 @@ public class TransferService {
         List<String> safe = new ArrayList<>();
         List<String> unsafe = new ArrayList<>();
         for (int i = 0; i < remoteFiles.size(); i++) {
-            if (TransferCleanup.copyIsComplete(Paths.get(localCopies.get(i)), sizes.get(i))) safe.add(remoteFiles.get(i));
+            if (TransferCleanup.copyIsComplete(Paths.get(localCopies.get(i)), sizes.get(i)))
+                safe.add(remoteFiles.get(i));
             else unsafe.add(TransferCleanup.baseName(remoteFiles.get(i)));
         }
         if (!unsafe.isEmpty()) {
@@ -2140,14 +2276,16 @@ public class TransferService {
         }
     }
 
-    /** Watcher: drops changed files that do not satisfy the selection conditions (the pick step does not apply — every new matching file is sent). */
+    /**
+     * Watcher: drops changed files that do not satisfy the selection conditions (the pick step does not apply — every new matching file is sent).
+     */
     private List<RemoteFileMetadata> applySelectionToCandidates(ScheduledTask task, List<RemoteFileMetadata> files,
-                                                                 Consumer<String> logLine) {
+                                                                Consumer<String> logLine) {
         FileSelection sel = task.getFileSelection();
         if (files == null || files.isEmpty() || !sel.hasFilters()) return files;
         List<RemoteFileMetadata> kept = sel.hasFilters()
                 ? sel.filterOnly(files, RemoteFileMetadata::fileName,
-                        RemoteFileMetadata::size, f -> f.lastModified().toEpochMilli())
+                RemoteFileMetadata::size, f -> f.lastModified().toEpochMilli())
                 : files;
         if (kept.size() != files.size()) {
             logLine.accept("[INFO] File selection rules kept " + kept.size() + " of " + files.size()
@@ -2156,7 +2294,9 @@ public class TransferService {
         return kept;
     }
 
-    /** Watcher fire succeeded: remember the files and run the "after a successful transfer" step. */
+    /**
+     * Watcher fire succeeded: remember the files and run the "after a successful transfer" step.
+     */
     private void afterWatcherSuccess(ScheduledTask task, Credential target, List<RemoteFileMetadata> files,
                                      boolean outbound, Consumer<String> logLine) {
         FileSelection sel = task.getFileSelection();
@@ -2228,8 +2368,9 @@ public class TransferService {
                     if (part.isEmpty()) continue;
                     if (prefix.length() > 0 && !prefix.toString().endsWith("/")) prefix.append('/');
                     prefix.append(part);
-                    try { ch.stat(prefix.toString()); }
-                    catch (com.jcraft.jsch.SftpException missing) {
+                    try {
+                        ch.stat(prefix.toString());
+                    } catch (com.jcraft.jsch.SftpException missing) {
                         ch.mkdir(prefix.toString());
                         persistentSftp.note(id, "mkdir " + prefix);
                     }
@@ -2269,7 +2410,7 @@ public class TransferService {
      * on disk after the WinSCP batch completes.
      */
     private void copyDownloadedFilesToExtraFolders(List<String> downloadedLocalPaths,
-            List<String> extraDestFolders, Consumer<String> logLine) {
+                                                   List<String> extraDestFolders, Consumer<String> logLine) {
         for (String localPath : downloadedLocalPaths) {
             File source = new File(localPath);
             if (!source.exists()) continue;
@@ -2291,50 +2432,9 @@ public class TransferService {
         }
     }
 
-    // ─── Exception type ───────────────────────────────────────────────────────
-
-    static class WatcherSkipException extends Exception {
-        public WatcherSkipException(String message) { super(message); }
-    }
-
-
-    // ─── Backup (retention-based archiving; local or remote, either side) ────
-    //
-    // "D" = today. backupRetentionDays files are KEPT in place at the source:
-    // D, D-1, ..., D-(retentionDays-1). Everything older is a backup
-    // candidate. Unlike previous versions, a run archives EVERY eligible file
-    // in one go — there is no more day-bucket/"batch days" limit. A large
-    // backlog is instead worked through using the same SIZE-based batching as
-    // file transfers (AppSettings.getTransferBatchMaxBytes()), pausing
-    // AppSettings.getTransferBatchIntervalSeconds() between batches, so a
-    // huge one-time backlog doesn't hammer the link or block for a long
-    // unbroken stretch.
-    //
-    // Either side (source or destination) may be LOCAL or REMOTE:
-    //   - LOCAL  side: backupSource/DestinationUsername is blank; the path is
-    //     a plain filesystem folder.
-    //   - REMOTE side: backupSource/DestinationUsername is set, and the path
-    //     is resolved over SFTP using that username's stored credential (the
-    //     same creds_<username>.xml mechanism File Transfer tasks use).
-    // Both sides being remote at once is not supported (would require a
-    // double SFTP hop) and is rejected with a clear error.
-
-    /** A backup-eligible file: its full identity/location, calendar day, and size in bytes. */
-    private static final class BackupCandidate {
-        final String name;
-        final LocalDate day;
-        final long size;
-        final Path localPath;      // set when source is LOCAL
-        final String remotePath;   // set when source is REMOTE (full remote path)
-        BackupCandidate(String name, LocalDate day, long size, Path localPath, String remotePath) {
-            this.name = name; this.day = day; this.size = size;
-            this.localPath = localPath; this.remotePath = remotePath;
-        }
-    }
-
     public boolean executeBackup(ScheduledTask task, Consumer<String> logLine) {
         String sourcePathStr = task.getBackupSourcePath();
-        String destPathStr   = task.getBackupDestinationPath();
+        String destPathStr = task.getBackupDestinationPath();
 
         if (sourcePathStr == null || sourcePathStr.trim().isEmpty()) {
             logLine.accept("[ERROR] Backup source path is not configured.");
@@ -2346,7 +2446,7 @@ public class TransferService {
         }
 
         boolean sourceRemote = task.getBackupSourceUsername() != null && !task.getBackupSourceUsername().trim().isEmpty();
-        boolean destRemote   = task.getBackupDestinationUsername() != null && !task.getBackupDestinationUsername().trim().isEmpty();
+        boolean destRemote = task.getBackupDestinationUsername() != null && !task.getBackupDestinationUsername().trim().isEmpty();
 
         if (sourceRemote && destRemote) {
             logLine.accept("[ERROR] Backup source and destination cannot both be remote "
@@ -2411,200 +2511,6 @@ public class TransferService {
         return ok;
     }
 
-    /** Local source: lists regular files older than the retention cutoff, grouped by calendar day. */
-    private List<BackupCandidate> enumerateLocalBackupCandidates(
-            String sourcePathStr, LocalDate keepFromDay, Consumer<String> logLine) {
-        File sourceDir = new File(sourcePathStr);
-        if (!sourceDir.isDirectory()) {
-            logLine.accept("[ERROR] Backup source folder does not exist: " + sourcePathStr);
-            return null;
-        }
-        File[] rawFiles = sourceDir.listFiles(File::isFile);
-        List<BackupCandidate> out = new ArrayList<>();
-        if (rawFiles == null) return out;
-        for (File f : rawFiles) {
-            LocalDate day = Instant.ofEpochMilli(f.lastModified())
-                    .atZone(java.time.ZoneId.systemDefault()).toLocalDate();
-            if (!day.isBefore(keepFromDay)) continue; // within retention window — leave in place
-            out.add(new BackupCandidate(f.getName(), day, f.length(), f.toPath(), null));
-        }
-        return out;
-    }
-
-    /** Remote source: lists remote files (over SFTP) older than the retention cutoff, grouped by calendar day. */
-    private List<BackupCandidate> enumerateRemoteBackupCandidates(
-            Credential sourceCred, String sourcePathStr, LocalDate keepFromDay, Consumer<String> logLine) throws Exception {
-        String remotePath = normalizeRemotePath(sourcePathStr);
-        String dirPath = remoteListingDirFor(remotePath);
-        java.util.Map<String, RemoteFileStat> stats =
-                rawRemoteFileStats(sourceCred, sourceCred.getPassword(), dirPath, logLine);
-        List<BackupCandidate> out = new ArrayList<>();
-        for (java.util.Map.Entry<String, RemoteFileStat> e : stats.entrySet()) {
-            String fullPath = e.getKey();
-            RemoteFileStat stat = e.getValue();
-            LocalDate day = Instant.ofEpochMilli(stat.epochMillis)
-                    .atZone(java.time.ZoneId.systemDefault()).toLocalDate();
-            if (!day.isBefore(keepFromDay)) continue;
-            String fname = fullPath.substring(fullPath.lastIndexOf('/') + 1);
-            out.add(new BackupCandidate(fname, day, stat.size, null, fullPath));
-        }
-        return out;
-    }
-
-    /** Local→local backup: moves files into {@code <destRoot>/<yyyy-MM-dd>/}, in size-based batches. */
-    private boolean runLocalToLocalBackup(List<BackupCandidate> candidates, String destPathStr, Consumer<String> logLine) {
-        File destRoot = new File(destPathStr);
-        if (!destRoot.exists() && !destRoot.mkdirs()) {
-            logLine.accept("[ERROR] Cannot create backup destination folder: " + destPathStr);
-            return false;
-        }
-        List<List<BackupCandidate>> batches = chunkBySize(candidates, c -> c.size, AppSettings.getTransferBatchMaxBytes());
-        int intervalSeconds = AppSettings.getTransferBatchIntervalSeconds();
-        if (batches.size() > 1) {
-            logLine.accept("[INFO] Splitting into " + batches.size() + " batch(es).");
-        }
-        boolean allOk = true;
-        int moved = 0;
-        for (int i = 0; i < batches.size(); i++) {
-            if (Thread.currentThread().isInterrupted()) {
-                logLine.accept("[INFO] Backup cancelled.");
-                return false;
-            }
-            List<BackupCandidate> batch = batches.get(i);
-            if (batches.size() > 1) {
-                logLine.accept("[INFO] Batch " + (i + 1) + "/" + batches.size() + " (" + batch.size() + " file(s))");
-            }
-            for (BackupCandidate c : batch) {
-                File dayDestDir = new File(destRoot, c.day.toString());
-                if (!dayDestDir.exists() && !dayDestDir.mkdirs()) {
-                    logLine.accept("[ERROR] Cannot create backup folder for " + c.day + ": " + dayDestDir);
-                    allOk = false;
-                    continue;
-                }
-                boolean ok = moveSingleFile(c.localPath, dayDestDir.toPath().resolve(c.name), logLine);
-                allOk &= ok;
-                if (ok) moved++;
-            }
-            if (i < batches.size() - 1 && intervalSeconds > 0) sleepBetweenBatches(intervalSeconds, logLine);
-        }
-        logLine.accept("[INFO] " + moved + " file(s) archived.");
-        return allOk;
-    }
-
-    /** Remote source → local destination: pulls files via WinSCP `get` into {@code <destRoot>/<yyyy-MM-dd>/}, in size-based batches. */
-    private boolean runRemoteToLocalBackup(String taskId, Credential sourceCred, List<BackupCandidate> candidates,
-            String destPathStr, Consumer<String> logLine) {
-        File destRoot = new File(destPathStr);
-        if (!destRoot.exists() && !destRoot.mkdirs()) {
-            logLine.accept("[ERROR] Cannot create backup destination folder: " + destPathStr);
-            return false;
-        }
-        List<SizedCommand> commands = new ArrayList<>();
-        java.util.Map<String, LocalDate> dayByRemotePath = new java.util.HashMap<>();
-        for (BackupCandidate c : candidates) {
-            File dayDestDir = new File(destRoot, c.day.toString());
-            if (!dayDestDir.exists() && !dayDestDir.mkdirs()) {
-                logLine.accept("[ERROR] Cannot create backup folder for " + c.day + ": " + dayDestDir);
-                continue;
-            }
-            String destPath = normalizeLocalPath(new File(dayDestDir, c.name).getAbsolutePath());
-            commands.add(new SizedCommand(
-                    "get -delete " + escapeWinScpRemotePath(c.remotePath) + " " + escapeWinScpPath(destPath), c.size));
-        }
-        try {
-            boolean ok = runBatchedWinScpCommands(sourceCred, sourceCred.getPassword(), commands, logLine, taskId);
-            // Originals are removed by WinSCP itself ("get -delete"), file by file, in the same session as the download.
-            if (ok) logLine.accept("[INFO] Removed " + candidates.size() + " original file(s) from the remote source in the same session.");
-            return ok;
-        } catch (Exception ex) {
-            logLine.accept("[ERROR] Remote\u2192local backup failed: " + ex.getMessage());
-            return false;
-        }
-    }
-
-    /** Local source → remote destination: pushes files via WinSCP `put` into {@code <destRoot>/<yyyy-MM-dd>/}, in size-based batches. */
-    private boolean runLocalToRemoteBackup(String taskId, Credential destCred, List<BackupCandidate> candidates,
-            String destPathStr, Consumer<String> logLine) {
-        String remoteRoot = normalizeRemotePath(destPathStr);
-        String remoteRootDir = remoteRoot.endsWith("/") ? remoteRoot : remoteRoot + "/";
-
-        // One mkdir per distinct day, de-duplicated, run best-effort first (a day
-        // folder that already exists from a previous run is not an error).
-        java.util.LinkedHashSet<String> mkdirCmds = new java.util.LinkedHashSet<>();
-        for (BackupCandidate c : candidates) {
-            mkdirCmds.add("mkdir " + escapeWinScpRemotePath((remoteRootDir + c.day)));
-        }
-
-        try {
-            boolean mkdirOk = runBestEffortWinScpCommands(destCred, mkdirCmds, logLine);
-            if (!mkdirOk) {
-                logLine.accept("[WARN] Some remote day folders may not have been created (they may already exist) — continuing.");
-            }
-            List<SizedCommand> putCommands = candidates.stream().map(c -> new SizedCommand(
-                    "put " + escapeWinScpPath(normalizeLocalPath(c.localPath.toAbsolutePath().toString()))
-                            + " " + escapeWinScpRemotePath(remoteRootDir + c.day + "/" + c.name), c.size))
-                    .collect(Collectors.toList());
-            boolean ok = runBatchedWinScpCommands(destCred, destCred.getPassword(), putCommands, logLine, taskId);
-            if (ok) {
-                for (BackupCandidate c : candidates) {
-                    try {
-                        Files.delete(c.localPath);
-                    } catch (IOException ex) {
-                        logLine.accept("[WARN] Uploaded but could not remove local original " + c.name + ": " + ex.getMessage());
-                    }
-                }
-            }
-            return ok;
-        } catch (Exception ex) {
-            logLine.accept("[ERROR] Local\u2192remote backup failed: " + ex.getMessage());
-            return false;
-        }
-    }
-
-    /** Runs a small set of WinSCP commands (e.g. mkdir) in one session, tolerating individual failures. */
-    private boolean runBestEffortWinScpCommands(Credential target, java.util.Collection<String> cmds, Consumer<String> logLine) throws Exception {
-        if (cmds.isEmpty()) return true;
-        File scriptFile = File.createTempFile("opstool_mkdir_", ".txt");
-        secureTemp(scriptFile);
-        try (PrintWriter pw = new PrintWriter(new FileWriter(scriptFile))) {
-            pw.println("option batch continue"); // don't abort the whole script if a single mkdir fails (dir exists)
-            pw.println("option confirm off");
-            writeOpenLine(pw, target, target.getPassword(), scriptFile);
-            for (String c : cmds) pw.println(c);
-            pw.println("close");
-            pw.println("exit");
-        }
-        try {
-            return runWinScpScript(scriptFile, logLine, "backup-mkdir");
-        } finally {
-            scriptFile.delete();
-        }
-    }
-
-    /** Deletes a batch of remote files (after a successful remote→local backup pull). */
-    private void deleteRemoteFilesViaWinScp(Credential target, List<String> remotePaths, Consumer<String> logLine) {
-        if (remotePaths.isEmpty()) return;
-        try {
-            File scriptFile = File.createTempFile("opstool_rm_", ".txt");
-            secureTemp(scriptFile);
-            try (PrintWriter pw = new PrintWriter(new FileWriter(scriptFile))) {
-                pw.println("option batch continue");
-                pw.println("option confirm off");
-                writeOpenLine(pw, target, target.getPassword(), scriptFile);
-                for (String p : remotePaths) pw.println("rm " + escapeWinScpRemotePath(p));
-                pw.println("close");
-                pw.println("exit");
-            }
-            try {
-                runWinScpScript(scriptFile, logLine, "backup-cleanup");
-            } finally {
-                scriptFile.delete();
-            }
-        } catch (Exception ex) {
-            logLine.accept("[WARN] Backed up but could not remove some remote originals: " + ex.getMessage());
-        }
-    }
-
     // ─── Mail / Outlook (Microsoft Graph) ────────────────────────────────────
     //
     // Originally implemented as raw IMAP socket commands (LOGIN, SELECT,
@@ -2663,6 +2569,217 @@ public class TransferService {
     // folder (Graph POST .../move — done *after* marking read, since a move
     // invalidates the original message ID). Both are best-effort per message:
     // one message's failure is logged and does not fail the whole run.
+
+    /**
+     * Local source: lists regular files older than the retention cutoff, grouped by calendar day.
+     */
+    private List<BackupCandidate> enumerateLocalBackupCandidates(
+            String sourcePathStr, LocalDate keepFromDay, Consumer<String> logLine) {
+        File sourceDir = new File(sourcePathStr);
+        if (!sourceDir.isDirectory()) {
+            logLine.accept("[ERROR] Backup source folder does not exist: " + sourcePathStr);
+            return null;
+        }
+        File[] rawFiles = sourceDir.listFiles(File::isFile);
+        List<BackupCandidate> out = new ArrayList<>();
+        if (rawFiles == null) return out;
+        for (File f : rawFiles) {
+            LocalDate day = Instant.ofEpochMilli(f.lastModified())
+                    .atZone(java.time.ZoneId.systemDefault()).toLocalDate();
+            if (!day.isBefore(keepFromDay)) continue; // within retention window — leave in place
+            out.add(new BackupCandidate(f.getName(), day, f.length(), f.toPath(), null));
+        }
+        return out;
+    }
+
+    // ─── Per-message processing (runs on a mail worker thread) ──────────────
+
+    /**
+     * Remote source: lists remote files (over SFTP) older than the retention cutoff, grouped by calendar day.
+     */
+    private List<BackupCandidate> enumerateRemoteBackupCandidates(
+            Credential sourceCred, String sourcePathStr, LocalDate keepFromDay, Consumer<String> logLine) throws Exception {
+        String remotePath = normalizeRemotePath(sourcePathStr);
+        String dirPath = remoteListingDirFor(remotePath);
+        java.util.Map<String, RemoteFileStat> stats =
+                rawRemoteFileStats(sourceCred, sourceCred.getPassword(), dirPath, logLine);
+        List<BackupCandidate> out = new ArrayList<>();
+        for (java.util.Map.Entry<String, RemoteFileStat> e : stats.entrySet()) {
+            String fullPath = e.getKey();
+            RemoteFileStat stat = e.getValue();
+            LocalDate day = Instant.ofEpochMilli(stat.epochMillis)
+                    .atZone(java.time.ZoneId.systemDefault()).toLocalDate();
+            if (!day.isBefore(keepFromDay)) continue;
+            String fname = fullPath.substring(fullPath.lastIndexOf('/') + 1);
+            out.add(new BackupCandidate(fname, day, stat.size, null, fullPath));
+        }
+        return out;
+    }
+
+    /**
+     * Local→local backup: moves files into {@code <destRoot>/<yyyy-MM-dd>/}, in size-based batches.
+     */
+    private boolean runLocalToLocalBackup(List<BackupCandidate> candidates, String destPathStr, Consumer<String> logLine) {
+        File destRoot = new File(destPathStr);
+        if (!destRoot.exists() && !destRoot.mkdirs()) {
+            logLine.accept("[ERROR] Cannot create backup destination folder: " + destPathStr);
+            return false;
+        }
+        List<List<BackupCandidate>> batches = chunkBySize(candidates, c -> c.size, AppSettings.getTransferBatchMaxBytes());
+        int intervalSeconds = AppSettings.getTransferBatchIntervalSeconds();
+        if (batches.size() > 1) {
+            logLine.accept("[INFO] Splitting into " + batches.size() + " batch(es).");
+        }
+        boolean allOk = true;
+        int moved = 0;
+        for (int i = 0; i < batches.size(); i++) {
+            if (Thread.currentThread().isInterrupted()) {
+                logLine.accept("[INFO] Backup cancelled.");
+                return false;
+            }
+            List<BackupCandidate> batch = batches.get(i);
+            if (batches.size() > 1) {
+                logLine.accept("[INFO] Batch " + (i + 1) + "/" + batches.size() + " (" + batch.size() + " file(s))");
+            }
+            for (BackupCandidate c : batch) {
+                File dayDestDir = new File(destRoot, c.day.toString());
+                if (!dayDestDir.exists() && !dayDestDir.mkdirs()) {
+                    logLine.accept("[ERROR] Cannot create backup folder for " + c.day + ": " + dayDestDir);
+                    allOk = false;
+                    continue;
+                }
+                boolean ok = moveSingleFile(c.localPath, dayDestDir.toPath().resolve(c.name), logLine);
+                allOk &= ok;
+                if (ok) moved++;
+            }
+            if (i < batches.size() - 1 && intervalSeconds > 0) sleepBetweenBatches(intervalSeconds, logLine);
+        }
+        logLine.accept("[INFO] " + moved + " file(s) archived.");
+        return allOk;
+    }
+
+    /**
+     * Remote source → local destination: pulls files via WinSCP `get` into {@code <destRoot>/<yyyy-MM-dd>/}, in size-based batches.
+     */
+    private boolean runRemoteToLocalBackup(String taskId, Credential sourceCred, List<BackupCandidate> candidates,
+                                           String destPathStr, Consumer<String> logLine) {
+        File destRoot = new File(destPathStr);
+        if (!destRoot.exists() && !destRoot.mkdirs()) {
+            logLine.accept("[ERROR] Cannot create backup destination folder: " + destPathStr);
+            return false;
+        }
+        List<SizedCommand> commands = new ArrayList<>();
+        java.util.Map<String, LocalDate> dayByRemotePath = new java.util.HashMap<>();
+        for (BackupCandidate c : candidates) {
+            File dayDestDir = new File(destRoot, c.day.toString());
+            if (!dayDestDir.exists() && !dayDestDir.mkdirs()) {
+                logLine.accept("[ERROR] Cannot create backup folder for " + c.day + ": " + dayDestDir);
+                continue;
+            }
+            String destPath = normalizeLocalPath(new File(dayDestDir, c.name).getAbsolutePath());
+            commands.add(new SizedCommand(
+                    "get -delete " + escapeWinScpRemotePath(c.remotePath) + " " + escapeWinScpPath(destPath), c.size));
+        }
+        try {
+            boolean ok = runBatchedWinScpCommands(sourceCred, sourceCred.getPassword(), commands, logLine, taskId);
+            // Originals are removed by WinSCP itself ("get -delete"), file by file, in the same session as the download.
+            if (ok)
+                logLine.accept("[INFO] Removed " + candidates.size() + " original file(s) from the remote source in the same session.");
+            return ok;
+        } catch (Exception ex) {
+            logLine.accept("[ERROR] Remote\u2192local backup failed: " + ex.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Local source → remote destination: pushes files via WinSCP `put` into {@code <destRoot>/<yyyy-MM-dd>/}, in size-based batches.
+     */
+    private boolean runLocalToRemoteBackup(String taskId, Credential destCred, List<BackupCandidate> candidates,
+                                           String destPathStr, Consumer<String> logLine) {
+        String remoteRoot = normalizeRemotePath(destPathStr);
+        String remoteRootDir = remoteRoot.endsWith("/") ? remoteRoot : remoteRoot + "/";
+
+        // One mkdir per distinct day, de-duplicated, run best-effort first (a day
+        // folder that already exists from a previous run is not an error).
+        java.util.LinkedHashSet<String> mkdirCmds = new java.util.LinkedHashSet<>();
+        for (BackupCandidate c : candidates) {
+            mkdirCmds.add("mkdir " + escapeWinScpRemotePath((remoteRootDir + c.day)));
+        }
+
+        try {
+            boolean mkdirOk = runBestEffortWinScpCommands(destCred, mkdirCmds, logLine);
+            if (!mkdirOk) {
+                logLine.accept("[WARN] Some remote day folders may not have been created (they may already exist) — continuing.");
+            }
+            List<SizedCommand> putCommands = candidates.stream().map(c -> new SizedCommand(
+                            "put " + escapeWinScpPath(normalizeLocalPath(c.localPath.toAbsolutePath().toString()))
+                                    + " " + escapeWinScpRemotePath(remoteRootDir + c.day + "/" + c.name), c.size))
+                    .collect(Collectors.toList());
+            boolean ok = runBatchedWinScpCommands(destCred, destCred.getPassword(), putCommands, logLine, taskId);
+            if (ok) {
+                for (BackupCandidate c : candidates) {
+                    try {
+                        Files.delete(c.localPath);
+                    } catch (IOException ex) {
+                        logLine.accept("[WARN] Uploaded but could not remove local original " + c.name + ": " + ex.getMessage());
+                    }
+                }
+            }
+            return ok;
+        } catch (Exception ex) {
+            logLine.accept("[ERROR] Local\u2192remote backup failed: " + ex.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Runs a small set of WinSCP commands (e.g. mkdir) in one session, tolerating individual failures.
+     */
+    private boolean runBestEffortWinScpCommands(Credential target, java.util.Collection<String> cmds, Consumer<String> logLine) throws Exception {
+        if (cmds.isEmpty()) return true;
+        File scriptFile = File.createTempFile("opstool_mkdir_", ".txt");
+        secureTemp(scriptFile);
+        try (PrintWriter pw = new PrintWriter(new FileWriter(scriptFile))) {
+            pw.println("option batch continue"); // don't abort the whole script if a single mkdir fails (dir exists)
+            pw.println("option confirm off");
+            writeOpenLine(pw, target, target.getPassword(), scriptFile);
+            for (String c : cmds) pw.println(c);
+            pw.println("close");
+            pw.println("exit");
+        }
+        try {
+            return runWinScpScript(scriptFile, logLine, "backup-mkdir");
+        } finally {
+            scriptFile.delete();
+        }
+    }
+
+    /**
+     * Deletes a batch of remote files (after a successful remote→local backup pull).
+     */
+    private void deleteRemoteFilesViaWinScp(Credential target, List<String> remotePaths, Consumer<String> logLine) {
+        if (remotePaths.isEmpty()) return;
+        try {
+            File scriptFile = File.createTempFile("opstool_rm_", ".txt");
+            secureTemp(scriptFile);
+            try (PrintWriter pw = new PrintWriter(new FileWriter(scriptFile))) {
+                pw.println("option batch continue");
+                pw.println("option confirm off");
+                writeOpenLine(pw, target, target.getPassword(), scriptFile);
+                for (String p : remotePaths) pw.println("rm " + escapeWinScpRemotePath(p));
+                pw.println("close");
+                pw.println("exit");
+            }
+            try {
+                runWinScpScript(scriptFile, logLine, "backup-cleanup");
+            } finally {
+                scriptFile.delete();
+            }
+        } catch (Exception ex) {
+            logLine.accept("[WARN] Backed up but could not remove some remote originals: " + ex.getMessage());
+        }
+    }
 
     public boolean executeImapMailTask(ScheduledTask task, Consumer<String> logLine)
             throws WatcherSkipException {
@@ -2726,7 +2843,7 @@ public class TransferService {
             return false;
         }
 
-        String folder   = nvl(task.getImapFolder(),         "INBOX");
+        String folder = nvl(task.getImapFolder(), "INBOX");
         String criteria = nvl(task.getMailSearchCriteria(), "UNSEEN");
         MailFetchMode mode = task.getMailFetchMode() != null
                 ? task.getMailFetchMode() : MailFetchMode.BODY_ONLY;
@@ -2746,8 +2863,8 @@ public class TransferService {
         logLine.accept("[INFO] Reading mail via Microsoft Graph — mailbox: " + mailbox
                 + " | folder: " + folder + " | criteria: " + criteria + " | mode: " + mode
                 + (watcherOn
-                        ? " | watcher: ON (after " + (afterEpoch > 0 ? Instant.ofEpochMilli(afterEpoch) : "epoch") + ", max " + maxResults + ")"
-                        : " | scope: " + scope + (scope == ScheduledTask.MailFetchScope.ALL_MATCHING ? " (max " + maxResults + ")" : "")));
+                ? " | watcher: ON (after " + (afterEpoch > 0 ? Instant.ofEpochMilli(afterEpoch) : "epoch") + ", max " + maxResults + ")"
+                : " | scope: " + scope + (scope == ScheduledTask.MailFetchScope.ALL_MATCHING ? " (max " + maxResults + ")" : "")));
 
         // Each message is handled end-to-end (download -> write .RCV/attachments -> mark read -> move)
         // on one of a few worker threads, so several mails arriving together are no longer processed
@@ -2758,7 +2875,11 @@ public class TransferService {
         final Map<String, String> folderIdCache = new java.util.concurrent.ConcurrentHashMap<>();
         final Object logLock = new Object();
         final java.util.Set<String> unsavedIds = java.util.concurrent.ConcurrentHashMap.newKeySet();
-        final Consumer<String> safeLog = s -> { synchronized (logLock) { logLine.accept(s); } };
+        final Consumer<String> safeLog = s -> {
+            synchronized (logLock) {
+                logLine.accept(s);
+            }
+        };
         // Run key/trigger live in thread-locals of this (task) thread; the mail workers must be handed them.
         final MailRunContext mailCtx = new MailRunContext(task, mailbox, folder,
                 RunHistoryService.currentRunKey(), RunHistoryService.currentTrigger());
@@ -2797,8 +2918,9 @@ public class TransferService {
         long oldestUnsaved = Long.MAX_VALUE;
         for (GraphMailService.MailMessage m : messages) {
             if (!unsavedIds.contains(m.id)) continue;
-            try { oldestUnsaved = Math.min(oldestUnsaved, Instant.parse(m.receivedDateTime).toEpochMilli()); }
-            catch (Exception ignored) { /* unparseable: ignore */ }
+            try {
+                oldestUnsaved = Math.min(oldestUnsaved, Instant.parse(m.receivedDateTime).toEpochMilli());
+            } catch (Exception ignored) { /* unparseable: ignore */ }
         }
         long newestEpoch = 0L;
         for (GraphMailService.MailMessage m : messages) {
@@ -2834,9 +2956,9 @@ public class TransferService {
         return true;
     }
 
-    // ─── Per-message processing (runs on a mail worker thread) ──────────────
-
-    /** Worker threads used per mail task run. Override with {@code mailWorkerThreads} in app-config.xml (1 = strictly sequential). */
+    /**
+     * Worker threads used per mail task run. Override with {@code mailWorkerThreads} in app-config.xml (1 = strictly sequential).
+     */
     private int mailWorkerThreads() {
         int n = 4;
         try {
@@ -2846,21 +2968,13 @@ public class TransferService {
         return Math.max(1, Math.min(n, 8));
     }
 
-    /** Guards "pick a free file name, then claim it" so concurrent workers never choose the same name. */
-    private final Object rcvNameLock = new Object();
+    // ─── Attachment download ────────────────────────────────────────────────
 
-    /** Receives one event per mail message a run handled; the scheduler wires this to the Events feed. */
-    public interface MailEventListener {
-        void onMailEvent(ScheduledTask task, boolean saved, String summary, String details,
-                         LocalDateTime start, LocalDateTime end, String runKey, String trigger);
+    public void setMailEventListener(MailEventListener l) {
+        this.mailEventListener = l;
     }
 
-    private volatile MailEventListener mailEventListener;
-
-    public void setMailEventListener(MailEventListener l) { this.mailEventListener = l; }
-
-    /** What the mail workers need to know about the run they belong to (captured on the task thread). */
-    private record MailRunContext(ScheduledTask task, String mailbox, String folder, String runKey, String trigger) {}
+    // ─── .RCV file output ─────────────────────────────────────────────────────
 
     /**
      * Everything that happens to one fetched message: log its content, write the .RCV file, save
@@ -2964,7 +3078,9 @@ public class TransferService {
         }
     }
 
-    /** Builds and delivers the Events-feed entry for one mail message — a one-line summary plus a full detail block. */
+    /**
+     * Builds and delivers the Events-feed entry for one mail message — a one-line summary plus a full detail block.
+     */
     private void fireMailEvent(MailRunContext ctx, GraphMailService.MailMessage m, MailFetchMode mode,
                                String classification, boolean saved, Path rcvFile, long rcvBytes, String rcvError,
                                List<String> attachReport, String readState, String moveState,
@@ -3025,12 +3141,10 @@ public class TransferService {
         }
     }
 
-    // ─── Attachment download ────────────────────────────────────────────────
-
     /**
      * Saves every downloadable (non-inline, file-type) attachment of a
      * message to disk under:
-     *   <attachmentBase>/<LDM|PTM|Others>/<message-scoped subfolder>/<original filename>
+     * <attachmentBase>/<LDM|PTM|Others>/<message-scoped subfolder>/<original filename>
      * using the same LDM/PTM/Others classification that decides which
      * mailbox folder the message itself gets moved to, so attachments and
      * their parent message end up filed the same way. Each message gets its
@@ -3085,7 +3199,7 @@ public class TransferService {
                 while (Files.exists(dest)) {
                     int extDot = safeName.lastIndexOf('.');
                     String base = extDot > 0 ? safeName.substring(0, extDot) : safeName;
-                    String ext  = extDot > 0 ? safeName.substring(extDot) : "";
+                    String ext = extDot > 0 ? safeName.substring(extDot) : "";
                     dest = attachmentsDir.resolve(base + "_" + (suffix++) + ext);
                 }
                 try {
@@ -3110,10 +3224,6 @@ public class TransferService {
         }
         return allSaved;
     }
-
-    // ─── .RCV file output ─────────────────────────────────────────────────────
-
-    private static final DateTimeFormatter RCV_LDM_PTM_TS_FMT = DateTimeFormatter.ofPattern("yyyyMMddHHmmss");
 
     /**
      * Builds a filesystem-safe filename for a fetched message.
@@ -3146,6 +3256,8 @@ public class TransferService {
         return ts + "_" + safeSubject + "_" + idSuffix + ".RCV";
     }
 
+    // ─── Cancellation ─────────────────────────────────────────────────────────
+
     /**
      * Resolves {@code outputDir/desiredName} to a path that doesn't already
      * exist, appending "_2", "_3", ... before the extension if needed.
@@ -3171,30 +3283,30 @@ public class TransferService {
     /**
      * Builds the .RCV file content. FULL_MESSAGE mode already returns raw
      * RFC 2822 MIME (headers included) from Graph, so it's written as-is.
-     *
+     * <p>
      * Content source preference: a message's own (non-inline) attachment text
      * takes priority over its body when a parseable text attachment exists
      * (see GraphMailService#fetchTextAttachments) — the structured content
      * these tasks care about is more often carried in an attached .txt/.csv
      * than typed into the body. Falls back to the body when there's no
      * usable attachment.
-     *
+     * <p>
      * BODY_ONLY and HEADERS_AND_BODY previously produced identical output —
      * both prepended Subject/From/Received regardless of mode, so "BODY_ONLY"
      * never actually meant body-only. Fixed to a real three-tier distinction:
-     *   BODY_ONLY        → the message content: HTML converted to plain text,
-     *                       automated banners (Outlook "first contact" /
-     *                       external-sender warnings) removed, truncated to
-     *                       start at the LDM/MVT/PTM marker, then
-     *                       signatures/sign-offs, footers/disclaimers, and
-     *                       quoted reply history stripped out (best-effort).
-     *                       When an LDM/MVT/PTM marker is found, a SITA-style
-     *                       =HEADER/=PRIORITY/... block (see
-     *                       buildSitaHeaderBlock) is prepended.
-     *   HEADERS_AND_BODY → Subject/From/Received + the full content as plain
-     *                       text, untouched (signatures/quotes kept, no SITA
-     *                       header — that block is specific to BODY_ONLY).
-     *   FULL_MESSAGE     → raw MIME from Graph, as before.
+     * BODY_ONLY        → the message content: HTML converted to plain text,
+     * automated banners (Outlook "first contact" /
+     * external-sender warnings) removed, truncated to
+     * start at the LDM/MVT/PTM marker, then
+     * signatures/sign-offs, footers/disclaimers, and
+     * quoted reply history stripped out (best-effort).
+     * When an LDM/MVT/PTM marker is found, a SITA-style
+     * =HEADER/=PRIORITY/... block (see
+     * buildSitaHeaderBlock) is prepended.
+     * HEADERS_AND_BODY → Subject/From/Received + the full content as plain
+     * text, untouched (signatures/quotes kept, no SITA
+     * header — that block is specific to BODY_ONLY).
+     * FULL_MESSAGE     → raw MIME from Graph, as before.
      */
     private String buildRcvFileContent(GraphMailService.MailMessage m, MailFetchMode mode, Consumer<String> logLine) {
         if (mode == MailFetchMode.FULL_MESSAGE) {
@@ -3263,8 +3375,6 @@ public class TransferService {
         return sb.toString();
     }
 
-    // ─── Cancellation ─────────────────────────────────────────────────────────
-
     /**
      * How many WinSCP/SFTP processes are currently in flight for this task
      * right now. Normally 0 (idle) or 1 (running, concurrency=1). With
@@ -3279,7 +3389,9 @@ public class TransferService {
         return procs == null ? 0 : procs.size();
     }
 
-    /** Total WinSCP/SFTP processes in flight across every task right now, for an at-a-glance overall count. */
+    /**
+     * Total WinSCP/SFTP processes in flight across every task right now, for an at-a-glance overall count.
+     */
     public int getTotalActiveSessionCount() {
         int total = 0;
         for (java.util.Set<Process> procs : activeProcesses.values()) {
@@ -3308,50 +3420,6 @@ public class TransferService {
         return counts;
     }
 
-    private static final String GRAPH_APP_ONLY_SCOPE = "https://graph.microsoft.com/.default";
-
-    /** app-config.xml {@code <graphAuthMode>CERTIFICATE</graphAuthMode>}; anything else = signed-in user (default). */
-    private static boolean graphCertificateMode() {
-        String v = util.AppConfig.readValue("graphAuthMode");
-        return v != null && v.trim().equalsIgnoreCase("CERTIFICATE");
-    }
-
-    // ── WinSCP runtime cap and cancel plumbing ──────────────────────────────
-    private static final java.util.concurrent.ScheduledExecutorService WATCHDOG =
-            java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
-                Thread t = new Thread(r, "winscp-watchdog");
-                t.setDaemon(true);
-                return t;
-            });
-
-    /** Real task id of the transfer running on this thread, so backup helper sessions can be cancelled. */
-    private final ThreadLocal<String> realTaskId = new ThreadLocal<>();
-
-    /** app-config.xml {@code <winscpMaxRuntimeMinutes>}; 0 or absent = no cap (default). */
-    private static long winScpMaxRuntimeMinutes() {
-        try {
-            String v = util.AppConfig.readValue("winscpMaxRuntimeMinutes");
-            return v == null ? 0 : Math.max(0, Long.parseLong(v.trim()));
-        } catch (NumberFormatException e) {
-            return 0;
-        }
-    }
-
-    // ── Java SFTP engine (default) ─────────────────────────────────────────
-    // The planning code still writes small WinSCP-style scripts; with transferEngine=sftp
-    // (default) they are executed by SftpScriptRunner on JSch instead of WinSCP.com.
-    // Set <transferEngine>winscp</transferEngine> in app-config.xml to go back to WinSCP.
-
-    private final ConcurrentHashMap<String, java.util.Set<service.sftp.SftpClient>> activeClients =
-            new ConcurrentHashMap<>();
-
-    private static boolean useSftpEngine() {
-        String v = util.AppConfig.readValue("transferEngine");
-        return v == null || !v.trim().equalsIgnoreCase("winscp");
-    }
-
-    private static final int SFTP_CONNECT_TIMEOUT_MS = 30_000;
-
     private service.sftp.SftpScriptRunner.Connector sftpConnector() {
         return (host, port, user, pw) ->
                 service.sftp.JschSftpClient.connect(host, port, user, pw, SFTP_CONNECT_TIMEOUT_MS);
@@ -3370,27 +3438,10 @@ public class TransferService {
         }
     }
 
-    /** One line saying why a script session was opened, from what the script does (shown as the session's purpose). */
-    private static String describeScript(List<String> script, String taskId) {
-        int get = 0, put = 0, rm = 0, mv = 0, mkdir = 0;
-        for (String l : script) {
-            String t = l.trim().toLowerCase();
-            if (t.startsWith("get ")) get++;
-            else if (t.startsWith("put ")) put++;
-            else if (t.startsWith("rm ")) rm++;
-            else if (t.startsWith("mv ")) mv++;
-            else if (t.startsWith("mkdir ")) mkdir++;
-        }
-        List<String> parts = new ArrayList<>();
-        if (get > 0) parts.add("download " + get + " file(s)");
-        if (put > 0) parts.add("upload " + put + " file(s)");
-        if (rm > 0) parts.add("delete " + rm + " original(s)");
-        if (mv > 0) parts.add("move " + mv + " original(s)");
-        if (mkdir > 0) parts.add("create " + mkdir + " folder(s)");
-        String what = parts.isEmpty() ? "SFTP commands" : String.join(", ", parts);
-        boolean cleanup = taskId != null && taskId.equals("backup-cleanup");
-        return (cleanup ? "SFTP cleanup after a successful transfer: " : "SFTP: ") + what;
-    }
+    // ── Java SFTP engine (default) ─────────────────────────────────────────
+    // The planning code still writes small WinSCP-style scripts; with transferEngine=sftp
+    // (default) they are executed by SftpScriptRunner on JSch instead of WinSCP.com.
+    // Set <transferEngine>winscp</transferEngine> in app-config.xml to go back to WinSCP.
 
     private boolean runScriptViaSftp(File scriptFile, Consumer<String> logLine, String taskId) throws Exception {
         String password = scriptPasswords.remove(scriptFile.getAbsolutePath());
@@ -3406,13 +3457,26 @@ public class TransferService {
             final java.util.concurrent.atomic.AtomicBoolean timedOut = new java.util.concurrent.atomic.AtomicBoolean();
             final java.util.List<service.sftp.SftpClient> mine = new java.util.concurrent.CopyOnWriteArrayList<>();
             service.sftp.SftpScriptRunner runner = new service.sftp.SftpScriptRunner(sftpConnector(),
-                    c -> { mine.add(c); registerClient(taskId, c); if (realId != null && !realId.equals(taskId)) registerClient(realId, c); },
-                    c -> { mine.remove(c); unregisterClient(taskId, c); if (realId != null && !realId.equals(taskId)) unregisterClient(realId, c); });
+                    c -> {
+                        mine.add(c);
+                        registerClient(taskId, c);
+                        if (realId != null && !realId.equals(taskId)) registerClient(realId, c);
+                    },
+                    c -> {
+                        mine.remove(c);
+                        unregisterClient(taskId, c);
+                        if (realId != null && !realId.equals(taskId)) unregisterClient(realId, c);
+                    });
             long maxMin = winScpMaxRuntimeMinutes();
             if (maxMin > 0) {
                 watchdog = WATCHDOG.schedule(() -> {
                     timedOut.set(true);
-                    for (service.sftp.SftpClient c : mine) { try { c.cancel(); } catch (Exception ignored) {} }
+                    for (service.sftp.SftpClient c : mine) {
+                        try {
+                            c.cancel();
+                        } catch (Exception ignored) {
+                        }
+                    }
                 }, maxMin, java.util.concurrent.TimeUnit.MINUTES);
             }
             openedAt = System.currentTimeMillis();
@@ -3480,19 +3544,24 @@ public class TransferService {
         java.util.Set<service.sftp.SftpClient> clients = activeClients.remove(taskId);
         if (clients != null) {
             for (service.sftp.SftpClient c : clients) {
-                try { c.cancel(); any = true; } catch (Exception ignored) {}
+                try {
+                    c.cancel();
+                    any = true;
+                } catch (Exception ignored) {
+                }
             }
         }
         java.util.Set<Process> procs = activeProcesses.remove(taskId);
         if (procs == null || procs.isEmpty()) return any;
         for (Process p : procs) {
-            try { p.destroyForcibly(); any = true; }
-            catch (Exception ignored) {}
+            try {
+                p.destroyForcibly();
+                any = true;
+            } catch (Exception ignored) {
+            }
         }
         return any;
     }
-
-    // ─── Credential resolution ────────────────────────────────────────────────
 
     private Credential resolveTargetCredential(ScheduledTask task, Consumer<String> logLine) {
         String uname = task.getTargetUsername();
@@ -3512,7 +3581,9 @@ public class TransferService {
         return null;
     }
 
-    /** Resolves a credential name to a stored {@link Credential} for a Backup source/destination side, or null if blank/not found. */
+    /**
+     * Resolves a credential name to a stored {@link Credential} for a Backup source/destination side, or null if blank/not found.
+     */
     private Credential resolveNamedCredential(String credentialName, String sideLabel, Consumer<String> logLine) {
         if (credentialName == null || credentialName.trim().isEmpty()) return null;
         Credential c = storage.loadCredentialByName(credentialName.trim());
@@ -3523,12 +3594,12 @@ public class TransferService {
         return c;
     }
 
-    /** The stored credential with this name, or null (an error line is logged). Used by "Watch a folder" tasks. */
+    /**
+     * The stored credential with this name, or null (an error line is logged). Used by "Watch a folder" tasks.
+     */
     public Credential credentialByName(String name, String sideLabel, Consumer<String> logLine) {
         return resolveNamedCredential(name, sideLabel, logLine);
     }
-
-    // ─── Local file helpers ───────────────────────────────────────────────────
 
     private File findLatestFile(File directory) {
         File[] files = directory.listFiles(File::isFile);
@@ -3538,23 +3609,23 @@ public class TransferService {
         return latest;
     }
 
-    // ─── Path / escaping helpers ──────────────────────────────────────────────
+    private String normalizeLocalPath(String path) {
+        return TransferPaths.normalizeLocalPath(path);
+    }
 
-    private String normalizeLocalPath(String path) { return TransferPaths.normalizeLocalPath(path); }
+    private String normalizeRemotePath(String path) {
+        return TransferPaths.normalizeRemotePath(path);
+    }
 
-    private String normalizeRemotePath(String path) { return TransferPaths.normalizeRemotePath(path); }
+    private String escapeWinScpPath(String path) {
+        return TransferPaths.escapeWinScpPath(path);
+    }
 
-    private String escapeWinScpPath(String path) { return TransferPaths.escapeWinScpPath(path); }
+    // ─── Credential resolution ────────────────────────────────────────────────
 
-    private String escapeWinScpRemotePath(String path) { return TransferPaths.escapeWinScpRemotePath(path); }
-
-    // ── WinSCP password hand-off ────────────────────────────────────────────
-    // The password is NOT written to the script file. The script's open line refers to
-    // %OPSTOOL_SFTP_PW%, which WinSCP expands from the environment of the one process
-    // that runs that script (WinSCP resolves environment variables before parsing a command).
-    private static final String PW_ENV = "OPSTOOL_SFTP_PW";
-    private final java.util.concurrent.ConcurrentHashMap<String, String> scriptPasswords =
-            new java.util.concurrent.ConcurrentHashMap<>();
+    private String escapeWinScpRemotePath(String path) {
+        return TransferPaths.escapeWinScpRemotePath(path);
+    }
 
     private void writeOpenLine(PrintWriter pw, Credential target, String password, File script) {
         scriptPasswords.put(script.getAbsolutePath(), password == null ? "" : password);
@@ -3567,24 +3638,36 @@ public class TransferService {
         if (pwd != null) pb.environment().put(PW_ENV, pwd.replace("\"", "\"\""));
     }
 
+    // ─── Local file helpers ───────────────────────────────────────────────────
+
     private String escapeUrl(String s) {
         return s.replace(";", "%3B").replace("@", "%40");
     }
 
-    private String maskPasswords(String line)  { return line.replaceAll("(?i)(password[=:])\\S+", "$1****"); }
-    private String nvl(String s, String def)   { return (s != null && !s.isEmpty()) ? s : def; }
+    // ─── Path / escaping helpers ──────────────────────────────────────────────
 
-    private String buildLocalDestinationPath(String dir, String fileName) { return TransferPaths.buildLocalDestinationPath(dir, fileName); }
-
-    private String prepareRemoteDestination(String remotePath, String fileName) { return TransferPaths.prepareRemoteDestination(remotePath, fileName); }
-
-    private void secureTemp(File f) {
-        f.setReadable(false, false); f.setReadable(true, true);
-        f.setWritable(false, false); f.setWritable(true, true);
+    private String maskPasswords(String line) {
+        return line.replaceAll("(?i)(password[=:])\\S+", "$1****");
     }
 
-    // ─── FIX B: Null-safe logTransferPaths ───────────────────────────────────
-    // Previously crashed with NPE when target == null on local→local tasks.
+    private String nvl(String s, String def) {
+        return (s != null && !s.isEmpty()) ? s : def;
+    }
+
+    private String buildLocalDestinationPath(String dir, String fileName) {
+        return TransferPaths.buildLocalDestinationPath(dir, fileName);
+    }
+
+    private String prepareRemoteDestination(String remotePath, String fileName) {
+        return TransferPaths.prepareRemoteDestination(remotePath, fileName);
+    }
+
+    private void secureTemp(File f) {
+        f.setReadable(false, false);
+        f.setReadable(true, true);
+        f.setWritable(false, false);
+        f.setWritable(true, true);
+    }
 
     private void logTransferPaths(ScheduledTask task, Credential target,
                                   Consumer<String> logLine) {
@@ -3596,5 +3679,101 @@ public class TransferService {
             logLine.accept("[INFO] Local source path  : " + task.getSourcePath());
             logLine.accept("[INFO] Remote target path : " + task.getTargetPath());
         }
+    }
+
+    /**
+     * Whether a local file batch operation copies (leaves original in place) or moves it.
+     */
+    private enum LocalFileOp {COPY, MOVE}
+
+    /**
+     * A single file's transfer over an already-open {@link ChannelSftp} —
+     * the unit of work {@link #transferFilesConcurrently} spreads across
+     * however many worker threads/channel slots a given fire warrants.
+     * Returns bytes transferred (for the running total).
+     */
+    @FunctionalInterface
+    private interface PerFileTransfer {
+        long transfer(ChannelSftp channel, RemoteFileMetadata meta) throws Exception;
+    }
+
+    /**
+     * Receives the "no files found" alerts of runs whose task asked for them; the scheduler wires this to the Events feed.
+     */
+    public interface NoFilesListener {
+        void noFiles(ScheduledTask task, String summary, String details);
+
+        /**
+         * Files are arriving again after a "no new files" alert.
+         */
+        void resumed(ScheduledTask task, String summary, String details);
+    }
+
+    /**
+     * Receives one event per mail message a run handled; the scheduler wires this to the Events feed.
+     */
+    public interface MailEventListener {
+        void onMailEvent(ScheduledTask task, boolean saved, String summary, String details,
+                         LocalDateTime start, LocalDateTime end, String runKey, String trigger);
+    }
+
+    /**
+     * A remote file's last-modified epoch (ms) and size (bytes), as parsed from `ls -l`.
+     */
+    private static final class RemoteFileStat {
+        final long epochMillis;
+        final long size;
+
+        RemoteFileStat(long epochMillis, long size) {
+            this.epochMillis = epochMillis;
+            this.size = size;
+        }
+    }
+
+    /**
+     * A WinSCP command line ("put ..."/"get ...") paired with the transferred file's size, for size-based batching.
+     */
+    private static final class SizedCommand {
+        final String command;
+        final long size;
+
+        SizedCommand(String command, long size) {
+            this.command = command;
+            this.size = size;
+        }
+    }
+
+    static class WatcherSkipException extends Exception {
+        public WatcherSkipException(String message) {
+            super(message);
+        }
+    }
+
+    /**
+     * A backup-eligible file: its full identity/location, calendar day, and size in bytes.
+     */
+    private static final class BackupCandidate {
+        final String name;
+        final LocalDate day;
+        final long size;
+        final Path localPath;      // set when source is LOCAL
+        final String remotePath;   // set when source is REMOTE (full remote path)
+
+        BackupCandidate(String name, LocalDate day, long size, Path localPath, String remotePath) {
+            this.name = name;
+            this.day = day;
+            this.size = size;
+            this.localPath = localPath;
+            this.remotePath = remotePath;
+        }
+    }
+
+    // ─── FIX B: Null-safe logTransferPaths ───────────────────────────────────
+    // Previously crashed with NPE when target == null on local→local tasks.
+
+    /**
+     * What the mail workers need to know about the run they belong to (captured on the task thread).
+     */
+    private record MailRunContext(ScheduledTask task, String mailbox, String folder, String runKey, String trigger) {
     }
 }

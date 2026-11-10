@@ -32,14 +32,29 @@ public class ToastManager {
         this.owner = owner;
     }
 
-    /** Displays a toast summarizing one completed run. Must be called on the EDT. */
+    private static String escape(String s) {
+        return s == null ? "" : s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
+    }
+
+    /**
+     * Displays a toast summarizing one completed run. Must be called on the EDT.
+     */
     public void showToast(TaskRunRecord r) {
         Color accent;
         String icon;
         switch (r.getStatus()) {
-            case SUCCESS: accent = AppTheme.EARTH_MOSS; icon = "\u2713"; break; // ✓
-            case FAILED:  accent = AppTheme.EARTH_RUST; icon = "\u2717"; break; // ✗
-            default:      accent = new Color(0xF9A825); icon = "\u23ED"; break; // ⏭ (skipped)
+            case SUCCESS:
+                accent = AppTheme.EARTH_MOSS;
+                icon = "\u2713";
+                break; // ✓
+            case FAILED:
+                accent = AppTheme.EARTH_RUST;
+                icon = "\u2717";
+                break; // ✗
+            default:
+                accent = new Color(0xF9A825);
+                icon = "\u23ED";
+                break; // ⏭ (skipped)
         }
         showToast(r.getTaskName() + " — " + r.getStatus(),
                 r.getReason() != null && !r.getReason().isEmpty() ? r.getReason() : "(no details)",
@@ -77,7 +92,8 @@ public class ToastManager {
 
         // Click a toast to dismiss it immediately.
         content.addMouseListener(new java.awt.event.MouseAdapter() {
-            @Override public void mouseClicked(java.awt.event.MouseEvent e) {
+            @Override
+            public void mouseClicked(java.awt.event.MouseEvent e) {
                 dismiss(toast);
             }
         });
@@ -100,7 +116,9 @@ public class ToastManager {
         repositionAll();
     }
 
-    /** Stacks all currently-active toasts bottom-up near the owner window's bottom-right corner. */
+    /**
+     * Stacks all currently-active toasts bottom-up near the owner window's bottom-right corner.
+     */
     private void repositionAll() {
         Rectangle ownerBounds = owner.getBounds();
         int baseY = ownerBounds.y + ownerBounds.height - MARGIN;
@@ -110,9 +128,5 @@ public class ToastManager {
             w.setLocation(ownerBounds.x + ownerBounds.width - w.getWidth() - MARGIN, baseY);
             baseY -= GAP;
         }
-    }
-
-    private static String escape(String s) {
-        return s == null ? "" : s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
     }
 }
