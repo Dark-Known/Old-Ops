@@ -13,54 +13,17 @@ import java.util.*;
  */
 public final class TaskChangeView {
 
-    /**
-     * Field key -> label used in the audit text. The task list screen writes the text with these.
-     */
-    public static final Map<String, String> LABELS = new LinkedHashMap<>();
+    private TaskChangeView() {}
+
+    /** Field key -> label used in the audit text; owned by the writer, {@link service.TaskChangeDescriber}. */
+    public static final Map<String, String> LABELS = service.TaskChangeDescriber.LABELS;
+
+    public enum Change { CREATED, EDITED, DELETED }
+
+    /** HTML for the details pane plus a plain-text twin for "Copy". */
+    public record View(String html, String text) {}
+
     private static final String[] PREFIXES = {"Created task \"", "Edited task \"", "Deleted task \""};
-
-    static {
-        LABELS.put("taskType", "Type");
-        LABELS.put("transferDirection", "Direction");
-        LABELS.put("transferMode", "Transfer mode");
-        LABELS.put("sourceCredential", "Source credential");
-        LABELS.put("targetCredential", "Target credential");
-        LABELS.put("targetUsername", "Target credential");
-        LABELS.put("sourcePath", "Source path");
-        LABELS.put("targetPath", "Target path");
-        LABELS.put("additionalTargetPaths", "Additional target paths");
-        LABELS.put("fileSelectionRules", "File selection rules");
-        LABELS.put("watchOptions", "What is reported");
-        LABELS.put("backupSourcePath", "Backup source path");
-        LABELS.put("backupDestinationPath", "Backup destination path");
-        LABELS.put("backupRetentionDays", "Backup retention (days)");
-        LABELS.put("backupSourceUsername", "Backup source credential");
-        LABELS.put("backupDestinationUsername", "Backup destination credential");
-        LABELS.put("imapFolder", "IMAP folder");
-        LABELS.put("mailSearchCriteria", "Mail search criteria");
-        LABELS.put("mailFetchMode", "Mail fetch mode");
-        LABELS.put("mailMailboxAddress", "Mailbox address");
-        LABELS.put("mailTenantId", "Mail tenant ID");
-        LABELS.put("mailClientId", "Mail client ID");
-        LABELS.put("mailFetchScope", "Mail fetch scope");
-        LABELS.put("mailMaxResults", "Mail max results");
-        LABELS.put("mailMarkAsRead", "Mark mail as read");
-        LABELS.put("mailMoveToFolderEnabled", "Move mail to folder");
-        LABELS.put("mailMoveToFolderName", "Move-to folder name");
-        LABELS.put("mailOutputFolder", "Mail output folder");
-        LABELS.put("scheduleType", "Schedule type");
-        LABELS.put("scheduledAt", "Scheduled at");
-        LABELS.put("intervalMinutes", "Interval (minutes)");
-        LABELS.put("intervalSeconds", "Interval (seconds)");
-        LABELS.put("cronExpression", "Cron expression");
-        LABELS.put("watcherEnabled", "Watcher enabled");
-        LABELS.put("inboundWatcherPollIntervalMinutes", "Watcher fallback poll interval (min)");
-        LABELS.put("inboundWatcherMaxAgeMinutes", "Watcher max file age (min)");
-        LABELS.put("retryCount", "Retry count");
-    }
-
-    private TaskChangeView() {
-    }
 
     public static boolean applies(String message) {
         if (message == null) return false;
@@ -68,9 +31,9 @@ public final class TaskChangeView {
         return false;
     }
 
-    /**
-     * @param muted CSS class for secondary text, @param bad CSS class for removed values.
-     */
+    private record Row(String label, String oldValue, String value) {}
+
+    /** @param muted CSS class for secondary text, @param bad CSS class for removed values. */
     public static View render(String message, String muted) {
         Change kind = message.startsWith(PREFIXES[0]) ? Change.CREATED
                 : message.startsWith(PREFIXES[1]) ? Change.EDITED : Change.DELETED;
@@ -137,13 +100,12 @@ public final class TaskChangeView {
         return new View(h.toString(), t.toString());
     }
 
-    /**
-     * "Label: value; Label: value" with known labels only, so a ';' inside a value does not split it.
-     */
+    // ── parsing ────────────────────────────────────────────────────
+
+    /** "Label: value; Label: value" with known labels only, so a ';' inside a value does not split it. */
     static List<Row> parse(String s, boolean edit) {
         List<Row> rows = new ArrayList<>();
-        if (s == null || s.isBlank() || s.startsWith("no fields") || s.startsWith("no fields actually changed"))
-            return rows;
+        if (s == null || s.isBlank() || s.startsWith("no fields") || s.startsWith("no fields actually changed")) return rows;
         Set<String> labels = new HashSet<>(LABELS.values());
         String label = null;
         StringBuilder value = new StringBuilder();
@@ -170,6 +132,8 @@ public final class TaskChangeView {
         if (arrow < 0) return new Row(label, "", value);
         return new Row(label, value.substring(0, arrow), value.substring(arrow + 3));
     }
+
+    // ── wording ────────────────────────────────────────────────────
 
     private static String friendly(String label, String value) {
         if (value == null) return "";
@@ -224,7 +188,7 @@ public final class TaskChangeView {
         };
     }
 
-    // ── parsing ────────────────────────────────────────────────────
+    private record Section(String title, List<String[]> rows) {}
 
     private static void add(List<String[]> rows, Map<String, String> v, String label, String shownLabel) {
         String val = v.get(label);
@@ -303,11 +267,7 @@ public final class TaskChangeView {
         return out;
     }
 
-    // ── wording ────────────────────────────────────────────────────
-
-    /**
-     * One plain sentence describing the task, or null when there is not enough information.
-     */
+    /** One plain sentence describing the task, or null when there is not enough information. */
     static String sentence(Map<String, String> v) {
         String type = v.getOrDefault("Type", "");
         String when = whenPhrase(v);
@@ -327,12 +287,11 @@ public final class TaskChangeView {
                 String local = v.get("Source path");
                 s = inbound
                         ? "Downloads " + which + " from " + server + (remote != null ? " (" + remote + ")" : "")
-                        + (local != null ? " to " + local : "")
+                                + (local != null ? " to " + local : "")
                         : "Uploads " + which + (local != null ? " from " + local : "") + " to " + server
-                        + (remote != null ? " (" + remote + ")" : "");
+                                + (remote != null ? " (" + remote + ")" : "");
             }
-            case "FOLDER_WATCH" ->
-                    s = "Watches " + v.getOrDefault("Backup source path", "a folder") + " for new and changed files (nothing is transferred)";
+            case "FOLDER_WATCH" -> s = "Watches " + v.getOrDefault("Backup source path", "a folder") + " for new and changed files (nothing is transferred)";
             case "BACKUP" -> s = "Backs up " + v.getOrDefault("Backup source path", "files")
                     + (v.get("Backup destination path") != null ? " to " + v.get("Backup destination path") : "");
             case "OUTLOOK_MAIL" -> s = "Reads mail from " + v.getOrDefault("Mailbox address", "a mailbox")
@@ -351,33 +310,14 @@ public final class TaskChangeView {
         if (type == null) return null;
         return switch (type) {
             case "RUN_NOW" -> "once, right away";
-            case "ONCE" ->
-                    v.get("Scheduled at") != null ? "once at " + friendly("Scheduled at", v.get("Scheduled at")) : "once";
+            case "ONCE" -> v.get("Scheduled at") != null ? "once at " + friendly("Scheduled at", v.get("Scheduled at")) : "once";
             case "DAILY" -> "every day";
             case "WEEKLY" -> "every week";
-            case "INTERVAL_MINUTES" ->
-                    v.get("Interval (minutes)") != null ? "every " + friendly("Interval (minutes)", v.get("Interval (minutes)")) : null;
-            case "INTERVAL_SECONDS" ->
-                    v.get("Interval (seconds)") != null ? "every " + friendly("Interval (seconds)", v.get("Interval (seconds)")) : null;
+            case "INTERVAL_MINUTES" -> v.get("Interval (minutes)") != null ? "every " + friendly("Interval (minutes)", v.get("Interval (minutes)")) : null;
+            case "INTERVAL_SECONDS" -> v.get("Interval (seconds)") != null ? "every " + friendly("Interval (seconds)", v.get("Interval (seconds)")) : null;
             default -> null;
         };
     }
 
-    private static String esc(String s) {
-        return MonitorStyle.htmlEscape(s);
-    }
-
-    public enum Change {CREATED, EDITED, DELETED}
-
-    /**
-     * HTML for the details pane plus a plain-text twin for "Copy".
-     */
-    public record View(String html, String text) {
-    }
-
-    private record Row(String label, String oldValue, String value) {
-    }
-
-    private record Section(String title, List<String[]> rows) {
-    }
+    private static String esc(String s) { return MonitorStyle.htmlEscape(s); }
 }

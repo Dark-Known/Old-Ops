@@ -1,5 +1,8 @@
 package service.sftp;
 
+import static org.junit.Assert.*;
+import static org.junit.Assume.assumeTrue;
+
 import org.junit.BeforeClass;
 import org.junit.Test;
 import util.SshHostKeys;
@@ -9,9 +12,6 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.List;
-
-import static org.junit.Assert.*;
-import static org.junit.Assume.assumeTrue;
 
 /**
  * Integration test against a real SFTP server. Skipped unless -Dopstool.sftp.port=NNNN is given
@@ -92,8 +92,7 @@ public class JschSftpClientIT {
             try {
                 c.download("/it/does-not-exist", new File(dir, "x.txt"));
                 fail();
-            } catch (IOException expected) {
-            }
+            } catch (IOException expected) { }
         }
         assertEquals(0, dir.list().length);
     }
@@ -106,8 +105,7 @@ public class JschSftpClientIT {
         try {
             c.list("/");
             fail("operations after cancel must fail");
-        } catch (IOException | RuntimeException expected) {
-        }
+        } catch (IOException | RuntimeException expected) { }
     }
 
     @Test

@@ -1,5 +1,8 @@
 package service;
 
+import persistence.PurgeResult;
+import persistence.BackgroundLog;
+import persistence.RunHistory;
 import model.TaskRunRecord;
 
 import java.time.Duration;
@@ -15,58 +18,25 @@ import java.util.function.BooleanSupplier;
  * other work, and shows up in the workers badge, the live queue and the Event Monitor.
  */
 public final class MaintenanceService {
-    /**
-     * Id of the purge job as it travels through the event queue and the worker pool.
-     */
+    /** Id of the purge job as it travels through the event queue and the worker pool. */
     public static final String JOB_PURGE = "system:purge";
     private static final String META_LAST_PURGE = "last_purge_at";
     private static final String META_LAST_SUMMARY = "last_purge_summary";
 
-    private final RunHistoryService history;
-    private final BackgroundLogService backgroundLog;
+    private final RunHistory history;
+    private final BackgroundLog backgroundLog;
 
-    public MaintenanceService(RunHistoryService history, BackgroundLogService backgroundLog) {
+    public MaintenanceService(RunHistory history, BackgroundLog backgroundLog) {
         this.history = history;
         this.backgroundLog = backgroundLog;
     }
 
-    /**
-     * True for ids of internal jobs (as opposed to ids of user-defined tasks).
-     */
-    public static boolean isSystemJob(String id) {
-        return id != null && id.startsWith("system:");
-    }
+    /** True for ids of internal jobs (as opposed to ids of user-defined tasks). */
+    public static boolean isSystemJob(String id) { return id != null && id.startsWith("system:"); }
 
-    /**
-     * Name shown for a system job wherever tasks are listed (queue, workers badge).
-     */
+    /** Name shown for a system job wherever tasks are listed (queue, workers badge). */
     public static String displayName(String id) {
         return JOB_PURGE.equals(id) ? "Purge old logs & history" : id;
-    }
-
-    private static PurgeResult safe(String label, Purge p) {
-        try {
-            return p.run();
-        } catch (RuntimeException e) {
-            return PurgeResult.failure(label, 0, 0, e.toString());
-        }
-    }
-
-    /**
-     * Moves background events that older builds stored in run history into their own database.
-     */
-    public static int migrateLegacyBackgroundRows(RunHistoryService history, BackgroundLogService bg) {
-        if (!bg.isOpen() || "1".equals(bg.meta("legacy_migrated"))) return 0;
-        List<TaskRunRecord> rows = history.listLegacyBackgroundRows();
-        int moved = 0;
-        if (!rows.isEmpty()) {
-            long maxId = rows.stream().mapToLong(TaskRunRecord::getId).max().orElse(0);
-            moved = bg.importRows(rows);
-            if (moved != rows.size()) return 0; // import failed: leave the rows where they are, retry next start
-            history.deleteLegacyBackgroundRows(maxId);
-        }
-        bg.setMeta("legacy_migrated", "1");
-        return moved;
     }
 
     /**
@@ -77,8 +47,8 @@ public final class MaintenanceService {
     public List<PurgeResult> runPurge(String trigger, BooleanSupplier cancelled) {
         List<PurgeResult> results = new ArrayList<>();
         try (BackgroundJobs.Job job = BackgroundJobs.begin("Purge old logs & history (" + trigger + ")", true)) {
-            results.add(safe("Background log", () -> backgroundLog.purge(PurgePolicy.backgroundLog(), cancelled)));
-            results.add(safe("Run history", () -> history.purge(PurgePolicy.runHistory(), cancelled)));
+            results.add(safe("Background log", () -> backgroundLog.purge(RetentionSettings.backgroundLog(), cancelled)));
+            results.add(safe("Run history", () -> history.purge(RetentionSettings.runHistory(), cancelled)));
             StringBuilder sum = new StringBuilder();
             for (PurgeResult r : results) {
                 if (sum.length() > 0) sum.append("; ");
@@ -92,41 +62,29 @@ public final class MaintenanceService {
         return results;
     }
 
-    /**
-     * When the last purge finished, or null if none has run yet.
-     */
+    private interface Purge { PurgeResult run(); }
+
+    private static PurgeResult safe(String label, Purge p) {
+        try { return p.run(); }
+        catch (RuntimeException e) { return PurgeResult.failure(label, 0, 0, e.toString()); }
+    }
+
+    /** When the last purge finished, or null if none has run yet. */
     public LocalDateTime lastPurgeAt() {
         String v = backgroundLog.meta(META_LAST_PURGE);
-        try {
-            return v == null ? null : LocalDateTime.parse(v);
-        } catch (Exception e) {
-            return null;
-        }
+        try { return v == null ? null : LocalDateTime.parse(v); } catch (Exception e) { return null; }
     }
 
-    public String lastPurgeSummary() {
-        return backgroundLog.meta(META_LAST_SUMMARY);
-    }
+    public String lastPurgeSummary() { return backgroundLog.meta(META_LAST_SUMMARY); }
 
-    /**
-     * True when scheduled purging is on and the configured interval has elapsed since the last one.
-     */
+    /** True when scheduled purging is on and the configured interval has elapsed since the last one. */
     public boolean purgeDue() {
-        if (!PurgePolicy.scheduledEnabled()) return false;
+        if (!RetentionSettings.scheduledEnabled()) return false;
         LocalDateTime last = lastPurgeAt();
-        return last == null || Duration.between(last, LocalDateTime.now()).toHours() >= PurgePolicy.intervalHours()
+        return last == null || Duration.between(last, LocalDateTime.now()).toHours() >= RetentionSettings.intervalHours()
                 || LocalDateTime.now().isBefore(last); // clock moved backwards: don't wait indefinitely
     }
 
-    public BackgroundLogService backgroundLog() {
-        return backgroundLog;
-    }
-
-    public RunHistoryService history() {
-        return history;
-    }
-
-    private interface Purge {
-        PurgeResult run();
-    }
+    public BackgroundLog backgroundLog() { return backgroundLog; }
+    public RunHistory history() { return history; }
 }

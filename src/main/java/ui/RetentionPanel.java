@@ -1,6 +1,13 @@
 package ui;
 
-import service.*;
+import persistence.CommandQueue;
+import service.RetentionSettings;
+import service.BackgroundJobs;
+import service.CommandQueueService;
+import service.MaintenanceService;
+import persistence.PurgePolicy;
+import persistence.PurgeResult;
+import service.TaskSchedulerService;
 
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
@@ -32,7 +39,6 @@ final class RetentionPanel extends JPanel {
     private final JLabel status = new JLabel(" ");
     private final JLabel sizes = new JLabel(" ");
     private final Timer statusTimer;
-    private volatile long cachedBgRows = -1, cachedBgRowsGen = -1;
 
     RetentionPanel(TaskSchedulerService scheduler) {
         this.scheduler = scheduler;
@@ -49,10 +55,7 @@ final class RetentionPanel extends JPanel {
         line(row++, c, "Background log", "Events from the app's own worker threads (separate database)", bgDays, bgMb);
         line(row++, c, "Run history", "Task runs and the Event Monitor's activity feed", runDays, runMb);
 
-        c.gridx = 0;
-        c.gridy = row;
-        c.gridwidth = 2;
-        c.insets = new Insets(10, 4, 4, 8);
+        c.gridx = 0; c.gridy = row; c.gridwidth = 2; c.insets = new Insets(10, 4, 4, 8);
         JPanel sched = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
         sched.setOpaque(false);
         auto.setOpaque(false);
@@ -63,15 +66,13 @@ final class RetentionPanel extends JPanel {
         add(sched, c);
         row++;
 
-        c.gridy = row++;
-        c.insets = new Insets(4, 4, 4, 8);
+        c.gridy = row++; c.insets = new Insets(4, 4, 4, 8);
         JPanel actions = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
         actions.setOpaque(false);
         actions.add(purgeNow);
         add(actions, c);
 
-        c.gridy = row++;
-        c.insets = new Insets(2, 4, 0, 8);
+        c.gridy = row++; c.insets = new Insets(2, 4, 0, 8);
         sizes.setFont(sizes.getFont().deriveFont(Font.PLAIN, 11.5f));
         add(sizes, c);
         c.gridy = row;
@@ -83,9 +84,7 @@ final class RetentionPanel extends JPanel {
         purgeNow.addActionListener(e -> purgeNow());
         purgeNow.setToolTipText("0 means no limit. When both limits are set, whichever is reached first removes the oldest entries.");
 
-        statusTimer = new Timer(4000, e -> {
-            if (isShowing()) refreshStatus();
-        });
+        statusTimer = new Timer(4000, e -> { if (isShowing()) refreshStatus(); });
         statusTimer.start();
     }
 
@@ -95,22 +94,11 @@ final class RetentionPanel extends JPanel {
         return sp;
     }
 
-    private static JLabel label(String text, boolean bold) {
-        JLabel l = new JLabel(text);
-        l.setFont(l.getFont().deriveFont(bold ? Font.BOLD : Font.PLAIN, 11f));
-        l.setForeground(new Color(0x888888));
-        return l;
-    }
-
     private void header(int row, GridBagConstraints c) {
         c.gridy = row;
-        c.gridx = 1;
-        add(label("Keep at most (days, 0 = any age)", true), c);
-        c.gridx = 2;
-        add(label("Max size (MB, 0 = no cap)", true), c);
+        c.gridx = 1; add(label("Keep at most (days, 0 = any age)", true), c);
+        c.gridx = 2; add(label("Max size (MB, 0 = no cap)", true), c);
     }
-
-    // ── Load / save ──────────────────────────────────────────────────────────
 
     private void line(int row, GridBagConstraints c, String title, String hint, JSpinner days, JSpinner mb) {
         c.gridy = row;
@@ -124,85 +112,80 @@ final class RetentionPanel extends JPanel {
         left.add(t);
         left.add(h);
         add(left, c);
-        c.gridx = 1;
-        add(days, c);
-        c.gridx = 2;
-        add(mb, c);
+        c.gridx = 1; add(days, c);
+        c.gridx = 2; add(mb, c);
     }
 
+    private static JLabel label(String text, boolean bold) {
+        JLabel l = new JLabel(text);
+        l.setFont(l.getFont().deriveFont(bold ? Font.BOLD : Font.PLAIN, 11f));
+        l.setForeground(new Color(0x888888));
+        return l;
+    }
+
+    // ── Load / save ──────────────────────────────────────────────────────────
+
     void load() {
-        PurgePolicy bg = PurgePolicy.backgroundLog(), run = PurgePolicy.runHistory();
+        PurgePolicy bg = RetentionSettings.backgroundLog(), run = RetentionSettings.runHistory();
         bgDays.setValue(bg.keepDays());
         bgMb.setValue((int) bg.maxMb());
         runDays.setValue(run.keepDays());
         runMb.setValue((int) run.maxMb());
-        auto.setSelected(PurgePolicy.scheduledEnabled());
-        everyHours.setValue(PurgePolicy.intervalHours());
+        auto.setSelected(RetentionSettings.scheduledEnabled());
+        everyHours.setValue(RetentionSettings.intervalHours());
         everyHours.setEnabled(auto.isSelected());
         refreshStatus();
     }
 
-    // ── Purge now ────────────────────────────────────────────────────────────
-
-    /**
-     * The settings keys this panel owns, for the Settings panel's single Save.
-     */
+    /** The settings keys this panel owns, for the Settings panel's single Save. */
     Map<String, String> values() {
         Map<String, String> m = new LinkedHashMap<>();
-        m.put(PurgePolicy.KEY_BG_DAYS, String.valueOf(bgDays.getValue()));
-        m.put(PurgePolicy.KEY_BG_MB, String.valueOf(bgMb.getValue()));
-        m.put(PurgePolicy.KEY_RUN_DAYS, String.valueOf(runDays.getValue()));
-        m.put(PurgePolicy.KEY_RUN_MB, String.valueOf(runMb.getValue()));
-        m.put(PurgePolicy.KEY_SCHEDULED, String.valueOf(auto.isSelected()));
-        m.put(PurgePolicy.KEY_INTERVAL_H, String.valueOf(everyHours.getValue()));
+        m.put(RetentionSettings.KEY_BG_DAYS, String.valueOf(bgDays.getValue()));
+        m.put(RetentionSettings.KEY_BG_MB, String.valueOf(bgMb.getValue()));
+        m.put(RetentionSettings.KEY_RUN_DAYS, String.valueOf(runDays.getValue()));
+        m.put(RetentionSettings.KEY_RUN_MB, String.valueOf(runMb.getValue()));
+        m.put(RetentionSettings.KEY_SCHEDULED, String.valueOf(auto.isSelected()));
+        m.put(RetentionSettings.KEY_INTERVAL_H, String.valueOf(everyHours.getValue()));
         return m;
     }
 
-    // ── Status line ──────────────────────────────────────────────────────────
+    // ── Purge now ────────────────────────────────────────────────────────────
 
     private void purgeNow() {
-        if (scheduler == null) {
-            setStatus("Purging needs the scheduler, which isn't available here.", true);
-            return;
-        }
+        if (scheduler == null) { setStatus("Purging needs the scheduler, which isn't available here.", true); return; }
         purgeNow.setEnabled(false);
         setStatus("Saving retention settings and queuing the purge…", false);
         Map<String, String> values = values();
         Async.call("Queue purge", () -> {
-                    // The purge reads the saved settings, so persist what is on screen first.
-                    if (!util.AppSettings.setAll(values))
-                        return "Could not save the retention settings (database not connected).";
-                    if (scheduler.requestPurge("manual")) {
-                        return "Queued — a task worker in this app will run it (see Event Monitor → Background).";
-                    }
-                    java.io.File dataDir = scheduler.getStorage().getDataDir();
-                    AppFeeds.Daemon d = AppFeeds.daemon(dataDir.toPath().resolve("scheduler-status-daemon.dat")).latest();
-                    if (d != null && d.alive()) {
-                        boolean ok = CommandQueueService.enqueue(dataDir, MaintenanceService.JOB_PURGE,
-                                CommandQueueService.Action.PURGE_NOW, "gui");
-                        return ok ? "Sent to the Daemon — one of its task workers will run it (see Event Monitor → Background)."
-                                : "Could not send the request to the Daemon.";
-                    }
-                    // No scheduler is running anywhere: do it on a background thread rather than not at all.
-                    java.util.List<PurgeResult> rs = scheduler.getMaintenance().runPurge("manual, service not running", () -> false);
-                    StringBuilder sb = new StringBuilder("The background service isn't running, so this was done on a background thread: ");
-                    for (PurgeResult r : rs) sb.append(r.summary()).append("  ");
-                    return sb.toString().trim();
-                }, msg -> {
-                    purgeNow.setEnabled(true);
-                    setStatus(msg, false);
-                    refreshStatus();
-                },
-                err -> {
-                    purgeNow.setEnabled(true);
-                    setStatus("Purge failed: " + err.getMessage(), true);
-                });
+            // The purge reads the saved settings, so persist what is on screen first.
+            if (!util.AppSettings.setAll(values)) return "Could not save the retention settings (database not connected).";
+            if (scheduler.requestPurge("manual")) {
+                return "Queued — a task worker in this app will run it (see Event Monitor → Background).";
+            }
+            java.io.File dataDir = scheduler.getStorage().getDataDir();
+            AppFeeds.Daemon d = AppFeeds.daemon(service.AppFolder.at(dataDir).daemonStatusFile()).latest();
+            if (d != null && d.alive()) {
+                boolean ok = service.AppFolder.at(dataDir).sendCommand(MaintenanceService.JOB_PURGE, CommandQueue.Action.PURGE_NOW);
+                return ok ? "Sent to the Daemon — one of its task workers will run it (see Event Monitor → Background)."
+                          : "Could not send the request to the Daemon.";
+            }
+            // No scheduler is running anywhere: do it on a background thread rather than not at all.
+            java.util.List<PurgeResult> rs = scheduler.getMaintenance().runPurge("manual, service not running", () -> false);
+            StringBuilder sb = new StringBuilder("The background service isn't running, so this was done on a background thread: ");
+            for (PurgeResult r : rs) sb.append(r.summary()).append("  ");
+            return sb.toString().trim();
+        }, msg -> { purgeNow.setEnabled(true); setStatus(msg, false); refreshStatus(); },
+           err -> { purgeNow.setEnabled(true); setStatus("Purge failed: " + err.getMessage(), true); });
     }
+
+    // ── Status line ──────────────────────────────────────────────────────────
 
     private void setStatus(String text, boolean error) {
         status.setText(text);
         status.setForeground(error ? new Color(0xC62828) : new Color(0x888888));
     }
+
+    private volatile long cachedBgRows = -1, cachedBgRowsGen = -1;
 
     void refreshStatus() {
         if (scheduler == null) return;
@@ -210,8 +193,8 @@ final class RetentionPanel extends JPanel {
             long bgSize = scheduler.getBackgroundLogService().sizeBytes();
             // COUNT(*) scans the table; only redo it when background_log.db was actually committed to.
             // (File sizes below are plain stat() calls, no SQL.)
-            long gen = service.DbChangeMonitor.forDataDir(scheduler.getStorage().getDataDir())
-                    .generation(service.DbChangeMonitor.Topic.BGLOG);
+            long gen = service.AppFolder.of(scheduler.getStorage()).changes()
+                    .generation(persistence.ChangeSignals.Topic.BGLOG);
             if (cachedBgRows < 0 || gen != cachedBgRowsGen) {
                 cachedBgRows = scheduler.getBackgroundLogService().rowCount();
                 cachedBgRowsGen = gen;
@@ -220,17 +203,14 @@ final class RetentionPanel extends JPanel {
             long runSize = scheduler.getRunHistoryService().sizeBytes();
             LocalDateTime last = scheduler.getMaintenance().lastPurgeAt();
             String sum = scheduler.getMaintenance().lastPurgeSummary();
-            return new Object[]{bgSize, bgRows, runSize, last, sum};
+            return new Object[]{ bgSize, bgRows, runSize, last, sum };
         }, r -> {
             sizes.setText("Now: background log " + PurgeResult.human((Long) r[0]) + " (" + r[1] + " entries)  ·  run history "
                     + PurgeResult.human((Long) r[2]) + "  ·  last purge "
                     + (r[3] == null ? "never" : ((LocalDateTime) r[3]).format(WHEN)));
             sizes.setToolTipText(r[4] == null ? null : (String) r[4]);
-        }, e -> {
-        });
+        }, e -> { });
     }
 
-    void dispose() {
-        statusTimer.stop();
-    }
+    void dispose() { statusTimer.stop(); }
 }

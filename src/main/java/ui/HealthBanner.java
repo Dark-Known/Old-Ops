@@ -1,5 +1,6 @@
 package ui;
 
+import persistence.RunHistory;
 import model.TaskRunRecord;
 import service.TaskSchedulerService;
 
@@ -29,7 +30,7 @@ import java.util.Map;
  *
  * <p>Refreshed two ways: a periodic query (covers Daemon-side failures,
  * which reach this only via the shared database) and an immediate push via
- * {@link service.RunHistoryService#addRunListener} for same-process
+ * {@link RunHistory#addRunListener} for same-process
  * failures, same event-bus pattern used elsewhere in this app.
  */
 public class HealthBanner extends JPanel {
@@ -58,10 +59,7 @@ public class HealthBanner extends JPanel {
 
         setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
         addMouseListener(new java.awt.event.MouseAdapter() {
-            @Override
-            public void mouseClicked(java.awt.event.MouseEvent e) {
-                showDetail();
-            }
+            @Override public void mouseClicked(java.awt.event.MouseEvent e) { showDetail(); }
         });
 
         refresh();
@@ -74,24 +72,6 @@ public class HealthBanner extends JPanel {
                 }
             });
         }
-    }
-
-    /**
-     * Groups failures by the most specific shared cause available: same
-     * task name + same failure category first (repeated failures of one
-     * task), falling back to just failure category (several different
-     * tasks failing the same way — e.g. all AUTH, suggesting one shared
-     * broken credential even though this app doesn't yet track which
-     * credential backs which failure explicitly).
-     */
-    private static Map<String, Integer> groupByLikelyCause(List<TaskRunRecord> failures) {
-        Map<String, Integer> groups = new LinkedHashMap<>();
-        for (TaskRunRecord r : failures) {
-            String category = r.getFailureCategory() != null ? r.getFailureCategory().name() : "UNKNOWN";
-            String key = r.getTaskName() + " (" + category + ")";
-            groups.merge(key, 1, Integer::sum);
-        }
-        return groups;
     }
 
     private void refresh() {
@@ -131,6 +111,24 @@ public class HealthBanner extends JPanel {
             sb.append("  (click for detail)");
             text.setText(sb.toString());
         }
+    }
+
+    /**
+     * Groups failures by the most specific shared cause available: same
+     * task name + same failure category first (repeated failures of one
+     * task), falling back to just failure category (several different
+     * tasks failing the same way — e.g. all AUTH, suggesting one shared
+     * broken credential even though this app doesn't yet track which
+     * credential backs which failure explicitly).
+     */
+    private static Map<String, Integer> groupByLikelyCause(List<TaskRunRecord> failures) {
+        Map<String, Integer> groups = new LinkedHashMap<>();
+        for (TaskRunRecord r : failures) {
+            String category = r.getFailureCategory() != null ? r.getFailureCategory().name() : "UNKNOWN";
+            String key = r.getTaskName() + " (" + category + ")";
+            groups.merge(key, 1, Integer::sum);
+        }
+        return groups;
     }
 
     private void showDetail() {

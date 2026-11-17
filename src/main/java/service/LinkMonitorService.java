@@ -23,14 +23,12 @@ public final class LinkMonitorService implements AutoCloseable {
     private final Consumer<LinkMonitor.Alert> sink;
     private final LongSupplier clock;
     private final LinkMonitor monitor;
-    private final LinkActivityLog activity;
-    private final java.util.Map<String, Long> rejectedAt = new java.util.HashMap<>();
+
     private LinkMonitorConfig config = LinkMonitorConfig.empty();
     private long configStamp = Long.MIN_VALUE;
     private LinkIngestServer server;
     private String lastProblemText = "";
     private boolean bindFailureLogged;
-    private long statusWrittenAt = Long.MIN_VALUE;
 
     public LinkMonitorService(File dataDir, Consumer<LinkMonitor.Alert> sink) {
         this(dataDir, sink, System::currentTimeMillis);
@@ -44,13 +42,9 @@ public final class LinkMonitorService implements AutoCloseable {
         this.activity = new LinkActivityLog(dataDir);
     }
 
-    public LinkMonitor monitor() {
-        return monitor;
-    }
+    public LinkMonitor monitor() { return monitor; }
 
-    /**
-     * Reads the settings if they changed and (re)starts the endpoint when needed. Call at start-up and then periodically.
-     */
+    /** Reads the settings if they changed and (re)starts the endpoint when needed. Call at start-up and then periodically. */
     public synchronized void refresh() {
         try {
             File f = new File(dataDir, LinkMonitorConfig.FILE_NAME);
@@ -92,19 +86,14 @@ public final class LinkMonitorService implements AutoCloseable {
                 log.warning("Socket-link endpoint runs WITHOUT HTTPS (tls.enabled=false): tokens and events travel in clear text.");
             }
             server = LinkIngestServer.start(config.bind, config.port, keystore, password, new LinkIngestServer.Handler() {
-                @Override
-                public LinkMonitor.Ingest handle(String t, String remote, List<LinkMonitor.Report> r) {
+                @Override public LinkMonitor.Ingest handle(String t, String remote, List<LinkMonitor.Report> r) {
                     return LinkMonitorService.this.handle(t, remote, r);
                 }
-
-                @Override
-                public void rejected(String remote, int status, String why) {
+                @Override public void rejected(String remote, int status, String why) {
                     LinkMonitorService.this.rejected(remote, status, why);
                 }
-
-                @Override
-                public void exchange(String remote, String method, String path, String token,
-                                     String request, int status, String response) {
+                @Override public void exchange(String remote, String method, String path, String token,
+                                               String request, int status, String response) {
                     LinkMonitorService.this.exchange(remote, method, path, token, request, status, response);
                 }
             });
@@ -120,16 +109,11 @@ public final class LinkMonitorService implements AutoCloseable {
     }
 
     private void stopServer() {
-        if (server != null) {
-            server.close();
-            server = null;
-        }
+        if (server != null) { server.close(); server = null; }
         bindFailureLogged = false;
     }
 
-    /**
-     * Finds the source this token belongs to (current token, or the previous one inside its grace period) and feeds the reports to it.
-     */
+    /** Finds the source this token belongs to (current token, or the previous one inside its grace period) and feeds the reports to it. */
     private LinkMonitor.Ingest handle(String token, String remote, List<LinkMonitor.Report> reports) {
         long now = clock.getAsLong();
         LinkMonitor.Source match = null;
@@ -144,9 +128,7 @@ public final class LinkMonitorService implements AutoCloseable {
         return r;
     }
 
-    /**
-     * Every accepted request lands in the Events feed: a heartbeat-only request at debug level, anything else as info.
-     */
+    /** Every accepted request lands in the Events feed: a heartbeat-only request at debug level, anything else as info. */
     private void recordActivity(LinkMonitor.Source src, String remote, List<LinkMonitor.Report> reports, LinkMonitor.Ingest r) {
         boolean onlyHeartbeats = true;
         StringBuilder body = new StringBuilder();
@@ -167,27 +149,24 @@ public final class LinkMonitorService implements AutoCloseable {
                 src.id(), src.label(), summary, details)));
     }
 
-    /**
-     * One line in the activity log for every request, with the source it belongs to when the token is known.
-     */
+    private final LinkActivityLog activity;
+
+    /** One line in the activity log for every request, with the source it belongs to when the token is known. */
     private void exchange(String remote, String method, String path, String token, String request, int status, String response) {
         long now = clock.getAsLong();
         String id = "", label = "";
         if (token != null) {
             for (LinkMonitor.Source s : config.sources) {
-                if (s.accepts(token, now)) {
-                    id = s.id();
-                    label = s.label();
-                }
+                if (s.accepts(token, now)) { id = s.id(); label = s.label(); }
             }
         }
         activity.append(new LinkActivityLog.Entry(now, remote, id, label, method, path, status,
                 LinkActivityLog.tokenHint(token), request, response));
     }
 
-    /**
-     * A turned-away request. Repeats from the same address and reason are recorded at most once a minute.
-     */
+    private final java.util.Map<String, Long> rejectedAt = new java.util.HashMap<>();
+
+    /** A turned-away request. Repeats from the same address and reason are recorded at most once a minute. */
     private void rejected(String remote, int status, String why) {
         long now = clock.getAsLong();
         String key = remote + "|" + status;
@@ -202,9 +181,7 @@ public final class LinkMonitorService implements AutoCloseable {
                 "From " + remote + ". Response: " + status + " " + why + ".")));
     }
 
-    /**
-     * Periodic check for silence and repeat reminders; also picks up settings changes.
-     */
+    /** Periodic check for silence and repeat reminders; also picks up settings changes. */
     public void tick() {
         refresh();
         try {
@@ -215,9 +192,9 @@ public final class LinkMonitorService implements AutoCloseable {
         writeStatus(true);
     }
 
-    /**
-     * Publishes the live state for the window. Requests trigger it too, at most every few seconds.
-     */
+    private long statusWrittenAt = Long.MIN_VALUE;
+
+    /** Publishes the live state for the window. Requests trigger it too, at most every few seconds. */
     void writeStatus(boolean force) {
         long now = clock.getAsLong();
         synchronized (this) {
@@ -243,23 +220,14 @@ public final class LinkMonitorService implements AutoCloseable {
 
     private void deliver(List<LinkMonitor.Alert> alerts) {
         for (LinkMonitor.Alert a : alerts) {
-            try {
-                sink.accept(a);
-            } catch (RuntimeException e) {
-                log.log(Level.WARNING, "Socket-link alert not recorded", e);
-            }
+            try { sink.accept(a); } catch (RuntimeException e) { log.log(Level.WARNING, "Socket-link alert not recorded", e); }
         }
     }
 
-    /**
-     * Port the endpoint is serving on, or -1 when it is not (disabled, or taken by another instance).
-     */
-    public synchronized int listeningPort() {
-        return server == null ? -1 : server.port();
-    }
+    /** Port the endpoint is serving on, or -1 when it is not (disabled, or taken by another instance). */
+    public synchronized int listeningPort() { return server == null ? -1 : server.port(); }
 
-    @Override
-    public synchronized void close() {
+    @Override public synchronized void close() {
         stopServer();
         writeStatus(true);
     }

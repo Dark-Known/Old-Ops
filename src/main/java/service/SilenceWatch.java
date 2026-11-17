@@ -6,7 +6,15 @@ package service;
  */
 final class SilenceWatch {
 
-    private SilenceWatch() {
+    private SilenceWatch() { }
+
+    enum Verdict {
+        /** Nothing recorded yet: start the clock now. */
+        START,
+        /** Files arrived recently enough (or the app has not been watching long enough to say). */
+        OK,
+        /** No file for longer than the threshold. */
+        OVERDUE
     }
 
     /**
@@ -20,20 +28,5 @@ final class SilenceWatch {
         if (ref <= 0) return Verdict.START;
         ref = Math.max(ref, schedulerStart);
         return now - ref >= thresholdMs ? Verdict.OVERDUE : Verdict.OK;
-    }
-
-    enum Verdict {
-        /**
-         * Nothing recorded yet: start the clock now.
-         */
-        START,
-        /**
-         * Files arrived recently enough (or the app has not been watching long enough to say).
-         */
-        OK,
-        /**
-         * No file for longer than the threshold.
-         */
-        OVERDUE
     }
 }

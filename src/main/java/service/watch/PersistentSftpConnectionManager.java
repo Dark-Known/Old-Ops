@@ -1,5 +1,6 @@
 package service.watch;
 
+import model.RunTrace;
 import com.jcraft.jsch.ChannelSftp;
 import com.jcraft.jsch.JSch;
 import com.jcraft.jsch.Session;
@@ -7,6 +8,7 @@ import model.Credential;
 
 import java.util.Properties;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
@@ -61,64 +63,58 @@ import java.util.logging.Logger;
  * task) is detected and forces a clean reconnect rather than reusing a
  * session against the old target.
  */
-public class PersistentSftpConnectionManager {
+public class PersistentSftpConnectionManager implements WatcherConnections {
 
     private static final Logger log = Logger.getLogger(PersistentSftpConnectionManager.class.getName());
 
-    /**
-     * How long a connection may sit completely unused before being proactively
-     * closed — a defensive safety net, not the primary cleanup mechanism; see
-     * the class javadoc. Callers are expected to {@link #close(String)}
-     * their own session once a fire is done with it, so in normal operation
-     * this reaper should rarely find anything left to reap.
-     */
+    /** How long a connection may sit completely unused before being proactively
+     *  closed — a defensive safety net, not the primary cleanup mechanism; see
+     *  the class javadoc. Callers are expected to {@link #close(String)}
+     *  their own session once a fire is done with it, so in normal operation
+     *  this reaper should rarely find anything left to reap. */
     private static final long IDLE_CLOSE_MILLIS = 10 * 60 * 1000L; // 10 minutes
 
-    /**
-     * Connect timeout for establishing (or re-establishing) a connection, and
-     * for opening each additional channel on it. Paid once per task (plus
-     * once per additional concurrent slot the first time it's used) and then
-     * amortized across every subsequent watcher fire for that task, so —
-     * unlike the old per-event connect — this no longer sits directly on the
-     * "change detected → transfer starts" critical path on anything but the
-     * very first fire (or a reconnect after a real drop).
-     */
+    /** Connect timeout for establishing (or re-establishing) a connection, and
+     *  for opening each additional channel on it. Paid once per task (plus
+     *  once per additional concurrent slot the first time it's used) and then
+     *  amortized across every subsequent watcher fire for that task, so —
+     *  unlike the old per-event connect — this no longer sits directly on the
+     *  "change detected → transfer starts" critical path on anything but the
+     *  very first fire (or a reconnect after a real drop). */
     private static final int CONNECT_TIMEOUT_MILLIS = 8_000;
 
     /** One task's kept-warm SSH session plus however many SFTP channel slots
      *  have been opened on it so far (grown lazily, up to whatever concurrency
      *  a given fire actually asks for). */
-    /**
-     * Why these sessions exist, shown as the purpose of their events in the Event Monitor.
-     */
+    /** Why these sessions exist, shown as the purpose of their events in the Event Monitor. */
     private static final String PURPOSE =
             "SFTP connection for this run (listing, transfers and cleanup of originals)";
+
+    private static final class Entry {
+        final Session session;
+        final ConcurrentHashMap<Integer, ChannelSftp> slots = new ConcurrentHashMap<>();
+        final String credentialFingerprint;
+        volatile long lastUsedMillis;
+        int connectCount;
+        final long openedAtMillis = System.currentTimeMillis();
+        String host, user;
+        volatile service.sftp.SessionLog log;
+        volatile String runKey;
+
+        Entry(Session session, String fingerprint, int connectCount) {
+            this.session = session;
+            this.credentialFingerprint = fingerprint;
+            this.connectCount = connectCount;
+            this.lastUsedMillis = System.currentTimeMillis();
+        }
+    }
+
     private final ConcurrentHashMap<String, Entry> entries = new ConcurrentHashMap<>();
     private final ScheduledExecutorService reaper;
+
     public PersistentSftpConnectionManager() {
         reaper = service.Workers.newScheduled(service.Workers.Lane.WATCH, 1);
         reaper.scheduleAtFixedRate(this::reapIdle, 1, 1, TimeUnit.MINUTES);
-    }
-
-    private static String fingerprint(Credential c) {
-        return c.getHost() + "|" + c.getUsername() + "|" + c.getPassword();
-    }
-
-    private static void closeQuietly(String taskId, Entry e, String reason) {
-        boolean wasOpen = e.session != null;
-        for (ChannelSftp c : e.slots.values()) {
-            try {
-                if (c.isConnected()) c.disconnect();
-            } catch (Exception ignored) {
-            }
-        }
-        try {
-            if (e.session != null && e.session.isConnected()) e.session.disconnect();
-        } catch (Exception ignored) {
-        }
-        if (e.log != null) e.log.add("Closing session: " + reason);
-        if (wasOpen) service.SshSessionEvents.closedInRun(taskId, PURPOSE, e.host, e.user, reason,
-                System.currentTimeMillis() - e.openedAtMillis, e.runKey, e.log != null ? e.log.text() : null);
     }
 
     private void reapIdle() {
@@ -132,6 +128,19 @@ public class PersistentSftpConnectionManager {
                 }
             }
         }
+    }
+
+    @Override
+    public service.sftp.SftpClient getClient(String taskId, Credential credential) throws Exception {
+        return acquireClient(taskId, 0, credential);
+    }
+
+    @Override
+    public service.sftp.SftpClient acquireClient(String taskId, int slot, Credential credential) throws Exception {
+        ChannelSftp channel = acquireChannel(taskId, slot, credential);
+        Entry e = entries.get(taskId);
+        service.sftp.SessionLog sessionLog = e != null && e.log != null ? e.log : new service.sftp.SessionLog();
+        return service.sftp.JschSftpClient.over(channel, sessionLog);
     }
 
     /**
@@ -202,6 +211,7 @@ public class PersistentSftpConnectionManager {
      * connection). Always 1 regardless of how many concurrent channel slots
      * are open — they all ride on the same single SSH session.
      */
+    @Override
     public int getSessionCount(String taskId) {
         Entry e = entries.get(taskId);
         return e != null ? Math.max(e.connectCount, 1) : 1;
@@ -224,7 +234,7 @@ public class PersistentSftpConnectionManager {
         } catch (Exception ex) {
             sl.add("Connect failed: " + ex.getMessage());
             service.SshSessionEvents.failedInRun(taskId, PURPOSE, credential.getHost(),
-                    credential.getUsername(), ex.getMessage(), service.RunHistoryService.currentRunKey(), sl.text());
+                    credential.getUsername(), ex.getMessage(), RunTrace.currentRunKey(), sl.text());
             throw ex;
         }
         // Keep the connection alive across long idle gaps between watcher
@@ -239,11 +249,15 @@ public class PersistentSftpConnectionManager {
         entry.host = credential.getHost();
         entry.user = credential.getUsername();
         entry.log = sl;
-        entry.runKey = service.RunHistoryService.currentRunKey();   // the run this session was opened for
+        entry.runKey = RunTrace.currentRunKey();   // the run this session was opened for
         service.SshSessionEvents.openedInRun(taskId, PURPOSE
-                        + (connectCount > 1 ? ", reconnect #" + (connectCount - 1) : ""), entry.host, entry.user,
+                + (connectCount > 1 ? ", reconnect #" + (connectCount - 1) : ""), entry.host, entry.user,
                 entry.runKey, sl.text());
         return entry;
+    }
+
+    private static String fingerprint(Credential c) {
+        return c.getHost() + "|" + c.getUsername() + "|" + c.getPassword();
     }
 
     /**
@@ -252,56 +266,44 @@ public class PersistentSftpConnectionManager {
      * its target credential changes, so the next fire reconnects cleanly
      * instead of reusing a session against a stale target.
      */
-    public synchronized void close(String taskId) {
-        close(taskId, "run finished");
-    }
+    @Override
+    public synchronized void close(String taskId) { close(taskId, "run finished"); }
 
-    /**
-     * Closes the task's connection and records why in the session's log and closing event.
-     */
+    /** Closes the task's connection and records why in the session's log and closing event. */
+    @Override
     public synchronized void close(String taskId, String reason) {
         Entry e = entries.remove(taskId);
         if (e != null) closeQuietly(taskId, e, reason);
     }
 
-    /**
-     * Adds a line to the transcript of the task's open session (shown in the Event Monitor). No-op if none is open.
-     */
+    /** Adds a line to the transcript of the task's open session (shown in the Event Monitor). No-op if none is open. */
+    @Override
     public void note(String taskId, String text) {
         Entry e = entries.get(taskId);
         if (e != null && e.log != null) e.log.add(text);
     }
 
+    @Override
     public synchronized void closeAll() {
-        for (java.util.Map.Entry<String, Entry> e : entries.entrySet())
-            closeQuietly(e.getKey(), e.getValue(), "shutdown");
+        for (java.util.Map.Entry<String, Entry> e : entries.entrySet()) closeQuietly(e.getKey(), e.getValue(), "shutdown");
         entries.clear();
     }
 
-    /**
-     * Call on application/daemon shutdown.
-     */
+    /** Call on application/daemon shutdown. */
+    @Override
     public void shutdown() {
         closeAll();
         reaper.shutdownNow();
     }
 
-    private static final class Entry {
-        final Session session;
-        final ConcurrentHashMap<Integer, ChannelSftp> slots = new ConcurrentHashMap<>();
-        final String credentialFingerprint;
-        final long openedAtMillis = System.currentTimeMillis();
-        volatile long lastUsedMillis;
-        int connectCount;
-        String host, user;
-        volatile service.sftp.SessionLog log;
-        volatile String runKey;
-
-        Entry(Session session, String fingerprint, int connectCount) {
-            this.session = session;
-            this.credentialFingerprint = fingerprint;
-            this.connectCount = connectCount;
-            this.lastUsedMillis = System.currentTimeMillis();
+    private static void closeQuietly(String taskId, Entry e, String reason) {
+        boolean wasOpen = e.session != null;
+        for (ChannelSftp c : e.slots.values()) {
+            try { if (c.isConnected()) c.disconnect(); } catch (Exception ignored) {}
         }
+        try { if (e.session != null && e.session.isConnected()) e.session.disconnect(); } catch (Exception ignored) {}
+        if (e.log != null) e.log.add("Closing session: " + reason);
+        if (wasOpen) service.SshSessionEvents.closedInRun(taskId, PURPOSE, e.host, e.user, reason,
+                System.currentTimeMillis() - e.openedAtMillis, e.runKey, e.log != null ? e.log.text() : null);
     }
 }

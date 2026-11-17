@@ -1,16 +1,14 @@
 package service;
 
+import static org.junit.Assert.*;
+
 import org.junit.Test;
 
 import java.util.ArrayList;
 import java.util.List;
 import java.util.function.Consumer;
 
-import static org.junit.Assert.*;
-
-/**
- * What is said on an SSH session travels with its "closed" event.
- */
+/** What is said on an SSH session travels with its "closed" event. */
 public class SshSessionLogTest {
     @Test
     public void closedEventCarriesTheSessionTranscript() {

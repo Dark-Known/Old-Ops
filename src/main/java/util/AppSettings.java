@@ -1,9 +1,11 @@
 package util;
 
 import java.io.File;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
-import java.sql.*;
+import persistence.SettingsStore;
+import persistence.SettingsStores;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -25,7 +27,7 @@ import java.util.logging.Logger;
  *       in hot-reloading it, and doing so would risk the installer and the
  *       running app disagreeing about what's "current".</li>
  *   <li><b>app.db</b>'s {@code settings} table (this class — see
- *       {@code <dataDir>/app.db}, shared with {@link service.CredentialDbService}'s
+ *       {@code <dataDir>/app.db}, shared with the credentials
  *       {@code credentials} table in the same file) holds the handful of
  *       values that genuinely are read on every message/task run and can
  *       safely change underneath a running app: mail routing folder names,
@@ -63,16 +65,20 @@ import java.util.logging.Logger;
  */
 public final class AppSettings {
 
+    private static final Logger log = Logger.getLogger(AppSettings.class.getName());
+    private static final long CACHE_TTL_MILLIS = 2000; // live-reload granularity
+
     // Keys
-    public static final String KEY_LDM_FOLDER = "ldmFolder";
-    public static final String KEY_PTM_FOLDER = "ptmFolder";
-    public static final String KEY_OTHERS_FOLDER = "othersFolder";
-    public static final String KEY_MAIL_ROUTING_RULES = "mailRoutingRulesJson";
-    public static final String KEY_DEFAULT_STATION_ADDR = "defaultStationAddress";
+    public static final String KEY_LDM_FOLDER            = "ldmFolder";
+    public static final String KEY_PTM_FOLDER             = "ptmFolder";
+    public static final String KEY_OTHERS_FOLDER          = "othersFolder";
+    public static final String KEY_MAIL_ROUTING_RULES     = "mailRoutingRulesJson";
+    public static final String KEY_DEFAULT_STATION_ADDR   = "defaultStationAddress";
     public static final String KEY_ATTACHMENT_DOWNLOAD_DIR = "attachmentDownloadLocation";
-    public static final String KEY_LOG_LEVEL = "logLevel";
-    public static final String KEY_JVM_MIN_HEAP = "jvmMinHeap";
-    public static final String KEY_JVM_MAX_HEAP = "jvmMaxHeap";
+    public static final String KEY_LOG_LEVEL              = "logLevel";
+    public static final String KEY_JVM_MIN_HEAP           = "jvmMinHeap";
+    public static final String KEY_JVM_MAX_HEAP           = "jvmMaxHeap";
+
     // ── Size-based transfer batching (replaces the old file-count based
     //    "transferBatchSize") ──────────────────────────────────────────────
     // A batch is capped by total bytes rather than file count, because a
@@ -84,10 +90,11 @@ public final class AppSettings {
     // An explicit KEY_TRANSFER_BATCH_MAX_BYTES override is honored if set
     // (> 0) so an admin who knows their real throughput can just set bytes
     // directly instead of the two derived inputs.
-    public static final String KEY_TRANSFER_BATCH_TARGET_SECONDS = "transferBatchTargetSeconds";
+    public static final String KEY_TRANSFER_BATCH_TARGET_SECONDS   = "transferBatchTargetSeconds";
     public static final String KEY_TRANSFER_ASSUMED_THROUGHPUT_MBPS = "transferAssumedThroughputMBps";
-    public static final String KEY_TRANSFER_BATCH_MAX_BYTES = "transferBatchMaxBytes";
+    public static final String KEY_TRANSFER_BATCH_MAX_BYTES        = "transferBatchMaxBytes";
     public static final String KEY_TRANSFER_BATCH_INTERVAL_SECONDS = "transferBatchIntervalSeconds";
+
     // How many batches run at once (separate WinSCP/SFTP sessions in
     // parallel) instead of one strictly sequential session at a time. Big
     // win for backlogs with many small files, where per-file protocol
@@ -96,12 +103,16 @@ public final class AppSettings {
     // thousands of files. 1 = old sequential behavior (default, safest).
     public static final String KEY_TRANSFER_BATCH_CONCURRENCY = "transferBatchConcurrency";
     public static final String KEY_WATCHER_FILES_PER_WORKER_THREAD = "watcherFilesPerWorkerThread";
+
     // How long a task may sit in RUNNING before the scheduler assumes it
     // crashed/hung and force-cancels it. For long-running transfers/backups
     // (e.g. large backlogs of many small files) this may need to be raised
     // well above the 30-minute default so a legitimately slow — but still
     // progressing — run isn't killed and reported as FAILED partway through.
     public static final String KEY_STALE_RUNNING_THRESHOLD_MINUTES = "staleRunningThresholdMinutes";
+    /** How watcher uploads write a file: "atomic" (temporary name, then rename) or "in-place" (straight to the final name). */
+    public static final String KEY_WATCHER_UPLOAD_MODE = "watcherUploadMode";
+
     // How many minutes a RUNNING task may go without emitting ANY new log
     // line before the scheduler treats it as network-stalled and
     // force-cancels it — independent of, and much shorter than, the overall
@@ -115,6 +126,7 @@ public final class AppSettings {
     // still letting a genuinely slow-but-progressing transfer run as long
     // as it needs to, since every WinSCP output line resets the clock.
     public static final String KEY_STALE_INACTIVITY_THRESHOLD_MINUTES = "staleInactivityThresholdMinutes";
+
     // Ceiling on how many task-execution worker threads the scheduler will
     // ever have alive at once (see TaskSchedulerService's fixed thread
     // pool). Read once at scheduler startup, not hot-reloaded — restart
@@ -123,6 +135,7 @@ public final class AppSettings {
     // number of truly-parallel threads rarely helps throughput but does
     // cost memory (each thread reserves its own stack).
     public static final String KEY_MAX_CONCURRENT_TASK_THREADS = "maxConcurrentTaskThreads";
+
     // Moved here from per-user java.util.prefs.Preferences so the Daemon —
     // and, once it's wrapped as a Windows Service running under a service
     // account, a process with no access to the interactive user's registry
@@ -130,29 +143,13 @@ public final class AppSettings {
     // saved, instead of silently falling back to a default. See class
     // javadoc: this store already propagates to any reader (GUI or daemon)
     // within CACHE_TTL_MILLIS with no extra wiring needed.
-    public static final String KEY_WINSCP_PATH = "winScpPath";
-    public static final String KEY_POLL_INTERVAL_SECONDS = "pollIntervalSeconds";
-    private static final Logger log = Logger.getLogger(AppSettings.class.getName());
-    private static final String DB_FILE_NAME = "app.db";
-    private static final String LEGACY_STANDALONE_DB_FILE_NAME = "app-settings.db";
-    private static final String LEGACY_JSON_FILE_NAME = "app-settings.json";
-    private static final long CACHE_TTL_MILLIS = 2000; // live-reload granularity
+    public static final String KEY_WINSCP_PATH            = "winScpPath";
+    public static final String KEY_POLL_INTERVAL_SECONDS  = "pollIntervalSeconds";
+
     // Built-in fallbacks, used only if neither app-settings.json nor
     // app-config.xml has a value (keeps behavior identical to before this
     // file existed, for anyone upgrading in place).
     private static final Map<String, String> HARD_DEFAULTS = new LinkedHashMap<>();
-    // app-config.xml tag each key is seeded from on first run.
-    private static final Map<String, String> XML_SEED_TAG = new LinkedHashMap<>();
-    private static final Object LOCK = new Object();
-    private static volatile Map<String, String> cache;
-    private static volatile long cacheLoadedAtMillis = -1;
-    private static volatile File resolvedDataDir;
-    private static volatile Connection conn;
-    // Set once, in connection()'s catch block, if the connection attempt
-    // fails. Mirrors TaskDbService/CredentialDbService's connectionError —
-    // see their javadoc for why this is surfaced rather than only logged.
-    private static volatile String lastConnectionError;
-
     static {
         HARD_DEFAULTS.put(KEY_LDM_FOLDER, "LDM");
         HARD_DEFAULTS.put(KEY_PTM_FOLDER, "PTM");
@@ -181,12 +178,15 @@ public final class AppSettings {
         HARD_DEFAULTS.put(KEY_TRANSFER_BATCH_CONCURRENCY, "1"); // 1 = sequential (old behavior)
         HARD_DEFAULTS.put(KEY_WATCHER_FILES_PER_WORKER_THREAD, "5");
         HARD_DEFAULTS.put(KEY_STALE_RUNNING_THRESHOLD_MINUTES, "30");
+        HARD_DEFAULTS.put(KEY_WATCHER_UPLOAD_MODE, "atomic");
         HARD_DEFAULTS.put(KEY_STALE_INACTIVITY_THRESHOLD_MINUTES, "5");
         HARD_DEFAULTS.put(KEY_MAX_CONCURRENT_TASK_THREADS, "20");
         HARD_DEFAULTS.put(KEY_WINSCP_PATH, "");
         HARD_DEFAULTS.put(KEY_POLL_INTERVAL_SECONDS, "60");
     }
 
+    // app-config.xml tag each key is seeded from on first run.
+    private static final Map<String, String> XML_SEED_TAG = new LinkedHashMap<>();
     static {
         XML_SEED_TAG.put(KEY_LDM_FOLDER, "ldmFolder");
         XML_SEED_TAG.put(KEY_PTM_FOLDER, "ptmFolder");
@@ -203,11 +203,16 @@ public final class AppSettings {
         XML_SEED_TAG.put(KEY_TRANSFER_BATCH_CONCURRENCY, "transferBatchConcurrency");
         XML_SEED_TAG.put(KEY_WATCHER_FILES_PER_WORKER_THREAD, "watcherFilesPerWorkerThread");
         XML_SEED_TAG.put(KEY_STALE_RUNNING_THRESHOLD_MINUTES, "staleRunningThresholdMinutes");
+        XML_SEED_TAG.put(KEY_WATCHER_UPLOAD_MODE, "watcherUploadMode");
         XML_SEED_TAG.put(KEY_STALE_INACTIVITY_THRESHOLD_MINUTES, "staleInactivityThresholdMinutes");
     }
 
-    private AppSettings() {
-    }
+    private static final Object LOCK = new Object();
+    private static volatile Map<String, String> cache;
+    private static volatile long cacheLoadedAtMillis = -1;
+    private static volatile File resolvedDataDir;
+
+    private AppSettings() {}
 
     // ─── Data directory / connection resolution ─────────────────────────────
 
@@ -232,126 +237,6 @@ public final class AppSettings {
         }
     }
 
-    /**
-     * Tunes this connection for a desktop app with three independent writers
-     * sharing one app.db file — see {@code service.TaskDbService}'s
-     * {@code applyPragmas} javadoc for the full reasoning (WAL mode,
-     * synchronous=NORMAL, and a busy_timeout). This is the third and last of
-     * the three connections onto the same file that previously ran with none
-     * of these set at all.
-     */
-    private static void applyPragmas(Connection c) throws SQLException {
-        try (Statement st = c.createStatement()) {
-            st.execute("PRAGMA journal_mode=WAL");
-            st.execute("PRAGMA synchronous=NORMAL");
-            st.execute("PRAGMA busy_timeout=5000");
-        }
-    }
-
-    private static Connection connection() {
-        if (conn != null) return conn;
-        synchronized (LOCK) {
-            if (conn != null) return conn;
-            File dir = dataDir();
-            dir.mkdirs();
-            File dbFile = new File(dir, DB_FILE_NAME);
-            try {
-                Class.forName("org.sqlite.JDBC");
-                Connection c = DriverManager.getConnection("jdbc:sqlite:" + dbFile.getAbsolutePath());
-                applyPragmas(c);
-                try (Statement st = c.createStatement()) {
-                    st.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)");
-                }
-                conn = c;
-                migrateLegacyStandaloneDbIfPresent(dir, c);
-                migrateLegacyJsonIfPresent(dir, c);
-            } catch (Exception e) {
-                log.log(Level.SEVERE, "Failed to open/initialize app-settings database", e);
-                lastConnectionError = e.getClass().getSimpleName() + ": " + e.getMessage();
-            }
-            return conn;
-        }
-    }
-
-    /**
-     * One-time import from a legacy standalone {@code app-settings.db} file
-     * (from before app settings and credentials were merged into one
-     * {@code app.db}), run only if the {@code settings} table in the new
-     * file is currently empty. Uses {@code ATTACH DATABASE} to copy rows
-     * directly. The old file is left on disk afterward (renamed with a
-     * {@code .migrated} suffix) purely as a safety net.
-     */
-    private static void migrateLegacyStandaloneDbIfPresent(File dir, Connection c) {
-        File legacy = new File(dir, LEGACY_STANDALONE_DB_FILE_NAME);
-        if (!legacy.exists()) return;
-
-        try (Statement st = c.createStatement();
-             ResultSet rs = st.executeQuery("SELECT COUNT(*) FROM settings")) {
-            if (rs.next() && rs.getInt(1) > 0) return; // already has data — don't overwrite
-        } catch (SQLException e) {
-            log.log(Level.WARNING, "Could not check settings table before legacy DB migration", e);
-            return;
-        }
-
-        try (Statement st = c.createStatement()) {
-            st.execute("ATTACH DATABASE '" + legacy.getAbsolutePath().replace("'", "''") + "' AS legacy_settings");
-            int migrated;
-            try (ResultSet rs = st.executeQuery("SELECT COUNT(*) FROM legacy_settings.settings")) {
-                migrated = rs.next() ? rs.getInt(1) : 0;
-            }
-            st.execute("INSERT INTO settings SELECT * FROM legacy_settings.settings");
-            st.execute("DETACH DATABASE legacy_settings");
-            if (migrated > 0) {
-                log.info("Migrated " + migrated + " setting(s) from legacy app-settings.db into app.db");
-            }
-            File renamed = new File(legacy.getParentFile(), legacy.getName() + ".migrated");
-            legacy.renameTo(renamed);
-        } catch (SQLException e) {
-            log.log(Level.WARNING, "Failed to migrate legacy app-settings.db into app.db", e);
-        }
-    }
-
-    /**
-     * One-time import of the legacy app-settings.json (used by versions
-     * prior to the move to SQLite) into the settings table, so upgrading in
-     * place doesn't silently reset every saved setting back to defaults.
-     * Runs only if the table is currently empty; the JSON file itself is
-     * left in place afterward (renamed with a .migrated suffix) rather than
-     * deleted, purely as a safety net.
-     */
-    private static void migrateLegacyJsonIfPresent(File dir, Connection c) {
-        File legacy = new File(dir, LEGACY_JSON_FILE_NAME);
-        if (!legacy.exists()) return;
-        try (Statement st = c.createStatement();
-             ResultSet rs = st.executeQuery("SELECT COUNT(*) FROM settings")) {
-            if (rs.next() && rs.getInt(1) > 0) return; // already has data — don't overwrite
-        } catch (SQLException e) {
-            log.log(Level.WARNING, "Could not check settings table before JSON migration", e);
-            return;
-        }
-        try {
-            String json = Files.readString(legacy.toPath(), StandardCharsets.UTF_8);
-            Map<String, Object> parsed = MiniJson.parseObject(json);
-            if (!parsed.isEmpty()) {
-                try (PreparedStatement ps = c.prepareStatement(
-                        "INSERT INTO settings (key, value) VALUES (?, ?) " +
-                                "ON CONFLICT(key) DO UPDATE SET value = excluded.value")) {
-                    for (Map.Entry<String, Object> e : parsed.entrySet()) {
-                        if (e.getValue() == null) continue;
-                        ps.setString(1, e.getKey());
-                        ps.setString(2, String.valueOf(e.getValue()));
-                        ps.executeUpdate();
-                    }
-                }
-                log.info("Migrated " + parsed.size() + " setting(s) from legacy app-settings.json into " + DB_FILE_NAME);
-            }
-            File renamed = new File(dir, LEGACY_JSON_FILE_NAME + ".migrated");
-            legacy.renameTo(renamed);
-        } catch (Exception e) {
-            log.log(Level.WARNING, "Failed to migrate legacy app-settings.json", e);
-        }
-    }
-
     // ─── Load (with live reload) ────────────────────────────────────────────
 
     private static Map<String, String> current() {
@@ -372,21 +257,9 @@ public final class AppSettings {
     }
 
     private static Map<String, String> load() {
-        Map<String, String> result = new LinkedHashMap<>();
-        Connection c = connection();
-        if (c != null) {
-            try (Statement st = c.createStatement();
-                 ResultSet rs = st.executeQuery("SELECT key, value FROM settings")) {
-                while (rs.next()) {
-                    String v = rs.getString("value");
-                    if (v != null) result.put(rs.getString("key"), v);
-                }
-                if (!result.isEmpty()) return result;
-            } catch (SQLException e) {
-                log.log(Level.WARNING, "Failed to read app settings from database", e);
-            }
-        }
-        // Empty table (first run) or DB unavailable: seed from app-config.xml
+        Map<String, String> result = new LinkedHashMap<>(store().readAll());
+        if (!result.isEmpty()) return result;
+        // Empty table (first run) or store unavailable: seed from app-config.xml
         // so upgrading in place doesn't silently change behavior, then
         // persist so the Settings panel has real rows to edit from now on.
         for (Map.Entry<String, String> seed : XML_SEED_TAG.entrySet()) {
@@ -394,8 +267,12 @@ public final class AppSettings {
             result.put(seed.getKey(), (xmlVal != null && !xmlVal.isEmpty())
                     ? xmlVal : HARD_DEFAULTS.get(seed.getKey()));
         }
-        if (c != null) writeThroughLocked(c, result);
+        store().replaceAll(result);   // false = no store available; the seeded values still serve this process
         return result;
+    }
+
+    private static SettingsStore store() {
+        return SettingsStores.forDataDir(dataDir());
     }
 
     // ─── Public read API ─────────────────────────────────────────────────────
@@ -406,17 +283,9 @@ public final class AppSettings {
         return HARD_DEFAULTS.get(key);
     }
 
-    public static String getLdmFolder() {
-        return get(KEY_LDM_FOLDER);
-    }
-
-    public static String getPtmFolder() {
-        return get(KEY_PTM_FOLDER);
-    }
-
-    public static String getOthersFolder() {
-        return get(KEY_OTHERS_FOLDER);
-    }
+    public static String getLdmFolder()             { return get(KEY_LDM_FOLDER); }
+    public static String getPtmFolder()              { return get(KEY_PTM_FOLDER); }
+    public static String getOthersFolder()           { return get(KEY_OTHERS_FOLDER); }
 
     /**
      * The full, user-editable list of mail-routing rules (classification key
@@ -483,11 +352,9 @@ public final class AppSettings {
         return rules;
     }
 
-    /**
-     * Persists the full mail-routing rule list. Takes effect on the very next
-     * message processed — no restart needed. Returns whether it was actually
-     * persisted — see {@link #set}.
-     */
+    /** Persists the full mail-routing rule list. Takes effect on the very next
+     *  message processed — no restart needed. Returns whether it was actually
+     *  persisted — see {@link #set}. */
     public static boolean setMailRoutingRules(List<MailRoutingRule> rules) {
         List<Map<String, String>> rows = new ArrayList<>();
         for (MailRoutingRule r : rules) {
@@ -520,45 +387,16 @@ public final class AppSettings {
         }
         return "Others"; // unreachable in practice — getMailRoutingRules() always guarantees an Others row
     }
-
-    public static String getDefaultStationAddress() {
-        String v = get(KEY_DEFAULT_STATION_ADDR);
-        return v == null || v.isEmpty() ? null : v;
-    }
-
-    /**
-     * Base folder attachments are downloaded under (each task's Attachments/&lt;LDM|PTM|Others&gt; subtree is created inside it). Empty/unset = fall back to the task's own output directory.
-     */
-    public static String getAttachmentDownloadLocation() {
-        String v = get(KEY_ATTACHMENT_DOWNLOAD_DIR);
-        return v == null || v.isEmpty() ? null : v;
-    }
-
-    public static String getLogLevel() {
-        return get(KEY_LOG_LEVEL);
-    }
-
-    public static String getWinScpPath() {
-        return get(KEY_WINSCP_PATH);
-    }
-
-    public static int getPollIntervalSeconds() {
-        return intOrDefault(KEY_POLL_INTERVAL_SECONDS);
-    }
-
-    /**
-     * Applies only on the JVM's NEXT start — see class javadoc.
-     */
-    public static String getJvmMinHeap() {
-        return get(KEY_JVM_MIN_HEAP);
-    }
-
-    /**
-     * Applies only on the JVM's NEXT start — see class javadoc.
-     */
-    public static String getJvmMaxHeap() {
-        return get(KEY_JVM_MAX_HEAP);
-    }
+    public static String getDefaultStationAddress()  { String v = get(KEY_DEFAULT_STATION_ADDR); return v == null || v.isEmpty() ? null : v; }
+    /** Base folder attachments are downloaded under (each task's Attachments/&lt;LDM|PTM|Others&gt; subtree is created inside it). Empty/unset = fall back to the task's own output directory. */
+    public static String getAttachmentDownloadLocation() { String v = get(KEY_ATTACHMENT_DOWNLOAD_DIR); return v == null || v.isEmpty() ? null : v; }
+    public static String getLogLevel()               { return get(KEY_LOG_LEVEL); }
+    public static String getWinScpPath()             { return get(KEY_WINSCP_PATH); }
+    public static int getPollIntervalSeconds()       { return intOrDefault(KEY_POLL_INTERVAL_SECONDS); }
+    /** Applies only on the JVM's NEXT start — see class javadoc. */
+    public static String getJvmMinHeap()             { return get(KEY_JVM_MIN_HEAP); }
+    /** Applies only on the JVM's NEXT start — see class javadoc. */
+    public static String getJvmMaxHeap()             { return get(KEY_JVM_MAX_HEAP); }
 
     private static int intOrDefault(String key) {
         try {
@@ -672,35 +510,28 @@ public final class AppSettings {
 
     /**
      * Sets and immediately persists a single value. Visible to the next read
-     * from any process/thread. Returns whether it was actually written to
-     * app.db — {@code false} means {@link #connection()} couldn't open at
-     * all (see {@link #getConnectionError()}); in that case the in-memory
-     * cache is deliberately NOT updated either, so reads keep returning the
-     * last known-good value instead of a change that only exists in this
-     * process's memory and vanishes on restart (or is invisible to the
-     * Daemon's separate connection). A connected-but-failed write (a
-     * genuine SQLException mid-write) still throws {@link RuntimeException}
-     * from {@link #writeThroughLocked}, unchanged from before.
+     * from any process/thread. Returns whether it was actually stored —
+     * {@code false} means the store is not available at all (see
+     * {@link #getConnectionError()}); in that case the in-memory cache is
+     * deliberately NOT updated either, so reads keep returning the last
+     * known-good value instead of a change that only exists in this process's
+     * memory and vanishes on restart (or is invisible to the Daemon). A write
+     * that fails part-way is thrown as a {@link RuntimeException} by the store.
      */
     public static boolean set(String key, String value) {
         synchronized (LOCK) {
             Map<String, String> base = new LinkedHashMap<>(current());
-            if (value == null || value.isEmpty()) base.remove(key);
-            else base.put(key, value);
-            Connection c = connection();
-            if (c == null) return false;
-            writeThroughLocked(c, base);
+            if (value == null || value.isEmpty()) base.remove(key); else base.put(key, value);
+            if (!store().replaceAll(base)) return false;
             cache = base;
             cacheLoadedAtMillis = System.currentTimeMillis();
             return true;
         }
     }
 
-    /**
-     * Sets and immediately persists several values in one transaction
-     * (preferred for a Settings-panel "Save"). See {@link #set} for exactly
-     * what the return value means and why the cache isn't touched on failure.
-     */
+    /** Sets and immediately persists several values in one transaction
+     *  (preferred for a Settings-panel "Save"). See {@link #set} for exactly
+     *  what the return value means and why the cache isn't touched on failure. */
     public static boolean setAll(Map<String, String> values) {
         synchronized (LOCK) {
             Map<String, String> base = new LinkedHashMap<>(current());
@@ -708,9 +539,7 @@ public final class AppSettings {
                 if (e.getValue() == null || e.getValue().isEmpty()) base.remove(e.getKey());
                 else base.put(e.getKey(), e.getValue());
             }
-            Connection c = connection();
-            if (c == null) return false;
-            writeThroughLocked(c, base);
+            if (!store().replaceAll(base)) return false;
             cache = base;
             cacheLoadedAtMillis = System.currentTimeMillis();
             return true;
@@ -718,63 +547,32 @@ public final class AppSettings {
     }
 
     /**
-     * True if the settings table's connection opened successfully AND is
-     * still alive right now — checked live via {@link Connection#isValid},
-     * not just "did it open at some point" (see TaskDbService#isConnected
-     * for why a snapshot isn't good enough). This is a SEPARATE JDBC
-     * connection from {@code TaskDbService}/{@code CredentialDbService},
-     * even though all three point at the same app.db file, so it's possible
-     * for this to be disconnected while the task/credential badge in
-     * MainWindow says connected, or vice versa — check this independently
-     * rather than assuming they move together.
+     * True if the settings store is open and usable right now. This is checked on the store's own
+     * connection, which can be down while the task/credential storage is up, or vice versa, so check it
+     * independently rather than assuming they move together.
      */
     public static boolean isConnected() {
-        Connection c = connection();
-        if (c == null) return false;
-        try {
-            return c.isValid(2);
-        } catch (SQLException e) {
-            return false;
-        }
+        return store().isConnected();
     }
 
-    /**
-     * Short exception summary from the failed connection attempt, or null if connected fine.
-     */
+    /** Short reason the store could not be opened, or null if it is connected fine. */
     public static String getConnectionError() {
         if (isConnected()) return null;
-        return lastConnectionError != null ? lastConnectionError : "unknown error";
+        String e = store().connectionError();
+        return e != null ? e : "unknown error";
     }
 
-    /**
-     * Caller must hold LOCK. Replaces the entire settings table contents with {@code values}.
-     */
-    private static void writeThroughLocked(Connection c, Map<String, String> values) {
-        try {
-            boolean priorAutoCommit = c.getAutoCommit();
-            c.setAutoCommit(false);
-            try (Statement del = c.createStatement()) {
-                del.execute("DELETE FROM settings");
-            }
-            try (PreparedStatement ps = c.prepareStatement("INSERT INTO settings (key, value) VALUES (?, ?)")) {
-                for (Map.Entry<String, String> e : values.entrySet()) {
-                    ps.setString(1, e.getKey());
-                    ps.setString(2, e.getValue());
-                    ps.addBatch();
-                }
-                ps.executeBatch();
-            }
-            c.commit();
-            c.setAutoCommit(priorAutoCommit);
-        } catch (SQLException ex) {
-            throw new RuntimeException("Could not save settings to " + DB_FILE_NAME + ": " + ex.getMessage(), ex);
-        }
-    }
-
-    /**
-     * Absolute path of the backing SQLite database, for display in the Settings panel.
-     */
+    /** Where the settings live (a file path for SQLite), for display in the Settings panel. */
     public static String filePath() {
-        return new File(dataDir(), DB_FILE_NAME).getAbsolutePath();
+        return store().location();
+    }
+
+    /** Forgets the cache and the resolved data folder, so a test can start from a clean slate. */
+    static void resetForTests() {
+        synchronized (LOCK) {
+            cache = null;
+            cacheLoadedAtMillis = -1;
+            resolvedDataDir = null;
+        }
     }
 }

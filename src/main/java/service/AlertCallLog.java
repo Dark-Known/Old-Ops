@@ -9,7 +9,11 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
-import java.util.*;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Deque;
+import java.util.List;
+import java.util.Map;
 
 /**
  * Every alert delivery attempt: what was sent about which task, to which webhook host, the answer, and the report file.
@@ -21,14 +25,17 @@ public final class AlertCallLog {
     public static final String FILE_NAME = "alerts-activity.log";
     static final long MAX_BYTES = 2L * 1024 * 1024;
 
-    private AlertCallLog() {
+    public record Entry(long time, String taskId, String taskName, String kind, String title, String host, int status,
+                        long millis, int attempt, String response, String reportPath, String payload) {
+        public boolean ok() { return status >= 200 && status < 300; }
     }
+
+    private AlertCallLog() { }
 
     public static synchronized void write(File dir, Entry e) {
         try {
-            File f = LogFiles.file(dir, FILE_NAME);
-            if (f.length() > MAX_BYTES)
-                Files.move(f.toPath(), LogFiles.file(dir, FILE_NAME + ".1").toPath(), StandardCopyOption.REPLACE_EXISTING);
+            File f = new File(dir, FILE_NAME);
+            if (f.length() > MAX_BYTES) Files.move(f.toPath(), new File(dir, FILE_NAME + ".1").toPath(), StandardCopyOption.REPLACE_EXISTING);
             String line = "{\"t\":" + e.time() + ",\"task\":\"" + esc(e.taskId()) + "\",\"name\":\"" + esc(e.taskName())
                     + "\",\"kind\":\"" + esc(e.kind()) + "\",\"title\":\"" + esc(e.title()) + "\",\"host\":\"" + esc(e.host())
                     + "\",\"status\":" + e.status() + ",\"ms\":" + e.millis() + ",\"attempt\":" + e.attempt()
@@ -42,8 +49,8 @@ public final class AlertCallLog {
 
     public static List<Entry> readRecent(File dataDir, int limit) {
         Deque<Entry> out = new ArrayDeque<>();
-        for (String name : new String[]{FILE_NAME + ".1", FILE_NAME}) {
-            File f = LogFiles.file(dataDir, name);
+        for (String name : new String[] { FILE_NAME + ".1", FILE_NAME }) {
+            File f = new File(dataDir, name);
             if (!f.isFile()) continue;
             try (BufferedReader r = Files.newBufferedReader(f.toPath(), StandardCharsets.UTF_8)) {
                 String line;
@@ -74,18 +81,6 @@ public final class AlertCallLog {
         }
     }
 
-    private static String clip(String s, int n) {
-        return s == null ? "" : s.length() <= n ? s : s.substring(0, n) + "...";
-    }
-
-    private static String esc(String s) {
-        return MiniJson.escapeString(s == null ? "" : s);
-    }
-
-    public record Entry(long time, String taskId, String taskName, String kind, String title, String host, int status,
-                        long millis, int attempt, String response, String reportPath, String payload) {
-        public boolean ok() {
-            return status >= 200 && status < 300;
-        }
-    }
+    private static String clip(String s, int n) { return s == null ? "" : s.length() <= n ? s : s.substring(0, n) + "..."; }
+    private static String esc(String s) { return MiniJson.escapeString(s == null ? "" : s); }
 }

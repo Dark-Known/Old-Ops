@@ -1,24 +1,39 @@
 package ui;
 
+import persistence.RunHistory;
+import persistence.sqlite.SqliteStorage;
+import service.BackgroundJobs;
+
+import ui.CredentialManagerPanel;
 import model.ScheduledTask;
 import service.TaskSchedulerService;
 import service.TransferService;
-import service.XmlStorageService;
+import persistence.AppStorage;
 
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
 import java.awt.*;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
+import java.io.File;
 import java.util.List;
 import java.util.prefs.Preferences;
 import java.util.stream.Collectors;
 
 public class MainWindow extends JFrame {
 
-    private final XmlStorageService storage;
+    private final AppStorage storage;
     private final TransferService transferService;
     private final TaskSchedulerService scheduler;
+
+    private TaskManagerPanel taskPanel;
+    private LazyPanel<CredentialManagerPanel> credLazy;
+    private LazyPanel<RunHistoryPanel> logsLazy;
+    private StatusStrip statusStrip;
+    private ToastManager toastManager;
+    private java.awt.event.ComponentListener sidebarResizeListener;
+    private java.util.function.Consumer<model.TaskRunRecord> runListener;
+
     // ── Daemon vs GUI scheduler hand-off ─────────────────────────────────
     // The headless Daemon (see Daemon.java) is the primary scheduler when
     // it's running: if setup.ps1 registered it, it fires tasks from system
@@ -31,6 +46,13 @@ public class MainWindow extends JFrame {
     // look alive right now; if it later goes offline, this window promotes
     // itself to active so scheduling doesn't just stop.
     private final java.nio.file.Path daemonStatusFile;
+    private JLabel schedulerBadge;
+    private JLabel linkBadge;
+    private javax.swing.Timer schedulerBadgeTimer;
+    private Runnable schedulerBadgeStreamUnsub = () -> { };
+    private JLabel dbLabel;
+    private javax.swing.Timer dbStatusTimer;
+    private WindowAdapter dbStatusActivationListener;
     // Cross-process: notices when a watcher task's trigger mode falls back
     // from push (native watch / remote SSH push) to plain polling, wherever
     // that task is actually running (Daemon or this GUI) — see its javadoc.
@@ -38,31 +60,16 @@ public class MainWindow extends JFrame {
     // started later, once toastManager exists (its
     // callback uses both).
     private final WatchStatusMonitor watchStatusMonitor;
-    private TaskManagerPanel taskPanel;
-    private LazyPanel<CredentialManagerPanel> credLazy;
-    private LazyPanel<RunHistoryPanel> logsLazy;
-    private StatusStrip statusStrip;
-    private ToastManager toastManager;
-    private java.awt.event.ComponentListener sidebarResizeListener;
-    private java.util.function.Consumer<model.TaskRunRecord> runListener;
-    private JLabel schedulerBadge;
-    private JLabel linkBadge;
-    private javax.swing.Timer schedulerBadgeTimer;
-    private Runnable schedulerBadgeStreamUnsub = () -> {
-    };
-    private JLabel dbLabel;
-    private javax.swing.Timer dbStatusTimer;
-    private WindowAdapter dbStatusActivationListener;
 
     public MainWindow() {
         String dataDir = loadDataDir();
-        this.storage = new XmlStorageService(dataDir);
+        this.storage = SqliteStorage.open(dataDir);
         this.transferService = new TransferService(storage);
         // Read poll interval preference (default 60s)
         Preferences prefs = Preferences.userNodeForPackage(SettingsPanel.class);
         int poll = prefs.getInt("poll_interval_seconds", 60);
-        this.scheduler = new TaskSchedulerService(storage, transferService, poll);
-        this.daemonStatusFile = java.nio.file.Path.of(dataDir, "scheduler-status-daemon.dat");
+        this.scheduler = new TaskSchedulerService(storage, transferService, SqliteStorage.openLogs(dataDir), poll);
+        this.daemonStatusFile = service.AppFolder.at(new java.io.File(dataDir)).daemonStatusFile();
         this.watchStatusMonitor = new WatchStatusMonitor(storage, scheduler, this::onWatchFallback);
 
         setTitle("Monitoring tool");
@@ -73,8 +80,7 @@ public class MainWindow extends JFrame {
 
         try {
             UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
-        } catch (Exception ignored) {
-        }
+        } catch (Exception ignored) {}
         // AppTheme.install() (see App.java's main()) already sets the real look and feel for
         // the whole app before this window is constructed; this fallback only matters if
         // MainWindow is ever instantiated directly without going through App.main().
@@ -96,11 +102,10 @@ public class MainWindow extends JFrame {
         buildUI();
 
         addWindowListener(new WindowAdapter() {
-            @Override
-            public void windowClosing(WindowEvent e) {
+            @Override public void windowClosing(WindowEvent e) {
                 int choice = JOptionPane.showConfirmDialog(MainWindow.this,
-                        "Quit Monitoring tool? Scheduled tasks will stop running.",
-                        "Exit", JOptionPane.YES_NO_OPTION);
+                    "Quit Monitoring tool? Scheduled tasks will stop running.",
+                    "Exit", JOptionPane.YES_NO_OPTION);
                 if (choice == JOptionPane.YES_OPTION) {
                     scheduler.stop();
                     watchStatusMonitor.stop();
@@ -112,28 +117,7 @@ public class MainWindow extends JFrame {
 
         showStartupFailures();
     }
-
-    public static void startMemoryReports(String dir) {
-        util.MemoryTrimmer.start(new java.io.File(dir, "logs"), "gui");
-    }
-
-    private static Color withAlpha(Color c, int alpha) {
-        return new Color(c.getRed(), c.getGreen(), c.getBlue(), alpha);
-    }
-
-    private static String prettyMode(String rawWatchModeName) {
-        return switch (rawWatchModeName) {
-            case "NATIVE_WATCH" -> "live (native watch)";
-            case "REMOTE_PUSH" -> "live (remote push)";
-            case "POLLING_ONLY_UNSUPPORTED" -> "polling only (unsupported)";
-            case "POLLING_ONLY" -> "polling only";
-            default -> rawWatchModeName;
-        };
-    }
-
-    public static void main(String[] args) {
-        SwingUtilities.invokeLater(() -> new MainWindow().setVisible(true));
-    }
+    public static void startMemoryReports(String dir) { util.MemoryTrimmer.start(new java.io.File(dir, "logs"), "gui"); }
 
     private String loadDataDir() {
         String defaultDir = "C:\\OpsTools\\Data";
@@ -143,13 +127,13 @@ public class MainWindow extends JFrame {
 
     private void showStartupFailures() {
         List<ScheduledTask> failedTasks = storage.loadTasks().stream()
-                .filter(t -> t.getStatus() == ScheduledTask.TaskStatus.FAILED
-                        || t.getStatus() == ScheduledTask.TaskStatus.RETRYING
-                        || t.getStatus() == ScheduledTask.TaskStatus.RUNNING)
-                .collect(Collectors.toList());
+            .filter(t -> t.getStatus() == ScheduledTask.TaskStatus.FAILED
+                      || t.getStatus() == ScheduledTask.TaskStatus.RETRYING
+                      || t.getStatus() == ScheduledTask.TaskStatus.RUNNING)
+            .collect(Collectors.toList());
         List<ScheduledTask> skippedTasks = storage.loadTasks().stream()
-                .filter(t -> "SKIPPED".equals(t.getLastRunResult()))
-                .collect(Collectors.toList());
+            .filter(t -> "SKIPPED".equals(t.getLastRunResult()))
+            .collect(Collectors.toList());
         if (failedTasks.isEmpty() && skippedTasks.isEmpty()) {
             return;
         }
@@ -162,15 +146,15 @@ public class MainWindow extends JFrame {
                 details.append("Task: ").append(task.getName()).append("\n");
                 details.append("Status: ").append(task.getStatus().name()).append("\n");
                 details.append("Last run: ")
-                        .append(task.getLastRunAt() != null ? task.getLastRunAt().toString() : "Never")
-                        .append("\n");
+                    .append(task.getLastRunAt() != null ? task.getLastRunAt().toString() : "Never")
+                    .append("\n");
                 details.append("Result: ")
-                        .append(task.getLastRunResult() != null ? task.getLastRunResult() : "Unknown")
-                        .append("\n");
+                    .append(task.getLastRunResult() != null ? task.getLastRunResult() : "Unknown")
+                    .append("\n");
                 details.append("Retries left: ").append(task.getRetryCount()).append("\n");
                 details.append("Last started: ")
-                        .append(task.getLastStartedAt() != null ? task.getLastStartedAt().toString() : "Never")
-                        .append("\n\n");
+                    .append(task.getLastStartedAt() != null ? task.getLastStartedAt().toString() : "Never")
+                    .append("\n\n");
             }
         }
         if (!skippedTasks.isEmpty()) {
@@ -179,8 +163,8 @@ public class MainWindow extends JFrame {
                 details.append("Task: ").append(task.getName()).append("\n");
                 details.append("Result: SKIPPED\n");
                 details.append("Last run: ")
-                        .append(task.getLastRunAt() != null ? task.getLastRunAt().toString() : "Never")
-                        .append("\n\n");
+                    .append(task.getLastRunAt() != null ? task.getLastRunAt().toString() : "Never")
+                    .append("\n\n");
             }
         }
 
@@ -196,9 +180,9 @@ public class MainWindow extends JFrame {
         scrollPane.setPreferredSize(new Dimension(600, 280));
 
         JOptionPane.showMessageDialog(this,
-                scrollPane,
-                "Task Alert",
-                JOptionPane.WARNING_MESSAGE);
+            scrollPane,
+            "Task Alert",
+            JOptionPane.WARNING_MESSAGE);
     }
 
     private void buildUI() {
@@ -209,7 +193,7 @@ public class MainWindow extends JFrame {
         // Both of these are re-registered further down every time buildUI() runs (currently
         // just the theme toggle rebuild) — without removing the previous ones first, each
         // rebuild would add ANOTHER toast listener and start ANOTHER refresh timer on top of
-        // the old ones, which never get garbage collected because RunHistoryService/the Timer
+        // the old ones, which never get garbage collected because RunHistory/the Timer
         // still holds a reference to them. That's exactly what caused every run to pop one
         // extra toast per theme toggle: the old (now invisible) ToastManager instances kept
         // firing right alongside the current one.
@@ -226,8 +210,7 @@ public class MainWindow extends JFrame {
             schedulerBadgeTimer = null;
         }
         schedulerBadgeStreamUnsub.run(); // re-registered by every buildUI(); don't stack listeners
-        schedulerBadgeStreamUnsub = () -> {
-        };
+        schedulerBadgeStreamUnsub = () -> { };
         if (dbStatusTimer != null) {
             dbStatusTimer.stop();
             dbStatusTimer = null;
@@ -325,14 +308,11 @@ public class MainWindow extends JFrame {
         // detected within a few seconds.
         refreshSchedulerBadge();
         refreshLinkBadge();
-        schedulerBadgeTimer = new javax.swing.Timer(3000, e -> {
-            refreshSchedulerBadge();
-            refreshLinkBadge();
-        });
+        schedulerBadgeTimer = new javax.swing.Timer(3000, e -> { refreshSchedulerBadge(); refreshLinkBadge(); });
         schedulerBadgeTimer.start();
         // The Daemon pushes status changes and the stream reports when the Daemon drops, so the badge flips
         // at once; the 3 s timer is only the safety net. Removed in the rebuild teardown (don't stack).
-        schedulerBadgeStreamUnsub = service.DaemonStatusStream.forDataDir(storage.getDataDir())
+        schedulerBadgeStreamUnsub = service.AppFolder.of(storage).daemonStatusStream()
                 .addListener(() -> javax.swing.SwingUtilities.invokeLater(this::refreshSchedulerBadge));
 
         header.add(titleStack, BorderLayout.WEST);
@@ -364,7 +344,7 @@ public class MainWindow extends JFrame {
                 new EmptyBorder(16, 8, 16, 8)));
         sidebar.setPreferredSize(new Dimension(152, 0));
 
-        String[] navNames = {"Tasks", "Credentials", "Logs", "API", "Settings"};
+        String[] navNames = { "Tasks", "Credentials", "Logs", "API", "Settings" };
         Icon[] navIcons = {
                 VectorIcons.checklist(navIdleFg, 18),
                 VectorIcons.key(navIdleFg, 18),
@@ -405,8 +385,7 @@ public class MainWindow extends JFrame {
                     case "Logs" -> logsLazy.get();
                     case "API" -> apiLazy.get();
                     case "Settings" -> settingsLazy.get();
-                    default -> {
-                    }
+                    default -> { }
                 }
                 cards.show(content, navNames[idx]);
                 for (int j = 0; j < navButtons.length; j++) {
@@ -436,9 +415,7 @@ public class MainWindow extends JFrame {
         final int expandedWidth = 152, collapsedWidth = 56, collapseBelow = 760;
         sidebarResizeListener = new java.awt.event.ComponentAdapter() {
             private Boolean collapsed = null; // null forces the first resize event to apply state
-
-            @Override
-            public void componentResized(java.awt.event.ComponentEvent e) {
+            @Override public void componentResized(java.awt.event.ComponentEvent e) {
                 boolean shouldCollapse = getWidth() < collapseBelow;
                 if (Boolean.valueOf(shouldCollapse).equals(collapsed)) return;
                 collapsed = shouldCollapse;
@@ -461,7 +438,7 @@ public class MainWindow extends JFrame {
         SwingUtilities.invokeLater(() -> sidebarResizeListener.componentResized(null));
 
         // ── Toast popups + live updates for every task run ──────────────────────
-        // Fired from RunHistoryService right after each run is recorded — covers
+        // Fired from RunHistory right after each run is recorded — covers
         // success, failure, AND skip, for every task, no matter which nav item is
         // currently showing. The listener itself runs on whatever thread recorded
         // the run (a scheduler worker thread), so everything it touches gets
@@ -478,18 +455,12 @@ public class MainWindow extends JFrame {
                     // Logs tab for anyone who does want to see it; it just
                     // doesn't pop a toast or bump the failure bell.
                     if (isInternalConcurrencySkip(record)) {
-                        {
-                            RunHistoryPanel rh = logsLazy.builtOrNull();
-                            if (rh != null) rh.onRunRecorded(record);
-                        }
+                        { RunHistoryPanel rh = logsLazy.builtOrNull(); if (rh != null) rh.onRunRecorded(record); }
                         return;
                     }
                     toastManager.showToast(record);
                     if (statusStrip != null) statusStrip.refresh();
-                    {
-                        RunHistoryPanel rh = logsLazy.builtOrNull();
-                        if (rh != null) rh.onRunRecorded(record);
-                    }
+                    { RunHistoryPanel rh = logsLazy.builtOrNull(); if (rh != null) rh.onRunRecorded(record); }
                 });
         scheduler.getRunHistoryService().addRunListener(runListener);
 
@@ -529,14 +500,13 @@ public class MainWindow extends JFrame {
         // etc.), a snapshot taken at launch could keep claiming "connected"
         // indefinitely afterwards — exactly the contradiction of the badge
         // saying connected while a save fails. isConnected() now checks the
-        // connection live (see TaskDbService#isConnected), and this label is
+        // connection live (see SqliteTaskRepository#isConnected), and this label is
         // re-checked on a timer, not just once.
         dbLabel = new JLabel();
         dbLabel.setFont(dbLabel.getFont().deriveFont(Font.BOLD, 11.5f));
         dbLabel.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
         dbLabel.addMouseListener(new java.awt.event.MouseAdapter() {
-            @Override
-            public void mouseClicked(java.awt.event.MouseEvent e) {
+            @Override public void mouseClicked(java.awt.event.MouseEvent e) {
                 // Re-check live at click time rather than trusting whatever the
                 // label said a moment ago — state can change between ticks.
                 boolean tasksOk = storage.isConnected();
@@ -548,16 +518,16 @@ public class MainWindow extends JFrame {
                         : !tasksOk ? "Tasks and credentials"
                         : "Settings";
                 JOptionPane.showMessageDialog(MainWindow.this,
-                        "app.db did not open successfully, so nothing you do in this session\n"
-                                + "will actually be saved — " + scope + " will look like they\n"
-                                + "worked, then disappear (or silently revert) on refresh.\n\n"
-                                + "Reason:\n" + (err != null ? err : "unknown")
-                                + "\n\nCommon causes: the resolved data directory below doesn't match\n"
-                                + "where your real app.db lives (check app-config.xml's <dataDir> is\n"
-                                + "actually being found), app.db is locked by another process (the\n"
-                                + "Daemon, a backup tool, antivirus), or the account running this app\n"
-                                + "lacks permission on the data directory.",
-                        "Database disconnected", JOptionPane.ERROR_MESSAGE);
+                    "app.db did not open successfully, so nothing you do in this session\n"
+                        + "will actually be saved — " + scope + " will look like they\n"
+                        + "worked, then disappear (or silently revert) on refresh.\n\n"
+                        + "Reason:\n" + (err != null ? err : "unknown")
+                        + "\n\nCommon causes: the resolved data directory below doesn't match\n"
+                        + "where your real app.db lives (check app-config.xml's <dataDir> is\n"
+                        + "actually being found), app.db is locked by another process (the\n"
+                        + "Daemon, a backup tool, antivirus), or the account running this app\n"
+                        + "lacks permission on the data directory.",
+                    "Database disconnected", JOptionPane.ERROR_MESSAGE);
             }
         });
         statusBar.add(new JSeparator(SwingConstants.VERTICAL));
@@ -569,10 +539,7 @@ public class MainWindow extends JFrame {
         dbStatusTimer = new javax.swing.Timer(30_000, e -> refreshDbStatusLabel());
         dbStatusTimer.start();
         dbStatusActivationListener = new WindowAdapter() {
-            @Override
-            public void windowActivated(WindowEvent e) {
-                refreshDbStatusLabel();
-            }
+            @Override public void windowActivated(WindowEvent e) { refreshDbStatusLabel(); }
         };
         addWindowListener(dbStatusActivationListener);
 
@@ -590,7 +557,7 @@ public class MainWindow extends JFrame {
      */
     private void refreshDbStatusLabel() {
         if (dbLabel == null) return;
-        // storage.isConnected() only covers TaskDbService/CredentialDbService.
+        // storage.isConnected() only covers SqliteTaskRepository/SqliteCredentialRepository.
         // util.AppSettings keeps its own, entirely separate JDBC connection to
         // the same app.db file, so it can fail independently of the other two
         // (e.g. it opens the file a moment before/after them, or hits its own
@@ -604,7 +571,7 @@ public class MainWindow extends JFrame {
                 err = storage.getConnectionError();
                 if (err == null) err = util.AppSettings.getConnectionError();
             }
-            return new Object[]{ok, err};
+            return new Object[] { ok, err };
         }, r -> applyDbStatus((Boolean) r[0], (String) r[1]), null);
     }
 
@@ -634,21 +601,19 @@ public class MainWindow extends JFrame {
     private void warnIfDataDirFallback() {
         if (util.AppConfig.locate() != null) return; // config file was found; nothing to warn about
         JOptionPane.showMessageDialog(this,
-                "app-config.xml could not be found, so this session is using the built-in\n"
-                        + "default data directory instead of the one configured for this install:\n\n"
-                        + "    " + loadDataDir() + "\n\n"
-                        + "If your tasks/credentials live in a different folder, they will not\n"
-                        + "appear, and anything you create now will be saved to the wrong place.\n\n"
-                        + "app-config.xml is looked for in the current working directory, then next\n"
-                        + "to the running jar — check how this app was launched (e.g. a shortcut's\n"
-                        + "\"Start in\" folder).",
-                "Configuration file not found", JOptionPane.WARNING_MESSAGE);
+            "app-config.xml could not be found, so this session is using the built-in\n"
+                + "default data directory instead of the one configured for this install:\n\n"
+                + "    " + loadDataDir() + "\n\n"
+                + "If your tasks/credentials live in a different folder, they will not\n"
+                + "appear, and anything you create now will be saved to the wrong place.\n\n"
+                + "app-config.xml is looked for in the current working directory, then next\n"
+                + "to the running jar — check how this app was launched (e.g. a shortcut's\n"
+                + "\"Start in\" folder).",
+            "Configuration file not found", JOptionPane.WARNING_MESSAGE);
     }
 
-    /**
-     * Wraps a panel in a rounded "card" container with breathing room, instead of it
-     * butting flush against the sidebar/window edges.
-     */
+    /** Wraps a panel in a rounded "card" container with breathing room, instead of it
+     *  butting flush against the sidebar/window edges. */
     private JPanel wrapCard(JComponent inner) {
         JPanel card = new JPanel(new BorderLayout());
         card.setBackground(UIManager.getColor("Panel.background"));
@@ -659,13 +624,10 @@ public class MainWindow extends JFrame {
         return card;
     }
 
-    /**
-     * A small rounded, semi-transparent status pill for the header (e.g. "GUI Scheduler Running").
-     */
+    /** A small rounded, semi-transparent status pill for the header (e.g. "GUI Scheduler Running"). */
     private JLabel statusChip(String text, Color dotColor) {
         JLabel chip = new JLabel("\u25CF  " + text) {
-            @Override
-            protected void paintComponent(Graphics g) {
+            @Override protected void paintComponent(Graphics g) {
                 Graphics2D g2 = (Graphics2D) g.create();
                 g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
                 g2.setColor(new Color(255, 255, 255, 30));
@@ -693,7 +655,7 @@ public class MainWindow extends JFrame {
      * status. This window is a thin client — it never runs the scheduler
      * itself, in-process or as a fallback — so there are exactly two honest
      * states to show: the service is up, or it isn't.
-     * <p>
+     *
      * Previously this method promoted the GUI's own (unstarted-by-default)
      * {@link TaskSchedulerService} to active whenever the Daemon looked
      * offline, so scheduling wouldn't silently stall. That made sense when
@@ -713,6 +675,8 @@ public class MainWindow extends JFrame {
                 () -> AppFeeds.daemonNow(daemonStatusFile).alive(), // push stream if live, else one file read
                 this::applySchedulerBadge, null);
     }
+
+    private record LinkSummary(int sources, int problems, boolean live) {}
 
     private void refreshLinkBadge() {
         if (linkBadge == null) return;
@@ -748,9 +712,13 @@ public class MainWindow extends JFrame {
         } else {
             restyleChip(schedulerBadge, "Scheduler: Service Offline", new Color(0xC97F7F));
             schedulerBadge.setToolTipText(
-                    "The background service isn't responding — scheduled tasks are not running right now. "
-                            + "Check the \"Monitoring-Tool-Daemon\" Windows Service or its Recovery settings.");
+                "The background service isn't responding — scheduled tasks are not running right now. "
+                + "Check the \"Monitoring-Tool-Daemon\" Windows Service or its Recovery settings.");
         }
+    }
+
+    private static Color withAlpha(Color c, int alpha) {
+        return new Color(c.getRed(), c.getGreen(), c.getBlue(), alpha);
     }
 
     /**
@@ -768,7 +736,7 @@ public class MainWindow extends JFrame {
         return record.getStatus() == model.TaskRunRecord.Status.SKIPPED
                 && record.getReason() != null
                 && (record.getReason().contains("already running in another process")
-                || record.getReason().contains("already running elsewhere in this same application instance"));
+                    || record.getReason().contains("already running elsewhere in this same application instance"));
     }
 
     /**
@@ -787,6 +755,16 @@ public class MainWindow extends JFrame {
                 "\u26A0" // ⚠
         );
         if (statusStrip != null) statusStrip.refresh();
+    }
+
+    private static String prettyMode(String rawWatchModeName) {
+        return switch (rawWatchModeName) {
+            case "NATIVE_WATCH" -> "live (native watch)";
+            case "REMOTE_PUSH" -> "live (remote push)";
+            case "POLLING_ONLY_UNSUPPORTED" -> "polling only (unsupported)";
+            case "POLLING_ONLY" -> "polling only";
+            default -> rawWatchModeName;
+        };
     }
 
     /**
@@ -811,7 +789,7 @@ public class MainWindow extends JFrame {
             // fall through to placeholder below
         }
         java.awt.image.BufferedImage img =
-                new java.awt.image.BufferedImage(32, 32, java.awt.image.BufferedImage.TYPE_INT_ARGB);
+            new java.awt.image.BufferedImage(32, 32, java.awt.image.BufferedImage.TYPE_INT_ARGB);
         Graphics2D g2 = img.createGraphics();
         g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
         g2.setColor(AppTheme.ACCENT_DARK);
@@ -823,6 +801,8 @@ public class MainWindow extends JFrame {
         return img;
     }
 
-    private record LinkSummary(int sources, int problems, boolean live) {
+    public static void main(String[] args) {
+        persistence.sqlite.SqliteStorage.installServices();
+        SwingUtilities.invokeLater(() -> new MainWindow().setVisible(true));
     }
 }

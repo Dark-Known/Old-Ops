@@ -3,9 +3,7 @@ package ui;
 import javax.swing.*;
 import java.awt.*;
 
-/**
- * A {@link JPanel} that paints a smooth diagonal two-color gradient instead of a flat fill.
- */
+/** A {@link JPanel} that paints a smooth diagonal two-color gradient instead of a flat fill. */
 public class GradientPanel extends JPanel {
 
     private final Color from;

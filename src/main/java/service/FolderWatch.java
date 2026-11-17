@@ -1,5 +1,6 @@
 package service;
 
+import persistence.TransferLedger;
 import model.FileSelection;
 import model.ScheduledTask;
 import model.WatchOptions;
@@ -11,7 +12,6 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.function.Consumer;
-import java.util.function.LongSupplier;
 import java.util.stream.Stream;
 
 /**
@@ -22,42 +22,27 @@ import java.util.stream.Stream;
  */
 public final class FolderWatch {
 
+    /** One file seen in the folder. */
+    public record Item(String name, long size, long mtimeMillis) {}
+
+    /** Lists the folder; throws when it can not be read (the run then fails and an alert can fire). */
+    public interface Lister {
+        List<Item> list(ScheduledTask task, Consumer<String> log) throws Exception;
+    }
+
+    /** What one look found. */
+    public record Outcome(boolean baseline, List<Item> added, List<Item> changed, boolean resumed, int watching, int ignored) {
+        public boolean quiet() { return !baseline && added.isEmpty() && changed.isEmpty(); }
+    }
+
     private static final String MARKER = "\u0000watching";
-    private final File dataDir;
+
+    private final TransferLedger ledger;
     private final Lister lister;
-    private final LongSupplier clock;
 
-    public FolderWatch(File dataDir, Lister lister) {
-        this(dataDir, lister, System::currentTimeMillis);
-    }
-    FolderWatch(File dataDir, Lister lister, LongSupplier clock) {
-        this.dataDir = dataDir;
+    public FolderWatch(TransferLedger ledger, Lister lister) {
+        this.ledger = ledger;
         this.lister = lister;
-        this.clock = clock;
-    }
-
-    private static void remember(TransferLedger ledger, ScheduledTask task, List<Item> items) throws IOException {
-        List<TransferLedger.Entry> e = new ArrayList<>();
-        for (Item it : items) e.add(new TransferLedger.Entry(it.name(), it.size(), it.mtimeMillis()));
-        ledger.record(task.getId(), e);
-    }
-
-    /**
-     * Lists a folder on this PC or a network share: regular files directly inside it.
-     */
-    public static List<Item> listLocal(String dir) throws IOException {
-        Path p = new File(dir).toPath();
-        if (!Files.isDirectory(p)) throw new IOException("The folder does not exist or can not be read: " + dir);
-        List<Item> out = new ArrayList<>();
-        try (Stream<Path> s = Files.list(p)) {
-            for (Path f : (Iterable<Path>) s::iterator) {
-                try {
-                    if (!Files.isRegularFile(f)) continue;
-                    out.add(new Item(f.getFileName().toString(), Files.size(f), Files.getLastModifiedTime(f).toMillis()));
-                } catch (IOException ignored) { /* vanished while listing */ }
-            }
-        }
-        return out;
     }
 
     public Outcome look(ScheduledTask task, Consumer<String> log) throws Exception {
@@ -69,7 +54,6 @@ public final class FolderWatch {
         List<Item> matching = sel.filterOnly(all, Item::name, Item::size, Item::mtimeMillis);
         int ignored = all.size() - matching.size();
 
-        TransferLedger ledger = new TransferLedger(dataDir, clock);
         TransferLedger.Snapshot known = ledger.snapshot(task.getId());
         // A marker file name that can not exist in a folder tells "looked before" from "never looked" (an empty folder leaves nothing else).
         boolean first = !known.wasSent(MARKER, 0, 0, FileSelection.SentPolicy.UNCHANGED);
@@ -78,8 +62,7 @@ public final class FolderWatch {
         for (Item it : matching) {
             if (known.wasSent(it.name(), it.size(), it.mtimeMillis(), FileSelection.SentPolicy.UNCHANGED)) continue;
             boolean seenName = known.wasSent(it.name(), it.size(), it.mtimeMillis(), FileSelection.SentPolicy.ANY_NAME);
-            if (seenName) changed.add(it);
-            else added.add(it);
+            if (seenName) changed.add(it); else added.add(it);
         }
 
         if (first) {
@@ -99,26 +82,25 @@ public final class FolderWatch {
         return new Outcome(false, added, changed, resumed, matching.size(), ignored);
     }
 
-    /**
-     * Lists the folder; throws when it can not be read (the run then fails and an alert can fire).
-     */
-    public interface Lister {
-        List<Item> list(ScheduledTask task, Consumer<String> log) throws Exception;
+    private static void remember(TransferLedger ledger, ScheduledTask task, List<Item> items) throws IOException {
+        List<TransferLedger.Entry> e = new ArrayList<>();
+        for (Item it : items) e.add(new TransferLedger.Entry(it.name(), it.size(), it.mtimeMillis()));
+        ledger.record(task.getId(), e);
     }
 
-    /**
-     * One file seen in the folder.
-     */
-    public record Item(String name, long size, long mtimeMillis) {
-    }
-
-    /**
-     * What one look found.
-     */
-    public record Outcome(boolean baseline, List<Item> added, List<Item> changed, boolean resumed, int watching,
-                          int ignored) {
-        public boolean quiet() {
-            return !baseline && added.isEmpty() && changed.isEmpty();
+    /** Lists a folder on this PC or a network share: regular files directly inside it. */
+    public static List<Item> listLocal(String dir) throws IOException {
+        Path p = new File(dir).toPath();
+        if (!Files.isDirectory(p)) throw new IOException("The folder does not exist or can not be read: " + dir);
+        List<Item> out = new ArrayList<>();
+        try (Stream<Path> s = Files.list(p)) {
+            for (Path f : (Iterable<Path>) s::iterator) {
+                try {
+                    if (!Files.isRegularFile(f)) continue;
+                    out.add(new Item(f.getFileName().toString(), Files.size(f), Files.getLastModifiedTime(f).toMillis()));
+                } catch (IOException ignored) { /* vanished while listing */ }
+            }
         }
+        return out;
     }
 }

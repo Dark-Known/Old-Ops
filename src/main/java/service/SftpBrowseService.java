@@ -1,95 +1,21 @@
 package service;
 
-import com.jcraft.jsch.ChannelSftp;
-import com.jcraft.jsch.JSch;
-import com.jcraft.jsch.Session;
+import service.sftp.ConnectOptions;
+import service.sftp.JschSftpClient;
+import service.sftp.RemoteEntry;
+import service.sftp.SftpClient;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Properties;
-import java.util.Vector;
 
 /**
- * Thin wrapper around a single JSch SFTP session used purely for interactive
+ * Thin wrapper around a single SFTP session used purely for interactive
  * directory browsing (see {@code ui.DirectoryBrowserDialog}) — as opposed to
  * {@link RemoteFileMetadataServiceFactory}, which opens a session for an
  * actual transfer run. Caller owns the lifecycle: {@link #connect} to open,
  * {@link #close()} when the browse dialog is dismissed.
  */
 public final class SftpBrowseService implements AutoCloseable {
-
-    private final Session session;
-    private final ChannelSftp channel;
-    private String host, user;
-    private long openedAt = System.currentTimeMillis();
-    private boolean reported = false;
-    private SftpBrowseService(Session session, ChannelSftp channel) {
-        this.session = session;
-        this.channel = channel;
-    }
-
-    public static SftpBrowseService connect(String host, String username, String password) throws Exception {
-        JSch jsch = new JSch();
-        Session session = jsch.getSession(username, host, 22);
-        util.SshAuth.apply(jsch, session, password);
-        Properties config = new Properties();
-        config.put("StrictHostKeyChecking", "no");
-        session.setConfig(config);
-        util.SshHostKeys.apply(jsch, session);
-        try {
-            session.connect(8_000);
-        } catch (Exception ex) {
-            SshSessionEvents.uiFailed("Remote folder browser", host, username, ex.getMessage());
-            throw ex;
-        }
-        try {
-            ChannelSftp channel = (ChannelSftp) session.openChannel("sftp");
-            channel.connect(6_000);
-            SftpBrowseService svc = new SftpBrowseService(session, channel);
-            svc.host = host;
-            svc.user = username;
-            svc.reported = true;
-            SshSessionEvents.uiOpened("Remote folder browser", host, username);
-            return svc;
-        } catch (Exception ex) {
-            session.disconnect();
-            SshSessionEvents.uiFailed("Remote folder browser", host, username, ex.getMessage());
-            throw ex;
-        }
-    }
-
-    /**
-     * The remote user's home / landing directory — used as the initial browse path.
-     */
-    public String home() throws Exception {
-        return channel.pwd();
-    }
-
-    @SuppressWarnings("unchecked")
-    public List<Entry> list(String path) throws Exception {
-        List<Entry> out = new ArrayList<>();
-        Vector<ChannelSftp.LsEntry> entries = channel.ls(path);
-        for (ChannelSftp.LsEntry e : entries) {
-            String n = e.getFilename();
-            if (".".equals(n) || "..".equals(n)) continue;
-            out.add(new Entry(n, e.getAttrs().isDir(), e.getAttrs().getSize()));
-        }
-        out.sort((a, b) -> {
-            if (a.directory != b.directory) return a.directory ? -1 : 1;
-            return a.name.compareToIgnoreCase(b.name);
-        });
-        return out;
-    }
-
-    @Override
-    public void close() {
-        if (channel != null && channel.isConnected()) channel.disconnect();
-        if (session != null && session.isConnected()) session.disconnect();
-        if (reported) {
-            reported = false;
-            SshSessionEvents.uiClosed("Remote folder browser", host, user, System.currentTimeMillis() - openedAt);
-        }
-    }
 
     public static final class Entry {
         public final String name;
@@ -100,6 +26,58 @@ public final class SftpBrowseService implements AutoCloseable {
             this.name = name;
             this.directory = directory;
             this.size = size;
+        }
+    }
+
+    private final SftpClient client;
+
+    private String host, user;
+    private long openedAt = System.currentTimeMillis();
+    private boolean reported = false;
+
+    private SftpBrowseService(SftpClient client) {
+        this.client = client;
+    }
+
+    private static final ConnectOptions OPTIONS = ConnectOptions.of(ConnectOptions.DEFAULT_PORT, 8_000, 6_000);
+
+    public static SftpBrowseService connect(String host, String username, String password) throws Exception {
+        SftpClient client;
+        try {
+            client = JschSftpClient.connect(host, username, password, OPTIONS);
+        } catch (Exception ex) {
+            SshSessionEvents.uiFailed("Remote folder browser", host, username, ex.getMessage());
+            throw ex;
+        }
+        SftpBrowseService svc = new SftpBrowseService(client);
+        svc.host = host; svc.user = username; svc.reported = true;
+        SshSessionEvents.uiOpened("Remote folder browser", host, username);
+        return svc;
+    }
+
+    /** The remote user's home / landing directory — used as the initial browse path. */
+    public String home() throws Exception {
+        return client.home();
+    }
+
+    public List<Entry> list(String path) throws Exception {
+        List<Entry> out = new ArrayList<>();
+        for (RemoteEntry e : client.list(path)) {
+            out.add(new Entry(e.name(), e.directory(), e.size()));
+        }
+        out.sort((a, b) -> {
+            if (a.directory != b.directory) return a.directory ? -1 : 1;
+            return a.name.compareToIgnoreCase(b.name);
+        });
+        return out;
+    }
+
+    @Override
+    public void close() {
+        client.close();
+        if (reported) {
+            reported = false;
+            SshSessionEvents.uiClosed("Remote folder browser", host, user, System.currentTimeMillis() - openedAt);
         }
     }
 }

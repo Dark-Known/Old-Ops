@@ -16,8 +16,6 @@ import java.awt.*;
  */
 final class WrapLayout extends FlowLayout {
 
-    private static final String ASKED = "wrapLayout.askedHeight";
-
     WrapLayout(int align, int hgap, int vgap) {
         super(align, hgap, vgap);
     }
@@ -58,6 +56,8 @@ final class WrapLayout extends FlowLayout {
             if (parent != null) parent.revalidate();
         });
     }
+
+    private static final String ASKED = "wrapLayout.askedHeight";
 
     private Dimension layoutSize(Container target, boolean preferred) {
         synchronized (target.getTreeLock()) {

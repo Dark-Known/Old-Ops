@@ -1,6 +1,9 @@
 package ui;
 
+import service.os.WindowsDaemonService;
+import persistence.RunHistory;
 import service.BackgroundJobs;
+
 import service.TransferService;
 import util.AppSettings;
 
@@ -9,67 +12,34 @@ import javax.swing.border.EmptyBorder;
 import javax.swing.table.DefaultTableModel;
 import java.awt.*;
 import java.io.*;
-import java.nio.charset.StandardCharsets;
-import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Base64;
+import java.nio.charset.StandardCharsets;
 import java.util.prefs.Preferences;
 
 public class SettingsPanel extends JPanel {
 
-    private static final String PREF_WINSCP = "winscp_path";
-    private static final String PREF_POLLSEC = "poll_interval_seconds";
-    private static final String TASK_NAME = "Monitoring-Tool-Daemon";
+    private static final String PREF_WINSCP   = "winscp_path";
+    private static final String PREF_POLLSEC  = "poll_interval_seconds";
+    private static final String TASK_NAME     = "Monitoring-Tool-Daemon";
     // Windows Service id, must match <id> in packaging/daemon-service.xml —
     // this is what actually runs the daemon now (see setup.ps1 /
     // packaging/install-service.ps1). TASK_NAME above is kept only for the
     // startup-fallback .cmd filename and is otherwise unused now that
     // Scheduled Task registration has been removed from this panel.
-    private static final String SERVICE_NAME = "OpsTransferToolDaemon";
-    /**
-     * Records an application-activity note (settings saved) into the Event
-     * Monitor's activity feed — see
-     * {@link service.RunHistoryService#recordActivityEvent}. No-op if this
-     * panel was constructed without a scheduler reference (see the
-     * single-arg constructor's javadoc).
-     */
-    // Human-readable labels for the settings-diff event detail below, keyed by
-    // the same constants used in live.put(...) — kept in one place so the
-    // event feed reads naturally ("Log level") instead of raw key constants.
-    private static final Map<String, String> SETTING_LABELS = Map.ofEntries(
-            Map.entry(service.ActivityVisibility.KEY_SLOW_JOB_MS, "Show background work slower than (ms)"),
-            Map.entry(service.ActivityVisibility.KEY_UI_STALL_MS, "Report UI stall longer than (ms)"),
-            Map.entry(AppSettings.KEY_DEFAULT_STATION_ADDR, "Default station address"),
-            Map.entry(AppSettings.KEY_ATTACHMENT_DOWNLOAD_DIR, "Attachment download directory"),
-            Map.entry(AppSettings.KEY_LOG_LEVEL, "Log level"),
-            Map.entry(AppSettings.KEY_JVM_MIN_HEAP, "JVM min heap"),
-            Map.entry(AppSettings.KEY_JVM_MAX_HEAP, "JVM max heap"),
-            Map.entry(AppSettings.KEY_TRANSFER_BATCH_TARGET_SECONDS, "Batch target duration (s)"),
-            Map.entry(AppSettings.KEY_TRANSFER_ASSUMED_THROUGHPUT_MBPS, "Assumed throughput (Mbps)"),
-            Map.entry(AppSettings.KEY_TRANSFER_BATCH_INTERVAL_SECONDS, "Batch interval (s)"),
-            Map.entry(AppSettings.KEY_TRANSFER_BATCH_MAX_BYTES, "Batch max bytes override"),
-            Map.entry(AppSettings.KEY_TRANSFER_BATCH_CONCURRENCY, "Batch concurrency"),
-            Map.entry(AppSettings.KEY_WATCHER_FILES_PER_WORKER_THREAD, "Watcher files per worker thread"),
-            Map.entry(AppSettings.KEY_STALE_RUNNING_THRESHOLD_MINUTES, "Stale running threshold (min)"),
-            Map.entry(AppSettings.KEY_MAX_CONCURRENT_TASK_THREADS, "Max concurrent task threads"),
-            Map.entry(AppSettings.KEY_POLL_INTERVAL_SECONDS, "Poll interval (s)"),
-            Map.entry(service.PurgePolicy.KEY_BG_DAYS, "Background log: keep days"),
-            Map.entry(service.PurgePolicy.KEY_BG_MB, "Background log: max MB"),
-            Map.entry(service.PurgePolicy.KEY_RUN_DAYS, "Run history: keep days"),
-            Map.entry(service.PurgePolicy.KEY_RUN_MB, "Run history: max MB"),
-            Map.entry(service.PurgePolicy.KEY_SCHEDULED, "Automatic purge"),
-            Map.entry(service.PurgePolicy.KEY_INTERVAL_H, "Purge every (hours)"));
+    private static final String SERVICE_NAME  = WindowsDaemonService.SERVICE_NAME;
+
     private final TransferService transferService;
     private final service.TaskSchedulerService scheduler; // may be null if not wired by caller
-    private final Preferences prefs = Preferences.userNodeForPackage(SettingsPanel.class);
-    private final java.util.concurrent.atomic.AtomicBoolean daemonActionRunning =
-            new java.util.concurrent.atomic.AtomicBoolean();
     private RetentionPanel retentionPanel;
     private VisibilityPanel visibilityPanel;
+    private final Preferences prefs = Preferences.userNodeForPackage(SettingsPanel.class);
     private JTextField tfWinScp;
-    private JLabel lblStatus;
-    private JLabel lblDaemonStatus;
+    private JLabel     lblStatus;
+    private JLabel     lblDaemonStatus;
     private javax.swing.JSpinner spinnerPollInterval;
+
     // Live settings (app-settings.db via util.AppSettings) — see buildRoutingPanel()
     private JTextField tfNewRuleKey;
     private JTextField tfNewRuleFolder;
@@ -89,7 +59,6 @@ public class SettingsPanel extends JPanel {
     private javax.swing.JSpinner spinnerWatcherFilesPerThread;
     private javax.swing.JSpinner spinnerStaleThresholdMinutes;
     private javax.swing.JSpinner spinnerMaxConcurrentTaskThreads;
-
     public SettingsPanel(TransferService transferService) {
         this(transferService, null);
     }
@@ -114,28 +83,6 @@ public class SettingsPanel extends JPanel {
         refreshDaemonStatus();
     }
 
-    /**
-     * Resolves the same real dataDir that MainWindow, Daemon, and AppSettings
-     * all use — app-config.xml's &lt;dataDir&gt;, falling back to
-     * {@code C:\OpsTools\Data} if that can't be read. Used only to display
-     * accurate paths in the "Application Info" section below; previously this
-     * section hardcoded {@code %USERPROFILE%\.opstool} regardless of what
-     * was actually configured, which could point users at the wrong folder
-     * entirely when looking for tasks.xml, daemon.log, or app-settings.json.
-     */
-    private static String resolveActualDataDir() {
-        String val = util.AppConfig.readValue("dataDir");
-        return (val != null && !val.isEmpty()) ? val : "C:\\OpsTools\\Data";
-    }
-
-    /**
-     * Mirrors Daemon.daemonLogFileName() — see note in openDaemonLog().
-     */
-    private static String resolveDaemonLogFileName() {
-        String name = util.AppConfig.readValue("daemonLogFile");
-        return (name != null && !name.trim().isEmpty()) ? name.trim() : "daemon-service.out.log";
-    }
-
     private void buildUI() {
         JPanel outer = new JPanel();
         outer.setLayout(new BoxLayout(outer, BoxLayout.Y_AXIS));
@@ -150,109 +97,14 @@ public class SettingsPanel extends JPanel {
         // full width and stays flush-left regardless of its text length.
         add(banner, BorderLayout.NORTH);
 
-        // WinSCP section
-        JPanel winscpPanel = new JPanel(new GridBagLayout());
-        winscpPanel.setBorder(new EmptyBorder(4, 4, 4, 4));
-        winscpPanel.setMaximumSize(new Dimension(Integer.MAX_VALUE, 120));
-
-        tfWinScp = new JTextField(transferService.getWinScpPath(), 40);
-        JButton btnBrowse = new JButton("Browse...");
-        btnBrowse.addActionListener(e -> {
-            JFileChooser fc = new JFileChooser();
-            fc.setDialogTitle("Select WinSCP.com");
-            fc.setFileFilter(new javax.swing.filechooser.FileNameExtensionFilter(
-                    "WinSCP.com", "com", "exe"));
-            if (fc.showOpenDialog(this) == JFileChooser.APPROVE_OPTION)
-                tfWinScp.setText(fc.getSelectedFile().getAbsolutePath());
-        });
-
-        GridBagConstraints lc = new GridBagConstraints();
-        lc.anchor = GridBagConstraints.WEST;
-        lc.insets = new Insets(6, 4, 4, 8);
-        lc.gridx = 0;
-        GridBagConstraints fc2 = new GridBagConstraints();
-        fc2.fill = GridBagConstraints.HORIZONTAL;
-        fc2.weightx = 1;
-        fc2.insets = new Insets(6, 0, 4, 6);
-        fc2.gridx = 1;
-        GridBagConstraints bc = new GridBagConstraints();
-        bc.insets = new Insets(6, 0, 4, 4);
-        bc.gridx = 2;
-
-        lc.gridy = fc2.gridy = bc.gridy = 0;
-        winscpPanel.add(new JLabel("WinSCP.com path:"), lc);
-        winscpPanel.add(tfWinScp, fc2);
-        winscpPanel.add(btnBrowse, bc);
+        JPanel winscpPanel = buildWinScpPanel();
         outer.add(card("WinSCP Configuration", winscpPanel));
         outer.add(Box.createVerticalStrut(12));
 
         outer.add(card("Message Routing & Attachments (live \u2014 no restart needed)", buildRoutingPanel()));
         outer.add(Box.createVerticalStrut(12));
 
-        // Background Daemon section
-        JPanel daemonPanel = new JPanel(new GridBagLayout());
-        daemonPanel.setBorder(new EmptyBorder(4, 4, 4, 4));
-        daemonPanel.setMaximumSize(new Dimension(Integer.MAX_VALUE, 210));
-
-        lblDaemonStatus = new JLabel("Checking...");
-        lblDaemonStatus.setFont(lblDaemonStatus.getFont().deriveFont(Font.BOLD));
-
-        JButton btnRegister = new GradientButton("Install Service (Admin required)");
-        JButton btnRemove = new GradientButton("Uninstall Service");
-        JButton btnRunNow = new JButton("Start Service");
-        JButton btnViewLog = new JButton("View Daemon Log");
-        JButton btnRefreshStatus = new JButton("Refresh Status");
-
-        styleBtn(btnRegister, AppTheme.EARTH_SIENNA);
-        styleBtn(btnRemove, AppTheme.EARTH_RUST);
-        styleBtn(btnRunNow, new Color(0xF57C00));
-
-        btnRegister.addActionListener(e -> registerDaemon());
-        btnRemove.addActionListener(e -> removeDaemon());
-        btnRunNow.addActionListener(e -> runDaemonNow());
-        btnViewLog.addActionListener(e -> openDaemonLog());
-        btnRefreshStatus.addActionListener(e -> refreshDaemonStatus());
-
-        GridBagConstraints g = new GridBagConstraints();
-        g.insets = new Insets(4, 4, 4, 4);
-
-        g.gridx = 0;
-        g.gridy = 0;
-        g.gridwidth = 1;
-        g.fill = GridBagConstraints.NONE;
-        g.weightx = 0;
-        daemonPanel.add(new JLabel("Status:"), g);
-        g.gridx = 1;
-        g.gridwidth = 3;
-        g.fill = GridBagConstraints.HORIZONTAL;
-        g.weightx = 1;
-        daemonPanel.add(lblDaemonStatus, g);
-
-        // Poll interval control
-        JLabel lblPoll = new JLabel("GUI poll interval (seconds):");
-        spinnerPollInterval = new javax.swing.JSpinner(new javax.swing.SpinnerNumberModel(60, 1, 3600, 1));
-
-        GridBagConstraints pc = new GridBagConstraints();
-        pc.insets = new Insets(6, 4, 4, 4);
-        pc.gridx = 0;
-        pc.gridy = 3;
-        daemonPanel.add(lblPoll, pc);
-        GridBagConstraints sc = new GridBagConstraints();
-        sc.insets = new Insets(6, 0, 4, 4);
-        sc.gridx = 1;
-        sc.gridy = 3;
-        sc.fill = GridBagConstraints.NONE;
-        daemonPanel.add(spinnerPollInterval, sc);
-
-        JPanel btnRow2 = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
-        btnRow2.add(btnRegister);
-        btnRow2.add(btnRemove);
-        btnRow2.add(btnRunNow);
-        btnRow2.add(btnViewLog);
-        btnRow2.add(btnRefreshStatus);
-        g.gridy = 2;
-        daemonPanel.add(btnRow2, g);
-
+        JPanel daemonPanel = buildDaemonPanel();
         outer.add(card("Daemon", daemonPanel));
         outer.add(Box.createVerticalStrut(12));
 
@@ -265,17 +117,7 @@ public class SettingsPanel extends JPanel {
         outer.add(card("Event Monitor visibility", visibilityPanel));
         outer.add(Box.createVerticalStrut(12));
 
-        // App Info section
-        JPanel infoPanel = new JPanel(new GridBagLayout());
-        infoPanel.setBorder(new EmptyBorder(4, 4, 4, 4));
-        infoPanel.setMaximumSize(new Dimension(Integer.MAX_VALUE, 185));
-
-        String dataDir = resolveActualDataDir();
-        addInfoRow(infoPanel, "Data directory:", dataDir, 0);
-        addInfoRow(infoPanel, "Tasks, credentials & settings (database):", dataDir + File.separator + "app.db", 1);
-        addInfoRow(infoPanel, "Daemon log:", dataDir + File.separator + "logs" + File.separator + resolveDaemonLogFileName(), 2);
-        addInfoRow(infoPanel, "Run history (database):", dataDir + File.separator + "run_history.db", 3);
-        addInfoRow(infoPanel, "Background log (database):", dataDir + File.separator + "background_log.db", 4);
+        JPanel infoPanel = buildInfoPanel();
         outer.add(card("Application Info", infoPanel));
         outer.add(Box.createVerticalStrut(12));
 
@@ -293,6 +135,108 @@ public class SettingsPanel extends JPanel {
         add(saveRow, BorderLayout.SOUTH);
     }
 
+    /** The WinSCP.com path row. */
+    private JPanel buildWinScpPanel() {
+        JPanel winscpPanel = new JPanel(new GridBagLayout());
+        winscpPanel.setBorder(new EmptyBorder(4, 4, 4, 4));
+        winscpPanel.setMaximumSize(new Dimension(Integer.MAX_VALUE, 120));
+
+        tfWinScp = new JTextField(transferService.getWinScpPath(), 40);
+        JButton btnBrowse = new JButton("Browse...");
+        btnBrowse.addActionListener(e -> {
+            JFileChooser fc = new JFileChooser();
+            fc.setDialogTitle("Select WinSCP.com");
+            fc.setFileFilter(new javax.swing.filechooser.FileNameExtensionFilter(
+                "WinSCP.com", "com", "exe"));
+            if (fc.showOpenDialog(this) == JFileChooser.APPROVE_OPTION)
+                tfWinScp.setText(fc.getSelectedFile().getAbsolutePath());
+        });
+
+        GridBagConstraints lc = new GridBagConstraints();
+        lc.anchor = GridBagConstraints.WEST; lc.insets = new Insets(6, 4, 4, 8); lc.gridx = 0;
+        GridBagConstraints fc2 = new GridBagConstraints();
+        fc2.fill = GridBagConstraints.HORIZONTAL; fc2.weightx = 1;
+        fc2.insets = new Insets(6, 0, 4, 6); fc2.gridx = 1;
+        GridBagConstraints bc = new GridBagConstraints();
+        bc.insets = new Insets(6, 0, 4, 4); bc.gridx = 2;
+
+        lc.gridy = fc2.gridy = bc.gridy = 0;
+        winscpPanel.add(new JLabel("WinSCP.com path:"), lc);
+        winscpPanel.add(tfWinScp, fc2);
+        winscpPanel.add(btnBrowse, bc);
+        return winscpPanel;
+    }
+
+    /** Daemon status, service buttons and the GUI poll interval. */
+    private JPanel buildDaemonPanel() {
+        JPanel daemonPanel = new JPanel(new GridBagLayout());
+        daemonPanel.setBorder(new EmptyBorder(4, 4, 4, 4));
+        daemonPanel.setMaximumSize(new Dimension(Integer.MAX_VALUE, 210));
+
+        lblDaemonStatus = new JLabel("Checking...");
+        lblDaemonStatus.setFont(lblDaemonStatus.getFont().deriveFont(Font.BOLD));
+
+        JButton btnRegister     = new GradientButton("Install Service (Admin required)");
+        JButton btnRemove       = new GradientButton("Uninstall Service");
+        JButton btnRunNow       = new JButton("Start Service");
+        JButton btnViewLog      = new JButton("View Daemon Log");
+        JButton btnRefreshStatus = new JButton("Refresh Status");
+
+        styleBtn(btnRegister, AppTheme.EARTH_SIENNA);
+        styleBtn(btnRemove,   AppTheme.EARTH_RUST);
+        styleBtn(btnRunNow,   new Color(0xF57C00));
+
+        btnRegister.addActionListener(e      -> registerDaemon());
+        btnRemove.addActionListener(e        -> removeDaemon());
+        btnRunNow.addActionListener(e        -> runDaemonNow());
+        btnViewLog.addActionListener(e       -> openDaemonLog());
+        btnRefreshStatus.addActionListener(e -> refreshDaemonStatus());
+
+        GridBagConstraints g = new GridBagConstraints();
+        g.insets = new Insets(4, 4, 4, 4);
+
+        g.gridx = 0; g.gridy = 0; g.gridwidth = 1; g.fill = GridBagConstraints.NONE; g.weightx = 0;
+        daemonPanel.add(new JLabel("Status:"), g);
+        g.gridx = 1; g.gridwidth = 3; g.fill = GridBagConstraints.HORIZONTAL; g.weightx = 1;
+        daemonPanel.add(lblDaemonStatus, g);
+
+        // Poll interval control
+        JLabel lblPoll = new JLabel("GUI poll interval (seconds):");
+        spinnerPollInterval = new javax.swing.JSpinner(new javax.swing.SpinnerNumberModel(60, 1, 3600, 1));
+
+        GridBagConstraints pc = new GridBagConstraints();
+        pc.insets = new Insets(6,4,4,4); pc.gridx = 0; pc.gridy = 3;
+        daemonPanel.add(lblPoll, pc);
+        GridBagConstraints sc = new GridBagConstraints();
+        sc.insets = new Insets(6,0,4,4); sc.gridx = 1; sc.gridy = 3; sc.fill = GridBagConstraints.NONE;
+        daemonPanel.add(spinnerPollInterval, sc);
+
+        JPanel btnRow2 = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
+        btnRow2.add(btnRegister);
+        btnRow2.add(btnRemove);
+        btnRow2.add(btnRunNow);
+        btnRow2.add(btnViewLog);
+        btnRow2.add(btnRefreshStatus);
+        g.gridy = 2;
+        daemonPanel.add(btnRow2, g);
+        return daemonPanel;
+    }
+
+    /** The read-only "where is my data" rows. */
+    private JPanel buildInfoPanel() {
+        JPanel infoPanel = new JPanel(new GridBagLayout());
+        infoPanel.setBorder(new EmptyBorder(4, 4, 4, 4));
+        infoPanel.setMaximumSize(new Dimension(Integer.MAX_VALUE, 185));
+
+        String dataDir = resolveActualDataDir();
+        addInfoRow(infoPanel, "Data directory:", dataDir, 0);
+        addInfoRow(infoPanel, "Tasks, credentials & settings (database):", dataDir + File.separator + "app.db", 1);
+        addInfoRow(infoPanel, "Daemon log:",     dataDir + File.separator + resolveDaemonLogFileName(), 2);
+        addInfoRow(infoPanel, "Run history (database):", dataDir + File.separator + "run_history.db", 3);
+        addInfoRow(infoPanel, "Background log (database):", dataDir + File.separator + "background_log.db", 4);
+        return infoPanel;
+    }
+
     /**
      * "Message Routing &amp; Attachments" section — the settings backed by
      * app-settings.json (via {@link AppSettings}) rather than app-config.xml.
@@ -306,8 +250,7 @@ public class SettingsPanel extends JPanel {
         panel.setBorder(new EmptyBorder(4, 4, 4, 4));
 
         GridBagConstraints lc = new GridBagConstraints();
-        lc.anchor = GridBagConstraints.WEST;
-        lc.insets = new Insets(4, 4, 4, 8);
+        lc.anchor = GridBagConstraints.WEST; lc.insets = new Insets(4, 4, 4, 8);
         GridBagConstraints fc = new GridBagConstraints();
         // fill = NONE (not HORIZONTAL): these are short folder-name/number fields,
         // so each should render at its own preferred width (set via JTextField(cols)
@@ -318,9 +261,7 @@ public class SettingsPanel extends JPanel {
         // location" field below), and HORIZONTAL fill would stretch every other
         // field in that column to match regardless of weightx. fill=NONE is what
         // actually decouples each field's rendered size from its neighbours'.
-        fc.fill = GridBagConstraints.NONE;
-        fc.weightx = 0;
-        fc.anchor = GridBagConstraints.WEST;
+        fc.fill = GridBagConstraints.NONE; fc.weightx = 0; fc.anchor = GridBagConstraints.WEST;
         fc.insets = new Insets(4, 0, 4, 4);
         GridBagConstraints bc = new GridBagConstraints();
         bc.insets = new Insets(4, 0, 4, 4);
@@ -341,10 +282,7 @@ public class SettingsPanel extends JPanel {
         row = addFieldRow(panel, lc, fc, "Mail routing:", buildMailRoutingWidget(), row);
         row = addFieldRow(panel, lc, fc, "Default SITA station address:", tfDefaultStationAddress, row);
 
-        lc.gridy = fc.gridy = bc.gridy = row;
-        lc.gridx = 0;
-        fc.gridx = 1;
-        bc.gridx = 2;
+        lc.gridy = fc.gridy = bc.gridy = row; lc.gridx = 0; fc.gridx = 1; bc.gridx = 2;
         panel.add(new JLabel("Attachment download location:"), lc);
         panel.add(tfAttachmentDir, fc);
         panel.add(btnBrowseAttach, bc);
@@ -394,10 +332,7 @@ public class SettingsPanel extends JPanel {
         heapRow.add(new JLabel("JVM max heap:"));
         heapRow.add(tfJvmMaxHeap);
         GridBagConstraints heapC = new GridBagConstraints();
-        heapC.gridx = 0;
-        heapC.gridy = row++;
-        heapC.gridwidth = 3;
-        heapC.anchor = GridBagConstraints.WEST;
+        heapC.gridx = 0; heapC.gridy = row++; heapC.gridwidth = 3; heapC.anchor = GridBagConstraints.WEST;
         heapC.insets = new Insets(4, 0, 4, 0);
         panel.add(heapRow, heapC);
 
@@ -432,10 +367,7 @@ public class SettingsPanel extends JPanel {
         wrap.add(addRow);
 
         mailRoutingPreviewModel = new DefaultTableModel(new Object[]{"Field Name", "Folder Name"}, 0) {
-            @Override
-            public boolean isCellEditable(int r, int c) {
-                return false;
-            }
+            @Override public boolean isCellEditable(int r, int c) { return false; }
         };
         mailRoutingPreviewTable = new JTable(mailRoutingPreviewModel);
         mailRoutingPreviewTable.setRowHeight(24);
@@ -443,10 +375,7 @@ public class SettingsPanel extends JPanel {
         mailRoutingPreviewTable.getTableHeader().setReorderingAllowed(false);
         mailRoutingPreviewTable.setToolTipText("Click to view, edit, or delete the full list");
         mailRoutingPreviewTable.addMouseListener(new java.awt.event.MouseAdapter() {
-            @Override
-            public void mouseClicked(java.awt.event.MouseEvent e) {
-                openMailRoutingEditor();
-            }
+            @Override public void mouseClicked(java.awt.event.MouseEvent e) { openMailRoutingEditor(); }
         });
         // No custom colors set anywhere here — a plain JTable/JScrollPane already
         // follows the app's current FlatLaf theme (light/dark) automatically, which
@@ -465,25 +394,13 @@ public class SettingsPanel extends JPanel {
         manageAll.setBorder(new EmptyBorder(3, 2, 0, 0));
         manageAll.setAlignmentX(Component.LEFT_ALIGNMENT);
         manageAll.addMouseListener(new java.awt.event.MouseAdapter() {
-            @Override
-            public void mouseClicked(java.awt.event.MouseEvent e) {
-                openMailRoutingEditor();
-            }
+            @Override public void mouseClicked(java.awt.event.MouseEvent e) { openMailRoutingEditor(); }
         });
         wrap.add(manageAll);
 
         refreshMailRoutingPreview();
         return wrap;
     }
-
-    /**
-     * Plain section heading — bold label with generous top/bottom breathing
-     * room, no box or line border around the section beneath it. Replaces
-     * this panel's previous {@code TitledBorder} boxes: a relaxed,
-     * whitespace-separated layout consistently reads clearer than a page of
-     * bordered boxes, and it's what {@code TaskManagerPanel}'s own redesign
-     * moved to as well (a "?" tooltip instead of a boxed legend panel).
-     */
 
     private void addMailRoutingRuleFromFields() {
         String key = tfNewRuleKey.getText().trim();
@@ -498,8 +415,7 @@ public class SettingsPanel extends JPanel {
         // and this call previously had NO event logging or failure check at all.
         java.util.List<util.MailRoutingRule> before = new java.util.ArrayList<>(mailRoutingRules);
         // Replace rather than duplicate if this key is already configured.
-        mailRoutingRules.removeIf(r -> key.equalsIgnoreCase(r.getKey()));
-        mailRoutingRules.add(new util.MailRoutingRule(key, folder));
+        util.MailRoutingChanges.upsert(mailRoutingRules, key, folder);
         try {
             if (!AppSettings.setMailRoutingRules(mailRoutingRules)) {
                 String detail = AppSettings.getConnectionError();
@@ -526,43 +442,10 @@ public class SettingsPanel extends JPanel {
             return;
         }
         logActivity("Settings saved", "Mail routing rules updated — "
-                + buildMailRoutingDiff(before, mailRoutingRules));
+                + util.MailRoutingChanges.describe(before, mailRoutingRules));
         tfNewRuleKey.setText("");
         tfNewRuleFolder.setText("");
         refreshMailRoutingPreview();
-    }
-
-    /**
-     * Builds a "what actually changed" description for a mail-routing-rules
-     * save — same principle as the settings/credential/task diffs: list every
-     * field name whose folder was added, removed, or changed, instead of a
-     * bare rule count that tells an operator nothing about WHICH mapping
-     * changed. Matching is case-insensitive on the field-name key, mirroring
-     * the existing de-duplication logic in addMailRoutingRuleFromFields().
-     */
-    private String buildMailRoutingDiff(java.util.List<util.MailRoutingRule> before,
-                                        java.util.List<util.MailRoutingRule> after) {
-        Map<String, String> oldByKey = new LinkedHashMap<>();
-        for (util.MailRoutingRule r : before) oldByKey.put(r.getKey().toLowerCase(), r.getFolder());
-        Map<String, String> newByKey = new LinkedHashMap<>();
-        for (util.MailRoutingRule r : after) newByKey.put(r.getKey().toLowerCase(), r.getFolder());
-
-        java.util.List<String> changes = new java.util.ArrayList<>();
-        for (util.MailRoutingRule r : after) {
-            String key = r.getKey().toLowerCase();
-            if (!oldByKey.containsKey(key)) {
-                changes.add("added \"" + r.getKey() + "\" \u2192 \"" + r.getFolder() + "\"");
-            } else if (!oldByKey.get(key).equals(r.getFolder())) {
-                changes.add("\"" + r.getKey() + "\": \"" + oldByKey.get(key) + "\" \u2192 \"" + r.getFolder() + "\"");
-            }
-        }
-        for (util.MailRoutingRule r : before) {
-            String key = r.getKey().toLowerCase();
-            if (!newByKey.containsKey(key)) {
-                changes.add("removed \"" + r.getKey() + "\" (was \u2192 \"" + r.getFolder() + "\")");
-            }
-        }
-        return changes.isEmpty() ? "no changes (re-saved as-is)" : String.join("; ", changes);
     }
 
     private void refreshMailRoutingPreview() {
@@ -573,9 +456,7 @@ public class SettingsPanel extends JPanel {
         }
     }
 
-    /**
-     * Full editable list — add/delete rows, edit any cell — opened by clicking the preview table.
-     */
+    /** Full editable list — add/delete rows, edit any cell — opened by clicking the preview table. */
     private void openMailRoutingEditor() {
         DefaultTableModel model = new DefaultTableModel(new Object[]{"Field Name", "Folder Name"}, 0);
         for (util.MailRoutingRule r : mailRoutingRules) {
@@ -674,7 +555,7 @@ public class SettingsPanel extends JPanel {
                 return;
             }
             logActivity("Settings saved", "Mail routing rules updated — "
-                    + buildMailRoutingDiff(mailRoutingRules, updated));
+                    + util.MailRoutingChanges.describe(mailRoutingRules, updated));
             refreshMailRoutingPreview();
             dlg.dispose();
         });
@@ -682,8 +563,14 @@ public class SettingsPanel extends JPanel {
         dlg.setVisible(true);
     }
 
-    // ── Daemon management ────────────────────────────────────────────────────
-
+    /**
+     * Plain section heading — bold label with generous top/bottom breathing
+     * room, no box or line border around the section beneath it. Replaces
+     * this panel's previous {@code TitledBorder} boxes: a relaxed,
+     * whitespace-separated layout consistently reads clearer than a page of
+     * bordered boxes, and it's what {@code TaskManagerPanel}'s own redesign
+     * moved to as well (a "?" tooltip instead of a boxed legend panel).
+     */
     /**
      * Wraps one settings section in a consistent card: a subtly bordered,
      * padded panel with a bold title row, replacing the old flat
@@ -707,16 +594,35 @@ public class SettingsPanel extends JPanel {
     }
 
     private int addFieldRow(JPanel panel, GridBagConstraints lc, GridBagConstraints fc, String label, JComponent field, int row) {
-        lc.gridx = 0;
-        lc.gridy = row;
-        fc.gridx = 1;
-        fc.gridy = row;
-        fc.gridwidth = 2;
+        lc.gridx = 0; lc.gridy = row;
+        fc.gridx = 1; fc.gridy = row; fc.gridwidth = 2;
         panel.add(new JLabel(label), lc);
         panel.add(field, fc);
         fc.gridwidth = 1;
         return row + 1;
     }
+
+    /**
+     * Resolves the same real dataDir that MainWindow, Daemon, and AppSettings
+     * all use — app-config.xml's &lt;dataDir&gt;, falling back to
+     * {@code C:\OpsTools\Data} if that can't be read. Used only to display
+     * accurate paths in the "Application Info" section below; previously this
+     * section hardcoded {@code %USERPROFILE%\.opstool} regardless of what
+     * was actually configured, which could point users at the wrong folder
+     * entirely when looking for tasks.xml, daemon.log, or app-settings.json.
+     */
+    private static String resolveActualDataDir() {
+        String val = util.AppConfig.readValue("dataDir");
+        return (val != null && !val.isEmpty()) ? val : "C:\\OpsTools\\Data";
+    }
+
+    /** Mirrors Daemon.daemonLogFileName() — see note in openDaemonLog(). */
+    private static String resolveDaemonLogFileName() {
+        String name = util.AppConfig.readValue("daemonLogFile");
+        return (name != null && !name.trim().isEmpty()) ? name.trim() : "daemon.log";
+    }
+
+    // ── Daemon management ────────────────────────────────────────────────────
 
     /**
      * Installs the daemon as a Windows Service by invoking
@@ -734,7 +640,7 @@ public class SettingsPanel extends JPanel {
         String jarPath = getJarPath();
         if (jarPath == null) {
             showError("Cannot locate the daemon jar.\n"
-                    + "Please run this from the installed location (C:\\OpsTools).");
+                + "Please run this from the installed location (C:\\OpsTools).");
             return;
         }
         File installDir = new File(jarPath).getParentFile();
@@ -745,14 +651,14 @@ public class SettingsPanel extends JPanel {
 
         if (!winswExe.exists()) {
             showError("daemon-service.exe (WinSW) not found in " + installDir + ".\n\n"
-                    + "Download WinSW-x64.exe from https://github.com/winsw/winsw/releases,\n"
-                    + "rename it to 'daemon-service.exe', and place it in:\n" + installDir + "\n\n"
-                    + "Then click Install Service again.");
+                + "Download WinSW-x64.exe from https://github.com/winsw/winsw/releases,\n"
+                + "rename it to 'daemon-service.exe', and place it in:\n" + installDir + "\n\n"
+                + "Then click Install Service again.");
             return;
         }
         if (!installScript.exists()) {
             showError("install-service.ps1 not found next to the daemon jar.\n"
-                    + "Re-run setup.ps1, or place packaging\\install-service.ps1 in:\n" + installDir);
+                + "Re-run setup.ps1, or place packaging\\install-service.ps1 in:\n" + installDir);
             return;
         }
 
@@ -761,56 +667,48 @@ public class SettingsPanel extends JPanel {
         // actually lives — that's app-config.xml's <dataDir>. Use the same
         // real dataDir everywhere.
         String dataDir = resolveActualDataDir();
-        String script = util.Scripts.compact("daemon/install-daemon.ps1",
-                "INSTALL_SCRIPT", installScript.getAbsolutePath(), "INSTALL_DIR", installDir.getAbsolutePath(),
-                "DATA_DIR", dataDir, "WINSW", winswExe.getAbsolutePath(), "JAR", jarPath);
+        String script = WindowsDaemonService.installScript(installScript, installDir, dataDir, winswExe, jarPath);
 
         // UAC prompt + install script can take a long time: never on the EDT.
         runDaemonAction("Install daemon service", job -> {
             int rc = runElevatedPowerShell(script, "Install daemon service");
-            try {
-                Thread.sleep(1500);
-            } catch (InterruptedException ignored) {
-            }
+            try { Thread.sleep(1500); } catch (InterruptedException ignored) {}
             boolean exists = serviceExists();
             if (!exists) job.fail("service not found after install (elevated exit code " + rc + ")");
             SwingUtilities.invokeLater(() -> {
                 if (exists) {
                     showInfo("Daemon service installed and started.\n\n"
-                            + "Service name: " + SERVICE_NAME + "\n\n"
-                            + "It now runs continuously in the background, independent of this window,\n"
-                            + "and restarts automatically if it crashes (see the service's Recovery tab\n"
-                            + "in services.msc).");
+                        + "Service name: " + SERVICE_NAME + "\n\n"
+                        + "It now runs continuously in the background, independent of this window,\n"
+                        + "and restarts automatically if it crashes (see the service's Recovery tab\n"
+                        + "in services.msc).");
                 } else {
                     showError("Service installation may have failed (elevated process exit code " + rc + ").\n"
-                            + "Check services.msc for '" + SERVICE_NAME + "', or re-run install-service.ps1 manually.\n"
-                            + "Make sure you clicked Yes on the UAC prompt.");
+                        + "Check services.msc for '" + SERVICE_NAME + "', or re-run install-service.ps1 manually.\n"
+                        + "Make sure you clicked Yes on the UAC prompt.");
                 }
                 refreshDaemonStatus();
             });
         });
     }
 
-    /**
-     * Runs a slow service action on a background thread; ignores clicks while one is already running.
-     */
+    private final java.util.concurrent.atomic.AtomicBoolean daemonActionRunning =
+            new java.util.concurrent.atomic.AtomicBoolean();
+
+    /** Runs a slow service action on a background thread; ignores clicks while one is already running. */
     private void runDaemonAction(String name, java.util.function.Consumer<BackgroundJobs.Job> work) {
         if (!daemonActionRunning.compareAndSet(false, true)) return;
         // Audited: the Event Monitor records when this started, how long it took and whether it failed.
         Async.runJob(name, true, job -> {
-            try {
-                work.accept(job);
-            } finally {
-                daemonActionRunning.set(false);
-            }
+            try { work.accept(job); } finally { daemonActionRunning.set(false); }
         });
     }
 
     private void removeDaemon() {
         int choice = JOptionPane.showConfirmDialog(this,
-                "Uninstall the daemon service?\n"
-                        + "Scheduled tasks will only run while this window is open.",
-                "Confirm Uninstall", JOptionPane.YES_NO_OPTION);
+            "Uninstall the daemon service?\n"
+            + "Scheduled tasks will only run while this window is open.",
+            "Confirm Uninstall", JOptionPane.YES_NO_OPTION);
         if (choice != JOptionPane.YES_OPTION) return;
 
         String jarPath = getJarPath();
@@ -818,12 +716,12 @@ public class SettingsPanel extends JPanel {
         File winswExe = new File(installDir, "daemon-service.exe");
         if (!winswExe.exists()) {
             showError("daemon-service.exe not found in " + installDir + " — cannot uninstall the service from here.\n"
-                    + "Remove it manually via services.msc, or run:\n"
-                    + "  sc.exe delete " + SERVICE_NAME);
+                + "Remove it manually via services.msc, or run:\n"
+                + "  sc.exe delete " + SERVICE_NAME);
             return;
         }
 
-        String script = util.Scripts.compact("daemon/uninstall-daemon.ps1", "WINSW", winswExe.getAbsolutePath());
+        String script = WindowsDaemonService.uninstallScript(winswExe);
         runDaemonAction("Uninstall daemon service", job -> {
             int rc = runElevatedPowerShell(script, "Uninstall daemon service");
             boolean removed = rc == 0 && !serviceExists();
@@ -833,8 +731,8 @@ public class SettingsPanel extends JPanel {
                     showInfo("Daemon service uninstalled.\nScheduled tasks will only run while this window is open.");
                 else
                     showError("Uninstall may have failed (exit code " + rc + ").\n"
-                            + "You can also remove it manually:\n"
-                            + "  services.msc \u2192 " + SERVICE_NAME + ", or: sc.exe delete " + SERVICE_NAME);
+                        + "You can also remove it manually:\n"
+                        + "  services.msc \u2192 " + SERVICE_NAME + ", or: sc.exe delete " + SERVICE_NAME);
                 refreshDaemonStatus();
             });
         });
@@ -847,7 +745,7 @@ public class SettingsPanel extends JPanel {
         // action here is simply making sure it's started if it was stopped.
         runDaemonAction("Start daemon service", job -> {
             try {
-                int rc = runElevatedPowerShell(util.Scripts.compact("daemon/start-service.ps1", "SERVICE", SERVICE_NAME), "Start daemon service");
+                int rc = runElevatedPowerShell(WindowsDaemonService.startScript(), "Start daemon service");
                 if (rc != 0) job.fail("elevated exit code " + rc);
                 Thread.sleep(500);
                 SwingUtilities.invokeLater(() -> {
@@ -855,7 +753,7 @@ public class SettingsPanel extends JPanel {
                         showInfo("Daemon service started.\nCheck the daemon log for details.");
                     } else {
                         showError("Failed to start the service (exit code " + rc + ").\n"
-                                + "Make sure it's installed first (Install Service button above).");
+                            + "Make sure it's installed first (Install Service button above).");
                     }
                     refreshDaemonStatus();
                 });
@@ -866,57 +764,18 @@ public class SettingsPanel extends JPanel {
         });
     }
 
-    /**
-     * Runs a PowerShell script elevated (triggers a UAC prompt) and waits
-     * for it to finish. The script reaches the elevated process via
-     * {@code -EncodedCommand} — a base64 blob of its UTF-16LE bytes —
-     * instead of as literal text threaded through several layers of shell
-     * quoting. Base64 contains none of {@code ' " \} or whitespace, so
-     * there is nothing left for any layer to misinterpret.
-     *
-     * @return the elevated process's exit code, or -1 if it couldn't even be launched
-     */
+    /** Runs a script elevated; on failure to launch it tells the person and returns -1. */
     private int runElevatedPowerShell(String script, String description) {
         try {
-            String encoded = Base64.getEncoder().encodeToString(script.getBytes(StandardCharsets.UTF_16LE));
-            String launcher = util.Scripts.oneLine("daemon/run-elevated.ps1", "ENCODED", encoded);
-            Process p = new ProcessBuilder(
-                    "powershell.exe", "-NonInteractive", "-NoProfile", "-Command", launcher)
-                    .redirectErrorStream(true)
-                    .start();
-            try (BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
-                while (br.readLine() != null) { /* drain — the elevated child's own stdout isn't visible to us anyway */ }
-            }
-            return p.waitFor();
+            return WindowsDaemonService.runElevated(script);
         } catch (Exception e) {
             SwingUtilities.invokeLater(() -> showError(description + " failed: " + e.getMessage()));
             return -1;
         }
     }
 
-    /**
-     * Queries the Windows Service Control Manager for SERVICE_NAME's
-     * current status (e.g. "Running", "Stopped") via Get-Service. This
-     * needs no elevation, unlike install/uninstall/start.
-     *
-     * @return the service's Status string, or null if it isn't installed at all
-     */
     private String queryServiceStatus() {
-        try {
-            Process p = new ProcessBuilder(
-                    "powershell.exe", "-NonInteractive", "-NoProfile", "-Command",
-                    util.Scripts.oneLine("daemon/query-service.ps1", "SERVICE", SERVICE_NAME))
-                    .redirectErrorStream(true)
-                    .start();
-            String line;
-            try (BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
-                line = br.readLine();
-            }
-            p.waitFor();
-            return (line == null || line.isBlank()) ? null : line.trim();
-        } catch (Exception e) {
-            return null;
-        }
+        return WindowsDaemonService.queryStatus();
     }
 
     private boolean serviceExists() {
@@ -928,7 +787,6 @@ public class SettingsPanel extends JPanel {
             protected String doInBackground() {
                 return queryServiceStatus();
             }
-
             protected void done() {
                 try {
                     String status = get();
@@ -938,7 +796,7 @@ public class SettingsPanel extends JPanel {
                     } else {
                         lblDaemonStatus.setText(status);
                         lblDaemonStatus.setForeground(
-                                status.equalsIgnoreCase("Running") ? AppTheme.EARTH_MOSS : new Color(0xF57C00));
+                            status.equalsIgnoreCase("Running") ? AppTheme.EARTH_MOSS : new Color(0xF57C00));
                     }
                 } catch (Exception e) {
                     lblDaemonStatus.setText("Error checking status");
@@ -956,20 +814,11 @@ public class SettingsPanel extends JPanel {
         // in the default package and can't be imported from here, so this
         // mirrors its daemonLogFileName() lookup directly — same as
         // resolveActualDataDir() already mirrors Daemon's dataDir lookup.)
-        File dataFolder = new File(resolveActualDataDir());
-        String custom = util.AppConfig.readValue("daemonLogFile");
-        String logPath;
-        if (custom != null && !custom.trim().isEmpty()) {
-            logPath = new File(custom.trim()).isAbsolute() ? custom.trim() : service.LogFiles.file(dataFolder, custom.trim()).getPath();
-        } else {
-            // the service wrapper writes the daemon's output here
-            File[] outs = new File(dataFolder, "logs").listFiles((d, n) -> n.endsWith(".out.log"));
-            logPath = outs != null && outs.length > 0 ? outs[0].getPath() : new File(new File(dataFolder, "logs"), "daemon-service.out.log").getPath();
-        }
+        String logPath = resolveActualDataDir() + File.separator + resolveDaemonLogFileName();
         File logFile = new File(logPath);
         if (!logFile.exists()) {
             showInfo("No daemon log found yet.\nExpected: " + logPath
-                    + "\n\nThe log is created when the daemon runs for the first time.");
+                + "\n\nThe log is created when the daemon runs for the first time.");
             return;
         }
         try {
@@ -993,7 +842,7 @@ public class SettingsPanel extends JPanel {
     private String getJarPath() {
         try {
             String path = getClass().getProtectionDomain()
-                    .getCodeSource().getLocation().toURI().getPath();
+                .getCodeSource().getLocation().toURI().getPath();
             if (path.startsWith("/") && path.length() > 2 && path.charAt(2) == ':')
                 path = path.substring(1);
             path = path.replace("/", "\\");
@@ -1009,9 +858,9 @@ public class SettingsPanel extends JPanel {
         String appData = System.getenv("APPDATA");
         if (appData == null || appData.isEmpty()) return null;
         return new File(appData + File.separator + "Microsoft" + File.separator
-                + "Windows" + File.separator + "Start Menu" + File.separator
-                + "Programs" + File.separator + "Startup" + File.separator
-                + TASK_NAME + "Startup.cmd");
+            + "Windows" + File.separator + "Start Menu" + File.separator
+            + "Programs" + File.separator + "Startup" + File.separator
+            + TASK_NAME + "Startup.cmd");
     }
 
     private boolean createStartupFallback(String jarPath, String dataDir) {
@@ -1020,10 +869,10 @@ public class SettingsPanel extends JPanel {
         try {
             fallback.getParentFile().mkdirs();
             String content = "@echo off\r\n"
-                    + "set \"JAVA_EXE=" + getJavaExe() + "\"\r\n"
-                    + "set \"JAR_PATH=" + jarPath + "\"\r\n"
-                    + "set \"DATA_DIR=" + dataDir + "\"\r\n"
-                    + "start \"" + TASK_NAME + "\" /MIN %JAVA_EXE% -cp %JAR_PATH% com.opstool.Daemon \"%DATA_DIR%\"\r\n";
+                + "set \"JAVA_EXE=" + getJavaExe() + "\"\r\n"
+                + "set \"JAR_PATH=" + jarPath + "\"\r\n"
+                + "set \"DATA_DIR=" + dataDir + "\"\r\n"
+                + "start \"" + TASK_NAME + "\" /MIN %JAVA_EXE% -cp %JAR_PATH% com.opstool.Daemon \"%DATA_DIR%\"\r\n";
             try (FileWriter fw = new FileWriter(fallback)) {
                 fw.write(content);
             }
@@ -1051,16 +900,11 @@ public class SettingsPanel extends JPanel {
 
     private void addInfoRow(JPanel p, String label, String value, int row) {
         GridBagConstraints lc = new GridBagConstraints();
-        lc.gridx = 0;
-        lc.gridy = row;
-        lc.anchor = GridBagConstraints.WEST;
+        lc.gridx = 0; lc.gridy = row; lc.anchor = GridBagConstraints.WEST;
         lc.insets = new Insets(3, 4, 3, 10);
         GridBagConstraints vc = new GridBagConstraints();
-        vc.gridx = 1;
-        vc.gridy = row;
-        vc.fill = GridBagConstraints.HORIZONTAL;
-        vc.weightx = 1;
-        vc.insets = new Insets(3, 0, 3, 4);
+        vc.gridx = 1; vc.gridy = row; vc.fill = GridBagConstraints.HORIZONTAL;
+        vc.weightx = 1; vc.insets = new Insets(3, 0, 3, 4);
         JTextField tf = new JTextField(value);
         tf.setEditable(false);
         tf.setBackground(AppTheme.isDark() ? new Color(0x3A3A3A) : new Color(0xF5F5F5));
@@ -1111,32 +955,12 @@ public class SettingsPanel extends JPanel {
     }
 
     /**
-     * Builds a field-level "what actually changed" description for the event
-     * feed — the "need max information so it's easy for the end user" ask.
-     * A generic "Application settings updated" told an operator nothing
-     * about WHAT changed; this lists every key whose value actually differs,
-     * as "Label: old → new", so the incident is legible from the feed alone
-     * without having to go compare configs by hand.
+     * Records an application-activity note (settings saved) into the Event
+     * Monitor's activity feed — see
+     * {@link RunHistory#recordActivityEvent}. No-op if this
+     * panel was constructed without a scheduler reference (see the
+     * single-arg constructor's javadoc).
      */
-    private String buildSettingsChangeDetail(Map<String, String> oldValues, Map<String, String> newValues) {
-        java.util.List<String> changes = new java.util.ArrayList<>();
-        for (String key : newValues.keySet()) {
-            String oldVal = oldValues.get(key);
-            String newVal = newValues.get(key);
-            boolean oldBlank = oldVal == null || oldVal.isEmpty();
-            boolean newBlank = newVal == null || newVal.isEmpty();
-            if (oldBlank && newBlank) continue;
-            if (!oldBlank && !newBlank && oldVal.equals(newVal)) continue;
-            String label = SETTING_LABELS.getOrDefault(key, key);
-            changes.add(label + ": " + (oldBlank ? "(not set)" : oldVal) + " \u2192 "
-                    + (newBlank ? "(not set)" : newVal));
-        }
-        if (changes.isEmpty()) {
-            return "Application settings re-saved with no changes.";
-        }
-        return "Application settings updated — " + String.join("; ", changes) + ".";
-    }
-
     private void logActivity(String title, String detail) {
         if (scheduler == null) return;
         // Audit writes go through a single background thread (in order) so a busy
@@ -1151,10 +975,8 @@ public class SettingsPanel extends JPanel {
         });
     }
 
-    /**
-     * Same as {@link #logActivity} but marks the event FAILED, so it renders
-     * as a failure (red, "Failed: ...") in the feed instead of a neutral note.
-     */
+    /** Same as {@link #logActivity} but marks the event FAILED, so it renders
+     *  as a failure (red, "Failed: ...") in the feed instead of a neutral note. */
     private void logActivityFailed(String title, String detail) {
         if (scheduler == null) return;
         // Audit writes go through a single background thread (in order) so a busy
@@ -1191,15 +1013,13 @@ public class SettingsPanel extends JPanel {
                     String.valueOf((Integer) spinnerBatchThroughputMBps.getValue()));
             live.put(AppSettings.KEY_TRANSFER_BATCH_INTERVAL_SECONDS,
                     String.valueOf((Integer) spinnerBatchIntervalSeconds.getValue()));
-            String maxBytesOverride = tfBatchMaxBytesOverride.getText().trim();
-            try {
-                long parsed = maxBytesOverride.isEmpty() ? 0 : Long.parseLong(maxBytesOverride);
-                live.put(AppSettings.KEY_TRANSFER_BATCH_MAX_BYTES, String.valueOf(Math.max(parsed, 0)));
-            } catch (NumberFormatException nfe) {
+            Long maxBytes = service.SettingsInput.parseBatchMaxBytes(tfBatchMaxBytesOverride.getText());
+            if (maxBytes == null) {
                 lblStatus.setText("Batch size override must be a whole number of bytes.");
                 lblStatus.setForeground(Color.RED);
                 return;
             }
+            live.put(AppSettings.KEY_TRANSFER_BATCH_MAX_BYTES, String.valueOf(maxBytes));
             live.put(AppSettings.KEY_TRANSFER_BATCH_CONCURRENCY,
                     String.valueOf((Integer) spinnerBatchConcurrency.getValue()));
             live.put(AppSettings.KEY_WATCHER_FILES_PER_WORKER_THREAD,
@@ -1225,16 +1045,14 @@ public class SettingsPanel extends JPanel {
                 // success, meaning the change looked like it took effect in this
                 // process but vanished on restart and was invisible to the
                 // Daemon's separate connection).
-                String detail = AppSettings.getConnectionError();
-                logActivityFailed("Settings save failed",
-                        "Could not save application settings — database not connected"
-                                + (detail != null ? ": " + detail : "."));
-                lblStatus.setText("Could not save settings — the database is not connected"
-                        + (detail != null ? (": " + detail) : ".") + " Your changes were NOT saved.");
+                service.SaveFailureText.Failure fail =
+                        service.SaveFailureText.settingsNotConnected(AppSettings.getConnectionError());
+                logActivityFailed("Settings save failed", fail.activityDetail);
+                lblStatus.setText(fail.userMessage);
                 lblStatus.setForeground(Color.RED);
                 return;
             }
-            logActivity("Settings saved", buildSettingsChangeDetail(oldValues, live));
+            logActivity("Settings saved", service.SettingsChangeDescriber.describe(oldValues, live));
         } catch (Exception ex) {
             logActivityFailed("Settings save failed", "Could not save live settings: " + ex.getMessage());
             lblStatus.setText("Could not save live settings: " + ex.getMessage());
@@ -1250,12 +1068,10 @@ public class SettingsPanel extends JPanel {
             // path at all, even when it was the only thing actually changed).
             String oldWinScpPath = AppSettings.get(AppSettings.KEY_WINSCP_PATH);
             if (!AppSettings.set(AppSettings.KEY_WINSCP_PATH, path)) {
-                String detail = AppSettings.getConnectionError();
-                logActivityFailed("Settings save failed",
-                        "Could not save WinSCP path — database not connected"
-                                + (detail != null ? ": " + detail : "."));
-                lblStatus.setText("Could not save the WinSCP path — the database is not connected"
-                        + (detail != null ? (": " + detail) : "."));
+                service.SaveFailureText.Failure fail =
+                        service.SaveFailureText.winScpPathNotConnected(AppSettings.getConnectionError());
+                logActivityFailed("Settings save failed", fail.activityDetail);
+                lblStatus.setText(fail.userMessage);
                 lblStatus.setForeground(Color.RED);
                 return;
             }
@@ -1300,7 +1116,7 @@ public class SettingsPanel extends JPanel {
         // (always-empty) in-memory state.
         java.io.File dataDir = scheduler.getStorage() != null ? scheduler.getStorage().getDataDir() : null;
         if (dataDir == null) return;
-        java.nio.file.Path daemonStatusFile = dataDir.toPath().resolve("scheduler-status-daemon.dat");
+        java.nio.file.Path daemonStatusFile = service.AppFolder.at(dataDir).daemonStatusFile();
         service.queue.SchedulerStatusSnapshot snapshot = service.queue.SchedulerStatusSnapshot.read(daemonStatusFile);
         if (snapshot == null || !snapshot.isFresh(service.queue.SchedulerStatusSnapshot.DEFAULT_STALE_MS)) return;
         java.util.List<String> runningIds = snapshot.getRunningTaskIds();
@@ -1310,16 +1126,12 @@ public class SettingsPanel extends JPanel {
         StringBuilder names = new StringBuilder();
         try {
             allTasks = scheduler.getStorage() != null ? scheduler.getStorage().loadTasks() : null;
-        } catch (Exception ignored) {
-        }
+        } catch (Exception ignored) {}
         for (String id : runningIds) {
             String display = id;
             if (allTasks != null) {
                 for (model.ScheduledTask t : allTasks) {
-                    if (t.getId().equals(id)) {
-                        display = t.getName();
-                        break;
-                    }
+                    if (t.getId().equals(id)) { display = t.getName(); break; }
                 }
             }
             if (names.length() > 0) names.append(", ");
@@ -1327,36 +1139,28 @@ public class SettingsPanel extends JPanel {
         }
 
         int choice = JOptionPane.showConfirmDialog(this,
-                "Log level changed from " + previousLevel + " to " + newLevel + ".\n\n"
-                        + "The following task(s) are currently running and already have log lines\n"
-                        + "written under the old level: " + names + "\n\n"
-                        + "Restart them now so their log is generated entirely at the new " + newLevel + " level?\n"
-                        + "(Their current run will be cancelled and immediately re-run from the start.)",
-                "Restart running tasks to apply new log level?",
-                JOptionPane.YES_NO_OPTION, JOptionPane.QUESTION_MESSAGE);
+            "Log level changed from " + previousLevel + " to " + newLevel + ".\n\n"
+            + "The following task(s) are currently running and already have log lines\n"
+            + "written under the old level: " + names + "\n\n"
+            + "Restart them now so their log is generated entirely at the new " + newLevel + " level?\n"
+            + "(Their current run will be cancelled and immediately re-run from the start.)",
+            "Restart running tasks to apply new log level?",
+            JOptionPane.YES_NO_OPTION, JOptionPane.QUESTION_MESSAGE);
 
         if (choice == JOptionPane.YES_OPTION) {
             for (String id : runningIds) {
-                service.CommandQueueService.enqueue(scheduler.getStorage().getDataDir(), id,
-                        service.CommandQueueService.Action.RESTART, "gui");
+                service.AppFolder.of(scheduler.getStorage()).sendCommand(id, persistence.CommandQueue.Action.RESTART);
             }
             lblStatus.setText("✓  Settings saved. Restarted " + runningIds.size() + " running task(s) for the new log level.");
             lblStatus.setForeground(AppTheme.EARTH_MOSS);
         }
     }
 
-    private void showInfo(String msg) {
-        JOptionPane.showMessageDialog(this, msg, "Info", JOptionPane.INFORMATION_MESSAGE);
-    }
-
-    private void showError(String msg) {
-        JOptionPane.showMessageDialog(this, msg, "Error", JOptionPane.ERROR_MESSAGE);
-    }
+    private void showInfo(String msg)  { JOptionPane.showMessageDialog(this, msg, "Info",  JOptionPane.INFORMATION_MESSAGE); }
+    private void showError(String msg) { JOptionPane.showMessageDialog(this, msg, "Error", JOptionPane.ERROR_MESSAGE); }
 
     private void styleBtn(JButton b, Color bg) {
-        b.setBackground(bg);
-        b.setForeground(Color.WHITE);
-        b.setFocusPainted(false);
-        b.setBorderPainted(false);
+        b.setBackground(bg); b.setForeground(Color.WHITE);
+        b.setFocusPainted(false); b.setBorderPainted(false);
     }
 }

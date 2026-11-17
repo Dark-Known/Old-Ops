@@ -20,9 +20,7 @@ final class LazyPanel<T extends JComponent> extends JPanel {
         this.wrapper = wrapper;
     }
 
-    /**
-     * Builds the page on first call; later calls return the same instance.
-     */
+    /** Builds the page on first call; later calls return the same instance. */
     T get() {
         if (page == null) {
             page = factory.get();
@@ -32,10 +30,6 @@ final class LazyPanel<T extends JComponent> extends JPanel {
         return page;
     }
 
-    /**
-     * The page if it has been built, else null (nothing to refresh yet).
-     */
-    T builtOrNull() {
-        return page;
-    }
+    /** The page if it has been built, else null (nothing to refresh yet). */
+    T builtOrNull() { return page; }
 }

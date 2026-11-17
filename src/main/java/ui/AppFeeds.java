@@ -2,7 +2,7 @@ package ui;
 
 import model.ScheduledTask;
 import service.DaemonStatusStream;
-import service.XmlStorageService;
+import persistence.AppStorage;
 import service.queue.SchedulerStatusSnapshot;
 
 import java.nio.file.Path;
@@ -14,11 +14,15 @@ import java.util.concurrent.ConcurrentHashMap;
  * snapshots instead of hitting disk / SQLite from Swing timers on the EDT.
  */
 public final class AppFeeds {
-    private static final ConcurrentHashMap<Path, DataFeed<Daemon>> DAEMON = new ConcurrentHashMap<>();
-    private static final ConcurrentHashMap<XmlStorageService, DataFeed<List<ScheduledTask>>> TASKS = new ConcurrentHashMap<>();
+    private AppFeeds() {}
 
-    private AppFeeds() {
+    /** Daemon liveness plus its last exported status (null snapshot when not alive). */
+    public record Daemon(boolean alive, SchedulerStatusSnapshot snapshot) {
+        public static final Daemon OFFLINE = new Daemon(false, null);
     }
+
+    private static final ConcurrentHashMap<Path, DataFeed<Daemon>> DAEMON = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<AppStorage, DataFeed<List<ScheduledTask>>> TASKS = new ConcurrentHashMap<>();
 
     /**
      * Daemon liveness plus status. Preferred source is the Daemon's push stream ({@link DaemonStatusStream}):
@@ -51,14 +55,7 @@ public final class AppFeeds {
                 ? new Daemon(true, snap) : Daemon.OFFLINE;
     }
 
-    public static DataFeed<List<ScheduledTask>> tasks(XmlStorageService storage) {
+    public static DataFeed<List<ScheduledTask>> tasks(AppStorage storage) {
         return TASKS.computeIfAbsent(storage, s -> new DataFeed<List<ScheduledTask>>(2000, s::loadTasksSnapshot).named("Task list feed"));
-    }
-
-    /**
-     * Daemon liveness plus its last exported status (null snapshot when not alive).
-     */
-    public record Daemon(boolean alive, SchedulerStatusSnapshot snapshot) {
-        public static final Daemon OFFLINE = new Daemon(false, null);
     }
 }

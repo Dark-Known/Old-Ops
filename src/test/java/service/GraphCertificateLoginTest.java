@@ -1,9 +1,12 @@
 package service;
 
+import static org.junit.Assert.*;
+
 import com.sun.net.httpserver.HttpServer;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
+import java.io.File;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.URLDecoder;
@@ -13,21 +16,14 @@ import java.nio.file.Path;
 import java.security.KeyStore;
 import java.security.Signature;
 import java.security.cert.X509Certificate;
-import java.util.Base64;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.util.concurrent.CopyOnWriteArrayList;
 
-import static org.junit.Assert.*;
-
-/**
- * Uses a throw-away self-signed certificate (keytool) and fake local Microsoft endpoints.
- */
+/** Uses a throw-away self-signed certificate (keytool) and fake local Microsoft endpoints. */
 public class GraphCertificateLoginTest {
 
-    private static final char[] PW = "test-pw".toCharArray();
     private static Path pfx;
+    private static final char[] PW = "test-pw".toCharArray();
 
     @BeforeClass
     public static void makeCertificate() throws Exception {
@@ -54,9 +50,7 @@ public class GraphCertificateLoginTest {
         List<Map<String, String>> requests = new CopyOnWriteArrayList<>();
         List<String> verdicts = new CopyOnWriteArrayList<>();
         KeyStore ks = KeyStore.getInstance("PKCS12");
-        try (var in = Files.newInputStream(pfx)) {
-            ks.load(in, PW);
-        }
+        try (var in = Files.newInputStream(pfx)) { ks.load(in, PW); }
         X509Certificate cert = (X509Certificate) ks.getCertificate("t");
 
         HttpServer fake = HttpServer.create(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 0);
@@ -71,9 +65,7 @@ public class GraphCertificateLoginTest {
                 boolean ok = sig.verify(Base64.getUrlDecoder().decode(parts[2]));
                 verdicts.add(ok + "|" + new String(Base64.getUrlDecoder().decode(parts[0]), StandardCharsets.UTF_8)
                         + "|" + new String(Base64.getUrlDecoder().decode(parts[1]), StandardCharsets.UTF_8) + "|" + ex.getRequestURI());
-            } catch (Exception e) {
-                verdicts.add("error " + e);
-            }
+            } catch (Exception e) { verdicts.add("error " + e); }
             byte[] out = "{\"access_token\":\"APP-TOKEN\",\"expires_in\":3600}".getBytes(StandardCharsets.UTF_8);
             ex.sendResponseHeaders(200, out.length);
             ex.getResponseBody().write(out);
@@ -158,8 +150,7 @@ public class GraphCertificateLoginTest {
             base.setGraphBaseForTesting("http://127.0.0.1:" + fake.getAddress().getPort());
             GraphMailService app = base.forMailbox("ops@contoso.com");
             assertEquals("/users/ops%40contoso.com", app.userPath());
-            app.fetchMessages("APP-TOKEN", "INBOX", "UNSEEN", util.MailFetchMode.BODY_ONLY, 5, 0, l -> {
-            });
+            app.fetchMessages("APP-TOKEN", "INBOX", "UNSEEN", util.MailFetchMode.BODY_ONLY, 5, 0, l -> { });
             assertFalse(paths.isEmpty());
             for (String p : paths) assertTrue(p, p.startsWith("/users/ops%40contoso.com/"));
             for (String a : auth) assertEquals("Bearer APP-TOKEN", a);

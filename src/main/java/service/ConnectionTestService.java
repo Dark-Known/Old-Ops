@@ -1,10 +1,9 @@
 package service;
 
-import com.jcraft.jsch.ChannelSftp;
-import com.jcraft.jsch.JSch;
-import com.jcraft.jsch.Session;
+import service.sftp.ConnectOptions;
+import service.sftp.JschSftpClient;
+import service.sftp.SftpClient;
 
-import java.util.Properties;
 
 /**
  * Verifies a set of target-system credentials by actually opening a JSch
@@ -19,10 +18,23 @@ import java.util.Properties;
  */
 public final class ConnectionTestService {
 
+    private ConnectionTestService() {}
+
     private static final int DEFAULT_PORT = 22;
     private static final int CONNECT_TIMEOUT_MS = 8_000;
     private static final int CHANNEL_TIMEOUT_MS = 6_000;
-    private ConnectionTestService() {
+
+    /** Outcome of a single test attempt. */
+    public static final class Result {
+        public final boolean success;
+        public final String message;
+        public final long elapsedMs;
+
+        public Result(boolean success, String message, long elapsedMs) {
+            this.success   = success;
+            this.message   = message;
+            this.elapsedMs = elapsedMs;
+        }
     }
 
     public static Result testSftp(String host, String username, String password) {
@@ -39,50 +51,39 @@ public final class ConnectionTestService {
             return new Result(false, "Username is required.", 0);
         }
 
-        Session session = null;
-        ChannelSftp channel = null;
+        SftpClient client = null;
         boolean opened = false;
         long openedAt = 0;
         try {
-            JSch jsch = new JSch();
-            session = jsch.getSession(username.trim(), host.trim(), port);
-            util.SshAuth.apply(jsch, session, password);
-
-            Properties config = new Properties();
-            config.put("StrictHostKeyChecking", "no");
-            session.setConfig(config);
-            util.SshHostKeys.apply(jsch, session);
-            session.connect(CONNECT_TIMEOUT_MS);
+            client = JschSftpClient.connect(host.trim(), username.trim(), password,
+                    ConnectOptions.of(port, CONNECT_TIMEOUT_MS, CHANNEL_TIMEOUT_MS));
             opened = true;
             openedAt = System.currentTimeMillis();
             SshSessionEvents.uiOpened("Test connection", host.trim(), username.trim());
 
-            channel = (ChannelSftp) session.openChannel("sftp");
-            channel.connect(CHANNEL_TIMEOUT_MS);
-            String home = channel.pwd();
+            String home = client.home();
 
             long elapsed = System.currentTimeMillis() - start;
             return new Result(true,
                     "Authenticated over SFTP. Home directory: " + home, elapsed);
 
         } catch (Exception ex) {
-            if (!opened)
-                SshSessionEvents.uiFailed("Test connection", host.trim(), username.trim(), describeFailure(ex));
+            if (!opened) SshSessionEvents.uiFailed("Test connection", host.trim(), username.trim(), describeFailure(ex));
             long elapsed = System.currentTimeMillis() - start;
             return new Result(false, describeFailure(ex), elapsed);
         } finally {
-            if (channel != null && channel.isConnected()) channel.disconnect();
-            if (session != null && session.isConnected()) session.disconnect();
+            if (client != null) client.close();
             if (opened) SshSessionEvents.uiClosed("Test connection", host.trim(), username.trim(),
                     System.currentTimeMillis() - openedAt);
         }
     }
 
-    /**
-     * Turns a raw JSch/IO exception into a short, human-readable reason.
-     */
-    private static String describeFailure(Exception ex) {
-        String raw = ex.getMessage() != null ? ex.getMessage() : ex.getClass().getSimpleName();
+    /** Turns a raw JSch/IO exception into a short, human-readable reason. */
+    static String describeFailure(Exception ex) {
+        // The client wraps the driver's error ("SFTP connect to h:22 failed: ..."); classify on the original reason,
+        // since the wrapper's own words would match "connect" for every failure.
+        Throwable reason = ex.getCause() != null ? ex.getCause() : ex;
+        String raw = reason.getMessage() != null ? reason.getMessage() : reason.getClass().getSimpleName();
         String lower = raw.toLowerCase();
 
         if (lower.contains("auth")) {
@@ -98,20 +99,5 @@ public final class ConnectionTestService {
             return "Could not reach host on port 22 — check firewall / SSH service status.";
         }
         return "Connection failed: " + raw;
-    }
-
-    /**
-     * Outcome of a single test attempt.
-     */
-    public static final class Result {
-        public final boolean success;
-        public final String message;
-        public final long elapsedMs;
-
-        public Result(boolean success, String message, long elapsedMs) {
-            this.success = success;
-            this.message = message;
-            this.elapsedMs = elapsedMs;
-        }
     }
 }

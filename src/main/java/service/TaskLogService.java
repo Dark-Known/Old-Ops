@@ -2,10 +2,9 @@ package service;
 
 import util.AppSettings;
 
-import java.io.File;
-import java.io.IOException;
-import java.io.PrintWriter;
+import java.io.*;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
@@ -19,18 +18,14 @@ import java.util.*;
  * keep folders unique even if two tasks share the same name, and renaming a
  * task later will simply start a new folder under the new name (old logs
  * stay where they were written).
- * <p>
+ * 
  * Latest log is always in task.log
  * Rotated logs are named task-YYYY-MM-DD-HHmmss.log
  */
 public class TaskLogService {
-
+    
     private static final DateTimeFormatter DT_FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
     private static final DateTimeFormatter FILE_FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd-HHmmss");
-    // Severity ordering for the app's DEBUG < INFO < WARN < ERROR levels
-    // (see util.AppSettings / the Settings panel). A message whose leading
-    // "[TAG]" ranks below the currently configured level is skipped.
-    private static final List<String> LEVEL_ORDER = List.of("DEBUG", "INFO", "WARN", "ERROR");
     // Was a hardcoded 5 MB, ignoring app-config.xml's <logging><maxLogSizeMB>
     // entirely (nothing in the codebase ever read it). Now reads
     // <logRotateMaxBytes>/<logRotateKeepFiles> — bytes rather than MB, since
@@ -41,9 +36,15 @@ public class TaskLogService {
     // line written.
     private final long maxLogSizeBytes;
     private final int keepArchiveCount;
+
+    // Severity ordering for the app's DEBUG < INFO < WARN < ERROR levels
+    // (see util.AppSettings / the Settings panel). A message whose leading
+    // "[TAG]" ranks below the currently configured level is skipped.
+    private static final List<String> LEVEL_ORDER = List.of("DEBUG", "INFO", "WARN", "ERROR");
+
     private final File logsDir;
     private final Map<String, PrintWriter> openWriters = new HashMap<>();
-
+    
     public TaskLogService(String dataDir) {
         this.logsDir = new File(dataDir, "logs");
         this.logsDir.mkdirs();
@@ -60,35 +61,21 @@ public class TaskLogService {
     public static long configuredMaxBytes() {
         String bytes = util.AppConfig.readValue("logRotateMaxBytes");
         if (bytes != null) {
-            try {
-                long v = Long.parseLong(bytes.trim());
-                if (v > 0) return v;
-            } catch (NumberFormatException ignored) {
-            }
+            try { long v = Long.parseLong(bytes.trim()); if (v > 0) return v; } catch (NumberFormatException ignored) { }
         }
         String mb = util.AppConfig.readValue("maxLogSizeMB");
         if (mb != null) {
-            try {
-                double v = Double.parseDouble(mb.trim());
-                if (v > 0) return (long) (v * 1024 * 1024);
-            } catch (NumberFormatException ignored) {
-            }
+            try { double v = Double.parseDouble(mb.trim()); if (v > 0) return (long) (v * 1024 * 1024); } catch (NumberFormatException ignored) { }
         }
         return 10L * 1024 * 1024;
     }
 
-    /**
-     * Rotated files kept per task: {@code <logRotateKeepFiles>}, then {@code <maxLogFiles>}, then 5.
-     */
+    /** Rotated files kept per task: {@code <logRotateKeepFiles>}, then {@code <maxLogFiles>}, then 5. */
     public static int configuredKeepCount() {
-        for (String key : new String[]{"logRotateKeepFiles", "maxLogFiles"}) {
+        for (String key : new String[] { "logRotateKeepFiles", "maxLogFiles" }) {
             String raw = util.AppConfig.readValue(key);
             if (raw == null) continue;
-            try {
-                int v = Integer.parseInt(raw.trim());
-                if (v > 0) return v;
-            } catch (NumberFormatException ignored) {
-            }
+            try { int v = Integer.parseInt(raw.trim()); if (v > 0) return v; } catch (NumberFormatException ignored) { }
         }
         return 5;
     }
@@ -113,69 +100,7 @@ public class TaskLogService {
         if (cleaned.length() > 60) cleaned = cleaned.substring(0, 60);
         return cleaned;
     }
-
-    /**
-     * Extracts the leading "[TAG]" (if any) and compares it against the configured level.
-     */
-    private static boolean meetsConfiguredLevel(String message) {
-        String configured = AppSettings.getLogLevel();
-        int configuredRank = LEVEL_ORDER.indexOf(configured);
-        if (configuredRank < 0) configuredRank = LEVEL_ORDER.indexOf("INFO"); // unknown value -> safe default
-
-        String tag = extractTag(message);
-        int msgRank = tag != null ? LEVEL_ORDER.indexOf(tag) : LEVEL_ORDER.indexOf("INFO");
-        if (msgRank < 0) msgRank = LEVEL_ORDER.indexOf("INFO");
-
-        return msgRank >= configuredRank;
-    }
-
-    private static String extractTag(String message) {
-        if (message == null || message.isEmpty() || message.charAt(0) != '[') return null;
-        int close = message.indexOf(']');
-        if (close <= 1) return null;
-        String tag = message.substring(1, close).trim().toUpperCase(Locale.ROOT);
-        return LEVEL_ORDER.contains(tag) ? tag : null;
-    }
-
-    /**
-     * Reads the last {@code max} lines of a file by scanning backwards from the end.
-     */
-    static List<String> tailLines(File f, int max) throws IOException {
-        if (max <= 0) return new ArrayList<>();
-        try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(f, "r")) {
-            long pos = raf.length();
-            java.util.ArrayDeque<byte[]> chunks = new java.util.ArrayDeque<>();
-            long newlines = 0;
-            final int CHUNK = 64 * 1024;
-            while (pos > 0 && newlines <= max) {
-                int n = (int) Math.min(CHUNK, pos);
-                pos -= n;
-                byte[] buf = new byte[n];
-                raf.seek(pos);
-                raf.readFully(buf);
-                for (byte b : buf) if (b == '\n') newlines++;
-                chunks.addFirst(buf);
-            }
-            int total = 0;
-            for (byte[] c : chunks) total += c.length;
-            byte[] all = new byte[total];
-            int off = 0;
-            for (byte[] c : chunks) {
-                System.arraycopy(c, 0, all, off, c.length);
-                off += c.length;
-            }
-            String text = new String(all, StandardCharsets.UTF_8); // malformed bytes become U+FFFD, never throw
-            List<String> lines = new ArrayList<>(java.util.Arrays.asList(text.split("\n", -1)));
-            if (!lines.isEmpty() && lines.get(lines.size() - 1).isEmpty()) lines.remove(lines.size() - 1);
-            if (pos > 0 && !lines.isEmpty()) lines.remove(0); // first line is a partial one
-            for (int i = 0; i < lines.size(); i++) {
-                String l = lines.get(i);
-                if (l.endsWith("\r")) lines.set(i, l.substring(0, l.length() - 1));
-            }
-            return lines.size() > max ? new ArrayList<>(lines.subList(lines.size() - max, lines.size())) : lines;
-        }
-    }
-
+    
     /**
      * Log a message for a specific task, filtered by the currently
      * configured log level (read fresh from {@link AppSettings} on every
@@ -194,9 +119,9 @@ public class TaskLogService {
         try {
             File taskDir = new File(logsDir, folderNameFor(taskId, taskName));
             taskDir.mkdirs();
-
+            
             File logFile = new File(taskDir, "task.log");
-
+            
             // Check if we need to rotate. BUG FIX: this rename used to be
             // attempted while openWriters still held an open PrintWriter on
             // the very file being renamed — on Windows that rename silently
@@ -216,8 +141,7 @@ public class TaskLogService {
                 String base = "task-" + LocalDateTime.now().format(FILE_FMT) + "-"
                         + String.format("%03d", System.currentTimeMillis() % 1000);
                 File rotatedFile = new File(taskDir, base + ".log");
-                for (int n = 1; rotatedFile.exists() && n < 1000; n++)
-                    rotatedFile = new File(taskDir, base + "-" + n + ".log");
+                for (int n = 1; rotatedFile.exists() && n < 1000; n++) rotatedFile = new File(taskDir, base + "-" + n + ".log");
                 if (logFile.renameTo(rotatedFile)) {
                     cleanupOldLogs(taskId, taskName, keepArchiveCount);
                 } else {
@@ -225,7 +149,7 @@ public class TaskLogService {
                             + " (rename returned false) — continuing to append to the current file.");
                 }
             }
-
+            
             // Append message with timestamp
             String line = "[" + LocalDateTime.now().format(DT_FMT) + "] " + message;
 
@@ -241,7 +165,7 @@ public class TaskLogService {
                     return null;
                 }
             });
-
+            
             if (pw != null) {
                 pw.println(line);
                 pw.flush();
@@ -251,6 +175,27 @@ public class TaskLogService {
         }
     }
 
+    /** Extracts the leading "[TAG]" (if any) and compares it against the configured level. */
+    private static boolean meetsConfiguredLevel(String message) {
+        String configured = AppSettings.getLogLevel();
+        int configuredRank = LEVEL_ORDER.indexOf(configured);
+        if (configuredRank < 0) configuredRank = LEVEL_ORDER.indexOf("INFO"); // unknown value -> safe default
+
+        String tag = extractTag(message);
+        int msgRank = tag != null ? LEVEL_ORDER.indexOf(tag) : LEVEL_ORDER.indexOf("INFO");
+        if (msgRank < 0) msgRank = LEVEL_ORDER.indexOf("INFO");
+
+        return msgRank >= configuredRank;
+    }
+
+    private static String extractTag(String message) {
+        if (message == null || message.isEmpty() || message.charAt(0) != '[') return null;
+        int close = message.indexOf(']');
+        if (close <= 1) return null;
+        String tag = message.substring(1, close).trim().toUpperCase(Locale.ROOT);
+        return LEVEL_ORDER.contains(tag) ? tag : null;
+    }
+    
     /**
      * Retrieve all log lines for a task from the current log file. Decoded leniently: one stray
      * byte (a log written by an older build in the platform charset) no longer makes the whole
@@ -267,9 +212,7 @@ public class TaskLogService {
         }
     }
 
-    /**
-     * The last N lines of the current log file only.
-     */
+    /** The last N lines of the current log file only. */
     public List<String> getTaskLogsLastN(String taskId, String taskName, int maxLines) {
         return getTaskLogsRecent(taskId, taskName, maxLines);
     }
@@ -311,6 +254,40 @@ public class TaskLogService {
         return cur.length() + ":" + cur.lastModified() + ":" + (all == null ? 0 : all.length);
     }
 
+    /** Reads the last {@code max} lines of a file by scanning backwards from the end. */
+    static List<String> tailLines(File f, int max) throws IOException {
+        if (max <= 0) return new ArrayList<>();
+        try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(f, "r")) {
+            long pos = raf.length();
+            java.util.ArrayDeque<byte[]> chunks = new java.util.ArrayDeque<>();
+            long newlines = 0;
+            final int CHUNK = 64 * 1024;
+            while (pos > 0 && newlines <= max) {
+                int n = (int) Math.min(CHUNK, pos);
+                pos -= n;
+                byte[] buf = new byte[n];
+                raf.seek(pos);
+                raf.readFully(buf);
+                for (byte b : buf) if (b == '\n') newlines++;
+                chunks.addFirst(buf);
+            }
+            int total = 0;
+            for (byte[] c : chunks) total += c.length;
+            byte[] all = new byte[total];
+            int off = 0;
+            for (byte[] c : chunks) { System.arraycopy(c, 0, all, off, c.length); off += c.length; }
+            String text = new String(all, StandardCharsets.UTF_8); // malformed bytes become U+FFFD, never throw
+            List<String> lines = new ArrayList<>(java.util.Arrays.asList(text.split("\n", -1)));
+            if (!lines.isEmpty() && lines.get(lines.size() - 1).isEmpty()) lines.remove(lines.size() - 1);
+            if (pos > 0 && !lines.isEmpty()) lines.remove(0); // first line is a partial one
+            for (int i = 0; i < lines.size(); i++) {
+                String l = lines.get(i);
+                if (l.endsWith("\r")) lines.set(i, l.substring(0, l.length() - 1));
+            }
+            return lines.size() > max ? new ArrayList<>(lines.subList(lines.size() - max, lines.size())) : lines;
+        }
+    }
+
     /**
      * Retrieve all rotated log files for a task (for archive/history).
      */
@@ -319,8 +296,8 @@ public class TaskLogService {
         try {
             File taskDir = new File(logsDir, folderNameFor(taskId, taskName));
             if (taskDir.exists()) {
-                File[] files = taskDir.listFiles((dir, name) ->
-                        name.startsWith("task-") && name.endsWith(".log") && !name.equals("task.log"));
+                File[] files = taskDir.listFiles((dir, name) -> 
+                    name.startsWith("task-") && name.endsWith(".log") && !name.equals("task.log"));
                 if (files != null) {
                     // Newest first. By name: the timestamp is in it, and unlike lastModified it survives
                     // several rotations in the same instant or a restored/copied file.
@@ -347,23 +324,18 @@ public class TaskLogService {
         } catch (Exception ignored) {
         }
     }
-
+    
     /**
      * Close all open writers (call on shutdown).
      */
     public synchronized void closeAll() {
         for (PrintWriter pw : openWriters.values()) {
-            try {
-                pw.close();
-            } catch (Exception ignored) {
-            }
+            try { pw.close(); } catch (Exception ignored) {}
         }
         openWriters.clear();
     }
-
-    /**
-     * Get the directory for a specific task's logs.
-     */
+    
+    /** Get the directory for a specific task's logs. */
     public File getTaskLogDirectory(String taskId, String taskName) {
         return new File(logsDir, folderNameFor(taskId, taskName));
     }

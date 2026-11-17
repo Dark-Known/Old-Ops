@@ -9,11 +9,10 @@ public class Credential {
     private String name;       // display label
     private String host;       // hostname / IP
     private String username;   // login username
-    private String password;   // plain-text in memory; encrypted at rest by CredentialDbService
+    private String password;   // plain-text in memory; encrypted at rest by SqliteCredentialRepository
     private String osType;     // WINDOWS or LINUX
 
-    public Credential() {
-    }
+    public Credential() {}
 
     public Credential(String id, String name, String host,
                       String username, String password, String osType) {
@@ -25,72 +24,30 @@ public class Credential {
         this.osType = osType;
     }
 
-    public String getId() {
-        return id;
-    }
+    public String getId()                   { return id; }
+    public void   setId(String id)          { this.id = id; }
 
-    public void setId(String id) {
-        this.id = id;
-    }
+    public String getName()                 { return name; }
+    public void   setName(String name)      { this.name = name; }
 
-    public String getName() {
-        return name;
-    }
+    public String getHost()                 { return host; }
+    public void   setHost(String host)      { this.host = host; }
 
-    public void setName(String name) {
-        this.name = name;
-    }
+    public String getUsername()             { return username; }
+    public void   setUsername(String u)     { this.username = u; }
 
-    public String getHost() {
-        return host;
-    }
+    /** Plain-text password – resolved from the per-user creds XML at runtime. */
+    public String getPassword()             { return password; }
+    public void   setPassword(String p)     { this.password = p; }
 
-    public void setHost(String host) {
-        this.host = host;
-    }
-
-    public String getUsername() {
-        return username;
-    }
-
-    public void setUsername(String u) {
-        this.username = u;
-    }
-
-    /**
-     * Plain-text password – resolved from the per-user creds XML at runtime.
-     */
-    public String getPassword() {
-        return password;
-    }
-
-    public void setPassword(String p) {
-        this.password = p;
-    }
-
-    /**
-     * @deprecated Use {@link #getPassword()} – kept for internal call-site compatibility.
-     */
+    /** @deprecated Use {@link #getPassword()} – kept for internal call-site compatibility. */
     @Deprecated
-    public String getEncryptedPassword() {
-        return password;
-    }
-
+    public String getEncryptedPassword()    { return password; }
     @Deprecated
-    public void setEncryptedPassword(String p) {
-        this.password = p;
-    }
+    public void   setEncryptedPassword(String p) { this.password = p; }
 
-    public String getOsType() {
-        return osType;
-    }
+    public String getOsType()               { return osType; }
+    public void   setOsType(String osType)  { this.osType = osType; }
 
-    public void setOsType(String osType) {
-        this.osType = osType;
-    }
-
-    @Override
-    public String toString() {
-        return name + " (" + host + ")";
-    }
+    @Override public String toString()      { return name + " (" + host + ")"; }
 }

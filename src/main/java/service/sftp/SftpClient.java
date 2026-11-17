@@ -13,15 +13,25 @@ import java.util.List;
  */
 public interface SftpClient extends AutoCloseable {
 
-    /**
-     * Entries of a remote directory (without "." and "..").
-     */
+    /** Entries of a remote directory (without "." and ".."). */
     List<RemoteEntry> list(String remoteDir) throws IOException;
 
-    /**
-     * Size/mtime of one remote path, or null if it does not exist.
-     */
+    /** Size/mtime of one remote path, or null if it does not exist. */
     RemoteEntry stat(String remotePath) throws IOException;
+
+    /** The remote user's home / landing directory. */
+    default String home() throws IOException {
+        throw new UnsupportedOperationException("home() is not supported by this client");
+    }
+
+    /**
+     * Lists a directory by changing into it and listing ".", which avoids path-escaping problems (spaces,
+     * glob characters) that listing the path itself can hit. This changes the session's working directory,
+     * so callers that use relative paths should prefer {@link #list(String)}.
+     */
+    default List<RemoteEntry> listViaCd(String remoteDir) throws IOException {
+        return list(remoteDir);
+    }
 
     /**
      * Downloads to {@code local}. The data is written to a temporary file next to the target and
@@ -36,14 +46,20 @@ public interface SftpClient extends AutoCloseable {
      */
     void upload(File local, String remotePath) throws IOException;
 
-    /**
-     * Creates the directory and any missing parents. No error if it already exists.
-     */
+    /** Uploads with an explicit write strategy (atomic = temporary name then rename; in-place = straight to the final name). */
+    default void upload(File local, String remotePath, UploadStrategy.Mode mode) throws IOException {
+        upload(local, remotePath);
+    }
+
+    /** Plain download: writes straight to {@code local} and leaves its modified time as "now". */
+    default void downloadPlain(String remotePath, File local) throws IOException {
+        download(remotePath, local);
+    }
+
+    /** Creates the directory and any missing parents. No error if it already exists. */
     void mkdirs(String remoteDir) throws IOException;
 
-    /**
-     * Deletes a remote file. Returns false if it did not exist.
-     */
+    /** Deletes a remote file. Returns false if it did not exist. */
     boolean delete(String remotePath) throws IOException;
 
     /**
@@ -52,9 +68,7 @@ public interface SftpClient extends AutoCloseable {
      */
     void rename(String from, String to) throws IOException;
 
-    /**
-     * Aborts whatever is running and closes the connection. Safe to call more than once.
-     */
+    /** Aborts whatever is running and closes the connection. Safe to call more than once. */
     void cancel();
 
     @Override

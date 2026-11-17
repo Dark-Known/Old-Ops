@@ -1,9 +1,10 @@
-import ui.MainWindow;
 
+import ui.MainWindow;
 import javax.swing.*;
 
 public class App {
     public static void main(String[] args) {
+        persistence.sqlite.SqliteStorage.installServices();   // before anything reads settings
         // Note: Admin elevation is handled by OpsTransferTool.bat launcher
         // Running directly via java -jar may not have admin privileges
         if (util.LeanLaunch.relaunchIfNeeded(args)) return;   // restarted with lean JVM settings; this copy exits
@@ -14,10 +15,7 @@ public class App {
         SwingUtilities.invokeLater(() -> {
             ui.EdtWatchdog.start(150); // logs any UI event that blocks the EDT for 150 ms or more
             new MainWindow().setVisible(true);
-            {
-                String dd = util.AppConfig.readValue("dataDir");
-                MainWindow.startMemoryReports(dd != null ? dd : "C:\\OpsTools\\Data");
-            } // trims unused heap; writes logs/memory-gui.txt
+            { String dd = util.AppConfig.readValue("dataDir"); MainWindow.startMemoryReports(dd != null ? dd : "C:\\OpsTools\\Data"); } // trims unused heap; writes logs/memory-gui.txt
         });
     }
 }

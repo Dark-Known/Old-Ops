@@ -1,19 +1,21 @@
 package service;
 
+import static org.junit.Assert.*;
+
 import model.EventKind;
 import org.junit.Test;
 
 import java.util.List;
 
-import static org.junit.Assert.*;
-
 public class LinkMonitorTest {
+
+    private static final long SEC = 1000L, MIN = 60 * SEC;
 
     private static LinkMonitor monitor() {
         LinkMonitor m = new LinkMonitor(0);
         m.setSources(List.of(new LinkMonitor.Source("a", "A to B", true, LinkTokens.hash("t"), "", 0, 0, 60, 180, 30, 3, 10)), 0);
         return m;
-    }    private static final long SEC = 1000L, MIN = 60 * SEC;
+    }
 
     private static LinkMonitor.Report ev(String type, long seq) {
         return new LinkMonitor.Report(type, null, seq, "i1", null, 0);
@@ -23,8 +25,7 @@ public class LinkMonitorTest {
         return m.ingest("a", List.of(r), now).alerts();
     }
 
-    @Test
-    public void downIsAlertedOnceThenRestoredOnce() {
+    @Test public void downIsAlertedOnceThenRestoredOnce() {
         LinkMonitor m = monitor();
         assertTrue(send(m, 1 * MIN, ev("connected", 1)).isEmpty());
         List<LinkMonitor.Alert> down = send(m, 5 * MIN, new LinkMonitor.Report("disconnected", null, 2, "i1", "connection reset", 0));
@@ -39,8 +40,7 @@ public class LinkMonitorTest {
         assertTrue(up.get(0).details().contains("4 min"));
     }
 
-    @Test
-    public void stalledIsItsOwnAlert() {
+    @Test public void stalledIsItsOwnAlert() {
         LinkMonitor m = monitor();
         send(m, MIN, ev("connected", 1));
         List<LinkMonitor.Alert> a = send(m, 2 * MIN, ev("stalled", 2));
@@ -48,8 +48,7 @@ public class LinkMonitorTest {
         assertEquals(EventKind.LINK_UP, send(m, 3 * MIN, ev("recovered", 3)).get(0).kind());
     }
 
-    @Test
-    public void reconnectingWhileDownIsNotRecovery() {
+    @Test public void reconnectingWhileDownIsNotRecovery() {
         LinkMonitor m = monitor();
         send(m, MIN, ev("connected", 1));
         send(m, 2 * MIN, ev("disconnected", 2));
@@ -58,8 +57,7 @@ public class LinkMonitorTest {
         assertEquals("only a real connect restores it", EventKind.LINK_UP, send(m, 4 * MIN, ev("connected", 4)).get(0).kind());
     }
 
-    @Test
-    public void duplicatesAndOldSequenceNumbersAreIgnored() {
+    @Test public void duplicatesAndOldSequenceNumbersAreIgnored() {
         LinkMonitor m = monitor();
         send(m, MIN, ev("connected", 5));
         LinkMonitor.Ingest r = m.ingest("a", List.of(ev("disconnected", 5), ev("disconnected", 4)), 2 * MIN);
@@ -68,8 +66,7 @@ public class LinkMonitorTest {
         assertEquals(LinkMonitor.State.CONNECTED, m.stateOf("a"));
     }
 
-    @Test
-    public void aRestartedApplicationStartsCountingAgain() {
+    @Test public void aRestartedApplicationStartsCountingAgain() {
         LinkMonitor m = monitor();
         send(m, MIN, new LinkMonitor.Report("connected", null, 900, "old", null, 0));
         LinkMonitor.Ingest r = m.ingest("a", List.of(new LinkMonitor.Report("disconnected", null, 1, "new", null, 0)), 2 * MIN);
@@ -77,8 +74,7 @@ public class LinkMonitorTest {
         assertEquals(EventKind.LINK_DOWN, r.alerts().get(0).kind());
     }
 
-    @Test
-    public void silenceIsAlertedOnceThenRemindersThenResumes() {
+    @Test public void silenceIsAlertedOnceThenRemindersThenResumes() {
         LinkMonitor m = monitor();
         send(m, 0, ev("connected", 1));
         assertTrue(m.tick(2 * MIN).isEmpty());
@@ -93,15 +89,13 @@ public class LinkMonitorTest {
         assertFalse(m.isSilent("a"));
     }
 
-    @Test
-    public void aSourceThatNeverReportsAlertsAfterTheQuietLimit() {
+    @Test public void aSourceThatNeverReportsAlertsAfterTheQuietLimit() {
         LinkMonitor m = monitor();
         assertTrue(m.tick(3 * MIN).isEmpty());
         assertEquals(EventKind.LINK_SILENT, m.tick(3 * MIN + 1).get(0).kind());
     }
 
-    @Test
-    public void heartbeatsKeepASourceFromGoingSilent() {
+    @Test public void heartbeatsKeepASourceFromGoingSilent() {
         LinkMonitor m = monitor();
         for (int i = 0; i < 20; i++) {
             send(m, i * MIN, new LinkMonitor.Report("heartbeat", "connected", i, "i1", null, 0));
@@ -109,8 +103,7 @@ public class LinkMonitorTest {
         }
     }
 
-    @Test
-    public void aHeartbeatReportingConnectedBringsADownLinkBackUp() {
+    @Test public void aHeartbeatReportingConnectedBringsADownLinkBackUp() {
         LinkMonitor m = monitor();
         send(m, MIN, ev("connected", 1));
         send(m, 2 * MIN, ev("disconnected", 2));
@@ -121,8 +114,7 @@ public class LinkMonitorTest {
         assertEquals(LinkMonitor.State.CONNECTED, m.stateOf("a"));
     }
 
-    @Test
-    public void aHeartbeatWithoutStateProvesLifeButCannotChangeTheState() {
+    @Test public void aHeartbeatWithoutStateProvesLifeButCannotChangeTheState() {
         LinkMonitor m = monitor();
         send(m, MIN, ev("disconnected", 1));
         for (int i = 2; i < 10; i++) {
@@ -132,8 +124,7 @@ public class LinkMonitorTest {
         assertEquals(LinkMonitor.State.DISCONNECTED, m.stateOf("a"));
     }
 
-    @Test
-    public void repeatedSequenceNumbersStillCountAsHeardFrom() {
+    @Test public void repeatedSequenceNumbersStillCountAsHeardFrom() {
         LinkMonitor m = monitor();
         send(m, MIN, new LinkMonitor.Report("heartbeat", "connected", 5, "i1", null, 0));
         for (int i = 2; i < 20; i++) {
@@ -142,25 +133,20 @@ public class LinkMonitorTest {
         }
     }
 
-    @Test
-    public void repeatedDropsRaiseAFlappingAlertWithItsOwnThrottle() {
+    @Test public void repeatedDropsRaiseAFlappingAlertWithItsOwnThrottle() {
         LinkMonitor m = monitor();               // flapCount 3 in 10 minutes
         long t = MIN;
         send(m, t, ev("connected", 1));
-        int flaps = 0;
-        long seq = 2;
+        int flaps = 0; long seq = 2;
         for (int i = 0; i < 3; i++) {
-            for (LinkMonitor.Alert a : send(m, t += MIN, ev("disconnected", seq++)))
-                if (a.kind() == EventKind.LINK_FLAPPING) flaps++;
+            for (LinkMonitor.Alert a : send(m, t += MIN, ev("disconnected", seq++))) if (a.kind() == EventKind.LINK_FLAPPING) flaps++;
             send(m, t += MIN, ev("connected", seq++));
         }
         assertEquals(1, flaps);
-        for (LinkMonitor.Alert a : send(m, t += MIN, ev("disconnected", seq++)))
-            assertTrue("throttled", a.kind() != EventKind.LINK_FLAPPING);
+        for (LinkMonitor.Alert a : send(m, t += MIN, ev("disconnected", seq++))) assertTrue("throttled", a.kind() != EventKind.LINK_FLAPPING);
     }
 
-    @Test
-    public void stillDownRemindersFollowTheRepeatInterval() {
+    @Test public void stillDownRemindersFollowTheRepeatInterval() {
         LinkMonitor m = monitor();
         send(m, 0, new LinkMonitor.Report("disconnected", null, 1, "i1", null, 0));
         // keep the source alive so only the state reminder fires
@@ -172,14 +158,12 @@ public class LinkMonitorTest {
         assertEquals(EventKind.LINK_DOWN, r.get(0).kind());
     }
 
-    @Test
-    public void unknownSourcesAreIgnored() {
+    @Test public void unknownSourcesAreIgnored() {
         LinkMonitor m = monitor();
         assertEquals(0, m.ingest("zzz", List.of(ev("connected", 1)), 0).accepted());
     }
 
-    @Test
-    public void aSourceAddedLaterStartsItsQuietClockWhenItIsAdded() {
+    @Test public void aSourceAddedLaterStartsItsQuietClockWhenItIsAdded() {
         LinkMonitor m = monitor();
         long later = 500 * MIN;
         m.setSources(List.of(new LinkMonitor.Source("a", "A to B", true, LinkTokens.hash("t"), "", 0, 0, 60, 180, 30, 3, 10),
@@ -189,16 +173,14 @@ public class LinkMonitorTest {
         assertEquals("the old one has really been quiet", 1, alerts.size());
     }
 
-    @Test
-    public void aDisabledSourceIsNotMonitored() {
+    @Test public void aDisabledSourceIsNotMonitored() {
         LinkMonitor m = new LinkMonitor(0);
         m.setSources(List.of(new LinkMonitor.Source("a", "A", false, LinkTokens.hash("t"), "", 0, 0, 60, 180, 30, 3, 10)), 0);
         assertTrue(m.tick(100 * MIN).isEmpty());
         assertTrue(m.sourceIds().isEmpty());
     }
 
-    @Test
-    public void thePreviousTokenWorksOnlyInsideItsGracePeriod() {
+    @Test public void thePreviousTokenWorksOnlyInsideItsGracePeriod() {
         LinkMonitor.Source s = new LinkMonitor.Source("a", "A", true, LinkTokens.hash("new"), LinkTokens.hash("old"), 1000, 0, 60, 180, 30, 3, 10);
         assertTrue(s.accepts("new", 5000));
         assertTrue(s.accepts("old", 999));
@@ -206,6 +188,4 @@ public class LinkMonitorTest {
         assertFalse(s.accepts("other", 0));
         assertFalse(new LinkMonitor.Source("a", "A", false, LinkTokens.hash("new"), "", 0, 0, 60, 180, 30, 3, 10).accepts("new", 0));
     }
-
-
 }

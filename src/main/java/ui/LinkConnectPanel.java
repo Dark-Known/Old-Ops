@@ -21,18 +21,21 @@ import java.util.List;
  */
 final class LinkConnectPanel {
 
-    final JComponent connectTab;
-    final JComponent certTab;
     private final File dataDir;
+    private ApiPanel.View view;
+
     private final JTextArea connectText = mono();
     private final JTextArea testOut = mono();
     private final JComboBox<String> hostBox = new JComboBox<>();
+
     private final JTextArea certInfo = mono();
     private final JTextArea certHow = mono();
     private final JTextArea certTestOut = mono();
     private final JButton btnCopyFp = new JButton("Copy fingerprint");
     private final JButton btnExport = new JButton("Export certificate...");
-    private ApiPanel.View view;
+
+    final JComponent connectTab;
+    final JComponent certTab;
 
     LinkConnectPanel(File dataDir) {
         this.dataDir = dataDir;
@@ -48,10 +51,6 @@ final class LinkConnectPanel {
         t.setWrapStyleWord(true);
         t.setBorder(new EmptyBorder(6, 8, 6, 8));
         return t;
-    }
-
-    private static void clip(String s) {
-        Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(s), null);
     }
 
     private JComponent buildConnect() {
@@ -91,9 +90,7 @@ final class LinkConnectPanel {
         JPanel top = new JPanel(new BorderLayout(6, 6));
         top.add(certInfo, BorderLayout.CENTER);
         JPanel buttons = new JPanel(new GridLayout(0, 1, 0, 4));
-        btnCopyFp.addActionListener(e -> {
-            if (view != null && view.cert() != null) clip(view.cert().sha256Fingerprint());
-        });
+        btnCopyFp.addActionListener(e -> { if (view != null && view.cert() != null) clip(view.cert().sha256Fingerprint()); });
         btnExport.addActionListener(e -> export());
         JButton verify = new JButton("Verify endpoint now");
         verify.setToolTipText("Connects to the live endpoint and compares the certificate it presents with link-server.cer");
@@ -134,11 +131,10 @@ final class LinkConnectPanel {
         sb.append("Body       {\"type\":\"heartbeat\",\"state\":\"connected\",\"seq\":1,\"instance\":\"app-start-time\"}\n");
         if (v.addresses().size() > 1) {
             sb.append("\nOther addresses that work:\n");
-            for (int i = 1; i < v.addresses().size(); i++)
-                sb.append("  ").append(v.addresses().get(i)).append("/socketLink/events\n");
+            for (int i = 1; i < v.addresses().size(); i++) sb.append("  ").append(v.addresses().get(i)).append("/socketLink/events\n");
         }
         sb.append("\nTest from server A\n");
-        sb.append("  PowerShell  ").append(util.Scripts.raw("link/link-health-check.ps1", "URL", url)).append("\n");
+        sb.append("  PowerShell  Invoke-RestMethod ").append(url).append("/socketLink/health\n");
         sb.append("  curl        curl ").append(c.tlsEnabled ? "--cacert link-server.cer " : "").append(url).append("/socketLink/health\n");
         sb.append("  Answer: ok\n");
         sb.append("\nSend a message\n");
@@ -181,9 +177,12 @@ final class LinkConnectPanel {
         how.append("Install it     certutil -dump link-server.cer     (Cert Hash(sha256) = fingerprint)\n");
         how.append("               certutil -addstore Root link-server.cer\n\n");
         how.append("Or pin it      no installation; the application compares the fingerprint itself. PowerShell check:\n");
-        for (String ln : util.Scripts.raw("link/link-pin-check.ps1", "HOST", host, "PORT", String.valueOf(c.port), "FINGERPRINT", fpNoColons).split("\n"))
-            how.append("  ").append(ln).append("\n");
-        how.append("\n");
+        how.append("  $tcp = New-Object Net.Sockets.TcpClient('").append(host).append("', ").append(c.port).append(")\n");
+        how.append("  $ssl = New-Object Net.Security.SslStream($tcp.GetStream(), $false, ({$true}))\n");
+        how.append("  $ssl.AuthenticateAsClient('").append(host).append("')\n");
+        how.append("  $c = New-Object Security.Cryptography.X509Certificates.X509Certificate2($ssl.RemoteCertificate)\n");
+        how.append("  [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($c.RawData)).Replace('-','') -eq '")
+           .append(fpNoColons).append("'\n\n");
         how.append("Other options: your own certificate (tls.keystore / tls.password), or HTTPS off (tls.enabled=false) on a private network.");
         certHow.setText(how.toString());
         certHow.setCaretPosition(0);
@@ -215,5 +214,9 @@ final class LinkConnectPanel {
         } catch (Exception ex) {
             JOptionPane.showMessageDialog(connectTab, "Could not save: " + ex.getMessage(), "Export", JOptionPane.ERROR_MESSAGE);
         }
+    }
+
+    private static void clip(String s) {
+        Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(s), null);
     }
 }

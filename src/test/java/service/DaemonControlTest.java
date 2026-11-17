@@ -1,5 +1,8 @@
 package service;
 
+import persistence.CommandQueue;
+import static org.junit.Assert.*;
+
 import org.junit.Test;
 
 import java.io.File;
@@ -11,8 +14,6 @@ import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.List;
 
-import static org.junit.Assert.*;
-
 public class DaemonControlTest {
 
     @Test
@@ -20,7 +21,7 @@ public class DaemonControlTest {
         File dir = Files.createTempDirectory("opstool-ctl").toFile();
         List<String> seen = new ArrayList<>();
         try (DaemonControlServer s = DaemonControlServer.start(dir, (a, id, who) -> seen.add(a + "|" + id + "|" + who))) {
-            assertTrue(DaemonControlClient.send(dir, CommandQueueService.Action.RUN_NOW, "task 1&x=2", "alice"));
+            assertTrue(DaemonControlClient.send(dir, CommandQueue.Action.RUN_NOW, "task 1&x=2", "alice"));
             assertEquals(List.of("RUN_NOW|task 1&x=2|alice"), seen); // special characters survive
         }
         assertFalse("control file removed on close", new File(dir, DaemonControlServer.FILE_NAME).exists());
@@ -29,10 +30,8 @@ public class DaemonControlTest {
     @Test
     public void executorFailureMeansNotDelivered() throws Exception {
         File dir = Files.createTempDirectory("opstool-ctl").toFile();
-        try (DaemonControlServer s = DaemonControlServer.start(dir, (a, id, who) -> {
-            throw new IllegalStateException("boom");
-        })) {
-            assertFalse(DaemonControlClient.send(dir, CommandQueueService.Action.CANCEL, "t", "bob"));
+        try (DaemonControlServer s = DaemonControlServer.start(dir, (a, id, who) -> { throw new IllegalStateException("boom"); })) {
+            assertFalse(DaemonControlClient.send(dir, CommandQueue.Action.CANCEL, "t", "bob"));
         }
     }
 
@@ -62,15 +61,14 @@ public class DaemonControlTest {
     @Test
     public void noDaemonMeansFallBackToQueue() throws Exception {
         File dir = Files.createTempDirectory("opstool-ctl").toFile();
-        assertFalse(DaemonControlClient.send(dir, CommandQueueService.Action.REFRESH, "", "gui")); // no control file
+        assertFalse(DaemonControlClient.send(dir, CommandQueue.Action.REFRESH, "", "gui")); // no control file
         File dead;
-        try (DaemonControlServer s = DaemonControlServer.start(dir, (a, id, who) -> {
-        })) {
+        try (DaemonControlServer s = DaemonControlServer.start(dir, (a, id, who) -> { })) {
             dead = new File(dir, DaemonControlServer.FILE_NAME);
             java.nio.file.Files.copy(dead.toPath(), new File(dir, "copy.json").toPath());
         }
         // stale control file left behind by a dead daemon: port refuses connections
         java.nio.file.Files.copy(new File(dir, "copy.json").toPath(), dead.toPath());
-        assertFalse(DaemonControlClient.send(dir, CommandQueueService.Action.REFRESH, "", "gui"));
+        assertFalse(DaemonControlClient.send(dir, CommandQueue.Action.REFRESH, "", "gui"));
     }
 }

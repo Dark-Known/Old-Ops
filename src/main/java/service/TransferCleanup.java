@@ -34,10 +34,22 @@ import java.util.function.Consumer;
  */
 public final class TransferCleanup {
 
+    private TransferCleanup() { }
+
     private static final DateTimeFormatter STAMP = DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss");
 
-    private TransferCleanup() {
+    /** An original on this PC, with what it looked like when it was listed for the transfer. */
+    public record LocalOriginal(Path path, long size, long mtimeMillis) {}
+
+    /** One remote rename: {@code from} → {@code to}, both full remote paths. */
+    public record RemoteMove(String from, String to) {}
+
+    /** What a cleanup did. {@code failed} + {@code kept} originals are still where they were. */
+    public record Result(int done, int failed, int kept) {
+        public boolean clean() { return failed == 0; }
     }
+
+    // ── Names ────────────────────────────────────────────────────────
 
     /**
      * {@code name} if it is free, otherwise {@code name} with a timestamp before the extension, otherwise
@@ -56,9 +68,7 @@ public final class TransferCleanup {
         }
     }
 
-    /**
-     * The file name part of a remote or local path.
-     */
+    /** The file name part of a remote or local path. */
     static String baseName(String path) {
         int i = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
         return i >= 0 ? path.substring(i + 1) : path;
@@ -81,11 +91,9 @@ public final class TransferCleanup {
         return plan;
     }
 
-    // ── Names ────────────────────────────────────────────────────────
+    // ── Safety checks ────────────────────────────────────────────────
 
-    /**
-     * True when {@code copy} exists as a regular file and, if {@code expectedSize >= 0}, has exactly that size.
-     */
+    /** True when {@code copy} exists as a regular file and, if {@code expectedSize >= 0}, has exactly that size. */
     public static boolean copyIsComplete(Path copy, long expectedSize) {
         try {
             return Files.isRegularFile(copy) && (expectedSize < 0 || Files.size(copy) == expectedSize);
@@ -93,6 +101,8 @@ public final class TransferCleanup {
             return false;
         }
     }
+
+    // ── Local originals (uploads) ────────────────────────────────────
 
     /**
      * Deletes or moves local originals after a successful upload. {@code archiveDir} is only used for
@@ -121,10 +131,7 @@ public final class TransferCleanup {
         for (LocalOriginal o : originals) {
             String name = o.path().getFileName().toString();
             try {
-                if (!Files.exists(o.path())) {
-                    done++;
-                    continue;
-                } // already gone — nothing left to clean up
+                if (!Files.exists(o.path())) { done++; continue; } // already gone — nothing left to clean up
                 if (changedSinceListed(o)) {
                     kept++;
                     stillThere.add(name);
@@ -165,11 +172,7 @@ public final class TransferCleanup {
         }
     }
 
-    // ── Safety checks ────────────────────────────────────────────────
-
-    /**
-     * Moves into {@code dir} under the first free name; a name that appears meanwhile is skipped, never replaced.
-     */
+    /** Moves into {@code dir} under the first free name; a name that appears meanwhile is skipped, never replaced. */
     private static Path moveWithoutOverwriting(Path source, Path dir, String name, Set<String> taken,
                                                LocalDateTime now) throws IOException {
         for (int attempt = 0; attempt < 1000; attempt++) {
@@ -183,28 +186,5 @@ public final class TransferCleanup {
             }
         }
         throw new IOException("no free name found in " + dir);
-    }
-
-    // ── Local originals (uploads) ────────────────────────────────────
-
-    /**
-     * An original on this PC, with what it looked like when it was listed for the transfer.
-     */
-    public record LocalOriginal(Path path, long size, long mtimeMillis) {
-    }
-
-    /**
-     * One remote rename: {@code from} → {@code to}, both full remote paths.
-     */
-    public record RemoteMove(String from, String to) {
-    }
-
-    /**
-     * What a cleanup did. {@code failed} + {@code kept} originals are still where they were.
-     */
-    public record Result(int done, int failed, int kept) {
-        public boolean clean() {
-            return failed == 0;
-        }
     }
 }

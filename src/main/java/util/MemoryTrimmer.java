@@ -1,6 +1,7 @@
 package util;
 
-import java.awt.*;
+import java.awt.Frame;
+import java.awt.Window;
 
 /**
  * Keeps the GUI's resident memory small. The live heap of the window is only
@@ -15,14 +16,13 @@ public final class MemoryTrimmer {
     private static final long IDLE_MS = 60_000;
     private static final long MIN_GAP_MS = 5 * 60_000;
     private static volatile boolean started;
+
+    private MemoryTrimmer() {}
+
     private static volatile java.io.File reportDir;
     private static volatile String reportWho = "app";
-    private MemoryTrimmer() {
-    }
 
-    /**
-     * Also writes memory-&lt;who&gt;.txt (heap, pools, top live classes) into dir every 10 minutes.
-     */
+    /** Also writes memory-&lt;who&gt;.txt (heap, pools, top live classes) into dir every 10 minutes. */
     public static void start(java.io.File dir, String who) {
         reportDir = dir;
         reportWho = who;
@@ -59,10 +59,7 @@ public final class MemoryTrimmer {
                     lastTrim = trim();
                     continue;
                 }
-                if (foreground()) {
-                    backgroundSince = 0;
-                    continue;
-                }
+                if (foreground()) { backgroundSince = 0; continue; }
                 if (backgroundSince == 0) backgroundSince = now;
                 if (now - backgroundSince >= IDLE_MS && now - lastTrim >= MIN_GAP_MS) {
                     lastTrim = trim();

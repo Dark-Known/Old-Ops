@@ -1,5 +1,8 @@
 package service;
 
+import persistence.sqlite.SqliteRunHistory;
+import static org.junit.Assert.*;
+
 import model.TaskRunRecord;
 import org.junit.Before;
 import org.junit.Test;
@@ -11,20 +14,16 @@ import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
-import static org.junit.Assert.*;
-
-/**
- * v2: UI reads use their own read-only connection and must never queue behind the write lock.
- */
+/** v2: UI reads use their own read-only connection and must never queue behind the write lock. */
 public class RunHistoryReadSplitTest {
 
     private File dir;
-    private RunHistoryService rhs;
+    private SqliteRunHistory rhs;
 
     @Before
     public void setUp() throws Exception {
         dir = Files.createTempDirectory("rhsplit").toFile();
-        rhs = new RunHistoryService(dir.getAbsolutePath());
+        rhs = new SqliteRunHistory(dir.getAbsolutePath());
     }
 
     private void record(String name, TaskRunRecord.Status st) {
@@ -50,10 +49,7 @@ public class RunHistoryReadSplitTest {
         Thread writer = new Thread(() -> {
             synchronized (rhs) { // simulates a long write / purge holding the writer lock
                 held.countDown();
-                try {
-                    release.await(10, TimeUnit.SECONDS);
-                } catch (InterruptedException ignored) {
-                }
+                try { release.await(10, TimeUnit.SECONDS); } catch (InterruptedException ignored) { }
             }
         });
         writer.start();
@@ -74,13 +70,13 @@ public class RunHistoryReadSplitTest {
 
     @Test
     public void monitorReportsItsWork() throws Exception {
-        DbChangeMonitor mon = DbChangeMonitor.forDataDir(dir);
+        persistence.sqlite.SqliteChangeMonitor mon = persistence.sqlite.SqliteChangeMonitor.forDataDir(dir);
         Thread.sleep(1200);
-        long before = mon.signalCount(DbChangeMonitor.Topic.RUNS);
+        long before = mon.signalCount(persistence.ChangeSignals.Topic.RUNS);
         record("c", TaskRunRecord.Status.SUCCESS);
-        long gen = mon.generation(DbChangeMonitor.Topic.RUNS);
-        mon.awaitChange(DbChangeMonitor.Topic.RUNS, gen, 5000);
-        assertTrue(mon.signalCount(DbChangeMonitor.Topic.RUNS) > before);
+        long gen = mon.generation(persistence.ChangeSignals.Topic.RUNS);
+        mon.awaitChange(persistence.ChangeSignals.Topic.RUNS, gen, 5000);
+        assertTrue(mon.signalCount(persistence.ChangeSignals.Topic.RUNS) > before);
         String d = mon.describe();
         assertTrue(d, d.contains("polls=") && d.contains("signals[") && d.contains("reconnects="));
     }

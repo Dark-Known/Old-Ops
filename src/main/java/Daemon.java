@@ -1,7 +1,9 @@
+
+
+import persistence.sqlite.SqliteStorage;
 import service.TaskSchedulerService;
 import service.TransferService;
-import service.XmlStorageService;
-
+import persistence.AppStorage;
 import java.io.File;
 import java.io.FileWriter;
 import java.io.PrintWriter;
@@ -11,45 +13,38 @@ import java.util.logging.*;
 
 /**
  * Headless scheduler daemon — no GUI, no Swing.
- * <p>
+ *
  * Registered as a Windows Scheduled Task by setup.ps1 so it fires
  * automatically at system startup (and every hour as a safety net),
  * independently of whether the main GUI application is open.
- * <p>
+ *
  * Usage:  java -cp OpsTransferTool.jar com.opstool.Daemon [dataDir]
- * <p>
+ *
  * If dataDir is omitted it defaults to %USERPROFILE%\.opstool  (same
  * directory the GUI uses), so both processes share the same app.db
  * (tasks, credentials, settings) without any extra configuration.
- * <p>
- * The daemon writes its own rotating log to <dataDir>/logs/daemon.log
+ *
+ * The daemon writes its own rotating log to <dataDir>/daemon.log
  * (max 5 MB, 3 files) so you can inspect it independently of the GUI.
- * <p>
+ *
  * Lifecycle:
- * 1. On startup it immediately checks all due tasks and runs them.
- * 2. It then polls every 60 seconds, exactly as the in-GUI scheduler does.
- * 3. It runs until the Windows Scheduled Task kills it (next trigger fires
- * a new instance; the old one is stopped first via the /F flag in setup).
- * 4. It catches SIGTERM / shutdown hooks and flushes logs cleanly.
+ *   1. On startup it immediately checks all due tasks and runs them.
+ *   2. It then polls every 60 seconds, exactly as the in-GUI scheduler does.
+ *   3. It runs until the Windows Scheduled Task kills it (next trigger fires
+ *      a new instance; the old one is stopped first via the /F flag in setup).
+ *   4. It catches SIGTERM / shutdown hooks and flushes logs cleanly.
  */
 public class Daemon {
 
     private static final DateTimeFormatter DT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
     private static final DateTimeFormatter FILE_DT = DateTimeFormatter.ofPattern("yyyy-MM-dd-HHmmss");
-    /**
-     * Longest the command poller sleeps even if no commit is signalled (belt and braces).
-     */
-    private static final long COMMAND_SAFETY_POLL_MS = 30_000;
-    /**
-     * Minimum gap between polls when the database is busy with unrelated commits.
-     */
-    private static final long COMMAND_MIN_GAP_MS = 250;
     private static PrintWriter daemonLog;
     private static String daemonLogPath;
     private static long maxLogBytes;
     private static int keepArchiveCount;
 
     public static void main(String[] args) throws Exception {
+        persistence.sqlite.SqliteStorage.installServices();   // before anything reads settings
 
         // ── Resolve data directory ───────────────────────────────────────────
         String dataDir = args.length > 0
@@ -57,16 +52,10 @@ public class Daemon {
                 : loadDataDirFromConfig();
 
         new File(dataDir).mkdirs();
-        service.BackgroundLogService.setProcessLabel("Daemon"); // background-log rows say which process wrote them
+        SqliteStorage.setBackgroundLogProcessLabel("Daemon"); // background-log rows say which process wrote them
 
         // ── Set up file logging ──────────────────────────────────────────────
-        // All logs live in <dataDir>/logs. Files an older version left in the data folder are moved over first.
-        // The daemon's log is its standard output: the service wrapper writes it to <dataDir>\logs\daemon-service.out.log
-        // (rotated by the wrapper). A separate daemon.log is only written when <logging><daemonLogFile> is set explicitly.
-        File logsDir = service.LogFiles.dir(new File(dataDir));
-        String custom = util.AppConfig.readValue("daemonLogFile");
-        String logPath = (custom == null || custom.trim().isEmpty()) ? null
-                : new File(custom.trim()).isAbsolute() ? custom.trim() : new File(logsDir, custom.trim()).getPath();
+        String logPath = dataDir + File.separator + daemonLogFileName();
         setupLogging(logPath, dataDir);
 
         log("Ops Transfer Tool Daemon starting");
@@ -81,18 +70,15 @@ public class Daemon {
                 + "Re-run packaging\\install-service.ps1 as Administrator to reinstall the service with the lean flags.");
 
         // ── Wire services (same classes the GUI uses) ────────────────────────
-        XmlStorageService storage = new XmlStorageService(dataDir);
-        TransferService transferSvc = new TransferService(storage);
+        AppStorage storage      = SqliteStorage.open(dataDir);
+        TransferService   transferSvc  = new TransferService(storage);
         loadWinScpPref(storage, transferSvc, dataDir);
 
         int pollInterval = 60;
         if (args.length > 1) {
-            try {
-                pollInterval = Integer.parseInt(args[1]);
-            } catch (Exception ignored) {
-            }
+            try { pollInterval = Integer.parseInt(args[1]); } catch (Exception ignored) {}
         }
-
+        
         // If poll interval not provided as argument, read it from app.db via
         // AppSettings — the same shared store SettingsPanel now saves to.
         // This replaces a previous java.util.prefs.Preferences read that
@@ -110,8 +96,8 @@ public class Daemon {
                 log("Poll interval loaded from app.db: " + saved + " seconds");
             }
         }
-
-        TaskSchedulerService scheduler = new TaskSchedulerService(storage, transferSvc, pollInterval);
+        
+        TaskSchedulerService scheduler = new TaskSchedulerService(storage, transferSvc, SqliteStorage.openLogs(dataDir), pollInterval);
 
         // Mirror every scheduler log line to our daemon.log
         scheduler.setLogCallback((taskId, line) -> log("[task:" + taskId + "] " + line));
@@ -158,7 +144,7 @@ public class Daemon {
             try {
                 Thread.sleep(60_000);
                 log("Daemon heartbeat — still running (db change monitor: "
-                        + service.DbChangeMonitor.forDataDir(new File(dataDir)).describe() + ")");
+                        + persistence.Changes.forDataDir(new File(dataDir)).describe() + ")");
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
@@ -172,23 +158,23 @@ public class Daemon {
     // instead of the GUI ever running these itself.
     private static void runCommandPollerLoop(String dataDir, TaskSchedulerService scheduler) {
         File dbDir = new File(dataDir);
-        service.DbChangeMonitor monitor = service.DbChangeMonitor.forDataDir(dbDir);
+        persistence.ChangeSignals monitor = persistence.Changes.forDataDir(dbDir);
         // One long-lived connection; wakes within ~0.5 s of any app.db commit (a GUI enqueue is one),
         // otherwise only on a slow safety interval. Idle cost is ~2 tiny SELECTs a minute instead of
         // ~60 fresh connection opens (plus schema DDL) a minute.
-        try (service.CommandQueueService.Poller poller = new service.CommandQueueService.Poller(dbDir)) {
+        try (persistence.CommandQueue.Poller poller = persistence.CommandQueues.forDataDir(dbDir).poller()) {
             while (!Thread.currentThread().isInterrupted()) {
                 // Read the generation BEFORE polling, so a command enqueued mid-poll re-triggers immediately.
-                long seen = monitor.generation(service.DbChangeMonitor.Topic.APP);
+                long seen = monitor.generation(persistence.ChangeSignals.Topic.APP);
                 try {
-                    for (service.CommandQueueService.Command cmd : poller.pollPending()) {
+                    for (persistence.CommandQueue.Command cmd : poller.pollPending()) {
                         handleCommand(poller, scheduler, cmd);
                     }
                 } catch (Exception e) {
                     log("Command poller error: " + e.getMessage());
                 }
                 try {
-                    monitor.awaitChange(service.DbChangeMonitor.Topic.APP, seen, COMMAND_SAFETY_POLL_MS);
+                    monitor.awaitChange(persistence.ChangeSignals.Topic.APP, seen, COMMAND_SAFETY_POLL_MS);
                     Thread.sleep(COMMAND_MIN_GAP_MS); // coalesce bursts of commits into one poll
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
@@ -197,8 +183,13 @@ public class Daemon {
         }
     }
 
+    /** Longest the command poller sleeps even if no commit is signalled (belt and braces). */
+    private static final long COMMAND_SAFETY_POLL_MS = 30_000;
+    /** Minimum gap between polls when the database is busy with unrelated commits. */
+    private static final long COMMAND_MIN_GAP_MS = 250;
+
     private static void runAction(TaskSchedulerService scheduler,
-                                  service.CommandQueueService.Action action, String taskId) {
+                                  persistence.CommandQueue.Action action, String taskId) {
         switch (action) {
             case RUN_NOW -> scheduler.runNow(taskId);
             case CANCEL -> scheduler.cancelTask(taskId);
@@ -210,8 +201,8 @@ public class Daemon {
         }
     }
 
-    private static void handleCommand(service.CommandQueueService.Poller poller, TaskSchedulerService scheduler,
-                                      service.CommandQueueService.Command cmd) {
+    private static void handleCommand(persistence.CommandQueue.Poller poller, TaskSchedulerService scheduler,
+                                       persistence.CommandQueue.Command cmd) {
         long t0 = System.currentTimeMillis();
         try {
             runAction(scheduler, cmd.action(), cmd.taskId());
@@ -254,7 +245,7 @@ public class Daemon {
         maxLogBytes = readConfiguredMaxBytes();
         keepArchiveCount = readConfiguredKeepCount();
         try {
-            if (logPath != null) daemonLog = new PrintWriter(new FileWriter(logPath, true), true);
+            daemonLog = new PrintWriter(new FileWriter(logPath, true), true);
         } catch (Exception e) {
             System.err.println("Could not open daemon log: " + e.getMessage());
         }
@@ -265,18 +256,13 @@ public class Daemon {
             // Remove default console handler
             for (Handler h : rootLogger.getHandlers()) rootLogger.removeHandler(h);
 
-            StreamHandler fh = new StreamHandler(System.out, new SimpleFormatter() {
-                @Override
-                public String format(LogRecord r) {
+            FileHandler fh = new FileHandler(
+                dataDir + File.separator + "daemon-%g.log", maxLogBytes, keepArchiveCount, true);
+            fh.setFormatter(new SimpleFormatter() {
+                @Override public String format(LogRecord r) {
                     return LocalDateTime.now().format(DT) + "  " + r.getMessage() + "\n";
                 }
-            }) {
-                @Override
-                public synchronized void publish(LogRecord r) {
-                    super.publish(r);
-                    flush();
-                }
-            };
+            });
             rootLogger.addHandler(fh);
             rootLogger.setLevel(parseLevel(util.AppSettings.getLogLevel()));
         } catch (Exception e) {
@@ -303,13 +289,9 @@ public class Daemon {
      * via {@link TaskSchedulerService#setLogCallback}, which only ever went
      * to the non-rotating file.
      */
-    private static long readConfiguredMaxBytes() {
-        return service.TaskLogService.configuredMaxBytes();
-    }
+    private static long readConfiguredMaxBytes() { return service.TaskLogService.configuredMaxBytes(); }
 
-    private static int readConfiguredKeepCount() {
-        return service.TaskLogService.configuredKeepCount();
-    }
+    private static int readConfiguredKeepCount() { return service.TaskLogService.configuredKeepCount(); }
 
     /**
      * Maps the app's DEBUG/INFO/WARN/ERROR log level (as configured in the
@@ -323,21 +305,17 @@ public class Daemon {
     private static Level parseLevel(String configured) {
         if (configured == null) return Level.INFO;
         switch (configured.trim().toUpperCase(java.util.Locale.ROOT)) {
-            case "DEBUG":
-                return Level.FINE;
-            case "WARN":
-                return Level.WARNING;
-            case "ERROR":
-                return Level.SEVERE;
+            case "DEBUG": return Level.FINE;
+            case "WARN":  return Level.WARNING;
+            case "ERROR": return Level.SEVERE;
             case "INFO":
-            default:
-                return Level.INFO;
+            default:      return Level.INFO;
         }
     }
 
     private static synchronized void log(String msg) {
         String line = LocalDateTime.now().format(DT) + "  " + msg;
-        System.out.println(line); // captured by the service wrapper into logs\daemon-service.out.log
+        System.out.println(line);
         rotateIfNeeded();
         if (daemonLog != null) {
             daemonLog.println(line);
@@ -404,9 +382,9 @@ public class Daemon {
     // the daemon runs as the interactive user or, once wrapped as a
     // Windows Service, as a service account with its own separate registry
     // hive that per-user Preferences would never have been visible from.
-    private static void loadWinScpPref(XmlStorageService storage,
-                                       TransferService transferSvc,
-                                       String dataDir) {
+    private static void loadWinScpPref(AppStorage storage,
+                                        TransferService transferSvc,
+                                        String dataDir) {
         try {
             String saved = util.AppSettings.getWinScpPath();
             if (saved != null && !saved.trim().isEmpty()) {

@@ -33,18 +33,11 @@ public class ImapSearchCriteria {
             this.description = description;
         }
 
-        public String getCriterion() {
-            return criterion;
-        }
-
-        public String getDescription() {
-            return description;
-        }
+        public String getCriterion() { return criterion; }
+        public String getDescription() { return description; }
 
         @Override
-        public String toString() {
-            return description + " (" + criterion + ")";
-        }
+        public String toString() { return description + " (" + criterion + ")"; }
     }
 
     /**
@@ -67,18 +60,11 @@ public class ImapSearchCriteria {
             this.description = description;
         }
 
-        public String getCriterion() {
-            return criterion;
-        }
-
-        public String getDescription() {
-            return description;
-        }
+        public String getCriterion() { return criterion; }
+        public String getDescription() { return description; }
 
         @Override
-        public String toString() {
-            return description + " (" + criterion + ")";
-        }
+        public String toString() { return description + " (" + criterion + ")"; }
     }
 
     /**
@@ -100,18 +86,11 @@ public class ImapSearchCriteria {
             this.description = description;
         }
 
-        public String getCriterion() {
-            return criterion;
-        }
-
-        public String getDescription() {
-            return description;
-        }
+        public String getCriterion() { return criterion; }
+        public String getDescription() { return description; }
 
         @Override
-        public String toString() {
-            return description;
-        }
+        public String toString() { return description; }
     }
 
     /**
@@ -129,18 +108,11 @@ public class ImapSearchCriteria {
             this.description = description;
         }
 
-        public String getCriterion() {
-            return criterion;
-        }
-
-        public String getDescription() {
-            return description;
-        }
+        public String getCriterion() { return criterion; }
+        public String getDescription() { return description; }
 
         @Override
-        public String toString() {
-            return description;
-        }
+        public String toString() { return description; }
     }
 
     /**
@@ -160,18 +132,11 @@ public class ImapSearchCriteria {
             this.description = description;
         }
 
-        public String getCriterion() {
-            return criterion;
-        }
-
-        public String getDescription() {
-            return description;
-        }
+        public String getCriterion() { return criterion; }
+        public String getDescription() { return description; }
 
         @Override
-        public String toString() {
-            return description + " (" + criterion + ")";
-        }
+        public String toString() { return description + " (" + criterion + ")"; }
     }
 
     /**

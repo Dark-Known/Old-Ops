@@ -1,10 +1,12 @@
 package service;
 
-import com.jcraft.jsch.ChannelSftp;
-import com.jcraft.jsch.JSch;
-import com.jcraft.jsch.Session;
+import persistence.AppStorage;
+import service.sftp.ConnectOptions;
+import service.sftp.JschSftpClient;
+import service.sftp.SftpClient;
 import model.Credential;
 import model.ScheduledTask;
+import service.RemoteFileMetadataService;
 
 import java.util.Properties;
 
@@ -23,11 +25,53 @@ import java.util.Properties;
  */
 public class RemoteFileMetadataServiceFactory {
 
-    private final XmlStorageService storage;
+    /**
+     * Wraps a {@link RemoteFileMetadataService} together with any closeable
+     * resources (the SFTP connection) that must be released after use.
+     */
+    public static final class ManagedMetadataService implements AutoCloseable {
+
+        private final RemoteFileMetadataService service;
+
+        /**
+         * The watch directory that the service should list.
+         * <ul>
+         *   <li>INBOUND SFTP       — remote source path (targetPath)</li>
+         *   <li>INBOUND local→local — local source/watch path (targetPath)</li>
+         *   <li>OUTBOUND watcher   — local source path (sourcePath) — handled
+         *       directly by TransferService via LocalFileMetadataService, so
+         *       the factory is not used for that branch.</li>
+         * </ul>
+         */
+        private final String watchDirectory;
+
+        /** Non-null only when a connection was opened; closed in {@link #close()}. */
+        private final SftpClient connection;
+
+        ManagedMetadataService(RemoteFileMetadataService service,
+                               String watchDirectory,
+                               SftpClient connection) {
+            this.service        = service;
+            this.watchDirectory = watchDirectory;
+            this.connection     = connection;
+        }
+
+        public RemoteFileMetadataService service()        { return service; }
+        public String                    watchDirectory() { return watchDirectory; }
+
+        @Override
+        public void close() {
+            if (connection != null) connection.close();
+        }
+    }
 
     // ─────────────────────────────────────────────────────────────────────────
 
-    public RemoteFileMetadataServiceFactory(XmlStorageService storage) {
+    private static final ConnectOptions CONNECT = ConnectOptions.of(ConnectOptions.DEFAULT_PORT, 30_000, 10_000);
+
+    private final AppStorage storage;
+
+    public RemoteFileMetadataServiceFactory(AppStorage storage) {
         this.storage = storage;
     }
 
@@ -47,30 +91,19 @@ public class RemoteFileMetadataServiceFactory {
                     "Cannot open SFTP connection: no credential resolved for task " + task.getId());
         }
 
-        JSch jsch = new JSch();
-        Session session = jsch.getSession(
-                credential.getUsername(),
-                credential.getHost(),
-                22);
-        util.SshAuth.apply(jsch, session, credential.getPassword());
-
-        Properties config = new Properties();
-        config.put("StrictHostKeyChecking", "no");
-        session.setConfig(config);
-        util.SshHostKeys.apply(jsch, session);
-        session.connect(30_000);
-
-        ChannelSftp channel = (ChannelSftp) session.openChannel("sftp");
-        channel.connect(10_000);
+        SftpClient client = JschSftpClient.connect(credential.getHost(), credential.getUsername(),
+                credential.getPassword(), CONNECT);
 
         // For INBOUND tasks the watch directory is the remote source path (targetPath).
         String watchDir = resolveRemoteWatchDirectory(task);
 
         return new ManagedMetadataService(
-                new SftpRemoteFileMetadataService(channel),
+                new SftpRemoteFileMetadataService(client),
                 watchDir,
-                session);
+                client);
     }
+
+    // ─── Helpers ─────────────────────────────────────────────────────────────
 
     /**
      * For an INBOUND task the watch directory is the <em>remote</em> source (targetPath).
@@ -93,8 +126,6 @@ public class RemoteFileMetadataServiceFactory {
         return path;
     }
 
-    // ─── Helpers ─────────────────────────────────────────────────────────────
-
     private String normalizeRemotePath(String path) {
         if (path == null) return "";
         String normalized = path.trim().replace("\\", "/");
@@ -107,58 +138,5 @@ public class RemoteFileMetadataServiceFactory {
         }
 
         return normalized;
-    }
-
-    /**
-     * Wraps a {@link RemoteFileMetadataService} together with any closeable
-     * resources (e.g. an SSH {@link Session}) that must be released after use.
-     */
-    public static final class ManagedMetadataService implements AutoCloseable {
-
-        private final RemoteFileMetadataService service;
-
-        /**
-         * The watch directory that the service should list.
-         * <ul>
-         *   <li>INBOUND SFTP       — remote source path (targetPath)</li>
-         *   <li>INBOUND local→local — local source/watch path (targetPath)</li>
-         *   <li>OUTBOUND watcher   — local source path (sourcePath) — handled
-         *       directly by TransferService via LocalFileMetadataService, so
-         *       the factory is not used for that branch.</li>
-         * </ul>
-         */
-        private final String watchDirectory;
-
-        /**
-         * Non-null only when an SSH session was opened; closed in {@link #close()}.
-         */
-        private final Session sshSession;
-
-        ManagedMetadataService(RemoteFileMetadataService service,
-                               String watchDirectory,
-                               Session sshSession) {
-            this.service = service;
-            this.watchDirectory = watchDirectory;
-            this.sshSession = sshSession;
-        }
-
-        public RemoteFileMetadataService service() {
-            return service;
-        }
-
-        public String watchDirectory() {
-            return watchDirectory;
-        }
-
-        public Session sshSession() {
-            return sshSession;
-        }
-
-        @Override
-        public void close() {
-            if (sshSession != null && sshSession.isConnected()) {
-                sshSession.disconnect();
-            }
-        }
     }
 }

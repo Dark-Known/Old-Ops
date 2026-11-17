@@ -32,20 +32,34 @@ import java.util.logging.Logger;
  *   -&gt; 200 {"accepted":2,"duplicates":0}
  * GET  /socketLink/health        no authentication, answers "ok" so the sender can test the route
  * </pre>
- * <p>
+ *
  * The token identifies the source; nothing in the body can name a different one.
  */
 public final class LinkIngestServer implements AutoCloseable {
 
+    private static final Logger log = Logger.getLogger(LinkIngestServer.class.getName());
     static final int MAX_BODY = 64 * 1024;
     static final int MAX_BATCH = 200;
-    private static final Logger log = Logger.getLogger(LinkIngestServer.class.getName());
+
+    public interface Handler {
+        /** Handles one batch from {@code remote}; returns null when the token belongs to no source. */
+        LinkMonitor.Ingest handle(String bearerToken, String remote, List<LinkMonitor.Report> reports);
+
+        /** A request that was turned away (HTTP status and reason), for the activity log. */
+        void rejected(String remote, int status, String why);
+
+        /** Called once for every request to the endpoint, whatever the outcome, for the activity log. */
+        default void exchange(String remote, String method, String path, String bearerToken,
+                              String requestBody, int status, String responseBody) { }
+    }
+
     private final HttpServer server;
     private final boolean tls;
-    private LinkIngestServer(HttpServer server, boolean tls) {
-        this.server = server;
-        this.tls = tls;
-    }
+
+    private LinkIngestServer(HttpServer server, boolean tls) { this.server = server; this.tls = tls; }
+
+    public int port() { return server.getAddress().getPort(); }
+    public boolean tls() { return tls; }
 
     public static LinkIngestServer start(String bind, int port, String keystore, String keystorePassword,
                                          Handler handler) throws Exception {
@@ -64,24 +78,16 @@ public final class LinkIngestServer implements AutoCloseable {
             t.setDaemon(true);
             return t;
         }));
-        for (String prefix : new String[]{"/socketLink"}) {
+        for (String prefix : new String[] { "/socketLink" }) {
             http.createContext(prefix + "/health", ex -> {
                 try {
-                    try {
-                        handler.exchange(remoteOf(ex), ex.getRequestMethod(), ex.getRequestURI().getPath(), null, "", 200, "ok");
-                    } catch (RuntimeException ignored) {
-                    }
+                    try { handler.exchange(remoteOf(ex), ex.getRequestMethod(), ex.getRequestURI().getPath(), null, "", 200, "ok"); }
+                    catch (RuntimeException ignored) { }
                     reply(ex, 200, "ok");
-                } finally {
-                    ex.close();
-                }
+                } finally { ex.close(); }
             });
             http.createContext(prefix + "/events", ex -> {
-                try {
-                    events(ex, handler);
-                } finally {
-                    ex.close();
-                }
+                try { events(ex, handler); } finally { ex.close(); }
             });
         }
         http.start();
@@ -92,9 +98,7 @@ public final class LinkIngestServer implements AutoCloseable {
     private static SSLContext sslContext(String keystore, String password) throws Exception {
         char[] pw = password == null ? new char[0] : password.toCharArray();
         KeyStore ks = KeyStore.getInstance("PKCS12");
-        try (InputStream in = Files.newInputStream(Path.of(keystore))) {
-            ks.load(in, pw);
-        }
+        try (InputStream in = Files.newInputStream(Path.of(keystore))) { ks.load(in, pw); }
         KeyManagerFactory kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
         kmf.init(ks, pw);
         SSLContext ctx = SSLContext.getInstance("TLS");
@@ -107,41 +111,32 @@ public final class LinkIngestServer implements AutoCloseable {
                 ? ex.getRemoteAddress().getAddress().getHostAddress() : "?";
     }
 
+    /** What the current request looked like, kept so the one place that answers can also log it. */
+    private record Seen(String method, String token, String body) {}
+
     private static void turnAway(HttpExchange ex, Handler handler, String remote, int status, String why, Seen seen) throws IOException {
-        try {
-            handler.rejected(remote, status, why);
-        } catch (RuntimeException ignored) {
-        }
+        try { handler.rejected(remote, status, why); } catch (RuntimeException ignored) { }
         answer(ex, handler, remote, seen, status, why);
     }
 
     private static void answer(HttpExchange ex, Handler handler, String remote, Seen seen, int status, String text) throws IOException {
-        try {
-            handler.exchange(remote, seen.method(), ex.getRequestURI().getPath(), seen.token(), seen.body(), status, text);
-        } catch (RuntimeException ignored) {
-        }
+        try { handler.exchange(remote, seen.method(), ex.getRequestURI().getPath(), seen.token(), seen.body(), status, text); }
+        catch (RuntimeException ignored) { }
         reply(ex, status, text);
     }
 
     private static void events(HttpExchange ex, Handler handler) throws IOException {
         String remote = remoteOf(ex);
         String method = ex.getRequestMethod();
-        if (!"POST".equals(method)) {
-            turnAway(ex, handler, remote, 405, "POST only", new Seen(method, null, ""));
-            return;
-        }
+        if (!"POST".equals(method)) { turnAway(ex, handler, remote, 405, "POST only", new Seen(method, null, "")); return; }
         String auth = ex.getRequestHeaders().getFirst("Authorization");
         if (auth == null || !auth.regionMatches(true, 0, "Bearer ", 0, 7)) {
-            turnAway(ex, handler, remote, 401, "missing bearer token", new Seen(method, null, ""));
-            return;
+            turnAway(ex, handler, remote, 401, "missing bearer token", new Seen(method, null, "")); return;
         }
         String token = auth.substring(7).trim();
 
         byte[] body = ex.getRequestBody().readNBytes(MAX_BODY + 1);
-        if (body.length > MAX_BODY) {
-            turnAway(ex, handler, remote, 413, "body too large", new Seen(method, token, "(" + body.length + "+ bytes)"));
-            return;
-        }
+        if (body.length > MAX_BODY) { turnAway(ex, handler, remote, 413, "body too large", new Seen(method, token, "(" + body.length + "+ bytes)")); return; }
         String text = new String(body, StandardCharsets.UTF_8);
         Seen seen = new Seen(method, token, text);
 
@@ -160,23 +155,17 @@ public final class LinkIngestServer implements AutoCloseable {
             turnAway(ex, handler, remote, 500, "server error", seen);
             return;
         }
-        if (result == null) {
-            turnAway(ex, handler, remote, 401, "unknown token", seen);
-            return;
-        }
+        if (result == null) { turnAway(ex, handler, remote, 401, "unknown token", seen); return; }
         answer(ex, handler, remote, seen, 200, "{\"accepted\":" + result.accepted() + ",\"duplicates\":" + result.duplicates() + "}");
     }
 
-    /**
-     * Accepts a single event object or {"events":[...]}.
-     */
+    /** Accepts a single event object or {"events":[...]}. */
     static List<LinkMonitor.Report> parse(String json) {
         Map<String, Object> root = MiniJson.parseObject(json);
         List<Object> arr = MiniJson.getArray(root, "events");
         List<Map<String, Object>> objs = new ArrayList<>();
         if (arr != null) {
-            if (arr.size() > MAX_BATCH)
-                throw new IllegalArgumentException("more than " + MAX_BATCH + " events in one request");
+            if (arr.size() > MAX_BATCH) throw new IllegalArgumentException("more than " + MAX_BATCH + " events in one request");
             for (Object o : arr) {
                 if (!(o instanceof Map)) throw new IllegalArgumentException("events must be objects");
                 @SuppressWarnings("unchecked") Map<String, Object> m = (Map<String, Object>) o;
@@ -215,41 +204,5 @@ public final class LinkIngestServer implements AutoCloseable {
         ex.getResponseBody().write(b);
     }
 
-    public int port() {
-        return server.getAddress().getPort();
-    }
-
-    public boolean tls() {
-        return tls;
-    }
-
-    @Override
-    public void close() {
-        server.stop(0);
-    }
-
-    public interface Handler {
-        /**
-         * Handles one batch from {@code remote}; returns null when the token belongs to no source.
-         */
-        LinkMonitor.Ingest handle(String bearerToken, String remote, List<LinkMonitor.Report> reports);
-
-        /**
-         * A request that was turned away (HTTP status and reason), for the activity log.
-         */
-        void rejected(String remote, int status, String why);
-
-        /**
-         * Called once for every request to the endpoint, whatever the outcome, for the activity log.
-         */
-        default void exchange(String remote, String method, String path, String bearerToken,
-                              String requestBody, int status, String responseBody) {
-        }
-    }
-
-    /**
-     * What the current request looked like, kept so the one place that answers can also log it.
-     */
-    private record Seen(String method, String token, String body) {
-    }
+    @Override public void close() { server.stop(0); }
 }

@@ -41,8 +41,9 @@ import java.util.logging.Logger;
  */
 public class CryptoUtil {
 
-    public static final String KEY_FILE_NAME = "opstool.key";
     private static final Logger log = Logger.getLogger(CryptoUtil.class.getName());
+
+    public static final String KEY_FILE_NAME = "opstool.key";
     private static final String V2_PREFIX = "v2:";
     private static final int GCM_IV_BYTES = 12;
     private static final int GCM_TAG_BITS = 128;
@@ -57,18 +58,15 @@ public class CryptoUtil {
 
     private static final SecureRandom RANDOM = new SecureRandom();
     private static final Object LOCK = new Object();
-    private static final String PROTECTED_PREFIX = "dpapi:";
+
     private static File keyDir;          // directory that holds KEY_FILE_NAME
     private static SecretKey cachedKey;  // loaded lazily from keyDir
     private static KeyProtector protector = KeyProtector.system();
     private static Boolean protectorUsable; // result of a one-time round-trip self-test
 
-    private CryptoUtil() {
-    }
+    private static final String PROTECTED_PREFIX = "dpapi:";
 
-    /**
-     * Test hook: replace the OS key protector and forget cached state.
-     */
+    /** Test hook: replace the OS key protector and forget cached state. */
     static void resetForTesting(File dir, KeyProtector p) {
         synchronized (LOCK) {
             keyDir = dir;
@@ -103,6 +101,8 @@ public class CryptoUtil {
         return protectorUsable;
     }
 
+    private CryptoUtil() {}
+
     /**
      * Tells CryptoUtil which directory holds the key file. The first call wins, so the
      * data directory passed to the storage layer is used consistently by every caller in
@@ -115,9 +115,7 @@ public class CryptoUtil {
         }
     }
 
-    /**
-     * True if the value was produced by {@link #encrypt} in the current format.
-     */
+    /** True if the value was produced by {@link #encrypt} in the current format. */
     public static boolean isV2(String value) {
         return value != null && value.startsWith(V2_PREFIX);
     }
@@ -195,8 +193,7 @@ public class CryptoUtil {
                     log.info("Created encryption key file " + path);
                 } catch (FileAlreadyExistsException race) {
                     raw = readKey(path);
-                    if (raw == null)
-                        throw new IOException("Encryption key file " + path + " exists but is unreadable or invalid");
+                    if (raw == null) throw new IOException("Encryption key file " + path + " exists but is unreadable or invalid");
                 }
             }
             cachedKey = new SecretKeySpec(raw, "AES");
@@ -234,9 +231,7 @@ public class CryptoUtil {
         return raw;
     }
 
-    /**
-     * Rewrites a plain key file in wrapped form (atomic replace); the key itself does not change.
-     */
+    /** Rewrites a plain key file in wrapped form (atomic replace); the key itself does not change. */
     private static void upgradeToProtected(Path path, byte[] raw) {
         try {
             Path tmp = path.resolveSibling(path.getFileName() + ".tmp");
@@ -250,9 +245,7 @@ public class CryptoUtil {
         }
     }
 
-    /**
-     * Best effort: owner-only on POSIX. On Windows the file inherits the data directory's ACL.
-     */
+    /** Best effort: owner-only on POSIX. On Windows the file inherits the data directory's ACL. */
     private static void restrictPermissions(Path path) {
         try {
             Files.setPosixFilePermissions(path, PosixFilePermissions.fromString("rw-------"));
@@ -267,10 +260,7 @@ public class CryptoUtil {
         String machine = System.getenv("COMPUTERNAME");
         if (machine == null || machine.isEmpty()) machine = System.getenv("HOSTNAME");
         if (machine == null || machine.isEmpty()) {
-            try {
-                machine = java.net.InetAddress.getLocalHost().getHostName();
-            } catch (Exception ignored) {
-            }
+            try { machine = java.net.InetAddress.getLocalHost().getHostName(); } catch (Exception ignored) {}
         }
         if (machine == null || machine.isEmpty()) machine = "unknown-host";
         SecretKeyFactory factory = SecretKeyFactory.getInstance(LEGACY_KEY_ALGO);
