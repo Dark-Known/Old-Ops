@@ -34,11 +34,8 @@ service\TaskInputValidator$Input.class
 service\TaskSchedulerService$WatchMode.class
 service\mail\MailTextProcessor$MarkerMatch.class
 ui\LinkMonitorPanel$Loaded.class
-service\XmlStorageService$TaskSnapshot.class
 service\CommandQueueService.class
-service\DbChangeMonitor$Topic.class
 service\sftp\UploadStrategy$Mode.class
-service\TransferLedger$State.class
 persistence\SettingsStore.class
 service\sftp\SftpScriptRunner$Outcome.class
 ui\DirectoryBrowserDialog$Item.class
@@ -136,13 +133,11 @@ util\Scripts.class
 service\GraphMailService$AttachmentBundle.class
 service\exec\FileTransferExecutor.class
 ui\GradientPanel.class
-service\RunHistoryService.class
 service\AlertQueueStore.class
 ui\monitor\QueuePanel$WatchRow.class
 ui\monitor\MonitorEvent.class
 service\queue\SchedulerStatusSnapshot$SessionEntry.class
 ui\ToastManager$2.class
-service\AppDb.class
 util\MailRoutingChanges.class
 ui\RunHistoryPanel$Loaded.class
 service\AlertReportServer.class
@@ -211,9 +206,7 @@ service\TaskSchedulerService.class
 util\MemoryTrimmer.class
 ui\DirectoryBrowserDialog$HomeIcon.class
 util\ImapSearchCriteria.class
-service\FailureClassifier.class
 ui\StatusStrip$Loaded.class
-service\TransferLedger$Snapshot.class
 ui\CredentialManagerPanel$CredentialRowRenderer.class
 ui\StatusStrip$3.class
 service\LinkMonitor$Snapshot.class
@@ -260,7 +253,6 @@ ui\monitor\EventFeedPanel$TaskItem.class
 ui\LinkMonitorPanel$1.class
 ui\monitor\FeedRow$Outcome.class
 ui\RetentionPanel.class
-service\SqlitePurge.class
 ui\GradientToggleButton.class
 util\ImapSearchCriteria$SimpleCriteria.class
 ui\AppFeeds.class
@@ -297,7 +289,6 @@ service\DaemonControlServer.class
 Daemon$3.class
 export\PdfTableWriter.class
 ui\ActionCenterButton$2.class
-service\TransferLedger.class
 ui\StatisticsPanel.class
 service\LinkMonitor$Ingest.class
 service\sftp\SftpScriptRunner.class
@@ -312,13 +303,11 @@ model\RunTrace.class
 service\TaskLogService.class
 util\MemoryReport.class
 service\transfer\TransferCommand$Download.class
-service\BackgroundLogService.class
 service\sftp\SessionLog.class
 model\TaskRunRecord.class
 util\NetErr.class
 service\transfer\SftpEngine.class
 model\RemoteFileException.class
-service\CredentialDbService.class
 ui\VectorIcons$6.class
 service\SshSessionEvents$Event.class
 service\AlertConfig$1.class
@@ -388,9 +377,7 @@ service\exec\FolderWatchExecutor$Events.class
 util\MailFetchMode.class
 ui\SettingsPanel$3.class
 service\FolderWatch$Outcome.class
-service\XmlStorageService.class
 persistence\TransferLedger$State.class
-service\DbChangeMonitor.class
 persistence\CommandQueues.class
 service\FolderWatch.class
 service\TaskInputValidator.class
@@ -422,13 +409,11 @@ ui\DirectoryBrowserDialog$4.class
 ui\MainWindow$4.class
 ui\RunHistoryPanel$StatusPillRenderer.class
 ui\LinkActivityPanel$Model.class
-service\TaskDbService.class
 ui\FileSelectionPanel.class
 service\AppFolder.class
 ui\MainWindow.class
 service\LocalFileMetadataService.class
 service\LinkMonitorConfig.class
-service\DbChangeMonitor$Watch.class
 service\TaskSchedulerService$WatchStep.class
 ui\monitor\QueuePanel$PendingRow.class
 ui\QueueMonitorView$ActivityRow.class
@@ -555,7 +540,6 @@ service\backup\BackupService$BackupCandidate.class
 service\DaemonStatusStream.class
 model\FileSelection$MatchMode.class
 service\AlertCallLog$Entry.class
-service\TransferLedger$Entry.class
 ui\TaskManagerPanel$1.class
 ui\TaskManagerPanel.class
 service\transfer\WinScpScript.class
