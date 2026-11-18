@@ -1943,7 +1943,7 @@ public class TaskSchedulerService {
         String taskId = task != null ? task.getId() : null;
         String taskName = task != null ? task.getName() : null;
         if (taskId != null) lastActivityMillis.put(taskId, System.currentTimeMillis());
-        log.info("[" + taskId + "] " + line);
+        if (logCallback == null) log.info("[" + taskId + "] " + line);
         logService.log(taskId, taskName, line);
         if (logCallback != null) {
             logCallback.accept(taskId, LocalDateTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"))

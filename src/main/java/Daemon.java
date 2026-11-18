@@ -24,8 +24,8 @@ import java.util.logging.*;
  * directory the GUI uses), so both processes share the same app.db
  * (tasks, credentials, settings) without any extra configuration.
  *
- * The daemon writes its own rotating log to <dataDir>/daemon.log
- * (max 5 MB, 3 files) so you can inspect it independently of the GUI.
+ * The daemon logs to standard output only; the service wrapper writes that to <dataDir>\logs\daemon-service.out.log
+ * (rotated by the wrapper). A separate file is written only when <logging><daemonLogFile> is set.
  *
  * Lifecycle:
  *   1. On startup it immediately checks all due tasks and runs them.
@@ -54,8 +54,13 @@ public class Daemon {
         new File(dataDir).mkdirs();
         SqliteStorage.setBackgroundLogProcessLabel("Daemon"); // background-log rows say which process wrote them
 
-        // ── Set up file logging ──────────────────────────────────────────────
-        String logPath = dataDir + File.separator + daemonLogFileName();
+        // All logs live in <dataDir>/logs. Files an older version left in the data folder are moved over first.
+        // The daemon's log is its standard output: the service wrapper writes it to <dataDir>\logs\daemon-service.out.log
+        // (rotated by the wrapper). A separate daemon.log is only written when <logging><daemonLogFile> is set explicitly.
+        File logsDir = service.LogFiles.dir(new File(dataDir));
+        String custom = util.AppConfig.readValue("daemonLogFile");
+        String logPath = (custom == null || custom.trim().isEmpty()) ? null
+                : new File(custom.trim()).isAbsolute() ? custom.trim() : new File(logsDir, custom.trim()).getPath();
         setupLogging(logPath, dataDir);
 
         log("Ops Transfer Tool Daemon starting");
@@ -245,7 +250,7 @@ public class Daemon {
         maxLogBytes = readConfiguredMaxBytes();
         keepArchiveCount = readConfiguredKeepCount();
         try {
-            daemonLog = new PrintWriter(new FileWriter(logPath, true), true);
+            if (logPath != null) daemonLog = new PrintWriter(new FileWriter(logPath, true), true);
         } catch (Exception e) {
             System.err.println("Could not open daemon log: " + e.getMessage());
         }
@@ -256,13 +261,11 @@ public class Daemon {
             // Remove default console handler
             for (Handler h : rootLogger.getHandlers()) rootLogger.removeHandler(h);
 
-            FileHandler fh = new FileHandler(
-                dataDir + File.separator + "daemon-%g.log", maxLogBytes, keepArchiveCount, true);
-            fh.setFormatter(new SimpleFormatter() {
+            StreamHandler fh = new StreamHandler(System.out, new SimpleFormatter() {
                 @Override public String format(LogRecord r) {
                     return LocalDateTime.now().format(DT) + "  " + r.getMessage() + "\n";
                 }
-            });
+            }) { @Override public synchronized void publish(LogRecord r) { super.publish(r); flush(); } };
             rootLogger.addHandler(fh);
             rootLogger.setLevel(parseLevel(util.AppSettings.getLogLevel()));
         } catch (Exception e) {
@@ -315,7 +318,7 @@ public class Daemon {
 
     private static synchronized void log(String msg) {
         String line = LocalDateTime.now().format(DT) + "  " + msg;
-        System.out.println(line);
+        System.out.println(line); // captured by the service wrapper into logs\daemon-service.out.log
         rotateIfNeeded();
         if (daemonLog != null) {
             daemonLog.println(line);

@@ -21,7 +21,7 @@ public class TaskRunRecord {
 
     /**
      * Coarse root-cause bucket for a FAILED row, assigned by
-     * {@link service.FailureClassifier} at the moment the failure is
+     * {@link model.FailureClassifier} at the moment the failure is
      * recorded — not re-derived from the log text on every view. Lets the
      * UI render a consistent badge + suggested action instead of everyone
      * reading the raw reason string and guessing, and lets the health

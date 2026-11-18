@@ -25,7 +25,7 @@ import java.util.Map;
  * that all classified as {@code AUTH} against the same credential username
  * are shown as one entry ("5 failures — likely credential 'svc-backup'"),
  * not five unrelated-looking rows. See {@link model.TaskRunRecord.FailureCategory}
- * and {@link service.FailureClassifier} for where the category/suggested
+ * and {@link model.FailureClassifier} for where the category/suggested
  * action on each row comes from.
  *
  * <p>Refreshed two ways: a periodic query (covers Daemon-side failures,

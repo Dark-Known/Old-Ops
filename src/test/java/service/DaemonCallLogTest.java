@@ -16,6 +16,7 @@ public class DaemonCallLogTest {
         try (DaemonControlServer s = DaemonControlServer.start(dir, (action, taskId, who) -> {
             if (action == CommandQueue.Action.CANCEL) throw new IllegalStateException("not running");
         })) {
+            DaemonCallLog.resetStatusPollThrottle();
             assertTrue(DaemonControlClient.send(dir, CommandQueue.Action.RUN_NOW, "task-1234567890", "gui"));
             assertTrue("a failing command is still answered", !DaemonControlClient.send(dir, CommandQueue.Action.CANCEL, "task-9", "gui"));
 
@@ -27,7 +28,8 @@ public class DaemonCallLogTest {
             http.send(java.net.http.HttpRequest.newBuilder(java.net.URI.create("http://127.0.0.1:" + s.port() + "/status"))
                     .header("X-Opstool-Token", s.token()).build(), java.net.http.HttpResponse.BodyHandlers.ofString());
         }
-        List<DaemonCallLog.Entry> log = DaemonCallLog.readRecent(dir, 50);
+        List<DaemonCallLog.Entry> log = recent(dir);
+        for (int i = 0; i < 100 && log.size() < 4; i++) { Thread.sleep(30); log = recent(dir); }
         assertEquals(4, log.size());
         DaemonCallLog.Entry run = log.get(0);
         assertEquals("RUN_NOW", run.action());
@@ -36,7 +38,13 @@ public class DaemonCallLogTest {
         assertEquals(500, log.get(1).status());
         assertEquals("not running", log.get(1).response());
         assertEquals(403, log.get(2).status());
-        assertTrue("the token is never written", !Files.readString(new File(dir, DaemonCallLog.FILE_NAME).toPath()).contains("wrong"));
+        assertTrue("the token is never written", !Files.readString(new File(new File(dir, "logs"), DaemonCallLog.FILE_NAME).toPath()).contains("wrong"));
         assertEquals("Status poll", DaemonCallLog.describe(log.get(3)));
+    }
+
+    private static List<DaemonCallLog.Entry> recent(File dir) {
+        List<DaemonCallLog.Entry> all = new java.util.ArrayList<>(DaemonCallLog.readRecent(dir, 50));
+        all.removeIf(e -> DaemonCallLog.describe(e).startsWith("Status stream"));
+        return all;
     }
 }

@@ -6,6 +6,7 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
+import util.Scripts;
 
 /**
  * The daemon as a Windows Service: the PowerShell that installs, removes and starts it, running that
@@ -22,22 +23,19 @@ public final class WindowsDaemonService {
 
     /** Runs {@code install-service.ps1} with the folders and files the service needs. */
     public static String installScript(File installScript, File installDir, String dataDir, File winSw, String jarPath) {
-        return "& \"" + installScript.getAbsolutePath() + "\" "
-                + "-InstallDir \"" + installDir.getAbsolutePath() + "\" "
-                + "-DataDir \"" + dataDir + "\" "
-                + "-WinSwPath \"" + winSw.getAbsolutePath() + "\" "
-                + "-JarPath \"" + jarPath + "\"";
+        return Scripts.oneLine("daemon/install-daemon.ps1",
+                "INSTALL_SCRIPT", installScript.getAbsolutePath(), "INSTALL_DIR", installDir.getAbsolutePath(),
+                "DATA_DIR", dataDir, "WINSW", winSw.getAbsolutePath(), "JAR", jarPath);
     }
 
     /** Stops then uninstalls the service through WinSW. */
     public static String uninstallScript(File winSw) {
-        return "& \"" + winSw.getAbsolutePath() + "\" stop; "
-                + "& \"" + winSw.getAbsolutePath() + "\" uninstall";
+        return Scripts.oneLine("daemon/uninstall-daemon.ps1", "WINSW", winSw.getAbsolutePath());
     }
 
     /** Starts the service if it was stopped. */
     public static String startScript() {
-        return "Start-Service -Name '" + SERVICE_NAME + "'";
+        return Scripts.oneLine("daemon/start-service.ps1", "SERVICE", SERVICE_NAME);
     }
 
     /**
@@ -48,8 +46,7 @@ public final class WindowsDaemonService {
      */
     public static String elevatedLauncher(String script) {
         String encoded = Base64.getEncoder().encodeToString(script.getBytes(StandardCharsets.UTF_16LE));
-        return "Start-Process powershell.exe -ArgumentList "
-                + "'-NoProfile','-NonInteractive','-EncodedCommand','" + encoded + "' -Verb RunAs -Wait";
+        return Scripts.oneLine("daemon/run-elevated.ps1", "ENCODED", encoded);
     }
 
     // ── running them ─────────────────────────────────────────────────────────
@@ -79,8 +76,7 @@ public final class WindowsDaemonService {
     public static String queryStatus() {
         try {
             Process p = new ProcessBuilder("powershell.exe", "-NonInteractive", "-NoProfile", "-Command",
-                    "Get-Service -Name '" + SERVICE_NAME + "' -ErrorAction SilentlyContinue "
-                            + "| Select-Object -ExpandProperty Status")
+                    Scripts.oneLine("daemon/query-service.ps1", "SERVICE", SERVICE_NAME))
                     .redirectErrorStream(true)
                     .start();
             String line;

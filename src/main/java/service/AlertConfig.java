@@ -1,5 +1,6 @@
 package service;
 
+import persistence.AppDbs;
 import model.EventKind;
 import util.CryptoUtil;
 
@@ -29,6 +30,8 @@ import java.util.Set;
 public final class AlertConfig {
 
     public static final String FILE_NAME = "alerts.properties";
+    /** Name of the row in app.db that holds the settings (the file name above is only the pre-database location). */
+    static final String KV_NAME = "alerts";
 
     /** What a task does about alerts. */
     public enum Mode { INHERIT, OFF, CUSTOM }
@@ -160,10 +163,15 @@ public final class AlertConfig {
     // ── Files ──────────────────────────────────────────────────────────────
 
     public static AlertConfig load(File dataDir) {
-        File f = new File(dataDir, FILE_NAME);
-        if (!f.isFile()) return empty();
+        String text = AppDbs.forDataDir(dataDir).get(KV_NAME);
+        if (text == null) {
+            // settings written by an older version were a loose file; move them into app.db once
+            text = takeLegacyFile(new File(dataDir, FILE_NAME));
+            if (text == null) return empty();
+            try { AppDbs.forDataDir(dataDir).put(KV_NAME, text); } catch (IOException e) { /* still usable this time */ }
+        }
         Properties p = new Properties();
-        try (InputStream in = new FileInputStream(f)) { p.load(in); } catch (IOException e) { return empty(); }
+        try { p.load(new java.io.StringReader(text)); } catch (IOException e) { return empty(); }
         return parse(p, dataDir);
     }
 
@@ -207,9 +215,9 @@ public final class AlertConfig {
             p.setProperty("task." + e.getKey() + ".mode", e.getValue().mode().name());
             if (e.getValue().mode() == Mode.CUSTOM) p.setProperty("task." + e.getKey() + ".kinds", join(e.getValue().kinds()));
         }
-        File tmp = new File(dataDir, FILE_NAME + ".tmp");
-        try (OutputStream out = new FileOutputStream(tmp)) { p.store(out, "Alert settings (the webhook address is encrypted)"); }
-        Files.move(tmp.toPath(), new File(dataDir, FILE_NAME).toPath(), StandardCopyOption.REPLACE_EXISTING);
+        java.io.StringWriter w = new java.io.StringWriter();
+        p.store(w, "Alert settings (the webhook address is encrypted)");
+        AppDbs.forDataDir(dataDir).put(KV_NAME, w.toString());
     }
 
     static Set<EventKind> parseKinds(String s) {
@@ -237,4 +245,14 @@ public final class AlertConfig {
     }
 
     @Override public String toString() { return "AlertConfig[enabled=" + enabled + ", kinds=" + Arrays.toString(kinds.toArray()) + "]"; }
+
+    /** Reads a legacy file's text and renames it {@code .migrated}, or returns null when there is no such file. */
+    private static String takeLegacyFile(File f) {
+        if (!f.isFile()) return null;
+        try {
+            String text = Files.readString(f.toPath(), java.nio.charset.StandardCharsets.UTF_8);
+            Files.move(f.toPath(), new File(f.getParentFile(), f.getName() + ".migrated").toPath(), StandardCopyOption.REPLACE_EXISTING);
+            return text;
+        } catch (IOException e) { return null; }
+    }
 }

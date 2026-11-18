@@ -123,6 +123,7 @@ public class GraphAttachmentStreamingTest {
         AtomicInteger hits = new AtomicInteger();
         HttpServer s = server(hits, true, true);
         try {
+            GraphCallLog.configure(logDir); // the call log is process-wide; other tests re-point it
             GraphMailService.AttachmentBundle b = fetch(s, new ArrayList<>());
             check(b);
             assertTrue("first request was throttled, then retried", hits.get() >= 2);

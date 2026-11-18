@@ -38,9 +38,9 @@ public final class LinkActivityLog {
 
     public synchronized void append(Entry e) {
         try {
-            File f = new File(dir, FILE_NAME);
+            File f = LogFiles.file(dir, FILE_NAME);
             if (f.length() > MAX_BYTES) {
-                Files.move(f.toPath(), new File(dir, FILE_NAME + ".1").toPath(), StandardCopyOption.REPLACE_EXISTING);
+                Files.move(f.toPath(), LogFiles.file(dir, FILE_NAME + ".1").toPath(), StandardCopyOption.REPLACE_EXISTING);
             }
             String line = "{\"t\":" + e.time()
                     + ",\"remote\":\"" + esc(e.remote()) + "\",\"source\":\"" + esc(e.sourceId())
@@ -58,7 +58,7 @@ public final class LinkActivityLog {
     public static List<Entry> readRecent(File dataDir, int limit) {
         Deque<Entry> out = new ArrayDeque<>();
         for (String name : new String[] { FILE_NAME + ".1", FILE_NAME }) {
-            File f = new File(dataDir, name);
+            File f = LogFiles.file(dataDir, name);
             if (!f.isFile()) continue;
             try (BufferedReader r = Files.newBufferedReader(f.toPath(), StandardCharsets.UTF_8)) {
                 String line;

@@ -231,7 +231,7 @@ public class SettingsPanel extends JPanel {
         String dataDir = resolveActualDataDir();
         addInfoRow(infoPanel, "Data directory:", dataDir, 0);
         addInfoRow(infoPanel, "Tasks, credentials & settings (database):", dataDir + File.separator + "app.db", 1);
-        addInfoRow(infoPanel, "Daemon log:",     dataDir + File.separator + resolveDaemonLogFileName(), 2);
+        addInfoRow(infoPanel, "Daemon log:",     dataDir + File.separator + "logs" + File.separator + resolveDaemonLogFileName(), 2);
         addInfoRow(infoPanel, "Run history (database):", dataDir + File.separator + "run_history.db", 3);
         addInfoRow(infoPanel, "Background log (database):", dataDir + File.separator + "background_log.db", 4);
         return infoPanel;
@@ -619,7 +619,7 @@ public class SettingsPanel extends JPanel {
     /** Mirrors Daemon.daemonLogFileName() — see note in openDaemonLog(). */
     private static String resolveDaemonLogFileName() {
         String name = util.AppConfig.readValue("daemonLogFile");
-        return (name != null && !name.trim().isEmpty()) ? name.trim() : "daemon.log";
+        return (name != null && !name.trim().isEmpty()) ? name.trim() : "daemon-service.out.log";
     }
 
     // ── Daemon management ────────────────────────────────────────────────────
@@ -814,7 +814,16 @@ public class SettingsPanel extends JPanel {
         // in the default package and can't be imported from here, so this
         // mirrors its daemonLogFileName() lookup directly — same as
         // resolveActualDataDir() already mirrors Daemon's dataDir lookup.)
-        String logPath = resolveActualDataDir() + File.separator + resolveDaemonLogFileName();
+        File dataFolder = new File(resolveActualDataDir());
+        String custom = util.AppConfig.readValue("daemonLogFile");
+        String logPath;
+        if (custom != null && !custom.trim().isEmpty()) {
+            logPath = new File(custom.trim()).isAbsolute() ? custom.trim() : service.LogFiles.file(dataFolder, custom.trim()).getPath();
+        } else {
+            // the service wrapper writes the daemon's output here
+            File[] outs = new File(dataFolder, "logs").listFiles((d, n) -> n.endsWith(".out.log"));
+            logPath = outs != null && outs.length > 0 ? outs[0].getPath() : new File(new File(dataFolder, "logs"), "daemon-service.out.log").getPath();
+        }
         File logFile = new File(logPath);
         if (!logFile.exists()) {
             showInfo("No daemon log found yet.\nExpected: " + logPath

@@ -34,6 +34,7 @@ public final class SqliteStorage {
         Changes.install(SqliteChangeMonitor::forDataDir);
         CommandQueues.install(SqliteCommandQueue::new);
         SettingsStores.install(SqliteSettingsStore::forDataDir);
+        persistence.AppDbs.install(SqliteAppDb::new);
     }
 
     /** Opens (creating and migrating if needed) the SQLite-backed storage in {@code dataDirPath}. */

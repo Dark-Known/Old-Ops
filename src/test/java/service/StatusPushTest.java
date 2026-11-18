@@ -1,8 +1,8 @@
 package service;
 
-import persistence.CommandQueue;
 import static org.junit.Assert.*;
 
+import persistence.CommandQueue;
 import org.junit.Before;
 import org.junit.Test;
 import service.queue.SchedulerStatusExporter;
@@ -159,6 +159,9 @@ public class StatusPushTest {
 
     @Test
     public void changesArriveByPushQuicklyAndIdleIsSilent() throws Exception {
+        // The status fingerprint includes how many background jobs are busy process-wide, so work left running by
+        // an earlier test in the same JVM would show up here as an extra status event. Wait until it has finished.
+        awaitTrue("no background job from another test still running", 10000, () -> service.Workers.busyBackground() == 0);
         try (Rig r = new Rig(dir, 300)) {
             export(r.exporter, 4, 0);
             awaitTrue("stream live with first status", 5000, () -> r.stream.latestIfLive() != null);

@@ -70,6 +70,7 @@ public class GraphMailService {
     String userPath() { return userPath; }
     private static final java.time.Duration REQUEST_TIMEOUT = java.time.Duration.ofSeconds(60);
     private static final int MAX_ATTEMPTS = 4;
+    private static final java.util.logging.Logger LOG = java.util.logging.Logger.getLogger(GraphMailService.class.getName());
     private static final java.time.Duration ATTACHMENT_TIMEOUT = java.time.Duration.ofMinutes(5);
 
     public static class MailMessage {
@@ -945,9 +946,19 @@ public class GraphMailService {
             try {
                 resp = http.send(req, handler);
             } catch (IOException | RuntimeException ex) {
-                GraphCallLog.record("graph", req.method(), req.uri(), userPath, 0, System.currentTimeMillis() - t0, -1, null, attempt,
-                        ex.getClass().getSimpleName() + ": " + ex.getMessage());
-                throw ex;
+                long ms = System.currentTimeMillis() - t0;
+                String why = util.NetErr.describe(ex, req.uri(), ms, 15_000);
+                GraphCallLog.record("graph", req.method(), req.uri(), userPath, 0, ms, -1, null, attempt, why);
+                // A connection that never opened cannot have reached Graph, so any call can be repeated; other transient
+                // failures (reset, closed) are repeated only for reads, which cannot do harm twice.
+                boolean again = util.NetErr.neverConnected(ex) || ("GET".equals(req.method()) && util.NetErr.transientFailure(ex));
+                if (!again || attempt == MAX_ATTEMPTS) {
+                    if (ex instanceof IOException) throw new IOException(why, ex);
+                    throw (RuntimeException) ex;
+                }
+                LOG.warning("Graph " + req.method() + " " + req.uri().getHost() + " failed (" + why + "); retrying in " + (3L * attempt) + " s (attempt " + (attempt + 1) + " of " + MAX_ATTEMPTS + ")");
+                Thread.sleep(3000L * attempt);
+                continue;
             }
             int code = resp.statusCode();
             logCall(req, resp, userPath, System.currentTimeMillis() - t0, attempt);
