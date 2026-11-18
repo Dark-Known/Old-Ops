@@ -1,4 +1,3 @@
-D:\OPS\OpsTransferTool-source\src\main\java\AdminElevation.java
 D:\OPS\OpsTransferTool-source\src\main\java\App.java
 D:\OPS\OpsTransferTool-source\src\main\java\Daemon.java
 D:\OPS\OpsTransferTool-source\src\main\java\export\HtmlReportWriter.java
@@ -106,10 +105,10 @@ D:\OPS\OpsTransferTool-source\src\main\java\service\SettingsChangeDescriber.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\SettingsInput.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\sftp\ConnectOptions.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\sftp\JschSftpClient.java
+D:\OPS\OpsTransferTool-source\src\main\java\service\sftp\LocalSftpClient.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\sftp\RemoteEntry.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\sftp\SessionLog.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\sftp\SftpClient.java
-D:\OPS\OpsTransferTool-source\src\main\java\service\sftp\SftpScriptRunner.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\sftp\UploadStrategy.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\SftpBrowseService.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\SftpRemoteFileMetadataService.java
@@ -127,6 +126,7 @@ D:\OPS\OpsTransferTool-source\src\main\java\service\TeamsCard.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\transfer\ByteFormat.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\transfer\CredentialLookup.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\transfer\EngineSettings.java
+D:\OPS\OpsTransferTool-source\src\main\java\service\transfer\LocalAwareEngine.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\transfer\LocalFileOps.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\transfer\RemoteDirs.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\transfer\RemoteFileStat.java
@@ -155,7 +155,6 @@ D:\OPS\OpsTransferTool-source\src\main\java\service\watch\WatcherBarText.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\watch\WatcherConnections.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\WatcherSkipException.java
 D:\OPS\OpsTransferTool-source\src\main\java\service\Workers.java
-D:\OPS\OpsTransferTool-source\src\main\java\ui\ActionCenterButton.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\ActivityEventPopup.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\AlertSettingsPanel.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\ApiPanel.java
@@ -165,7 +164,6 @@ D:\OPS\OpsTransferTool-source\src\main\java\ui\Async.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\components\IconTile.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\components\PillBadge.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\components\StatCard.java
-D:\OPS\OpsTransferTool-source\src\main\java\ui\CredentialListModel.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\CredentialManagerPanel.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\DataFeed.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\DirectoryBrowserDialog.java
@@ -175,8 +173,6 @@ D:\OPS\OpsTransferTool-source\src\main\java\ui\EventMonitorWindow.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\FileSelectionPanel.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\GradientButton.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\GradientPanel.java
-D:\OPS\OpsTransferTool-source\src\main\java\ui\GradientToggleButton.java
-D:\OPS\OpsTransferTool-source\src\main\java\ui\HealthBanner.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\IconTile.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\IssueGrouping.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\LazyPanel.java
@@ -211,21 +207,17 @@ D:\OPS\OpsTransferTool-source\src\main\java\ui\RunHistoryPanel.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\RunLogSummarizer.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\SearchCriteriaPanel.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\SettingsPanel.java
-D:\OPS\OpsTransferTool-source\src\main\java\ui\SettingsRow.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\StatCard.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\StatisticsPanel.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\StatusStrip.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\TaskDialog.java
-D:\OPS\OpsTransferTool-source\src\main\java\ui\TaskListModel.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\TaskManagerPanel.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\TestConnectionDialog.java
-D:\OPS\OpsTransferTool-source\src\main\java\ui\Theme.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\ToastManager.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\VectorIcons.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\VisibilityPanel.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\WatcherInfoPopup.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\WatchStatusMonitor.java
-D:\OPS\OpsTransferTool-source\src\main\java\ui\WorkerActivityStrip.java
 D:\OPS\OpsTransferTool-source\src\main\java\ui\WorkersTooltip.java
 D:\OPS\OpsTransferTool-source\src\main\java\util\AppConfig.java
 D:\OPS\OpsTransferTool-source\src\main\java\util\AppSettings.java

@@ -8,7 +8,6 @@ import model.Credential;
 import model.ScheduledTask;
 import service.RemoteFileMetadataService;
 
-import java.util.Properties;
 
 /**
  * Resolves the appropriate {@link RemoteFileMetadataService} implementation
@@ -91,8 +90,8 @@ public class RemoteFileMetadataServiceFactory {
                     "Cannot open SFTP connection: no credential resolved for task " + task.getId());
         }
 
-        SftpClient client = JschSftpClient.connect(credential.getHost(), credential.getUsername(),
-                credential.getPassword(), CONNECT);
+        SftpClient client = credential.isLocal() ? new service.sftp.LocalSftpClient()
+                : JschSftpClient.connect(credential.getHost(), credential.getUsername(), credential.getPassword(), CONNECT);
 
         // For INBOUND tasks the watch directory is the remote source path (targetPath).
         String watchDir = resolveRemoteWatchDirectory(task);

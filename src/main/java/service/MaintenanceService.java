@@ -3,7 +3,6 @@ package service;
 import persistence.PurgeResult;
 import persistence.BackgroundLog;
 import persistence.RunHistory;
-import model.TaskRunRecord;
 
 import java.time.Duration;
 import java.time.LocalDateTime;

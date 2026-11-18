@@ -1,7 +1,5 @@
 package architecture;
 
-import persistence.sqlite.SqliteBackgroundLog;
-import persistence.sqlite.SqliteRunHistory;
 import static org.junit.Assert.*;
 import static org.junit.Assume.assumeTrue;
 

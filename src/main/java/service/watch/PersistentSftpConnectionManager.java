@@ -8,7 +8,6 @@ import model.Credential;
 
 import java.util.Properties;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
@@ -137,6 +136,7 @@ public class PersistentSftpConnectionManager implements WatcherConnections {
 
     @Override
     public service.sftp.SftpClient acquireClient(String taskId, int slot, Credential credential) throws Exception {
+        if (credential != null && credential.isLocal()) return new service.sftp.LocalSftpClient(); // no connection to keep alive
         ChannelSftp channel = acquireChannel(taskId, slot, credential);
         Entry e = entries.get(taskId);
         service.sftp.SessionLog sessionLog = e != null && e.log != null ? e.log : new service.sftp.SessionLog();

@@ -14,8 +14,6 @@ import java.awt.*;
 import java.io.*;
 import java.util.LinkedHashMap;
 import java.util.Map;
-import java.util.Base64;
-import java.nio.charset.StandardCharsets;
 import java.util.prefs.Preferences;
 
 public class SettingsPanel extends JPanel {

@@ -1,7 +1,6 @@
 model\FileSelection$SentPolicy.class
 ui\ActivityEventPopup$1.class
 Daemon.class
-ui\Theme.class
 ui\QueueMonitorView$RunSource.class
 ui\TaskManagerPanel$3.class
 service\TaskSchedulerService$2.class
@@ -37,7 +36,6 @@ ui\LinkMonitorPanel$Loaded.class
 service\CommandQueueService.class
 service\sftp\UploadStrategy$Mode.class
 persistence\SettingsStore.class
-service\sftp\SftpScriptRunner$Outcome.class
 ui\DirectoryBrowserDialog$Item.class
 ui\TaskDialog$4.class
 service\AlertQueueStore$Job.class
@@ -48,7 +46,6 @@ service\transfer\TransferCommand$MoveRemote.class
 service\mail\MailIngestService.class
 persistence\TransferLedger$Entry.class
 service\BackgroundJobs.class
-ui\ActionCenterButton$3.class
 ui\monitor\DetailPane$3.class
 ui\monitor\EventFeedPanel$5.class
 model\FileSelection$Filter.class
@@ -61,7 +58,6 @@ service\DaemonControlServer$Executor.class
 persistence\CommandQueues$Unavailable$1.class
 model\FileSelection$Pick.class
 ui\monitor\TaskChangeView$Row.class
-ui\SettingsRow.class
 util\CryptoUtil.class
 ui\MainWindow$5.class
 ui\monitor\EventFeedPanel$2.class
@@ -85,10 +81,8 @@ ui\RunLogSummarizer$FileEntry.class
 ui\WatcherInfoPopup$Result.class
 service\TransferService$1.class
 ui\monitor\MonitorPrefs$Range.class
-ui\WorkerActivityStrip$Row.class
 persistence\Changes$Never.class
 service\RemoteFileMetadataServiceFactory$ManagedMetadataService.class
-ui\ActionCenterButton$1.class
 model\FileSelection$Op.class
 service\LinkStatusFile$Status.class
 ui\monitor\DetailPane$1.class
@@ -206,6 +200,7 @@ service\TaskSchedulerService.class
 util\MemoryTrimmer.class
 ui\DirectoryBrowserDialog$HomeIcon.class
 util\ImapSearchCriteria.class
+service\transfer\LocalAwareEngine.class
 ui\StatusStrip$Loaded.class
 ui\CredentialManagerPanel$CredentialRowRenderer.class
 ui\StatusStrip$3.class
@@ -230,7 +225,6 @@ service\transfer\TransferCommand.class
 service\SilenceWatch$Verdict.class
 service\schedule\NextRunLabel$1.class
 service\watch\WatcherBarText$1.class
-ui\WorkerActivityStrip.class
 persistence\TaskRepository.class
 service\TransferCleanup$LocalOriginal.class
 service\TeamsCard.class
@@ -242,7 +236,6 @@ persistence\sqlite\SqliteChangeMonitor$Watch.class
 service\ConnectionTestService.class
 Daemon$2.class
 service\RemoteFileMetadataService.class
-ui\ActionCenterButton$RoundedLineBorder.class
 ui\LazyPanel.class
 ui\WatcherInfoPopup.class
 persistence\TransferLedger.class
@@ -253,7 +246,6 @@ ui\monitor\EventFeedPanel$TaskItem.class
 ui\LinkMonitorPanel$1.class
 ui\monitor\FeedRow$Outcome.class
 ui\RetentionPanel.class
-ui\GradientToggleButton.class
 util\ImapSearchCriteria$SimpleCriteria.class
 ui\AppFeeds.class
 service\SaveFailureText.class
@@ -288,11 +280,8 @@ model\FileSelection$AfterAction.class
 service\DaemonControlServer.class
 Daemon$3.class
 export\PdfTableWriter.class
-ui\ActionCenterButton$2.class
 ui\StatisticsPanel.class
 service\LinkMonitor$Ingest.class
-service\sftp\SftpScriptRunner.class
-ui\HealthBanner.class
 service\WatcherSkipException.class
 service\sftp\ConnectOptions.class
 ui\monitor\MonitorStyle.class
@@ -333,7 +322,6 @@ ui\MainWindow$1.class
 model\FailureClassifier.class
 service\schedule\NextFire$1.class
 persistence\AppDb.class
-service\sftp\SftpScriptRunner$Connector.class
 service\exec\RunContext.class
 service\FolderWatch$Lister.class
 service\MonitorEvents.class
@@ -349,7 +337,6 @@ service\sftp\UploadStrategy.class
 ui\DirectoryBrowserDialog$1.class
 ui\DirectoryBrowserDialog$GoArrowIcon.class
 ui\TaskManagerPanel$LogMode.class
-ui\ActionCenterButton$Snapshot.class
 ui\monitor\EventFeedPanel$RowRenderer.class
 service\backup\BackupService$BatchRunner.class
 persistence\RepositoryAppStorage$TaskSnapshot.class
@@ -365,7 +352,6 @@ ui\monitor\TaskChangeView$Section.class
 ui\NotificationBell$1.class
 persistence\CommandQueue$Action.class
 service\DaemonCallLog$Entry.class
-ui\ActionCenterButton.class
 service\os\WindowsDaemonService.class
 ui\QueueMonitorView$PendingRow.class
 service\AlertCallLog.class
@@ -381,7 +367,6 @@ persistence\TransferLedger$State.class
 persistence\CommandQueues.class
 service\FolderWatch.class
 service\TaskInputValidator.class
-ui\HealthBanner$1.class
 service\TaskSchedulerService$WatchGroup.class
 ui\monitor\DetailPane.class
 ui\StatusStrip$1.class
@@ -419,13 +404,11 @@ ui\monitor\QueuePanel$PendingRow.class
 ui\QueueMonitorView$ActivityRow.class
 ui\VectorIcons$8.class
 ui\VisibilityPanel.class
-ui\CredentialListModel.class
 ui\monitor\MonitorPrefs.class
 persistence\sqlite\SqliteTransferLedger.class
 ui\DirectoryBrowserDialog$3.class
 ui\SettingsPanel.class
 persistence\CommandQueues$Unavailable.class
-ui\Theme$3.class
 service\queue\SchedulerStatusSnapshot.class
 service\MaintenanceService$Purge.class
 service\Workers.class
@@ -440,7 +423,6 @@ service\Workers$1.class
 ui\WatchStatusMonitor.class
 model\ScheduledTask$TransferMode.class
 service\queue\TaskWorkerPool.class
-ui\TaskListModel.class
 service\LinkTls.class
 service\queue\SchedulerStatusSnapshot$WatchEntry.class
 ui\monitor\WrapLayout.class
@@ -454,6 +436,7 @@ service\TransferPaths.class
 ui\RunHistoryPanel$1.class
 service\TeamsCard$Alert.class
 service\AlertConfig.class
+service\sftp\LocalSftpClient.class
 service\transfer\TransferCommand$DeleteRemote.class
 service\StatusBroadcaster.class
 ui\ToastManager.class
@@ -473,10 +456,8 @@ model\ScheduledTask$TaskType.class
 model\ScheduledTask$TransferDirection.class
 service\watch\ListenerScripts.class
 ui\components\StatCard.class
-AdminElevation.class
 service\sftp\SftpClient.class
 ui\EdtWatchdog.class
-ui\Theme$4.class
 ui\RunHistoryPanel.class
 ui\DirectoryBrowserDialog$BackArrowIcon.class
 ui\LinkOverviewPanel$Section.class
@@ -520,7 +501,6 @@ ui\monitor\QueuePanel$Section$Model.class
 ui\TaskManagerPanel$2.class
 model\Credential.class
 util\LeanLaunch.class
-ui\Theme$2.class
 service\backup\BackupService.class
 ui\monitor\FilterChip.class
 service\sftp\UploadStrategy$RemoteFiles.class
@@ -543,8 +523,6 @@ service\AlertCallLog$Entry.class
 ui\TaskManagerPanel$1.class
 ui\TaskManagerPanel.class
 service\transfer\WinScpScript.class
-ui\Theme$1.class
-service\sftp\SftpScriptRunner$ConnectFailed.class
 ui\LinkMonitorPanel$SourceTableModel.class
 service\TransferCleanup$RemoteMove.class
 ui\monitor\EventFilter.class

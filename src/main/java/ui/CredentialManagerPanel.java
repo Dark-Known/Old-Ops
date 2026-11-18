@@ -83,11 +83,13 @@ public class CredentialManagerPanel extends JPanel {
         btnEdit.addActionListener(e -> {
             Credential c = credList.getSelectedValue();
             if (c == null) { JOptionPane.showMessageDialog(this, "Select a credential to edit."); return; }
+            if (c.isLocal()) { builtInNotice(); return; }
             showDialog(c);
         });
         btnDelete.addActionListener(e -> {
             Credential c = credList.getSelectedValue();
             if (c == null) { JOptionPane.showMessageDialog(this, "Select a credential to delete."); return; }
+            if (c.isLocal()) { builtInNotice(); return; }
             String username = c.getName();   // credentials are identified by name
             int inUse = storage.countTasksUsingCredential(username);
             String warning = inUse > 0
@@ -149,6 +151,13 @@ public class CredentialManagerPanel extends JPanel {
         add(btnPanel,  BorderLayout.SOUTH);
 
         refresh();
+    }
+
+    private void builtInNotice() {
+        JOptionPane.showMessageDialog(this,
+            "\"" + Credential.LOCAL_NAME + "\" is built in and cannot be edited or deleted.\n"
+          + "Pick it in a File Transfer task to copy or move files between two folders on this computer.",
+            "Built-in credential", JOptionPane.INFORMATION_MESSAGE);
     }
 
     public void refresh() {
@@ -223,7 +232,8 @@ public class CredentialManagerPanel extends JPanel {
                                                         int index, boolean isSelected, boolean cellHasFocus) {
             nameLabel.setText(c.getName() != null && !c.getName().isBlank()
                     ? c.getName() : c.getUsername() + "@" + c.getHost());
-            metaLabel.setText(c.getUsername() + "  \u00b7  " + c.getHost()
+            metaLabel.setText(c.isLocal() ? "Built in  \u00b7  folders on this computer"
+                    : c.getUsername() + "  \u00b7  " + c.getHost()
                     + "  \u00b7  " + (c.getOsType() != null ? c.getOsType() : "?"));
 
             boolean windows = "WINDOWS".equalsIgnoreCase(c.getOsType());

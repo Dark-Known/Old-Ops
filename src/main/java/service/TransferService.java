@@ -11,7 +11,6 @@ import model.RemoteFileMetadata;
 import model.ScheduledTask;
 import model.ScheduledTask.TransferDirection;
 import model.ScheduledTask.TransferMode;
-import service.RemoteFileMetadataServiceFactory.ManagedMetadataService;
 import service.mail.MailIngestService;
 import service.transfer.EngineSettings;
 import service.transfer.RemoteFileStat;
@@ -26,46 +25,36 @@ import service.transfer.TransferCommand;
 import service.transfer.TransferJob;
 import service.transfer.SftpEngine;
 import service.transfer.SwitchingEngine;
+import service.transfer.LocalAwareEngine;
 import service.transfer.TransferEngine;
 import service.transfer.WinScpEngine;
 import service.watch.PersistentSftpConnectionManager;
 import service.watch.WatcherConnections;
-import util.MailFetchMode;
-import util.MiniJson;
-import util.AppConfig;
 import util.AppSettings;
 
 import java.io.*;
 import java.net.InetAddress;
 import java.nio.file.*;
-import java.nio.charset.StandardCharsets;
 import java.time.Instant;
-import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Consumer;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
  * Executes file transfers via WinSCP's scripting interface (winscp.com).
- * Local→local file transfers are not supported — every FILE_TRANSFER task
- * moves data to/from a remote SFTP target.
+ * Local→local copies are done by picking the built-in "Local (this computer)"
+ * credential as the target; every other FILE_TRANSFER target is a remote host.
  *
  * <h2>Watcher integration — both directions</h2>
  * When {@code task.isWatcherEnabled() == true} AND
@@ -215,9 +204,9 @@ public class TransferService {
         this.storage                = storage;
         this.metadataServiceFactory = new RemoteFileMetadataServiceFactory(storage);
         this.winScpPath             = detectWinScp();
-        this.engine                 = new SwitchingEngine(EngineSettings::useSftpEngine,
-                new SftpEngine(sessions, lastFailureClassification::set),
-                new WinScpEngine(() -> winScpPath, new ScriptFiles(), sessions));
+        SftpEngine sftpEngine       = new SftpEngine(sessions, lastFailureClassification::set);
+        this.engine                 = new LocalAwareEngine(sftpEngine, new SwitchingEngine(EngineSettings::useSftpEngine,
+                sftpEngine, new WinScpEngine(() -> winScpPath, new ScriptFiles(), sessions)));
         // Shared dataDir-based path, NOT the per-user-home default — the
         // Daemon runs as SYSTEM (see app-config.xml <runAsSystem>) while the
         // GUI runs as the logged-in user, so a user-home-based token path
@@ -316,11 +305,10 @@ public class TransferService {
         }
 
         // ── Non-watcher remote path ───────────────────────────────────────────
-        // Local→local file transfers are not supported — every FILE_TRANSFER
-        // task must resolve to a remote target credential.
+        // The target is either a remote credential or the built-in Local one.
         if (target == null) {
-            logLine.accept("[ERROR] No target credential resolved. Local\u2192local file transfers are "
-                    + "not supported — set a Target Username/host/credential for this task.");
+            logLine.accept("[ERROR] No target credential resolved. Choose a credential for this task "
+                    + "(or \"" + Credential.LOCAL_NAME + "\" to copy between two local folders).");
             return false;
         }
 
@@ -1994,13 +1982,14 @@ public class TransferService {
                     .filter(x -> x.getId().equals(task.getTargetCredentialId()))
                     .findFirst().orElse(null);
         }
-        logLine.accept("[ERROR] No target credential configured — local\u2192local transfers are not supported.");
+        logLine.accept("[ERROR] No target credential configured — choose one, or \"" + Credential.LOCAL_NAME + "\" for local folders.");
         return null;
     }
 
     /** Resolves a credential name to a stored {@link Credential} for a Backup source/destination side, or null if blank/not found. */
     private Credential resolveNamedCredential(String credentialName, String sideLabel, Consumer<String> logLine) {
         if (credentialName == null || credentialName.trim().isEmpty()) return null;
+        if (Credential.isLocalName(credentialName)) return null;   // built-in Local = a local side
         Credential c = storage.loadCredentialByName(credentialName.trim());
         if (c == null) {
             logLine.accept("[ERROR] No credential named '" + credentialName + "' for backup " + sideLabel

@@ -5,6 +5,7 @@ import model.FailureClassifier;
 import model.TaskRunRecord;
 import service.SshSessionEvents;
 import service.sftp.JschSftpClient;
+import service.sftp.LocalSftpClient;
 import service.sftp.RemoteEntry;
 import service.sftp.SessionLog;
 import service.sftp.SftpClient;
@@ -27,6 +28,9 @@ public final class SftpEngine implements TransferEngine {
 
     private static final int CONNECT_TIMEOUT_MS = 30_000;
 
+    /** The host of the built-in "Local (this computer)" credential: no connection is made, files are read and written directly. */
+    static final String LOCAL_HOST = Credential.local().getHost();
+
     private final SessionRegistry sessions;
     private final Consumer<TaskRunRecord> failureSink;
 
@@ -40,7 +44,9 @@ public final class SftpEngine implements TransferEngine {
     }
 
     private SftpJobRunner.Connector connector() {
-        return (host, port, user, pw) -> JschSftpClient.connect(host, port, user, pw, CONNECT_TIMEOUT_MS);
+        return (host, port, user, pw) -> LOCAL_HOST.equals(host)
+                ? new LocalSftpClient()
+                : JschSftpClient.connect(host, port, user, pw, CONNECT_TIMEOUT_MS);
     }
 
     /** One line saying why a session was opened, from what the job does (shown as the session's purpose). */
@@ -128,7 +134,7 @@ public final class SftpEngine implements TransferEngine {
         final String listPurpose = "SFTP listing of " + dirPath + " (find the files to transfer)";
         SshSessionEvents.opened(null, listPurpose, target.getHost(), target.getUsername());
         String end = "finished";
-        try (SftpClient c = JschSftpClient.connect(
+        try (SftpClient c = target.isLocal() ? new LocalSftpClient() : JschSftpClient.connect(
                 target.getHost(), 22, target.getUsername(), password, CONNECT_TIMEOUT_MS)) {
             Map<String, RemoteFileStat> stats = new LinkedHashMap<>();
             for (RemoteEntry e : c.list(dirPath)) {

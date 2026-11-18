@@ -246,4 +246,22 @@ public class RepositoryAppStorageTest {
     @Test public void theDataDirIsWhatWasGiven() {
         assertEquals(new File("data"), storage.getDataDir());
     }
+
+    // ── built-in Local credential ────────────────────────────────────────────
+
+    @Test public void theLocalCredentialIsAlwaysListedFirst() {
+        creds.rows.add(credential("c1", "Prod"));
+        List<Credential> all = storage.loadAllCredentials();
+        assertTrue(all.get(0).isLocal());
+        assertEquals(2, all.size());
+        assertTrue(storage.loadCredentialByName(Credential.LOCAL_NAME).isLocal());
+        assertTrue(storage.loadCredentialById(Credential.LOCAL_ID).isLocal());
+    }
+
+    @Test public void theLocalCredentialCannotBeDeletedOrOverwritten() {
+        assertFalse(storage.deleteCredential(Credential.LOCAL_NAME));
+        assertFalse(storage.saveCredential(credential("x", "local (this computer)")));
+        assertTrue(creds.rows.isEmpty());
+        assertTrue(storage.loadAllCredentials().get(0).isLocal());
+    }
 }
