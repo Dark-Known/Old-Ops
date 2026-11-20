@@ -107,7 +107,7 @@ public class SqliteCredentialRepository implements CredentialRepository {
         String initError = null;
         try {
             Class.forName("org.sqlite.JDBC");
-            c = DriverManager.getConnection("jdbc:sqlite:" + dbFile.getAbsolutePath());
+            c = Db.connect(dbFile);
             applyPragmas(c);
             try (Statement st = c.createStatement()) {
                 st.execute(CREATE_TABLE_SQL.replace("%T%", "credentials"));

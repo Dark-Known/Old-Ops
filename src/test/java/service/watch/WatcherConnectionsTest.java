@@ -7,6 +7,7 @@ import org.junit.Before;
 import org.junit.Test;
 import persistence.SettingsStore;
 import persistence.SettingsStores;
+import util.AppSettings;
 
 import java.util.LinkedHashMap;
 import java.util.Map;

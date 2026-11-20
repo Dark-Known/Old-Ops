@@ -36,6 +36,9 @@ public final class TaskForm {
 
     // shared
     public int retryCount;
+    /** Per-task SFTP batch cap (MB) and parallel sessions; 0 = use Settings. */
+    public int transferBatchMaxMb;
+    public int transferConcurrency;
 
     // schedule
     public String scheduleType;        // ONCE | DAILY | WEEKLY | INTERVAL_MINUTES | INTERVAL_SECONDS | other

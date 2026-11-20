@@ -40,8 +40,9 @@ public final class DaemonStatusStream {
     private static final Logger log = Logger.getLogger(DaemonStatusStream.class.getName());
 
     /** No bytes (not even a heartbeat) for this long and the connection is treated as dead and recycled. */
-    static final long STALL_MS = 15_000;
-    private static final long WATCHDOG_EVERY_MS = 5_000;
+    static long stallMs() { return util.Timers.ms("timerStatusStreamStallMs", 15_000); }
+    private static long watchdogEveryMs() { return util.Timers.ms("timerStatusStreamWatchdogMs", 5_000); }
+    private long lastWatchdogCheckMs;
     private static final long BACKOFF_START_MS = 1_000, BACKOFF_MAX_MS = 10_000;
     /** While there is no control file (Daemon not running) just look again this often: a stat is trivial. */
     private static final long WAITING_FOR_DAEMON_MS = 2_000;
@@ -94,7 +95,7 @@ public final class DaemonStatusStream {
     public SchedulerStatusSnapshot latestIfLive() {
         SchedulerStatusSnapshot s = latest;
         if (s == null || !connected) return null;
-        return System.currentTimeMillis() - lastByteMs <= STALL_MS ? s : null;
+        return System.currentTimeMillis() - lastByteMs <= stallMs() ? s : null;
     }
 
     public boolean isConnected() { return connected; }
@@ -154,10 +155,13 @@ public final class DaemonStatusStream {
         connected = true;
         connects++;
         ScheduledFuture<?> watchdog = WATCHDOG.scheduleWithFixedDelay(() -> {
-            if (System.currentTimeMillis() - lastByteMs > STALL_MS) {
+            long now = System.currentTimeMillis();
+            if (now - lastWatchdogCheckMs < watchdogEveryMs()) return;
+            lastWatchdogCheckMs = now;
+            if (now - lastByteMs > stallMs()) {
                 try { body.close(); } catch (Exception ignored) { } // unblocks readLine() below
             }
-        }, WATCHDOG_EVERY_MS, WATCHDOG_EVERY_MS, TimeUnit.MILLISECONDS);
+        }, 1000, 1000, TimeUnit.MILLISECONDS);   // ticks each second; the check itself follows the live interval
 
         boolean any = false;
         try (BufferedReader br = new BufferedReader(new InputStreamReader(body, StandardCharsets.UTF_8))) {

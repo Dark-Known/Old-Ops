@@ -117,11 +117,31 @@ public class SqliteTransferLedgerTest {
         assertTrue(l.snapshot("task'1").wasSent(odd, 0, 0, SentPolicy.UNCHANGED));
     }
 
-    @Test public void theMemoryLivesInItsOwnFileInTheDataFolder() throws Exception {
+    @Test public void theMemoryLivesInAppDbAndIsSharedBetweenInstances() throws Exception {
         File dir = tempDir();
         new SqliteTransferLedger(dir).record("t", Arrays.asList(new Entry("a", 1, 1)));
-        assertTrue(new File(dir, "transfer_ledger.db").isFile());
+        assertTrue(new File(dir, "app.db").isFile());
+        assertFalse("no separate file any more", new File(dir, "transfer_ledger.db").exists());
         // a second instance (e.g. the Daemon next to the GUI) sees the same data
         assertEquals(1, new SqliteTransferLedger(dir).count("t"));
+    }
+
+    @Test public void theOldSeparateFileIsImportedOnceAndRenamed() throws Exception {
+        File dir = tempDir();
+        try (java.sql.Connection c = java.sql.DriverManager.getConnection("jdbc:sqlite:" + new File(dir, "transfer_ledger.db").getAbsolutePath());
+             java.sql.Statement st = c.createStatement()) {
+            st.execute("CREATE TABLE sent_files (task_id TEXT NOT NULL, name TEXT NOT NULL, size INTEGER NOT NULL, "
+                    + "mtime INTEGER NOT NULL, sent_at INTEGER NOT NULL, PRIMARY KEY (task_id, name, size, mtime))");
+            st.execute("CREATE TABLE task_state (task_id TEXT PRIMARY KEY, last_files_at INTEGER NOT NULL DEFAULT 0, "
+                    + "watching_since INTEGER NOT NULL DEFAULT 0, last_alert_at INTEGER NOT NULL DEFAULT 0)");
+            st.execute("INSERT INTO sent_files VALUES ('t','old.csv',5,6," + System.currentTimeMillis() + ")");
+            st.execute("INSERT INTO task_state VALUES ('t',111,222,0)");
+        }
+        SqliteTransferLedger l = new SqliteTransferLedger(dir);
+        assertTrue(l.snapshot("t").wasSent("old.csv", 5, 6, SentPolicy.UNCHANGED));
+        assertEquals(111, l.state("t").lastFilesAt());
+        assertFalse(new File(dir, "transfer_ledger.db").exists());
+        assertTrue(new File(dir, "transfer_ledger.db.migrated").isFile());
+        assertEquals("a second open does not import again", 1, new SqliteTransferLedger(dir).count("t"));
     }
 }

@@ -71,25 +71,21 @@ public class CredentialManagerPanel extends JPanel {
         // Only "Add Credential" is accent-styled — same one-primary-action
         // restraint as TaskManagerPanel's toolbar; Delete keeps a red-tinted
         // label as its only distinguishing mark instead of a loud gradient.
-        JButton btnAdd     = new GradientButton("Add Credential");
+        JButton btnAdd     = new JButton("Add Credential");
         JButton btnEdit    = new JButton("Edit");
         JButton btnDelete  = new JButton("Delete");
         JButton btnRefresh = new JButton("Refresh");
 
-        styleButton(btnAdd, AppTheme.EARTH_MOSS);
-        btnDelete.setForeground(AppTheme.EARTH_RUST);
 
         btnAdd.addActionListener(e -> showDialog(null));
         btnEdit.addActionListener(e -> {
             Credential c = credList.getSelectedValue();
             if (c == null) { JOptionPane.showMessageDialog(this, "Select a credential to edit."); return; }
-            if (c.isLocal()) { builtInNotice(); return; }
             showDialog(c);
         });
         btnDelete.addActionListener(e -> {
             Credential c = credList.getSelectedValue();
             if (c == null) { JOptionPane.showMessageDialog(this, "Select a credential to delete."); return; }
-            if (c.isLocal()) { builtInNotice(); return; }
             String username = c.getName();   // credentials are identified by name
             int inUse = storage.countTasksUsingCredential(username);
             String warning = inUse > 0
@@ -151,13 +147,6 @@ public class CredentialManagerPanel extends JPanel {
         add(btnPanel,  BorderLayout.SOUTH);
 
         refresh();
-    }
-
-    private void builtInNotice() {
-        JOptionPane.showMessageDialog(this,
-            "\"" + Credential.LOCAL_NAME + "\" is built in and cannot be edited or deleted.\n"
-          + "Pick it in a File Transfer task to copy or move files between two folders on this computer.",
-            "Built-in credential", JOptionPane.INFORMATION_MESSAGE);
     }
 
     public void refresh() {
@@ -232,8 +221,7 @@ public class CredentialManagerPanel extends JPanel {
                                                         int index, boolean isSelected, boolean cellHasFocus) {
             nameLabel.setText(c.getName() != null && !c.getName().isBlank()
                     ? c.getName() : c.getUsername() + "@" + c.getHost());
-            metaLabel.setText(c.isLocal() ? "Built in  \u00b7  folders on this computer"
-                    : c.getUsername() + "  \u00b7  " + c.getHost()
+            metaLabel.setText(c.getUsername() + "  \u00b7  " + c.getHost()
                     + "  \u00b7  " + (c.getOsType() != null ? c.getOsType() : "?"));
 
             boolean windows = "WINDOWS".equalsIgnoreCase(c.getOsType());
@@ -412,9 +400,8 @@ public class CredentialManagerPanel extends JPanel {
             new JLabel("<html><i style='color:#888'>Renaming updates the tasks that use this credential."
                 + " Passwords are stored encrypted.</i></html>"), 6);
 
-        JButton btnSave   = new GradientButton("Save");
+        JButton btnSave   = new JButton("Save");
         JButton btnCancel = new JButton("Cancel");
-        styleButton(btnSave, AppTheme.EARTH_SIENNA);
         btnCancel.addActionListener(e -> dlg.dispose());
         btnSave.addActionListener(e -> {
             String host = tfHost.getText().trim();
@@ -510,8 +497,4 @@ public class CredentialManagerPanel extends JPanel {
         p.add(field, fc);
     }
 
-    private void styleButton(JButton btn, Color bg) {
-        btn.setBackground(bg); btn.setForeground(Color.WHITE);
-        btn.setFocusPainted(false); btn.setBorderPainted(false);
-    }
 }

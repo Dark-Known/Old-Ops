@@ -8,6 +8,7 @@ import model.Credential;
 
 import java.util.Properties;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
@@ -80,7 +81,7 @@ public class PersistentSftpConnectionManager implements WatcherConnections {
      *  unlike the old per-event connect — this no longer sits directly on the
      *  "change detected → transfer starts" critical path on anything but the
      *  very first fire (or a reconnect after a real drop). */
-    private static final int CONNECT_TIMEOUT_MILLIS = 8_000;
+    private static int CONNECT_TIMEOUT_MILLIS() { return util.Timers.msInt("timerSftpConnectTimeoutMs", 8_000); }
 
     /** One task's kept-warm SSH session plus however many SFTP channel slots
      *  have been opened on it so far (grown lazily, up to whatever concurrency
@@ -136,7 +137,6 @@ public class PersistentSftpConnectionManager implements WatcherConnections {
 
     @Override
     public service.sftp.SftpClient acquireClient(String taskId, int slot, Credential credential) throws Exception {
-        if (credential != null && credential.isLocal()) return new service.sftp.LocalSftpClient(); // no connection to keep alive
         ChannelSftp channel = acquireChannel(taskId, slot, credential);
         Entry e = entries.get(taskId);
         service.sftp.SessionLog sessionLog = e != null && e.log != null ? e.log : new service.sftp.SessionLog();
@@ -181,7 +181,7 @@ public class PersistentSftpConnectionManager implements WatcherConnections {
             // yet (or dropped) — cheap: one more channel on an already-live
             // connection, no fresh handshake.
             ChannelSftp opened = (ChannelSftp) existing.session.openChannel("sftp");
-            opened.connect(CONNECT_TIMEOUT_MILLIS);
+            opened.connect(CONNECT_TIMEOUT_MILLIS());
             existing.slots.put(slot, opened);
             return opened;
         }
@@ -195,7 +195,7 @@ public class PersistentSftpConnectionManager implements WatcherConnections {
         }
         Entry created = connect(taskId, credential, priorConnectCount + 1);
         ChannelSftp channel = (ChannelSftp) created.session.openChannel("sftp");
-        channel.connect(CONNECT_TIMEOUT_MILLIS);
+        channel.connect(CONNECT_TIMEOUT_MILLIS());
         created.slots.put(slot, channel);
         entries.put(taskId, created);
         return channel;
@@ -230,7 +230,7 @@ public class PersistentSftpConnectionManager implements WatcherConnections {
         session.setConfig(config);
         util.SshHostKeys.apply(jsch, session);
         try {
-            session.connect(CONNECT_TIMEOUT_MILLIS);
+            session.connect(CONNECT_TIMEOUT_MILLIS());
         } catch (Exception ex) {
             sl.add("Connect failed: " + ex.getMessage());
             service.SshSessionEvents.failedInRun(taskId, PURPOSE, credential.getHost(),

@@ -66,7 +66,7 @@ public final class SqliteSettingsStore implements SettingsStore {
             File dbFile = new File(dir, DB_FILE_NAME);
             try {
                 Class.forName("org.sqlite.JDBC");
-                Connection c = DriverManager.getConnection("jdbc:sqlite:" + dbFile.getAbsolutePath());
+                Connection c = Db.connect(dbFile);
                 applyPragmas(c);
                 try (Statement st = c.createStatement()) {
                     st.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)");

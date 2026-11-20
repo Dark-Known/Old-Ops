@@ -2,6 +2,8 @@ package ui;
 
 import persistence.CommandQueue;
 import service.RetentionSettings;
+import service.BackgroundJobs;
+import service.CommandQueueService;
 import service.MaintenanceService;
 import persistence.PurgePolicy;
 import persistence.PurgeResult;

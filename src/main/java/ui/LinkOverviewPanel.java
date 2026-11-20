@@ -2,6 +2,7 @@ package ui;
 
 import service.DaemonCallLog;
 import service.GraphCallLog;
+import service.LinkActivityLog;
 import service.LinkMonitor;
 import service.LinkStatusFile;
 
@@ -9,6 +10,7 @@ import javax.swing.*;
 import javax.swing.border.EmptyBorder;
 import java.awt.*;
 import java.text.SimpleDateFormat;
+import java.util.Date;
 
 /** Overview cards for one API: the socket links and endpoint, the Outlook mail API, or the background service. */
 final class LinkOverviewPanel extends JPanel {

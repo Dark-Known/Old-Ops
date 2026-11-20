@@ -57,6 +57,23 @@ import java.util.logging.Logger;
  *       the sftp subsystem and refuse this outright, on either OS.</li>
  * </ul>
  *
+ * <h2>One listener per folder, shared by every task that watches it</h2>
+ * Listeners are keyed by server + user + normalized folder (see {@link #listenerKey}), not by task. Tasks that watch
+ * the same folder subscribe to one listener: one SSH connection and one remote process, and each streamed file name
+ * is passed to every subscribed task. The listener closes when its last subscriber leaves.
+ *
+ * <h2>Catching up after a gap</h2>
+ * While no listener runs (connection lost, daemon stopped, task just enabled) a new file produces no event, and a task
+ * with a live watch is not polled. So every time a listener becomes ready, each subscribed task gets one catch-up
+ * wake-up with no file names; the scheduler answers with the same baseline scan a poll would run. Files that landed in
+ * the gap are therefore picked up as soon as the listener is back, without remote buffering.
+ *
+ * <h2>Cleaning up after a lost connection</h2>
+ * A Windows listener never ends other processes itself. Once armed it reports its own processes; this class records
+ * them ({@link RemoteListenerRegistry}) and, before it arms a listener for the same folder again, ends exactly the
+ * recorded ones that are still running ({@link RemoteProcessJanitor}). A listener of another daemon or task was never
+ * recorded here, so it is never touched.
+ *
  * <p>If any check fails, this class marks the task unsupported (cached, with
  * backoff, so it doesn't hammer a server that just rejected an exec request)
  * and gets out of the way entirely — the task's existing scheduled poll (see
@@ -80,8 +97,20 @@ public class RemotePushWatcher {
     private static final String HEARTBEAT = "__HB__";
     /** Final line of the Windows listener: "__END__<why>". */
     private static final String END_PREFIX = "__END__";
+    /** Breadcrumb lines the Windows listener prints after each startup phase ("__STEP__listening"). They are logged
+     *  in the session transcript, never treated as file events, so an early death can be traced to a phase. */
+    private static final String STEP_PREFIX = "__STEP__";
+    /** The Windows listener's last startup breadcrumb: the watcher is registered and the event loop is about to run.
+     *  Must match {@code Mark 'listening'} in windows/event-loop.ps1 (checked by ListenerScriptsTest). */
+    static final String STEP_LISTENING = "listening";
+    /** The Linux listener prints no breadcrumbs: this long after its channel opens, inotifywait is certainly watching. */
+    private static long LINUX_ARM_DELAY_MS() { return util.Timers.ms("timerLinuxListenerArmDelayMs", 1_500); }
 
     private final AppStorage storage;
+    // Remote processes this installation's listeners have reported (survives a restart of the daemon).
+    private final RemoteListenerRegistry processes;
+    // taskId, why -> the listener is ready: look for files that arrived while nothing was watching.
+    private final BiConsumer<String, String> onCatchUp;
     // taskId, changedFileNames -> wake the task up now, naming exactly the file(s)
     // inotifywait/FileSystemWatcher reported.
     private final BiConsumer<String, Set<String>> onSettled;
@@ -89,7 +118,12 @@ public class RemotePushWatcher {
     private ExecutorService listenerExecutor;
     private ScheduledExecutorService debounceExecutor;
 
+    // One remote listener per server+user+folder, however many tasks watch that folder.
+    private final Map<String, ListenerHandle> listenersByKey = new ConcurrentHashMap<>();
+    // The listener each task is subscribed to.
     private final Map<String, ListenerHandle> activeByTaskId = new ConcurrentHashMap<>();
+    // Guards changes to the two maps above and to a listener's subscriber set.
+    private final Object subscriptionLock = new Object();
     private final Map<String, Long> unsupportedUntil = new ConcurrentHashMap<>();
     // Filenames accumulated for a task's pending fire, merged across every
     // streamed line that arrives before the debounce settles.
@@ -107,8 +141,19 @@ public class RemotePushWatcher {
     private volatile boolean running = false;
 
     public RemotePushWatcher(AppStorage storage, BiConsumer<String, Set<String>> onSettled) {
+        this(storage, onSettled, (taskId, why) -> { });
+    }
+
+    public RemotePushWatcher(AppStorage storage, BiConsumer<String, Set<String>> onSettled, BiConsumer<String, String> onCatchUp) {
+        this(storage, onSettled, onCatchUp, RemoteListenerRegistry.inDataDir(storage == null ? null : storage.getDataDir()));
+    }
+
+    RemotePushWatcher(AppStorage storage, BiConsumer<String, Set<String>> onSettled,
+                      BiConsumer<String, String> onCatchUp, RemoteListenerRegistry processes) {
         this.storage = storage;
         this.onSettled = onSettled;
+        this.onCatchUp = onCatchUp;
+        this.processes = processes;
     }
 
     public synchronized void start() {
@@ -123,7 +168,8 @@ public class RemotePushWatcher {
     public synchronized void stop() {
         if (!running) return;
         running = false;
-        for (ListenerHandle h : activeByTaskId.values()) h.close();
+        for (ListenerHandle h : new HashSet<>(listenersByKey.values())) h.close();
+        listenersByKey.clear();
         activeByTaskId.clear();
         if (listenerExecutor != null) listenerExecutor.shutdownNow();
         if (debounceExecutor != null) debounceExecutor.shutdownNow();
@@ -148,10 +194,11 @@ public class RemotePushWatcher {
             if (os == null) continue; // unset/unrecognised osType — not our problem to solve
 
             stillEligible.add(t.getId());
+            String key = listenerKey(cred, os, t.getTargetPath());
             ListenerHandle existing = activeByTaskId.get(t.getId());
-            if (existing != null && existing.matches(t)) continue; // already listening, config unchanged
+            if (existing != null && existing.key.equals(key) && existing.usable()) continue; // already on a live listener, config unchanged
 
-            startListener(t, cred, os);
+            subscribe(t, cred, os, key);
         }
 
         for (String taskId : new ArrayList<>(activeByTaskId.keySet())) {
@@ -208,7 +255,7 @@ public class RemotePushWatcher {
     public void forceReconnect(ScheduledTask task) {
         if (!running || task == null) return;
         unsupportedUntil.remove(task.getId());
-        stopListener(task.getId());
+        dropListenerOf(task.getId());
         if (!isEligible(task)) {
             reasonByTaskId.put(task.getId(),
                     "not eligible for remote push (check watcher enabled, direction is INBOUND, and transfer mode is Latest Only)");
@@ -223,23 +270,103 @@ public class RemotePushWatcher {
                         + (cred.getOsType() == null ? "unset" : cred.getOsType()) + ")");
             return;
         }
-        startListener(task, cred, os);
+        subscribe(task, cred, os, listenerKey(cred, os, task.getTargetPath()));
     }
 
+    /** Unsubscribes a task. Its listener is closed only if nobody else is subscribed to it. */
     private void stopListener(String taskId) {
-        ListenerHandle h = activeByTaskId.remove(taskId);
-        if (h != null) h.close();
+        ListenerHandle toClose = null;
+        synchronized (subscriptionLock) {
+            ListenerHandle h = activeByTaskId.remove(taskId);
+            if (h != null) {
+                h.subscribers.remove(taskId);
+                if (h.subscribers.isEmpty()) {
+                    listenersByKey.remove(h.key, h);
+                    toClose = h;
+                }
+            }
+        }
+        cancelPending(taskId);
+        if (toClose != null) toClose.close();   // waits briefly for the remote process to exit, so outside the lock
+    }
+
+    /**
+     * Ends the listener this task is on, for every task sharing it (the manual Reconnect must really reconnect).
+     * The other tasks rejoin a new listener on the next {@link #sync}.
+     */
+    private void dropListenerOf(String taskId) {
+        ListenerHandle h = activeByTaskId.get(taskId);
+        if (h == null) return;
+        List<String> others = new ArrayList<>();
+        synchronized (subscriptionLock) {
+            for (String id : h.subscribers) {
+                activeByTaskId.remove(id, h);
+                if (!id.equals(taskId)) others.add(id);
+            }
+            h.subscribers.clear();
+            listenersByKey.remove(h.key, h);
+        }
+        cancelPending(taskId);
+        for (String id : others) {
+            cancelPending(id);
+            reasonByTaskId.put(id, "the listener shared with another task on this folder was restarted by its Reconnect; rejoining on the next sync");
+        }
+        h.close();
+    }
+
+    private void cancelPending(String taskId) {
         ScheduledFuture<?> pending = pendingFires.remove(taskId);
         if (pending != null) pending.cancel(false);
         pendingNamesByTaskId.remove(taskId);
     }
 
-    private void startListener(ScheduledTask task, Credential cred, RemoteOs os) {
-        stopListener(task.getId());
-        ListenerHandle handle = new ListenerHandle(task.getId(), task.getTargetPath());
-        activeByTaskId.put(task.getId(), handle);
-        reasonByTaskId.put(task.getId(), "connecting (" + os + ")...");
-        listenerExecutor.submit(() -> runListener(task.getId(), cred, task.getTargetPath(), os, handle));
+    /** Subscribes the task to the listener for {@code key}, starting that listener if no live one exists yet. */
+    void subscribe(ScheduledTask task, Credential cred, RemoteOs os, String key) {
+        String id = task.getId();
+        ListenerHandle previous = activeByTaskId.get(id);
+        if (previous != null && !previous.key.equals(key)) stopListener(id);   // the task now watches another folder or server
+        ListenerHandle toStart = null;
+        ListenerHandle h;
+        synchronized (subscriptionLock) {
+            h = listenersByKey.get(key);
+            if (h == null || !h.usable()) {
+                h = new ListenerHandle(key, id, task.getTargetPath());
+                listenersByKey.put(key, h);
+                toStart = h;
+            }
+            h.subscribers.add(id);
+            activeByTaskId.put(id, h);
+            if (previous != null && previous != h) previous.subscribers.remove(id);
+        }
+        if (toStart != null) {
+            reasonByTaskId.put(id, "connecting (" + os + ")...");
+            launch(toStart, cred, os);
+        } else {
+            reasonByTaskId.put(id, h.state != null ? h.state : "connecting (" + os + ")...");
+            if (h.armed) catchUp(id, "the task joined a listener that was already running");
+        }
+    }
+
+    /**
+     * The listener is now watching the folder. Anything that landed while nothing was watching produced no event, so
+     * every subscriber gets one catch-up wake-up (the scheduler decides whether the task needs it).
+     */
+    void armed(ListenerHandle handle, String why) {
+        handle.armed = true;
+        for (String id : handle.subscribers) catchUp(id, why);
+    }
+
+    private void catchUp(String taskId, String why) {
+        try {
+            onCatchUp.accept(taskId, why);
+        } catch (Exception e) {
+            log.warning("Watcher task " + taskId + ": catch-up callback failed: " + e.getMessage());
+        }
+    }
+
+    /** Starts the connection for a new listener. Separate so tests can run the subscription logic without SSH. */
+    void launch(ListenerHandle handle, Credential cred, RemoteOs os) {
+        listenerExecutor.submit(() -> runListener(cred, handle.path, os, handle));
     }
 
     /** Connection attempts before giving up and letting the scheduler fall back to polling. */
@@ -251,26 +378,30 @@ public class RemotePushWatcher {
      * exit), reconnects in place a few times before giving up. A short glitch therefore no longer flips the task
      * to "polling only" and back; only a connection that stays down does.
      */
-    private void runListener(String taskId, Credential cred, String rawTargetPath, RemoteOs os, ListenerHandle handle) {
+    private void runListener(Credential cred, String rawTargetPath, RemoteOs os, ListenerHandle handle) {
         try {
             int attempt = 0;
             while (!handle.closed) {
-                boolean retry = runListenerOnce(taskId, cred, rawTargetPath, os, handle, attempt);
+                boolean retry = runListenerOnce(cred, rawTargetPath, os, handle, attempt);
                 if (!retry || handle.closed || attempt >= MAX_RECONNECTS) break;
-                reasonByTaskId.put(taskId, "connection lost - reconnecting (attempt " + (attempt + 1) + " of "
+                setReason(handle, "connection lost - reconnecting (attempt " + (attempt + 1) + " of "
                         + MAX_RECONNECTS + ")...");
                 try { Thread.sleep(RECONNECT_DELAYS_MS[attempt]); }
                 catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
                 attempt++;
             }
         } finally {
-            activeByTaskId.remove(taskId, handle);
+            synchronized (subscriptionLock) {
+                listenersByKey.remove(handle.key, handle);
+                for (String id : handle.subscribers) activeByTaskId.remove(id, handle);
+            }
         }
     }
 
     /** One connection of the listener. Returns true if it ended unexpectedly and is worth retrying. */
-    private boolean runListenerOnce(String taskId, Credential cred, String rawTargetPath, RemoteOs os,
+    private boolean runListenerOnce(Credential cred, String rawTargetPath, RemoteOs os,
                                     ListenerHandle handle, int attempt) {
+        final String taskId = handle.ownerTaskId;   // the task this connection is logged under; every subscriber gets the events
         Session session = null;
         ChannelExec channel = null;
         boolean opened = false;
@@ -279,13 +410,18 @@ public class RemotePushWatcher {
         boolean retry = false;
         final ByteArrayOutputStream errBuf = new ByteArrayOutputStream();
         final long[] lastOutputAt = {0};
+        final String[] lastStep = {null};      // last breadcrumb the Windows listener printed
         final service.sftp.SessionLog sl = new service.sftp.SessionLog();   // transcript shown in the Event Monitor
+        final Object conn = new Object();
+        boolean armedHere = false;             // this connection has already reported ready
+        final String armedWhy = attempt > 0 ? "the listener reconnected after the connection was lost" : "the listener was armed";
         try {
             JSch jsch = new JSch();
             session = jsch.getSession(cred.getUsername(), cred.getHost(), 22);
             session.setLogger(sl.jschLogger());
             sl.add("Connecting to " + cred.getHost() + ":22 as " + cred.getUsername() + " (remote " + os + ")"
                     + (attempt > 0 ? " - reconnect attempt " + attempt + " of " + MAX_RECONNECTS : ""));
+            sl.add("Shared listener for " + rawTargetPath + ": " + handle.subscribers.size() + " task(s) subscribed");
             util.SshAuth.apply(jsch, session, cred.getPassword());
             Properties config = new Properties();
             config.put("StrictHostKeyChecking", "no");
@@ -307,6 +443,11 @@ public class RemotePushWatcher {
             handle.session = session;
             if (handle.closed) return false; // stopped/replaced while connecting: never start a remote process
 
+            if (os == RemoteOs.WINDOWS) {
+                endPreviousProcesses(session, handle, sl);
+                if (handle.closed) return false;
+            }
+
             channel = (ChannelExec) session.openChannel("exec");
             handle.channel = channel;
             String remoteCommand = os == RemoteOs.WINDOWS
@@ -322,7 +463,20 @@ public class RemotePushWatcher {
             channel.connect(15_000);
             if (handle.closed) return false; // finally{} tears the channel + session down
             sl.add("Listener running; waiting for change events");
-            reasonByTaskId.put(taskId, "connected (" + os + "), waiting for first change event");
+            handle.connection = conn;
+            if (os != RemoteOs.WINDOWS) {
+                ScheduledExecutorService later = debounceExecutor;
+                if (later != null) {
+                    try {
+                        later.schedule(() -> {
+                            if (!handle.closed && handle.connection == conn) armed(handle, armedWhy);
+                        }, LINUX_ARM_DELAY_MS(), TimeUnit.MILLISECONDS);
+                    } catch (RejectedExecutionException stopping) {
+                        // the watcher is being stopped: nothing to catch up for
+                    }
+                }
+            }
+            setReason(handle, "connected (" + os + "), waiting for first change event");
 
             BufferedReader reader = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8));
             boolean sawAnyLine = false;
@@ -331,6 +485,30 @@ public class RemotePushWatcher {
             while (!handle.closed && (line = reader.readLine()) != null) {
                 line = line.trim();
                 if (line.isEmpty()) continue;
+                if (line.startsWith(STEP_PREFIX)) {      // progress marker, not a file event and not "output" for the checks below
+                    lastStep[0] = line.substring(STEP_PREFIX.length());
+                    sl.add("Remote listener step: " + lastStep[0]);
+                    if (!armedHere && STEP_LISTENING.equals(lastStep[0])) {
+                        armedHere = true;
+                        armed(handle, armedWhy);
+                    }
+                    continue;
+                }
+                if (line.startsWith(RemoteProcessJanitor.PROC_PREFIX)) {   // the listener's own processes: remember them for the next arm
+                    List<RemoteListenerRegistry.Proc> reported = RemoteProcessJanitor.parseReport(
+                            line, handle.key, cred.getHost(), cred.getUsername(), System.currentTimeMillis());
+                    if (reported.isEmpty()) {
+                        sl.add("Remote listener sent a process report that could not be read: " + line);
+                    } else {
+                        processes.add(reported);
+                        sl.add("Remote listener processes recorded: " + reported.stream().map(Object::toString).collect(java.util.stream.Collectors.joining(", ")));
+                        if (!armedHere) {   // the report is printed after the watcher is registered
+                            armedHere = true;
+                            armed(handle, armedWhy);
+                        }
+                    }
+                    continue;
+                }
                 sawAnyLine = true;
                 lastOutputAt[0] = System.currentTimeMillis();
                 if (line.equals(HEARTBEAT)) continue;
@@ -356,7 +534,7 @@ public class RemotePushWatcher {
                     sl.add("Remote reported: " + reason);
                     log.info("Watcher task " + taskId + ": " + reason + "; falling back to scheduled polling only for "
                             + (UNSUPPORTED_RETRY_MS / 60000) + " min.");
-                    markUnsupported(taskId, reason);
+                    markUnsupported(handle, reason);
                     break;
                 }
                 // Each line IS the changed filename (inotifywait's --format '%f',
@@ -364,14 +542,14 @@ public class RemotePushWatcher {
                 // straight through instead of discarding it, so the transfer step
                 // can fetch exactly this file instead of re-deriving "what's new"
                 // from a baseline-filtered directory scan.
-                reasonByTaskId.put(taskId, "connected (" + os + "), streaming remote change events");
+                setReason(handle, "connected (" + os + "), streaming remote change events");
                 sl.add("Remote says changed: " + line);
-                scheduleFire(taskId, line);
+                fanOut(handle, line);
             }
             long upNow = System.currentTimeMillis() - openedAt;
             // Silence from the very start means the server refused the exec channel. A stream that ended later
             // (even before any file changed) was a working listener that got cut - that is a drop, not "unsupported".
-            if ((sawAnyLine || upNow >= 10_000) && !handle.closed && !unsupportedBackoffActive(taskId)) {
+            if ((sawAnyLine || upNow >= 10_000) && !handle.closed && !handle.unsupported) {
                 // The remote side ended the stream by itself. Say exactly what we know about why.
                 long up = System.currentTimeMillis() - openedAt;
                 long quiet = lastOutputAt[0] == 0 ? up : System.currentTimeMillis() - lastOutputAt[0];
@@ -388,19 +566,31 @@ public class RemotePushWatcher {
                 retry = true;
             }
             if (!sawAnyLine && upNow < 10_000 && !handle.closed) {
-                // Channel closed with no output at all — most likely exec was
-                // refused outright (e.g. an SFTP-subsystem-only server).
+                // The stream ended with no event and no heartbeat. Two very different causes: the server refused the
+                // exec channel (the script never started), or the script started and its process was ended early.
+                // The listener's breadcrumbs tell them apart.
+                for (int i = 0; i < 20 && !channel.isClosed(); i++) Thread.sleep(50);  // exit status can trail the end of the stream
                 String err0 = plainStderr(errBuf.toString(StandardCharsets.UTF_8).trim());
                 if (err0.length() > 600) err0 = err0.substring(0, 600) + "\u2026";
                 int exit0 = channel.getExitStatus();
-                String reason = "remote exec (" + os + ") produced no output within " + (upNow / 1000) + " s"
-                        + (exit0 >= 0 ? " (exit status " + exit0 + ")" : "")
-                        + (err0.isEmpty() ? " and wrote nothing to stderr - the SSH server may have refused the exec channel (some SFTP-only servers do)"
-                                          : "; the remote shell said: " + err0);
+                boolean connected = session.isConnected();
+                String reason;
+                if (lastStep[0] != null) {
+                    reason = "remote listener (" + os + ") started but its process ended after " + (upNow / 1000) + " s, last step reached: \""
+                            + lastStep[0] + "\"" + (exit0 >= 0 ? ", exit status " + exit0 : ", no exit status")
+                            + ", SSH session " + (connected ? "still connected" : "disconnected")
+                            + (err0.isEmpty() ? ", nothing on stderr" : ", the remote shell said: " + err0)
+                            + ". Something on the server ended it: another listener for the same folder, antivirus/EDR, or an error";
+                } else {
+                    reason = "remote exec (" + os + ") produced no output within " + (upNow / 1000) + " s"
+                            + (exit0 >= 0 ? " (exit status " + exit0 + ")" : "")
+                            + (err0.isEmpty() ? " and wrote nothing to stderr - the SSH server may have refused the exec channel (some SFTP-only servers do)"
+                                              : "; the remote shell said: " + err0);
+                }
                 log.info("Watcher task " + taskId + ": " + reason + "; falling back to scheduled polling only.");
                 sl.add(reason);
-                markUnsupported(taskId, reason);
-                endReason = "remote exec produced no output";
+                markUnsupported(handle, reason);
+                endReason = lastStep[0] != null ? "remote listener ended early after step \"" + lastStep[0] + "\"" : "remote exec produced no output";
             }
         } catch (Exception e) {
             endReason = "error: " + e.getMessage();
@@ -412,10 +602,12 @@ public class RemotePushWatcher {
                     String reason = "connection failed (" + os + "): " + e.getMessage();
                     log.info("Watcher task " + taskId + ": remote push listener unavailable (" + e.getMessage()
                             + "); falling back to scheduled polling only.");
-                    markUnsupported(taskId, reason);
+                    markUnsupported(handle, reason);
                 }
             }
         } finally {
+            handle.armed = false;
+            if (handle.connection == conn) handle.connection = null;
             if (channel != null && channel.isConnected()) channel.disconnect();
             if (session != null && session.isConnected()) session.disconnect();
             if (opened) {
@@ -431,9 +623,51 @@ public class RemotePushWatcher {
         return retry && !handle.closed;
     }
 
-    private boolean unsupportedBackoffActive(String taskId) {
-        Long until = unsupportedUntil.get(taskId);
-        return until != null && System.currentTimeMillis() < until;
+    /**
+     * Windows: before arming, ends the listener processes an earlier connection for this folder left behind. Only
+     * processes this service recorded are touched. Never keeps the listener from arming.
+     */
+    private void endPreviousProcesses(Session session, ListenerHandle handle, service.sftp.SessionLog sl) {
+        try {
+            RemoteProcessJanitor.endPrevious(processes, handle.key, (command, timeoutMs) -> runRemote(session, command, timeoutMs),
+                    sl::add, 10_000);
+        } catch (Exception e) {
+            sl.add("Checking for earlier listener processes failed: " + e.getMessage());
+        }
+    }
+
+    /** Runs one command on the server over this session and returns what it printed; fails if it takes longer than {@code timeoutMs}. */
+    private static List<String> runRemote(Session session, String command, long timeoutMs) throws Exception {
+        ChannelExec ch = (ChannelExec) session.openChannel("exec");
+        try {
+            ch.setCommand(command);
+            ch.setErrStream(new ByteArrayOutputStream());
+            InputStream in = ch.getInputStream();
+            ch.connect(10_000);
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            byte[] buf = new byte[4096];
+            long deadline = System.currentTimeMillis() + timeoutMs;
+            while (true) {
+                while (in.available() > 0) {
+                    int n = in.read(buf);
+                    if (n < 0) break;
+                    out.write(buf, 0, n);
+                }
+                if (ch.isClosed()) {
+                    while (in.available() > 0) {
+                        int n = in.read(buf);
+                        if (n < 0) break;
+                        out.write(buf, 0, n);
+                    }
+                    break;
+                }
+                if (System.currentTimeMillis() > deadline) throw new TimeoutException("no answer within " + (timeoutMs / 1000) + " s");
+                Thread.sleep(50);
+            }
+            return Arrays.asList(out.toString(StandardCharsets.UTF_8).split("\\r?\\n"));
+        } finally {
+            if (ch.isConnected()) ch.disconnect();
+        }
     }
 
     // ─── Command builders ───────────────────────────────────────────────────
@@ -445,7 +679,8 @@ public class RemotePushWatcher {
 
     /** Windows: PowerShell around System.IO.FileSystemWatcher, sent with -EncodedCommand (see {@code resources/scripts/watcher/windows/}). */
     private String buildWindowsCommand(String rawTargetPath) {
-        return ListenerScripts.windows(normalizeWindowsPath(rawTargetPath), HEARTBEAT, END_PREFIX, UNAVAILABLE_MARKER);
+        return ListenerScripts.windows(normalizeWindowsPath(rawTargetPath), HEARTBEAT, END_PREFIX, STEP_PREFIX,
+                RemoteProcessJanitor.PROC_PREFIX, UNAVAILABLE_MARKER);
     }
 
     /** Windows PowerShell writes progress and errors to stderr as CLIXML; keep only the error text, drop progress records. */
@@ -457,9 +692,25 @@ public class RemotePushWatcher {
         return sb.toString().trim();
     }
 
-    private void markUnsupported(String taskId, String reason) {
-        unsupportedUntil.put(taskId, System.currentTimeMillis() + UNSUPPORTED_RETRY_MS);
-        reasonByTaskId.put(taskId, reason);
+    /** The listener cannot work here: every task on it falls back to polling for the backoff window. */
+    void markUnsupported(ListenerHandle handle, String reason) {
+        handle.unsupported = true;
+        handle.state = reason;
+        long until = System.currentTimeMillis() + UNSUPPORTED_RETRY_MS;
+        for (String id : handle.subscribers) {
+            unsupportedUntil.put(id, until);
+            reasonByTaskId.put(id, reason);
+        }
+    }
+
+    private void setReason(ListenerHandle handle, String reason) {
+        handle.state = reason;
+        for (String id : handle.subscribers) reasonByTaskId.put(id, reason);
+    }
+
+    /** A changed file name arrived on a shared listener: every subscribed task is woken for it (each filters for itself). */
+    void fanOut(ListenerHandle handle, String fileName) {
+        for (String id : handle.subscribers) scheduleFire(id, fileName);
     }
 
     private void scheduleFire(String taskId, String fileName) {
@@ -490,7 +741,7 @@ public class RemotePushWatcher {
         });
     }
 
-    private Credential resolveCredential(ScheduledTask task) {
+    Credential resolveCredential(ScheduledTask task) {
         String uname = task.getTargetUsername();
         if (uname != null && !uname.isEmpty()) {
             return storage.loadCredentialByName(uname);
@@ -503,9 +754,9 @@ public class RemotePushWatcher {
         return null;
     }
 
-    private enum RemoteOs { LINUX, WINDOWS }
+    enum RemoteOs { LINUX, WINDOWS }
 
-    private static RemoteOs resolveOs(Credential cred) {
+    static RemoteOs resolveOs(Credential cred) {
         if (cred == null || cred.getOsType() == null) return null;
         String os = cred.getOsType().trim().toUpperCase(Locale.ROOT);
         if (os.equals("LINUX")) return RemoteOs.LINUX;
@@ -517,7 +768,7 @@ public class RemotePushWatcher {
 
     /** POSIX-style path for the Linux/inotifywait branch (mirrors
      *  RemoteFileMetadataServiceFactory's SFTP path normalization). */
-    private static String normalizeLinuxPath(String path) {
+    static String normalizeLinuxPath(String path) {
         if (path == null) return "/";
         String normalized = path.trim().replace("\\", "/").replaceAll("/+", "/");
         if (normalized.matches("^[A-Za-z]:/.*")) normalized = "/" + normalized;
@@ -544,7 +795,7 @@ public class RemotePushWatcher {
      *  correctly reports it doesn't exist, and every single Windows INBOUND
      *  watcher task ends up POLLING_ONLY_UNSUPPORTED regardless of whether
      *  the directory is real. */
-    private static String normalizeWindowsPath(String path) {
+    static String normalizeWindowsPath(String path) {
         if (path == null) return "";
         String normalized = path.trim();
         if (normalized.matches("^/[A-Za-z]:(/.*)?$")) {
@@ -561,7 +812,20 @@ public class RemotePushWatcher {
         return normalized;
     }
 
-
+    /**
+     * Identity of a remote listener: two tasks with the same key share one. Same OS, server, user and folder, where the
+     * folder is compared the way the OS does (Windows ignores case and slash direction, a trailing separator or a
+     * trailing wildcard; Linux ignores a trailing slash); the SSH port is fixed at 22 everywhere in this class.
+     */
+    static String listenerKey(Credential cred, RemoteOs os, String rawTargetPath) {
+        boolean windows = os == RemoteOs.WINDOWS;
+        String path = windows ? normalizeWindowsPath(rawTargetPath).toLowerCase(Locale.ROOT) : normalizeLinuxPath(rawTargetPath);
+        if (!windows && path.length() > 1 && path.endsWith("/")) path = path.substring(0, path.length() - 1);
+        String host = cred.getHost() == null ? "" : cred.getHost().trim().toLowerCase(Locale.ROOT);
+        String user = cred.getUsername() == null ? "" : cred.getUsername().trim();
+        if (windows) user = user.toLowerCase(Locale.ROOT);
+        return os + "|" + host + "|22|" + user + "|" + path;
+    }
 
     /** The remote listener's stdin: one newline every 10 s (its lease), then end-of-input once closed. */
     static final class LeaseStream extends InputStream {
@@ -588,21 +852,30 @@ public class RemotePushWatcher {
         void end() { synchronized (lock) { ended = true; lock.notifyAll(); } }
     }
 
-    private static final class ListenerHandle {
-        final String taskId;
-        final String path;
+    /** One remote listener (and its SSH connection), shared by every task in {@link #subscribers}. */
+    static final class ListenerHandle {
+        final String key;
+        final String ownerTaskId;   // first subscriber: the task this connection's session events are logged under
+        final String path;          // folder as the owner wrote it; the remote command is built from it
+        final Set<String> subscribers = ConcurrentHashMap.newKeySet();
+        final LeaseStream lease = new LeaseStream();
         volatile boolean closed = false;
+        volatile boolean unsupported = false;
+        volatile boolean armed = false;     // watching right now (false while connecting or between connections)
+        volatile Object connection;         // identifies the current connection, so a delayed arm cannot belong to an older one
+        volatile String state;              // latest human-readable state, given to tasks that join later
         volatile Session session;
         volatile ChannelExec channel;
-        final LeaseStream lease = new LeaseStream();
 
-        ListenerHandle(String taskId, String path) {
-            this.taskId = taskId;
+        ListenerHandle(String key, String ownerTaskId, String path) {
+            this.key = key;
+            this.ownerTaskId = ownerTaskId;
             this.path = path;
         }
 
-        boolean matches(ScheduledTask t) {
-            return path.equals(t.getTargetPath());
+        /** Can a new subscriber rely on this listener? */
+        boolean usable() {
+            return !closed && !unsupported;
         }
 
         void close() {

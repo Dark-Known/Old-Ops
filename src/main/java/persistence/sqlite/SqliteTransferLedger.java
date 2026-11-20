@@ -5,12 +5,13 @@ import persistence.TransferLedger;
 import java.io.File;
 import java.io.IOException;
 import java.sql.Connection;
-import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.Collection;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.function.LongSupplier;
 
@@ -18,8 +19,8 @@ import java.util.function.LongSupplier;
  * The memory of which files a task has already sent — what "Skip files already sent" consults, and
  * what the "Forget sent files" button clears.
  *
- * <p>It lives in its own database file ({@value #FILE_NAME}) in the data folder, one set of rows per
- * task, so it can be deleted or inspected without touching tasks or run history. An entry is the
+ * <p>It lives in {@code app.db} (tables {@code sent_files} and {@code task_state}), one set of rows per
+ * task. Until then it had its own file ({@value #FILE_NAME}); that file is imported once and renamed to {@code .migrated}. An entry is the
  * file's name, size and last-changed time <i>as seen on the source side</i> at the moment it was sent,
  * plus when that happened; entries older than {@value TransferLedger#RETENTION_DAYS} days are dropped.
  *
@@ -30,8 +31,10 @@ import java.util.function.LongSupplier;
  */
 public final class SqliteTransferLedger implements TransferLedger {
 
+    /** The separate file older versions kept this memory in; imported into app.db once. */
     public static final String FILE_NAME = "transfer_ledger.db";
 
+    private final File dataDir;
     private final File dbFile;
     private final LongSupplier clock;
 
@@ -39,7 +42,8 @@ public final class SqliteTransferLedger implements TransferLedger {
 
     /** For tests: a clock that can be moved to check the retention. */
     public SqliteTransferLedger(File dataDir, LongSupplier clockMillis) {
-        this.dbFile = new File(dataDir, FILE_NAME);
+        this.dataDir = dataDir;
+        this.dbFile = new File(dataDir, "app.db");
         this.clock = clockMillis;
     }
 
@@ -65,24 +69,22 @@ public final class SqliteTransferLedger implements TransferLedger {
         if (entries == null || entries.isEmpty()) return;
         long now = clock.getAsLong();
         try (Connection c = open()) {
-            c.setAutoCommit(false);
-            try (PreparedStatement ps = c.prepareStatement(
-                    "INSERT INTO sent_files (task_id, name, size, mtime, sent_at) VALUES (?,?,?,?,?) "
-                            + "ON CONFLICT(task_id, name, size, mtime) DO UPDATE SET sent_at = excluded.sent_at")) {
-                for (Entry e : entries) {
-                    ps.setString(1, taskId);
-                    ps.setString(2, e.name());
-                    ps.setLong(3, e.size());
-                    ps.setLong(4, e.mtimeMillis());
-                    ps.setLong(5, now);
-                    ps.addBatch();
+            Db.inTransaction(c, tx -> {
+                try (PreparedStatement ps = tx.prepareStatement(
+                        "INSERT INTO sent_files (task_id, name, size, mtime, sent_at) VALUES (?,?,?,?,?) "
+                                + "ON CONFLICT(task_id, name, size, mtime) DO UPDATE SET sent_at = excluded.sent_at")) {
+                    for (Entry e : entries) {
+                        ps.setString(1, taskId);
+                        ps.setString(2, e.name());
+                        ps.setLong(3, e.size());
+                        ps.setLong(4, e.mtimeMillis());
+                        ps.setLong(5, now);
+                        ps.addBatch();
+                    }
+                    ps.executeBatch();
                 }
-                ps.executeBatch();
-                c.commit();
-            } catch (SQLException ex) {
-                try { c.rollback(); } catch (SQLException ignored) { }
-                throw ex;
-            }
+                return null;
+            });
         } catch (SQLException e) {
             throw new IOException("Cannot write the sent-files memory (" + dbFile + "): " + e.getMessage(), e);
         }
@@ -145,14 +147,13 @@ public final class SqliteTransferLedger implements TransferLedger {
     @Override public boolean markFilesTransferred(String taskId) throws IOException {
         long now = clock.getAsLong();
         try (Connection c = open()) {
-            c.setAutoCommit(false);
-            try {
-                boolean wasSilent = false;
-                try (PreparedStatement ps = c.prepareStatement("SELECT last_alert_at FROM task_state WHERE task_id = ?")) {
+            return Db.inTransaction(c, tx -> {
+                boolean wasSilent;
+                try (PreparedStatement ps = tx.prepareStatement("SELECT last_alert_at FROM task_state WHERE task_id = ?")) {
                     ps.setString(1, taskId);
                     try (ResultSet rs = ps.executeQuery()) { wasSilent = rs.next() && rs.getLong(1) > 0; }
                 }
-                try (PreparedStatement ps = c.prepareStatement(
+                try (PreparedStatement ps = tx.prepareStatement(
                         "INSERT INTO task_state (task_id, last_files_at, watching_since, last_alert_at) VALUES (?, ?, ?, 0) "
                                 + "ON CONFLICT(task_id) DO UPDATE SET last_files_at = excluded.last_files_at, last_alert_at = 0")) {
                     ps.setString(1, taskId);
@@ -160,12 +161,8 @@ public final class SqliteTransferLedger implements TransferLedger {
                     ps.setLong(3, now);
                     ps.executeUpdate();
                 }
-                c.commit();
                 return wasSilent;
-            } catch (SQLException ex) {
-                try { c.rollback(); } catch (SQLException ignored) { }
-                throw ex;
-            }
+            });
         } catch (SQLException e) {
             throw new IOException("Cannot write the task state (" + dbFile + "): " + e.getMessage(), e);
         }
@@ -193,20 +190,10 @@ public final class SqliteTransferLedger implements TransferLedger {
 
     // ── internals ────────────────────────────────────────────────────
 
-    /** Opens the file (creating it and the table on first use) and drops entries past the retention. */
+    /** Opens app.db (creating the tables on first use), imports the old separate file once, and drops entries past the retention. */
     private Connection open() throws SQLException {
-        File dir = dbFile.getAbsoluteFile().getParentFile();
-        if (dir != null && !dir.exists() && !dir.mkdirs() && !dir.exists()) {
-            throw new SQLException("cannot create folder " + dir);
-        }
-        try {
-            Class.forName("org.sqlite.JDBC");
-        } catch (ClassNotFoundException e) {
-            throw new SQLException("SQLite driver not available", e);
-        }
-        Connection c = DriverManager.getConnection("jdbc:sqlite:" + dbFile.getAbsolutePath());
+        Connection c = Db.open(dbFile);
         try (Statement st = c.createStatement()) {
-            st.execute("PRAGMA busy_timeout=5000");
             st.execute("CREATE TABLE IF NOT EXISTS sent_files ("
                     + "task_id TEXT NOT NULL, name TEXT NOT NULL, size INTEGER NOT NULL, "
                     + "mtime INTEGER NOT NULL, sent_at INTEGER NOT NULL, "
@@ -220,6 +207,7 @@ public final class SqliteTransferLedger implements TransferLedger {
             c.close();
             throw e;
         }
+        importLegacy(c);
         try (PreparedStatement ps = c.prepareStatement("DELETE FROM sent_files WHERE sent_at < ?")) {
             ps.setLong(1, clock.getAsLong() - TimeUnit.DAYS.toMillis(RETENTION_DAYS));
             ps.executeUpdate();
@@ -228,5 +216,40 @@ public final class SqliteTransferLedger implements TransferLedger {
             throw e;
         }
         return c;
+    }
+
+    /**
+     * Copies the rows of the old {@value #FILE_NAME} into app.db and renames that file to {@code .migrated}. Safe to repeat or to
+     * run in the GUI and the Daemon at the same time (existing rows win). If anything fails the old file is left where it is and
+     * the import is tried again next time; a failure here never stops a run.
+     */
+    private void importLegacy(Connection c) {
+        File legacy = new File(dataDir, FILE_NAME);
+        if (!legacy.isFile()) return;
+        try (Statement st = c.createStatement()) {
+            try (PreparedStatement ps = c.prepareStatement("ATTACH DATABASE ? AS old")) {
+                ps.setString(1, legacy.getAbsolutePath());
+                ps.execute();
+            }
+            try {
+                st.execute("BEGIN IMMEDIATE");
+                try {
+                    st.execute("INSERT OR IGNORE INTO sent_files (task_id, name, size, mtime, sent_at) "
+                            + "SELECT task_id, name, size, mtime, sent_at FROM old.sent_files");
+                    st.execute("INSERT OR IGNORE INTO task_state (task_id, last_files_at, watching_since, last_alert_at) "
+                            + "SELECT task_id, last_files_at, watching_since, last_alert_at FROM old.task_state");
+                    st.execute("COMMIT");
+                } catch (SQLException e) {
+                    try { st.execute("ROLLBACK"); } catch (SQLException ignored) { }
+                    throw e;
+                }
+            } finally {
+                try { st.execute("DETACH DATABASE old"); } catch (SQLException ignored) { }
+            }
+            java.nio.file.Files.move(legacy.toPath(), new File(dataDir, FILE_NAME + ".migrated").toPath(),
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        } catch (SQLException | IOException e) {
+            // keep going: the old file stays and is imported next time (or another process already moved it)
+        }
     }
 }

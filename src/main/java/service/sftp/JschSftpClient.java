@@ -17,7 +17,7 @@ import java.util.Vector;
 /** {@link SftpClient} on JSch, with trust-on-first-use host-key checking ({@link util.SshHostKeys}). */
 public final class JschSftpClient implements SftpClient {
 
-    private static final int SERVER_ALIVE_MS = 15_000;
+    private static int SERVER_ALIVE_MS() { return util.Timers.msInt("timerSftpKeepAliveMs", 15_000); }
 
     private final Session session;
     private final ChannelSftp channel;
@@ -55,7 +55,7 @@ public final class JschSftpClient implements SftpClient {
             log.add("Connecting to " + host + ":" + options.port + " as " + username);
             util.SshAuth.apply(jsch, session, password);
             util.SshHostKeys.apply(jsch, session);
-            session.setServerAliveInterval(SERVER_ALIVE_MS);
+            session.setServerAliveInterval(SERVER_ALIVE_MS());
             session.setServerAliveCountMax(4);
             session.connect(options.sessionTimeoutMs);
             ChannelSftp ch = (ChannelSftp) session.openChannel("sftp");

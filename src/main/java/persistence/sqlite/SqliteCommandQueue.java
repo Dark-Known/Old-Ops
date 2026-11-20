@@ -61,7 +61,7 @@ public final class SqliteCommandQueue implements CommandQueue {
         } catch (ClassNotFoundException e) {
             throw new SQLException("SQLite JDBC driver not on classpath", e);
         }
-        Connection c = DriverManager.getConnection("jdbc:sqlite:" + dbFile.getAbsolutePath());
+        Connection c = Db.connect(dbFile);
         try (Statement st = c.createStatement()) { st.execute("PRAGMA busy_timeout=5000"); }
         return c;
     }

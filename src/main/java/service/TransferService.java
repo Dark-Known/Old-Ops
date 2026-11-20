@@ -11,6 +11,7 @@ import model.RemoteFileMetadata;
 import model.ScheduledTask;
 import model.ScheduledTask.TransferDirection;
 import model.ScheduledTask.TransferMode;
+import service.RemoteFileMetadataServiceFactory.ManagedMetadataService;
 import service.mail.MailIngestService;
 import service.transfer.EngineSettings;
 import service.transfer.RemoteFileStat;
@@ -25,36 +26,44 @@ import service.transfer.TransferCommand;
 import service.transfer.TransferJob;
 import service.transfer.SftpEngine;
 import service.transfer.SwitchingEngine;
-import service.transfer.LocalAwareEngine;
 import service.transfer.TransferEngine;
 import service.transfer.WinScpEngine;
 import service.watch.PersistentSftpConnectionManager;
 import service.watch.WatcherConnections;
+import util.MailFetchMode;
+import util.MiniJson;
+import util.AppConfig;
 import util.AppSettings;
 
 import java.io.*;
 import java.net.InetAddress;
 import java.nio.file.*;
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Consumer;
-import java.util.concurrent.SynchronousQueue;
-import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
  * Executes file transfers via WinSCP's scripting interface (winscp.com).
- * Local→local copies are done by picking the built-in "Local (this computer)"
- * credential as the target; every other FILE_TRANSFER target is a remote host.
+ * Local→local file transfers are not supported — every FILE_TRANSFER task
+ * moves data to/from a remote SFTP target.
  *
  * <h2>Watcher integration — both directions</h2>
  * When {@code task.isWatcherEnabled() == true} AND
@@ -153,46 +162,8 @@ public class TransferService {
         detectionCallback.remove();
     }
 
-    /**
-     * The one and only pool of "extra" worker threads used to parallelize a
-     * single watcher fire's files across multiple SFTP channels (see
-     * {@link #transferFilesConcurrently}) — shared across every task, not
-     * one freshly-created-and-destroyed pool per fire. This is the concrete
-     * shape of "a pool of threads executes the task: one thread for low
-     * load, multiple threads + batches for a big burst":
-     * <ul>
-     *   <li>A quiet task naming 1-2 files never touches this pool at all —
-     *       {@link #transferFilesConcurrently} takes a direct single-thread,
-     *       single-channel path with zero pool overhead.</li>
-     *   <li>A large burst splits into batches (see
-     *       {@link util.AppSettings#getWatcherFilesPerWorkerThread()}) and
-     *       those batches run as tasks submitted <i>here</i> — one shared,
-     *       bounded pool for the whole app.</li>
-     * </ul>
-     * Deliberately elastic rather than a plain fixed-size pool:
-     * {@code corePoolSize=0} means no threads exist at all while every task
-     * is quiet, threads are created on demand up to the ceiling below, and
-     * one that's gone unused for {@link #BATCH_POOL_IDLE_SECONDS} dies again
-     * rather than sitting around forever after one big burst. The ceiling
-     * itself ({@link util.AppSettings#getTransferBatchConcurrency()}) is
-     * re-applied on every fire (see {@link #transferFilesConcurrently}), so
-     * — unlike a plain fixed pool sized once at startup — raising that
-     * setting takes effect on the very next transfer, no restart needed.
-     * The hand-off queue is a {@link SynchronousQueue} (no queueing — either
-     * a thread is free/spun up immediately, or the ceiling is reached) paired
-     * with {@link ThreadPoolExecutor.CallerRunsPolicy}: if every task
-     * currently bursting has genuinely saturated the ceiling, the excess
-     * batch just runs inline on whichever thread submitted it rather than
-     * queueing indefinitely or being rejected — a graceful, self-throttling
-     * degradation instead of unbounded thread growth.
-     */
-    private static final int BATCH_POOL_IDLE_SECONDS = 60;
-    private final ThreadPoolExecutor batchWorkerPool = new ThreadPoolExecutor(
-            0, Math.max(1, AppSettings.getTransferBatchConcurrency()),
-            BATCH_POOL_IDLE_SECONDS, TimeUnit.SECONDS,
-            new SynchronousQueue<>(),
-            Workers.factory(Workers.Lane.WATCH),
-            new ThreadPoolExecutor.CallerRunsPolicy());
+    // Extra threads for parallel transfers come from the shared worker pool and thread budget
+    // (see ThreadBudget); there is no private transfer pool any more.
 
     public TransferService(AppStorage storage) {
         this(storage, new PersistentSftpConnectionManager());
@@ -204,9 +175,9 @@ public class TransferService {
         this.storage                = storage;
         this.metadataServiceFactory = new RemoteFileMetadataServiceFactory(storage);
         this.winScpPath             = detectWinScp();
-        SftpEngine sftpEngine       = new SftpEngine(sessions, lastFailureClassification::set);
-        this.engine                 = new LocalAwareEngine(sftpEngine, new SwitchingEngine(EngineSettings::useSftpEngine,
-                sftpEngine, new WinScpEngine(() -> winScpPath, new ScriptFiles(), sessions)));
+        this.engine                 = new SwitchingEngine(EngineSettings::useSftpEngine,
+                new SftpEngine(sessions, lastFailureClassification::set),
+                new WinScpEngine(() -> winScpPath, new ScriptFiles(), sessions));
         // Shared dataDir-based path, NOT the per-user-home default — the
         // Daemon runs as SYSTEM (see app-config.xml <runAsSystem>) while the
         // GUI runs as the logged-in user, so a user-home-based token path
@@ -242,7 +213,6 @@ public class TransferService {
     /** Closes every kept-warm watcher SFTP connection — call on scheduler/app shutdown. */
     public void shutdownWatcherConnections() {
         persistentSftp.shutdown();
-        batchWorkerPool.shutdownNow();
     }
 
     private String detectWinScp() {
@@ -305,10 +275,11 @@ public class TransferService {
         }
 
         // ── Non-watcher remote path ───────────────────────────────────────────
-        // The target is either a remote credential or the built-in Local one.
+        // Local→local file transfers are not supported — every FILE_TRANSFER
+        // task must resolve to a remote target credential.
         if (target == null) {
-            logLine.accept("[ERROR] No target credential resolved. Choose a credential for this task "
-                    + "(or \"" + Credential.LOCAL_NAME + "\" to copy between two local folders).");
+            logLine.accept("[ERROR] No target credential resolved. Local\u2192local file transfers are "
+                    + "not supported — set a Target Username/host/credential for this task.");
             return false;
         }
 
@@ -437,51 +408,40 @@ public class TransferService {
      */
     private boolean runLocalFileOpsConcurrently(List<Path> batch, Path destDir, LocalFileOp op,
             Consumer<String> logLine, int concurrency, int[] doneOut) {
-        java.util.concurrent.ExecutorService pool =
-                Workers.newPool(Workers.Lane.TRANSFER, Math.min(concurrency, batch.size()));
+        // Up to `concurrency` copiers: this thread plus extra threads taken from the shared budget.
+        int workers = 1 + ThreadBudget.acquireUpTo(Math.min(concurrency, batch.size()) - 1);
         java.util.concurrent.atomic.AtomicInteger done = new java.util.concurrent.atomic.AtomicInteger(0);
-        boolean allOk = true;
-        try {
-            List<java.util.concurrent.Callable<Boolean>> tasks = new ArrayList<>();
-            for (Path src : batch) {
-                tasks.add(() -> {
-                    try (BackgroundJobs.Job j = BackgroundJobs.begin((op == LocalFileOp.MOVE ? "Move " : "Copy ") + src.getFileName(), false)) {
-                    boolean ok = op == LocalFileOp.MOVE
-                            ? moveSingleFile(src, destDir.resolve(src.getFileName()), logLine)
-                            : copySingleFile(src, destDir.resolve(src.getFileName()), logLine);
-                    if (ok) done.incrementAndGet();
-                    if (!ok) j.fail("file operation reported failure");
-                    return ok;
+        java.util.concurrent.atomic.AtomicBoolean allOk = new java.util.concurrent.atomic.AtomicBoolean(true);
+        java.util.concurrent.ConcurrentLinkedQueue<Path> pending = new java.util.concurrent.ConcurrentLinkedQueue<>(batch);
+        List<java.util.concurrent.Callable<Boolean>> loops = new ArrayList<>();
+        for (int w = 0; w < workers; w++) {
+            loops.add(() -> {
+                Path src;
+                while ((src = pending.poll()) != null) {
+                    final Path file = src;
+                    try (BackgroundJobs.Job j = BackgroundJobs.begin((op == LocalFileOp.MOVE ? "Move " : "Copy ") + file.getFileName(), false)) {
+                        boolean ok = op == LocalFileOp.MOVE
+                                ? moveSingleFile(file, destDir.resolve(file.getFileName()), logLine)
+                                : copySingleFile(file, destDir.resolve(file.getFileName()), logLine);
+                        if (ok) done.incrementAndGet();
+                        else { allOk.set(false); j.fail("file operation reported failure"); }
+                    } catch (Exception e) {
+                        lastFailureClassification.set(FailureClassifier.classifyThrowable(e));
+                        allOk.set(false);
                     }
-                });
-            }
-            List<java.util.concurrent.Future<Boolean>> results;
-            try {
-                results = pool.invokeAll(tasks);
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-                doneOut[0] = done.get();
-                return false;
-            }
-            for (java.util.concurrent.Future<Boolean> r : results) {
-                try {
-                    if (!Boolean.TRUE.equals(r.get())) allOk = false;
-                } catch (Exception e) {
-                    // Unwrap: Future.get() wraps whatever the worker threw in
-                    // an ExecutionException, so classifying the wrapper
-                    // itself would always fall through to UNKNOWN — the
-                    // real, classifiable exception is its cause.
-                    Throwable real = e instanceof java.util.concurrent.ExecutionException && e.getCause() != null
-                            ? e.getCause() : e;
-                    lastFailureClassification.set(FailureClassifier.classifyThrowable(real));
-                    allOk = false;
+                    if (Thread.currentThread().isInterrupted()) break;
                 }
-            }
-        } finally {
-            Workers.shutdownNow(pool);
+                return true;
+            });
+        }
+        try {
+            ThreadBudget.runAll(loops);
+        } catch (Exception e) {
+            if (e instanceof InterruptedException) Thread.currentThread().interrupt();
+            allOk.set(false);
         }
         doneOut[0] = done.get();
-        return allOk;
+        return allOk.get();
     }
 
     /** Copies a single file, replacing the destination if it already exists. */
@@ -805,7 +765,7 @@ public class TransferService {
                 // Remote (SFTP) stat is a real network round trip per file —
                 // spread the named files across multiple channel slots on the
                 // task's one kept-warm session (same pattern, and same shared
-                // batchWorkerPool, as the actual transfer step below) so N
+                // shared worker budget, as the actual transfer step below) so N
                 // named files cost roughly one round-trip's worth of wall time
                 // instead of N sequential ones.
                 long connStart = System.nanoTime();
@@ -842,6 +802,7 @@ public class TransferService {
                                                                  Consumer<String> logLine) throws Exception {
         List<String> nameList = new ArrayList<>(names);
         int concurrency = computeWatcherConcurrency(nameList.size());
+        concurrency = 1 + ThreadBudget.acquireUpTo(concurrency - 1);   // extra threads come from the shared budget
 
         if (concurrency <= 1) {
             SftpClient channel = persistentSftp.getClient(task.getId(), target);
@@ -862,7 +823,6 @@ public class TransferService {
         for (int i = 0; i < concurrency; i++) chunks.add(new ArrayList<>());
         for (int i = 0; i < nameList.size(); i++) chunks.get(i % concurrency).add(nameList.get(i));
 
-        batchWorkerPool.setMaximumPoolSize(Math.max(1, AppSettings.getTransferBatchConcurrency()));
         List<java.util.concurrent.Callable<List<RemoteFileMetadata>>> tasks = new ArrayList<>();
         for (int slot = 0; slot < concurrency; slot++) {
             final int s = slot;
@@ -880,9 +840,8 @@ public class TransferService {
                 return found;
             });
         }
-        List<java.util.concurrent.Future<List<RemoteFileMetadata>>> results = batchWorkerPool.invokeAll(tasks);
         List<RemoteFileMetadata> matched = new ArrayList<>();
-        for (java.util.concurrent.Future<List<RemoteFileMetadata>> f : results) matched.addAll(f.get());
+        for (List<RemoteFileMetadata> part : ThreadBudget.runAll(tasks)) matched.addAll(part);
         return matched;
     }
 
@@ -972,6 +931,8 @@ public class TransferService {
     private long transferFilesConcurrently(ScheduledTask task, Credential target, List<RemoteFileMetadata> files,
                                             Consumer<String> logLine, PerFileTransfer op) throws Exception {
         int concurrency = computeWatcherConcurrency(files.size());
+        // Threads beyond the first come out of the shared worker-thread budget (ThreadBudget).
+        concurrency = 1 + ThreadBudget.acquireUpTo(concurrency - 1);
 
         if (concurrency <= 1) {
             SftpClient channel = persistentSftp.getClient(task.getId(), target);
@@ -999,23 +960,10 @@ public class TransferService {
                 return bytes;
             });
         }
-        // Re-applied on every call (cheap) rather than only at construction —
-        // this is what makes the ceiling live-adjustable: raising the
-        // setting takes effect on the very next fire, no restart needed.
-        // setMaximumPoolSize requires >= corePoolSize (0 here), so this is
-        // always safe regardless of ordering.
-        batchWorkerPool.setMaximumPoolSize(Math.max(1, AppSettings.getTransferBatchConcurrency()));
-
-        // Submitted to the one shared, app-wide batchWorkerPool rather than a
-        // pool created (and torn down) for this fire alone — see its javadoc.
-        // invokeAll blocks this calling thread until every batch finishes, so
-        // pool size directly bounds how many of these run at once across the
-        // whole app; CallerRunsPolicy means asking for more than that still
-        // works correctly (just runs some batches inline) rather than
-        // deadlocking or being rejected.
-        List<java.util.concurrent.Future<Long>> results = batchWorkerPool.invokeAll(tasks);
+        // The first chunk runs on this thread, the rest on the shared worker pool; the slots taken above are
+        // given back as each chunk ends.
         long total = 0L;
-        for (java.util.concurrent.Future<Long> f : results) total += f.get(); // rethrows the first worker's exception, if any
+        for (long bytes : ThreadBudget.runAll(tasks)) total += bytes;
         return total;
     }
 
@@ -1257,24 +1205,31 @@ public class TransferService {
      */
     private boolean runBatchedWinScpCommands(Credential target, String password,
             List<SizedCommand> sizedCommands, Consumer<String> logLine, String taskId) throws Exception {
+        return runBatchedWinScpCommands(target, password, sizedCommands, logLine, taskId, null);
+    }
+
+    /** @param task the task being run, whose own batch size / parallel sessions (if set) replace the Settings values; null = Settings */
+    private boolean runBatchedWinScpCommands(Credential target, String password,
+            List<SizedCommand> sizedCommands, Consumer<String> logLine, String taskId, ScheduledTask task) throws Exception {
 
         if (sizedCommands.isEmpty()) {
             logLine.accept("[WARN] Nothing to transfer.");
             return false;
         }
 
-        long maxBytes = AppSettings.getTransferBatchMaxBytes();
+        TransferTuning tuning = TransferTuning.of(task, AppSettings.getTransferBatchMaxBytes(), AppSettings.getTransferBatchConcurrency());
+        long maxBytes = tuning.maxBytes;
         int intervalSeconds = AppSettings.getTransferBatchIntervalSeconds();
-        int concurrency = AppSettings.getTransferBatchConcurrency();
-        List<List<SizedCommand>> batches = chunkBySize(sizedCommands, sc -> sc.size, maxBytes);
+        int concurrency = tuning.concurrency;
+        List<List<SizedCommand>> batches = TransferBatching.planForSessions(sizedCommands, sc -> sc.size, maxBytes, concurrency);
         long totalBytes = sizedCommands.stream().mapToLong(sc -> sc.size).sum();
         int threadsUsed = Math.max(1, Math.min(concurrency, batches.size()));
 
         if (batches.size() > 1) {
             logLine.accept("[INFO] " + sizedCommands.size() + " file(s), " + humanReadableBytes(totalBytes)
                     + " total — splitting into " + batches.size() + " batch(es), capped at ~"
-                    + humanReadableBytes(maxBytes) + " per batch (configurable in Settings)."
-                    + (concurrency > 1 ? " Running up to " + concurrency + " batch(es) at a time." : ""));
+                    + humanReadableBytes(maxBytes) + " per batch (" + (task != null && task.getTransferBatchMaxMb() > 0 ? "set on this task" : "configurable in Settings") + ")."
+                    + (concurrency > 1 ? " Sessions are added as needed, up to " + concurrency + "." : ""));
         }
 
         boolean allOk = (concurrency <= 1 || batches.size() <= 1)
@@ -1319,52 +1274,31 @@ public class TransferService {
      */
     private boolean runBatchesConcurrently(Credential target, String password, List<List<SizedCommand>> batches,
             int concurrency, int intervalSeconds, Consumer<String> logLine, String taskId) throws Exception {
-        boolean allOk = true;
         int total = batches.size();
-        java.util.concurrent.ExecutorService pool =
-                Workers.newPool(Workers.Lane.TRANSFER, Math.min(concurrency, total));
         try {
-            for (int waveStart = 0; waveStart < total; waveStart += concurrency) {
-                if (Thread.currentThread().isInterrupted()) {
-                    logLine.accept("[INFO] Transfer cancelled.");
-                    return false;
+            // The first session runs on this (the task's) thread; extra sessions run on the shared worker pool
+            // and each takes a slot from the same budget as the tasks themselves (ThreadBudget).
+            TransferScaler.Result r = TransferScaler.run(batches, concurrency, SCALE_UP_AFTER_MS(),
+                    ThreadBudget.pool(), Workers.scheduled(Workers.Lane.SCHEDULER),
+                    ThreadBudget::tryAcquire, () -> ThreadBudget.release(1), batch -> {
+                int idx = batches.indexOf(batch);
+                try (BackgroundJobs.Job j = BackgroundJobs.begin("Transfer batch " + (idx + 1) + "/" + total + " (task " + taskId + ")", false)) {
+                    boolean ok = runOneBatch(target, password, batch, idx, total, logLine, taskId);
+                    if (!ok) j.fail("batch " + (idx + 1) + " reported failure");
+                    return ok;
                 }
-                int waveEnd = Math.min(waveStart + concurrency, total);
-                List<java.util.concurrent.Callable<Boolean>> waveTasks = new ArrayList<>();
-                for (int i = waveStart; i < waveEnd; i++) {
-                    final int idx = i;
-                    waveTasks.add(() -> {
-                        try (BackgroundJobs.Job j = BackgroundJobs.begin("Transfer batch " + (idx + 1) + "/" + total + " (task " + taskId + ")", false)) {
-                            boolean ok = runOneBatch(target, password, batches.get(idx), idx, total, logLine, taskId);
-                            if (!ok) j.fail("batch " + (idx + 1) + " reported failure");
-                            return ok;
-                        }
-                    });
-                }
-                List<java.util.concurrent.Future<Boolean>> results;
-                try {
-                    results = pool.invokeAll(waveTasks);
-                } catch (InterruptedException ie) {
-                    logLine.accept("[INFO] Transfer cancelled.");
-                    Thread.currentThread().interrupt();
-                    return false;
-                }
-                for (java.util.concurrent.Future<Boolean> r : results) {
-                    try {
-                        if (!Boolean.TRUE.equals(r.get())) allOk = false;
-                    } catch (Exception e) {
-                        allOk = false;
-                    }
-                }
-                if (waveEnd < total && intervalSeconds > 0) {
-                    sleepBetweenBatches(intervalSeconds, logLine);
-                }
-            }
-        } finally {
-            Workers.shutdownNow(pool);
+            }, () -> { if (intervalSeconds > 0) sleepBetweenBatches(intervalSeconds, logLine); });
+            if (r.peakWorkers > 1) logLine.accept("[INFO] Sessions scaled up to " + r.peakWorkers + " as the work needed them.");
+            return r.allOk;
+        } catch (InterruptedException ie) {
+            logLine.accept("[INFO] Transfer cancelled.");
+            Thread.currentThread().interrupt();
+            return false;
         }
-        return allOk;
     }
+
+    /** A further session is opened only if work is still waiting this long after the last one started. */
+    private static long SCALE_UP_AFTER_MS() { return util.Timers.ms("timerSessionScaleUpMs", 2000); }
 
     /** Runs one batch as a single session. Safe to call from multiple threads concurrently. */
     private boolean runOneBatch(Credential target, String password, List<SizedCommand> batch,
@@ -1511,7 +1445,7 @@ public class TransferService {
                 if (stat != null) toRecord.add(new TransferLedger.Entry(fname, stat.size, stat.epochMillis));
             }
 
-            boolean ok = runBatchedWinScpCommands(target, target.getPassword(), commands, logLine, task.getId());
+            boolean ok = runBatchedWinScpCommands(target, target.getPassword(), commands, logLine, task.getId(), task);
             if (ok && !extraDestFolders.isEmpty()) {
                 copyDownloadedFilesToExtraFolders(downloadedLocalPaths, extraDestFolders, logLine);
             }
@@ -1612,7 +1546,7 @@ public class TransferService {
             }
         }
 
-        boolean ok = runBatchedWinScpCommands(target, target.getPassword(), commands, logLine, task.getId());
+        boolean ok = runBatchedWinScpCommands(target, target.getPassword(), commands, logLine, task.getId(), task);
         if (ok) {
             noFilesAlerts.reset(task.getId());
             markArrival(task, selection, logLine);
@@ -1982,14 +1916,13 @@ public class TransferService {
                     .filter(x -> x.getId().equals(task.getTargetCredentialId()))
                     .findFirst().orElse(null);
         }
-        logLine.accept("[ERROR] No target credential configured — choose one, or \"" + Credential.LOCAL_NAME + "\" for local folders.");
+        logLine.accept("[ERROR] No target credential configured — local\u2192local transfers are not supported.");
         return null;
     }
 
     /** Resolves a credential name to a stored {@link Credential} for a Backup source/destination side, or null if blank/not found. */
     private Credential resolveNamedCredential(String credentialName, String sideLabel, Consumer<String> logLine) {
         if (credentialName == null || credentialName.trim().isEmpty()) return null;
-        if (Credential.isLocalName(credentialName)) return null;   // built-in Local = a local side
         Credential c = storage.loadCredentialByName(credentialName.trim());
         if (c == null) {
             logLine.accept("[ERROR] No credential named '" + credentialName + "' for backup " + sideLabel

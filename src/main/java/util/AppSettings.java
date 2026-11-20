@@ -1,6 +1,9 @@
 package util;
 
 import java.io.File;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import persistence.SettingsStore;
 import persistence.SettingsStores;
 import java.util.ArrayList;
@@ -172,7 +175,7 @@ public final class AppSettings {
         HARD_DEFAULTS.put(KEY_TRANSFER_ASSUMED_THROUGHPUT_MBPS, "5");
         HARD_DEFAULTS.put(KEY_TRANSFER_BATCH_MAX_BYTES, "0"); // 0 = derive from the two settings above
         HARD_DEFAULTS.put(KEY_TRANSFER_BATCH_INTERVAL_SECONDS, "5");
-        HARD_DEFAULTS.put(KEY_TRANSFER_BATCH_CONCURRENCY, "1"); // 1 = sequential (old behavior)
+        HARD_DEFAULTS.put(KEY_TRANSFER_BATCH_CONCURRENCY, "3"); // up to 3 SFTP sessions at once (1 = one at a time)
         HARD_DEFAULTS.put(KEY_WATCHER_FILES_PER_WORKER_THREAD, "5");
         HARD_DEFAULTS.put(KEY_STALE_RUNNING_THRESHOLD_MINUTES, "30");
         HARD_DEFAULTS.put(KEY_WATCHER_UPLOAD_MODE, "atomic");
@@ -423,8 +426,8 @@ public final class AppSettings {
 
     /**
      * How many batches are run concurrently (each its own WinSCP/SFTP
-     * session) instead of one at a time. Defaults to 1 (sequential, matches
-     * pre-existing behavior). Values &lt;= 1 mean sequential. Read live —
+     * session) instead of one at a time. Defaults to 3. Values &lt;= 1 mean
+     * sequential. Read live —
      * editable from the Settings panel, app-settings.json, or app-config.xml
      * — no restart required.
      */

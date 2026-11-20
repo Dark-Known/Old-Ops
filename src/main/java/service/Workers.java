@@ -27,6 +27,7 @@ public final class Workers {
 
     /** Roles a thread can have. Sizes are the default thread count; TRANSFER and WATCH size per pool. */
     public enum Lane {
+        WORK("worker", "Tasks & transfers (one shared budget)"),
         UI("ui-worker", "UI actions & screen loads"),
         ORDERED("ordered-worker", "Ordered writes (audit log)"),
         FEED("feed-worker", "Live feeds & polling"),
@@ -191,6 +192,6 @@ public final class Workers {
     }
 
     private static int defaultSize(Lane l) {
-        return switch (l) { case UI -> 3; case ORDERED -> 1; case FEED -> 2; case WATCH -> 2; case TRANSFER -> 4; case SERVICE -> 1; case SCHEDULER -> 4; };
+        return switch (l) { case UI -> 3; case ORDERED -> 1; case FEED -> 2; case WATCH -> 2; case TRANSFER -> 4; case SERVICE -> 1; case SCHEDULER -> 4; case WORK -> 4; };
     }
 }

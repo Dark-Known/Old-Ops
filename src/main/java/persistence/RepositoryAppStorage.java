@@ -85,38 +85,14 @@ public class RepositoryAppStorage implements AppStorage {
 
     // ─── Credentials ─────────────────────────────────────────────────────────
 
-    // The built-in "Local (this computer)" entry is always present, first in the list, and never stored,
-    // renamed or deleted: a task that uses it works on this machine's folders instead of connecting to a server.
-
-    @Override public Credential loadCredentialByName(String name) {
-        return Credential.isLocalName(name) ? Credential.local() : credentials.loadByName(name);
-    }
-    @Override public Credential loadCredentialById(String id) {
-        return Credential.LOCAL_ID.equals(id) ? Credential.local() : credentials.loadById(id);
-    }
-    @Override public boolean isCredentialNameTaken(String name, String exceptId) {
-        return Credential.isLocalName(name) || credentials.isNameTaken(name, exceptId);
-    }
-    @Override public boolean deleteCredential(String name) {
-        if (Credential.isLocalName(name)) {
-            credentials.setLastSaveError("The built-in \"" + Credential.LOCAL_NAME + "\" entry cannot be deleted");
-            return false;
-        }
-        return credentials.delete(name);
-    }
-    @Override public List<Credential> loadAllCredentials() {
-        List<Credential> all = new java.util.ArrayList<>();
-        all.add(Credential.local());
-        for (Credential c : credentials.loadAll()) if (!c.isLocal()) all.add(c);
-        return all;
-    }
+    @Override public Credential loadCredentialByName(String name) { return credentials.loadByName(name); }
+    @Override public Credential loadCredentialById(String id)     { return credentials.loadById(id); }
+    @Override public boolean isCredentialNameTaken(String name, String exceptId) { return credentials.isNameTaken(name, exceptId); }
+    @Override public boolean deleteCredential(String name)        { return credentials.delete(name); }
+    @Override public List<Credential> loadAllCredentials()        { return credentials.loadAll(); }
 
     @Override
     public synchronized boolean saveCredential(Credential cred) {
-        if (cred.isLocal() || Credential.isLocalName(cred.getName())) {
-            credentials.setLastSaveError("\"" + Credential.LOCAL_NAME + "\" is built in and cannot be changed or reused as a name");
-            return false;
-        }
         Credential before = cred.getId() == null ? null : credentials.loadById(cred.getId());
         String oldName = before != null ? before.getName() : null;
         if (!credentials.save(cred)) return false;

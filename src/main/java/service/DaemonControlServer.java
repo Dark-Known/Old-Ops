@@ -47,7 +47,7 @@ public final class DaemonControlServer implements AutoCloseable {
     }
 
     /** A heartbeat comment goes out this often so clients can tell "idle" from "daemon gone". */
-    static final long DEFAULT_HEARTBEAT_MS = 5_000;
+    static long defaultHeartbeatMs() { return util.Timers.ms("timerDaemonHeartbeatMs", 5_000); }
     /** Cap on concurrent status streams (one per GUI window is plenty; each holds a server thread). */
     private static final int MAX_STREAMS = 4;
 
@@ -69,12 +69,12 @@ public final class DaemonControlServer implements AutoCloseable {
     }
 
     public static DaemonControlServer start(File dataDir, Executor executor) throws IOException {
-        return start(dataDir, executor, new StatusBroadcaster(), DEFAULT_HEARTBEAT_MS);
+        return start(dataDir, executor, new StatusBroadcaster(), 0);
     }
 
     /** As above, and also serves {@code GET /status} and the push stream {@code GET /status/stream} from {@code bus}. */
     public static DaemonControlServer start(File dataDir, Executor executor, StatusBroadcaster bus) throws IOException {
-        return start(dataDir, executor, bus, DEFAULT_HEARTBEAT_MS);
+        return start(dataDir, executor, bus, 0);
     }
 
     static DaemonControlServer start(File dataDir, Executor executor, StatusBroadcaster bus, long heartbeatMs) throws IOException {
@@ -206,7 +206,7 @@ public final class DaemonControlServer implements AutoCloseable {
             os.write(": connected\n\n".getBytes(StandardCharsets.UTF_8));
             os.flush();
             while (!sub.isClosed()) {
-                String msg = sub.next(heartbeatMs);
+                String msg = sub.next(heartbeatMs > 0 ? heartbeatMs : defaultHeartbeatMs());
                 if (msg != null) events++;
                 os.write((msg == null ? ": hb\n\n" : toSseEvent(msg)).getBytes(StandardCharsets.UTF_8));
                 os.flush(); // throws once the client has gone away, which ends the loop

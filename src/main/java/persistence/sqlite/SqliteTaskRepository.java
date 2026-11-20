@@ -65,7 +65,7 @@ public class SqliteTaskRepository implements TaskRepository {
         String initError = null;
         try {
             Class.forName("org.sqlite.JDBC");
-            c = DriverManager.getConnection("jdbc:sqlite:" + dbFile.getAbsolutePath());
+            c = Db.connect(dbFile);
             applyPragmas(c);
             try (Statement st = c.createStatement()) {
                 st.execute(CREATE_TASKS_TABLE_SQL);
@@ -195,7 +195,9 @@ public class SqliteTaskRepository implements TaskRepository {
                         "last_run_result TEXT," +
                         "created_at TEXT," +
                         "retry_count INTEGER," +
-                        "watch_options TEXT" +
+                        "watch_options TEXT," +
+                        "transfer_batch_max_mb INTEGER," +
+                        "transfer_concurrency INTEGER" +
                         ")";
 
     /**
@@ -335,8 +337,9 @@ public class SqliteTaskRepository implements TaskRepository {
             "mail_output_folder, schedule_type, scheduled_at, interval_minutes, interval_seconds, " +
             "cron_expression, watcher_enabled, inbound_watcher_poll_interval_minutes, " +
             "inbound_watcher_max_age_minutes, last_known_remote_file_epoch, last_known_remote_file_size, " +
-            "last_run_at, last_started_at, last_run_result, created_at, retry_count, watch_options" +
-            ") VALUES (" + "?,".repeat(47).replaceAll(",$", "") + ") " +
+            "last_run_at, last_started_at, last_run_result, created_at, retry_count, watch_options, " +
+            "transfer_batch_max_mb, transfer_concurrency" +
+            ") VALUES (" + "?,".repeat(49).replaceAll(",$", "") + ") " +
             "ON CONFLICT(id) DO UPDATE SET " +
             "name=excluded.name, task_type=excluded.task_type, status=excluded.status, " +
             "source_credential_id=excluded.source_credential_id, target_credential_id=excluded.target_credential_id, " +
@@ -361,7 +364,8 @@ public class SqliteTaskRepository implements TaskRepository {
             "last_known_remote_file_epoch=excluded.last_known_remote_file_epoch, " +
             "last_known_remote_file_size=excluded.last_known_remote_file_size, " +
             "last_run_at=excluded.last_run_at, last_started_at=excluded.last_started_at, " +
-            "last_run_result=excluded.last_run_result, created_at=excluded.created_at, retry_count=excluded.retry_count, watch_options=excluded.watch_options";
+            "last_run_result=excluded.last_run_result, created_at=excluded.created_at, retry_count=excluded.retry_count, watch_options=excluded.watch_options, " +
+            "transfer_batch_max_mb=excluded.transfer_batch_max_mb, transfer_concurrency=excluded.transfer_concurrency";
 
     /**
      * Inserts or replaces (by id) a task. Assigns an id if missing, same as the
@@ -425,6 +429,8 @@ public class SqliteTaskRepository implements TaskRepository {
             ps.setString(i++, t.getCreatedAt() != null ? t.getCreatedAt().format(DT_FMT) : null);
             ps.setInt(i++, t.getRetryCount());
             ps.setString(i++, t.getWatchOptions());
+            ps.setInt(i++, t.getTransferBatchMaxMb());
+            ps.setInt(i++, t.getTransferConcurrency());
             ps.executeUpdate();
             lastSaveError = null;
             return true;
@@ -611,6 +617,8 @@ public class SqliteTaskRepository implements TaskRepository {
         if (createdAt != null && !createdAt.isEmpty()) t.setCreatedAt(LocalDateTime.parse(createdAt, DT_FMT));
         t.setRetryCount(rs.getInt("retry_count"));
         t.setWatchOptions(rs.getString("watch_options"));
+        t.setTransferBatchMaxMb(rs.getInt("transfer_batch_max_mb"));   // NULL (older rows) reads as 0 = use Settings
+        t.setTransferConcurrency(rs.getInt("transfer_concurrency"));
         return t;
     }
 

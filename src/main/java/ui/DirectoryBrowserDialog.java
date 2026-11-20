@@ -128,13 +128,8 @@ public final class DirectoryBrowserDialog {
         addressContainer.add(breadcrumbBar, "crumbs");
         addressContainer.add(address, "edit");
 
-        JButton btnGo = navButton(new GoArrowIcon(windows ? Color.WHITE : accent), windows);
+        JButton btnGo = navButton(new GoArrowIcon(accent), windows);
         btnGo.setToolTipText("Go");
-        if (windows) {
-            btnGo.setBackground(accent);
-            btnGo.setOpaque(true);
-            btnGo.setBorderPainted(false);
-        }
 
         toolbar.add(navGroup, BorderLayout.WEST);
         toolbar.add(addressContainer, BorderLayout.CENTER);
@@ -237,7 +232,7 @@ public final class DirectoryBrowserDialog {
         statusLabel.setForeground(muted);
 
         // ── Bottom: OK / Cancel ──────────────────────────────────────────────
-        JButton btnOk = windows ? new GradientButton("Select Folder") : new JButton("select");
+        JButton btnOk = windows ? new JButton("Select Folder") : new JButton("select");
         JButton btnCancel = new JButton(windows ? "Cancel" : "cancel");
         btnOk.setFont(baseFont);
         btnCancel.setFont(baseFont);
@@ -245,14 +240,6 @@ public final class DirectoryBrowserDialog {
         btnCancel.setFocusPainted(false);
         btnOk.setMargin(new Insets(6, 16, 6, 16));
         btnCancel.setMargin(new Insets(6, 16, 6, 16));
-        if (windows) {
-            btnOk.setBackground(accent);
-            btnOk.setForeground(Color.WHITE);
-        } else {
-            btnOk.setBackground(new Color(0x2D2D2D));
-            btnOk.setForeground(accent);
-            btnOk.setBorder(BorderFactory.createLineBorder(accent));
-        }
 
         JPanel bottom = new JPanel(new BorderLayout());
         bottom.setBackground(toolbarBg);

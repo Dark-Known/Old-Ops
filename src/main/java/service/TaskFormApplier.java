@@ -92,6 +92,8 @@ public final class TaskFormApplier {
         }
 
         t.setRetryCount(f.retryCount);
+        t.setTransferBatchMaxMb(f.transferBatchMaxMb);
+        t.setTransferConcurrency(f.transferConcurrency);
         applySchedule(t, f);
         return t;
     }

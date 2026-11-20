@@ -57,6 +57,8 @@ public final class TaskChangeDescriber {
         LABELS.put("inboundWatcherPollIntervalMinutes", "Watcher fallback poll interval (min)");
         LABELS.put("inboundWatcherMaxAgeMinutes", "Watcher max file age (min)");
         LABELS.put("retryCount", "Retry count");
+        LABELS.put("transferBatchMaxMb", "Batch size (MB, 0 = Settings)");
+        LABELS.put("transferConcurrency", "Parallel SFTP sessions (0 = Settings)");
     }
 
     public static Map<String, String> snapshot(ScheduledTask t, Map<String, String> credNameById) {
@@ -98,6 +100,8 @@ public final class TaskChangeDescriber {
         f.put("inboundWatcherPollIntervalMinutes", String.valueOf(t.getInboundWatcherPollIntervalMinutes()));
         f.put("inboundWatcherMaxAgeMinutes", String.valueOf(t.getInboundWatcherMaxAgeMinutes()));
         f.put("retryCount", String.valueOf(t.getRetryCount()));
+        f.put("transferBatchMaxMb", String.valueOf(t.getTransferBatchMaxMb()));
+        f.put("transferConcurrency", String.valueOf(t.getTransferConcurrency()));
         return f;
     }
 

@@ -9,6 +9,7 @@ import service.TaskForm;
 import service.TaskFormApplier;
 import service.TransferService;
 import persistence.AppStorage;
+import util.MailFetchMode;
 import util.*;
 import model.ScheduledTask.*;
 import javax.swing.*;
@@ -26,11 +27,11 @@ import java.util.UUID;
  *
  * Watcher + service integration changes:
  *
- *  FILE TRANSFER
- *  ─────────────
- *  Every FILE_TRANSFER task needs a target credential. Pick a remote one
- *  (host, username, password) to move data over SFTP, or the built-in
- *  "Local (this computer)" to copy/move between two local folders.
+ *  FILE TRANSFER — REMOTE ONLY
+ *  ────────────────────────────
+ *  Local→local file transfers are not supported. Every FILE_TRANSFER task
+ *  requires a resolved target credential (Target Credentials tab: host,
+ *  username, password) and moves data over SFTP in both directions.
  *
  *  BACKUP — LOCAL OR REMOTE, EITHER SIDE
  *  ──────────────────────────────────────
@@ -58,6 +59,7 @@ public class TaskDialog extends JDialog {
     private final AppStorage storage;
     private final RunHistory auditLog; // nullable — see 4-arg constructor
     private ScheduledTask result;
+    private int keptBatchMb;   // a task's own batch size is no longer edited here, but an existing value is kept
 
     // ── General ───────────────────────────────────────────────────────────────
     private JPanel    general;
@@ -78,6 +80,7 @@ public class TaskDialog extends JDialog {
     private JPasswordField pfTargetPass;
     private JComboBox<String> cbTargetOs;
     private JSpinner  spinnerRetryCount;
+    private JComboBox<String> comboConcurrency;   // index = number of sessions; 0 = same as Settings
 
     // ── File transfer extras ──────────────────────────────────────────────────
     private JComboBox<String> cbTransferDirection;
@@ -327,7 +330,8 @@ public class TaskDialog extends JDialog {
 
         refreshWatcherStatusLabel(existing);
 
-        // Local→local is done with the built-in "Local (this computer)" credential.
+        // ── Local→local mode is not supported — every FILE_TRANSFER task
+        // requires a remote target credential (see Target Credentials tab).
 
         lblTargetFolder = new JLabel();
 
@@ -338,6 +342,14 @@ public class TaskDialog extends JDialog {
                         new String(pfTargetPass.getPassword()), (String) cbTargetOs.getSelectedItem())),   2);
         addRow(fileTransferPanel, lblAdditionalTargetFolders, additionalDestinationsField, 4);
         addRow(fileTransferPanel, "Watcher baseline",        watcherStatusRow,       7);
+
+        keptBatchMb = existing != null ? existing.getTransferBatchMaxMb() : 0;
+        comboConcurrency = new JComboBox<>(new String[]{"Same as Settings (" + util.AppSettings.getTransferBatchConcurrency() + ")",
+                "1", "2", "3", "4", "5", "6", "7", "8"});
+        comboConcurrency.setSelectedIndex(existing != null ? Math.min(8, existing.getTransferConcurrency()) : 0);
+        comboConcurrency.setToolTipText("How many SFTP sessions this task may use at the same time. More is faster for many files but "
+                + "opens more logins on the server.");
+        addRow(fileTransferPanel, "Parallel SFTP sessions", comboConcurrency, 8);
 
         transferTab = new JPanel(new GridBagLayout());
         transferTab.setOpaque(false);
@@ -387,7 +399,7 @@ public class TaskDialog extends JDialog {
         anchorTop(general,     2);
         anchorTop(backupPanel, 11);
         anchorTop(watchPanel,  9);
-        anchorTop(targetPanel, 7);
+        anchorTop(targetPanel, 6);
         anchorTop(mailPanel,   23);
         anchorTop(schedulePanel, 3);
         anchorTop(retryPanel,  2);
@@ -472,9 +484,8 @@ public class TaskDialog extends JDialog {
         add(scroll, BorderLayout.CENTER);
 
         // ── Buttons ───────────────────────────────────────────────────────────
-        JButton btnSave   = new GradientButton(existing == null ? "Create Task" : "Save Changes");
+        JButton btnSave   = new JButton(existing == null ? "Create Task" : "Save Changes");
         JButton btnCancel = new JButton("Cancel");
-        styleBtn(btnSave, AppTheme.EARTH_SIENNA);
         btnCancel.addActionListener(e -> dispose());
         btnSave.addActionListener(e -> save(existing));
 
@@ -542,26 +553,9 @@ public class TaskDialog extends JDialog {
                 cbTargetOs.setSelectedItem(cred.getOsType() != null ? cred.getOsType() : "WINDOWS");
             }
         };
-        JLabel localNote = new JLabel("<html>Local: files are copied between two folders on this computer. "
-                + "Set both paths below to local folders; nothing connects to a server.</html>");
-        localNote.setForeground(new Color(0x2F5BEA));
-        JButton[] testButton = new JButton[1];
-        Runnable applyLocalMode = () -> {
-            boolean local = Credential.isLocalName(targetCredentialName());
-            for (JComponent f : new JComponent[]{tfTargetHost, tfTargetUser, pfTargetPass, cbTargetOs}) f.setEnabled(!local);
-            localNote.setVisible(local);
-            if (testButton[0] != null) testButton[0].setEnabled(!local);
-            if (local) {
-                Credential lc = Credential.local();
-                tfTargetHost.setText(lc.getHost());
-                tfTargetUser.setText(nz(lc.getUsername()));
-                pfTargetPass.setText("");
-                cbTargetOs.setSelectedItem(localOsType());
-            }
-        };
-        cbTargetCredential.addActionListener(e -> { fillFromSaved.run(); applyLocalMode.run(); });
+        cbTargetCredential.addActionListener(e -> fillFromSaved.run());
         cbTargetCredential.getEditor().getEditorComponent().addFocusListener(new java.awt.event.FocusAdapter() {
-            @Override public void focusLost(java.awt.event.FocusEvent e) { fillFromSaved.run(); applyLocalMode.run(); }
+            @Override public void focusLost(java.awt.event.FocusEvent e) { fillFromSaved.run(); }
         });
 
         addRow(targetPanel, "Credential name", cbTargetCredential, 0);
@@ -570,10 +564,7 @@ public class TaskDialog extends JDialog {
         addRow(targetPanel, "Password",        pfTargetPass, 3);
         addRow(targetPanel, "OS Type",         cbTargetOs,   4);
 
-        addRow(targetPanel, "", localNote, 6);
         JButton btnTestConnection = new JButton("Test Connection");
-        testButton[0] = btnTestConnection;
-        applyLocalMode.run();
         btnTestConnection.setToolTipText("Opens a real SFTP session with the fields above to verify they work");
         btnTestConnection.addActionListener(e -> {
             String host = tfTargetHost.getText().trim();
@@ -1262,7 +1253,6 @@ public class TaskDialog extends JDialog {
         in.taskType = (String) cbTaskType.getSelectedItem();
         in.targetHost = targetHost;
         in.targetUser = targetUser;
-        in.targetIsLocal = model.Credential.isLocalName(targetCredentialName());
         in.targetPass = targetPass;
         in.sourcePath = tfSourcePath.getText();
         in.targetFolder = tfTargetFolder.getText();
@@ -1329,6 +1319,8 @@ public class TaskDialog extends JDialog {
         f.backupDestinationRemote = cbBackupDestinationRemote.isSelected();
         f.backupRetentionDays = (Integer) spBackupRetentionDays.getValue();
         f.retryCount = (Integer) spinnerRetryCount.getValue();
+        f.transferConcurrency = comboConcurrency.getSelectedIndex();
+        f.transferBatchMaxMb = keptBatchMb;
         f.scheduleType = (String) cbScheduleType.getSelectedItem();
         f.scheduledAt = tfScheduledAt.getText();
         f.time = tfTime.getText();
@@ -1415,7 +1407,7 @@ public class TaskDialog extends JDialog {
         // Skipped for mail (uses OAuth2, not a stored credential) and backup
         // (backup credentials are persisted separately, see below).
         String credName = targetCredentialName();
-        if (!isMail && !isBackup && !isWatch && !targetUser.isEmpty() && !Credential.isLocalName(credName)) {
+        if (!isMail && !isBackup && !isWatch && !targetUser.isEmpty()) {
             Credential cred = storage.loadCredentialByName(credName);
             if (cred != null) {
                 if (!confirmSharedCredentialChange(existing, cred, targetHost, targetUser)) return;
@@ -1521,7 +1513,6 @@ public class TaskDialog extends JDialog {
      * few seconds to time out), then shows the themed browser window.
      */
     private void browseRemote(JTextField field, String host, String username, String password, String osType) {
-        if (Credential.isLocalName(targetCredentialName())) { browseLocal(field, "This Computer"); return; }   // "Local (this computer)": no server to connect to
         if (host.isEmpty() || username.isEmpty()) {
             JOptionPane.showMessageDialog(this,
                     "Enter a Hostname / IP and Username first.",
@@ -1803,10 +1794,6 @@ public class TaskDialog extends JDialog {
         panel.add(Box.createGlue(), gc);
     }
 
-    private void styleBtn(JButton b, Color bg) {
-        b.setBackground(bg); b.setForeground(Color.WHITE);
-        b.setFocusPainted(false); b.setBorderPainted(false);
-    }
 
     /**
      * Records an application-activity note into the Event Monitor's feed —

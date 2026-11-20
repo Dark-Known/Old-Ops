@@ -1,6 +1,7 @@
 package ui.monitor;
 
 import model.EventKind;
+import model.TaskRunRecord;
 
 import java.time.Duration;
 import java.time.LocalDateTime;

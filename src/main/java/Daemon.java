@@ -76,6 +76,7 @@ public class Daemon {
 
         // ── Wire services (same classes the GUI uses) ────────────────────────
         AppStorage storage      = SqliteStorage.open(dataDir);
+        persistence.sqlite.DbHealth.runAsync(new File(dataDir));   // integrity check + one backup of app.db per day (logs/sql.log has slow/failed SQL)
         TransferService   transferSvc  = new TransferService(storage);
         loadWinScpPref(storage, transferSvc, dataDir);
 
@@ -179,8 +180,8 @@ public class Daemon {
                     log("Command poller error: " + e.getMessage());
                 }
                 try {
-                    monitor.awaitChange(persistence.ChangeSignals.Topic.APP, seen, COMMAND_SAFETY_POLL_MS);
-                    Thread.sleep(COMMAND_MIN_GAP_MS); // coalesce bursts of commits into one poll
+                    monitor.awaitChange(persistence.ChangeSignals.Topic.APP, seen, COMMAND_SAFETY_POLL_MS());
+                    Thread.sleep(COMMAND_MIN_GAP_MS()); // coalesce bursts of commits into one poll
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                 }
@@ -189,9 +190,9 @@ public class Daemon {
     }
 
     /** Longest the command poller sleeps even if no commit is signalled (belt and braces). */
-    private static final long COMMAND_SAFETY_POLL_MS = 30_000;
+    private static long COMMAND_SAFETY_POLL_MS() { return util.Timers.ms("timerCommandSafetyPollMs", 30_000); }
     /** Minimum gap between polls when the database is busy with unrelated commits. */
-    private static final long COMMAND_MIN_GAP_MS = 250;
+    private static long COMMAND_MIN_GAP_MS() { return util.Timers.ms("timerCommandMinGapMs", 250); }
 
     private static void runAction(TaskSchedulerService scheduler,
                                   persistence.CommandQueue.Action action, String taskId) {

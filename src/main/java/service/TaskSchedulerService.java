@@ -37,8 +37,10 @@ import java.nio.channels.OverlappingFileLockException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.time.DayOfWeek;
 import java.time.Duration;
 import java.time.LocalDateTime;
+import java.time.LocalTime;
 import java.lang.management.ManagementFactory;
 import java.lang.management.ThreadMXBean;
 import java.time.format.DateTimeFormatter;
@@ -248,7 +250,7 @@ public class TaskSchedulerService {
         // Retention (age + size) is enforced by a scheduled purge that runs on a task worker —
         // see maintenanceTick() — rather than blocking start-up with a synchronous delete here.
         this.pollIntervalSeconds = Math.max(1, pollIntervalSeconds);
-        this.remotePushWatcher = new RemotePushWatcher(storage, this::onWatchWakeup);
+        this.remotePushWatcher = new RemotePushWatcher(storage, this::onWatchWakeup, this::onWatchCatchUp);
         SshSessionEvents.setSink(sshSink);
     }
 
@@ -328,11 +330,25 @@ public class TaskSchedulerService {
     // run that eventually handles it — so "Change detected" (watch thread) and
     // "Started"/outcome (worker thread) land in the same run group.
     private final ConcurrentMap<String, String> pendingWakeKeys = new ConcurrentHashMap<>();
+    // Tasks whose in-flight run was cancelled by the user (cancel, disable, restart): that run must not be retried.
+    private final java.util.Set<String> cancelRequested = ConcurrentHashMap.newKeySet();
     // Tasks whose next runNow() is an automatic retry rather than a manual run.
     private final java.util.Set<String> retryTriggered = ConcurrentHashMap.newKeySet();
     // Per-task watcher state, for emitting arm/degrade/restore events on change only.
     private final Map<String, WatchMode> lastEventWatchMode = new ConcurrentHashMap<>();
     private final java.util.Set<String> everPushed = ConcurrentHashMap.newKeySet();
+
+    /**
+     * The task's status as saved right now (so a Disable from the window is seen), falling back to the last loaded list;
+     * null if the task no longer exists.
+     */
+    private TaskStatus currentStatus(String taskId) {
+        try {
+            for (ScheduledTask t : storage.loadTasks()) if (t.getId().equals(taskId)) return t.getStatus();
+        } catch (RuntimeException ignored) { /* use the cached copy below */ }
+        ScheduledTask cached = lookupTask(taskId);
+        return cached == null ? null : cached.getStatus();
+    }
 
     private ScheduledTask lookupTask(String taskId) {
         for (ScheduledTask t : lastLoadedTasks) if (t.getId().equals(taskId)) return t;
@@ -465,6 +481,31 @@ public class TaskSchedulerService {
             // Best-effort — recording must never stop the wake-up from being delivered.
         }
         eventQueue.publish(new TaskDueEvent(taskId, LocalDateTime.now(), 0, true, changedFileNames));
+    }
+
+    /**
+     * Called by {@link RemotePushWatcher} each time a remote listener becomes ready (daemon start, reconnect after a lost
+     * connection, a task joining a running listener). While nothing was watching, a new file produced no event, and a task
+     * with a live watch is not polled, so such a file would wait for the next change. This runs one scan now, with no
+     * file names: the same baseline scan a poll would do, so only files not yet transferred are picked up.
+     *
+     * <p>A task that has never run has no baseline yet: its first scan would pull the newest existing file (see the
+     * initial-run rule in the README), which enabling a watcher must not do by itself, so it waits for its first real change.
+     */
+    private void onWatchCatchUp(String taskId, String why) {
+        ScheduledTask t = lookupTask(taskId);
+        if (t == null || t.getLastRunAt() == null) return;
+        String runKey = pendingWakeKeys.computeIfAbsent(taskId, k -> RunTrace.newRunKey());
+        try {
+            LocalDateTime now = LocalDateTime.now();
+            String msg = "Watcher ready \u2014 checking for files that arrived while it was not watching";
+            runHistoryService.recordEvent(EventKind.WATCH_TRIGGERED, taskId, t.getName(),
+                    t.getTaskType() != null ? t.getTaskType().name() : null,
+                    TaskRunRecord.Status.SUCCESS, msg, msg + "\n  Why now: " + why, now, now, runKey, "WATCHER");
+        } catch (Exception ignored) {
+            // Best-effort — recording must never stop the catch-up from being delivered.
+        }
+        eventQueue.publish(new TaskDueEvent(taskId, LocalDateTime.now(), 0, true, java.util.Collections.<String>emptySet()));
     }
 
     /** How a watcher-enabled task is currently being triggered — for UI display only. */
@@ -1570,6 +1611,7 @@ public class TaskSchedulerService {
         Thread runner = runningThreads.get(taskId);
         boolean interrupted = false;
         if (runner != null) {
+            cancelRequested.add(taskId); // so the run that ends because of this is not treated as a failure to retry
             runner.interrupt(); // the worker clears the flag afterwards and keeps serving the queue
             interrupted = true;
             cancelledAny = true;
@@ -1661,6 +1703,7 @@ public class TaskSchedulerService {
         final String runKey = RunTrace.currentRunKey();
         activeRunKeys.put(task.getId(), runKey);
         final Thread self = Thread.currentThread();
+        cancelRequested.remove(task.getId()); // a cancel from before this run started is not about this run
         runningThreads.put(task.getId(), self);
         try {
             executeTaskBody(task, changedFileNames);
@@ -1779,7 +1822,13 @@ public class TaskSchedulerService {
         skipReason = outcome.skipReason();
         failureReason = outcome.failureReason();
 
-        if (!success && task.getRetryCount() > 0) {
+        TaskStatus storedStatus = currentStatus(task.getId());
+        boolean cancelled = cancelRequested.remove(task.getId());
+        if (!success && cancelled) {
+            emitCap.accept("[INFO] Run was cancelled or the task was disabled - not retrying.");
+            if (failureReason == null) failureReason = "Cancelled";
+        }
+        if (RetryPolicy.shouldRetry(success, task.getRetryCount(), cancelled, storedStatus)) {
             String retryReason = failureReason != null ? failureReason : lastErrorLine(runLog.toString());
             emitCap.accept("[INFO] Task failed and will be retried " + task.getRetryCount() + " time(s).\n");
             runHistoryService.recordRun(task.getId(), task.getName(), task.getTaskType().name(),
@@ -1812,10 +1861,10 @@ public class TaskSchedulerService {
             if ((!finalSkipped && finalSuccess && (t.getScheduleType() == ScheduleType.INTERVAL_MINUTES
                     || t.getScheduleType() == ScheduleType.INTERVAL_SECONDS))
                     || finalSkipped) {
-                t.setStatus(TaskStatus.PENDING);
-                emit(task, "[INFO] Task reset to PENDING for next scheduled run");
+                t.setStatus(RetryPolicy.statusAfterRun(t.getStatus(), TaskStatus.PENDING));
+                if (t.getStatus() == TaskStatus.PENDING) emit(task, "[INFO] Task reset to PENDING for next scheduled run");
             } else {
-                t.setStatus(finalSuccess ? TaskStatus.SUCCESS : TaskStatus.FAILED);
+                t.setStatus(RetryPolicy.statusAfterRun(t.getStatus(), finalSuccess ? TaskStatus.SUCCESS : TaskStatus.FAILED));
             }
             if (!storage.saveTaskRunState(t)) logBackendSaveFailure(t, "run result/status after completion");
             // Publish the task's next occurrence immediately — this is what
@@ -1921,6 +1970,7 @@ public class TaskSchedulerService {
     private void retryTask(ScheduledTask task) {
         List<ScheduledTask> tasks = storage.loadTasks();
         tasks.stream().filter(t -> t.getId().equals(task.getId())).findFirst().ifPresent(t -> {
+            if (t.getStatus() == TaskStatus.DISABLED) return; // disabled during the 5 s wait: stay disabled
             if (t.getRetryCount() > 0) {
                 t.setRetryCount(t.getRetryCount() - 1);
                 t.setStatus(TaskStatus.PENDING);

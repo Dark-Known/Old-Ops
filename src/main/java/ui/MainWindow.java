@@ -2,6 +2,7 @@ package ui;
 
 import persistence.RunHistory;
 import persistence.sqlite.SqliteStorage;
+import service.BackgroundJobs;
 
 import ui.CredentialManagerPanel;
 import model.ScheduledTask;

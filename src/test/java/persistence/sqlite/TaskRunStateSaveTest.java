@@ -7,6 +7,7 @@ import model.ScheduledTask.TaskStatus;
 import model.ScheduledTask.TaskType;
 import org.junit.Test;
 
+import java.io.File;
 import java.nio.file.Files;
 import java.time.LocalDateTime;
 

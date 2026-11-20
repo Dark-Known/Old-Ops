@@ -27,11 +27,11 @@ public final class SchedulerStatusExporter {
     private static final Logger log = Logger.getLogger(SchedulerStatusExporter.class.getName());
 
     /** Longest the file may go without a rewrite: readers treat a file older than ~8 s as "daemon not running". */
-    private static final long DAEMON_HEARTBEAT_MS = 5_000;
+    private static long daemonHeartbeatMs() { return util.Timers.ms("timerDaemonHeartbeatMs", 5_000); }
     /** Other processes' files are not used for liveness by anyone, so they only need an occasional refresh. */
-    private static final long OTHER_HEARTBEAT_MS = 60_000;
+    private static long guiHeartbeatMs() { return util.Timers.ms("timerGuiHeartbeatMs", 60_000); }
     /** Under activity, never rewrite the file more often than the old fixed 2 s cadence. */
-    private static final long MIN_FILE_GAP_MS = 2_000;
+    private static long MIN_FILE_GAP_MS() { return util.Timers.ms("timerStatusFileMinGapMs", 2_000); }
 
     private final Path targetFile;
     private final String processLabel;
@@ -47,7 +47,12 @@ public final class SchedulerStatusExporter {
     private long filesWritten;
 
     public SchedulerStatusExporter(Path targetFile, String processLabel) {
-        this(targetFile, processLabel, "daemon".equals(processLabel) ? DAEMON_HEARTBEAT_MS : OTHER_HEARTBEAT_MS);
+        this(targetFile, processLabel, 0); // 0 = follow the live timer for this process
+    }
+
+    private long effectiveHeartbeatMs() {
+        if (heartbeatMs > 0) return heartbeatMs;
+        return "daemon".equals(processLabel) ? daemonHeartbeatMs() : guiHeartbeatMs();
     }
 
     public SchedulerStatusExporter(Path targetFile, String processLabel, long heartbeatMs) {
@@ -150,7 +155,7 @@ public final class SchedulerStatusExporter {
                 changed = !fingerprint.equals(lastFingerprint);
                 if (changed) { lastFingerprint = fingerprint; fileDirty = true; }
                 long since = now - lastFileWriteMs;
-                writeFileNow = (fileDirty && since >= MIN_FILE_GAP_MS) || since >= heartbeatMs;
+                writeFileNow = (fileDirty && since >= MIN_FILE_GAP_MS()) || since >= effectiveHeartbeatMs();
             }
             if (changed) {
                 Consumer<String> l = listener;

@@ -8,7 +8,7 @@ import java.util.Base64;
 /**
  * Builds the remote commands that listen for file changes. The scripts themselves live in
  * {@code src/main/resources/scripts/watcher/}: {@code windows/listener.ps1} is a skeleton that pulls in one file per concern
- * (watch the folder, take over from a stale listener, guard against orphaning, the event loop, cleanup) and
+ * (watch the folder, guard against orphaning, report its processes, the event loop, cleanup) and
  * {@code linux/listener.sh} is the Linux counterpart. Comment lines, blank lines and indentation are removed
  * before sending, so the files can be commented freely without making the command longer.
  */
@@ -17,12 +17,35 @@ final class ListenerScripts {
     private ListenerScripts() {}
 
     /** Windows: {@code powershell -EncodedCommand ...}; {@code dir} is the already normalised folder. */
-    static String windows(String dir, String heartbeat, String endPrefix, String unavailableMarker) {
+    static String windows(String dir, String heartbeat, String endPrefix, String stepPrefix, String procPrefix,
+                          String unavailableMarker) {
         String script = expand(load("windows/listener.ps1"))
                 .replace("{{PATH}}", dir.replace("'", "''"))
                 .replace("{{HB}}", heartbeat)
                 .replace("{{END}}", endPrefix)
+                .replace("{{STEP}}", stepPrefix)
+                .replace("{{PROC}}", procPrefix)
                 .replace("{{UNAVAILABLE}}", unavailableMarker);
+        return encodedPowerShell(script);
+    }
+
+    /**
+     * Windows: the command that ends listener processes recorded from an earlier connection (see
+     * {@code windows/end-previous.ps1}). {@code targets} is "pid:start,pid:start" with digits only; the caller builds
+     * it from numbers, and it is checked here too because it ends up inside a script.
+     */
+    static String windowsEndPrevious(String targets, String goneTag, String killedTag, String keptTag, String failedTag) {
+        if (!targets.matches("\\d+:\\d+(,\\d+:\\d+)*")) throw new IllegalArgumentException("targets must be pid:start pairs: " + targets);
+        String script = load("windows/end-previous.ps1")
+                .replace("{{TARGETS}}", targets)
+                .replace("{{GONE}}", goneTag)
+                .replace("{{KILLED}}", killedTag)
+                .replace("{{KEPT}}", keptTag)
+                .replace("{{FAILED}}", failedTag);
+        return encodedPowerShell(script);
+    }
+
+    private static String encodedPowerShell(String script) {
         String encoded = Base64.getEncoder().encodeToString(script.getBytes(StandardCharsets.UTF_16LE));
         // -NonInteractive + -NoProfile keep this fast and free of profile noise on stdout; -ExecutionPolicy Bypass
         // is scoped to this process only (it does not change the host's persistent policy).

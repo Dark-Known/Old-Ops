@@ -12,23 +12,6 @@ public class Credential {
     private String password;   // plain-text in memory; encrypted at rest by SqliteCredentialRepository
     private String osType;     // WINDOWS or LINUX
 
-    /** Name of the built-in credential that means "this computer's own folders" (no server, no login). */
-    public static final String LOCAL_NAME = "Local (this computer)";
-    public static final String LOCAL_ID = "local";
-    public static final String LOCAL_OS = "LOCAL";
-
-    /** The always-present default entry: a File Transfer or Backup that uses it copies between folders on this machine. */
-    public static Credential local() {
-        return new Credential(LOCAL_ID, LOCAL_NAME, "localhost", System.getProperty("user.name", ""), "", LOCAL_OS);
-    }
-
-    /** Whether this is the built-in local entry (by id, name or OS type), which is never stored or edited. */
-    public boolean isLocal() {
-        return LOCAL_ID.equals(id) || LOCAL_NAME.equals(name) || LOCAL_OS.equals(osType);
-    }
-
-    public static boolean isLocalName(String name) { return name != null && LOCAL_NAME.equalsIgnoreCase(name.trim()); }
-
     public Credential() {}
 
     public Credential(String id, String name, String host,

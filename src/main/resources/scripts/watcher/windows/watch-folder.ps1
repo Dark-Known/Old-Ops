@@ -4,3 +4,4 @@ if(-not(Test-Path -LiteralPath $p -PathType Container)){Write-Output('{{UNAVAILA
 $w=New-Object IO.FileSystemWatcher $p
 $w.EnableRaisingEvents=$true
 'Created','Changed','Renamed'|%{[void](Register-ObjectEvent $w $_)}
+Mark 'watching the folder'

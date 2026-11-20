@@ -89,7 +89,8 @@ public class TaskWorkerPool {
     private final TaskEventQueue queue;
     private final Consumer<TaskDueEvent> handler;
     private final Supplier<HandlerOutcome> outcomeSupplier;
-    private final ExecutorService workers;
+    private Thread dispatcher;
+    private final java.util.Set<java.util.concurrent.Future<?>> inFlightFutures = java.util.concurrent.ConcurrentHashMap.newKeySet();
     private final int workerCount;
     private final AtomicInteger activeWorkers = new AtomicInteger(0);
     // Newest-first bounded feed of handled events, for the monitoring UI.
@@ -117,62 +118,72 @@ public class TaskWorkerPool {
         this.handler = handler;
         this.outcomeSupplier = outcomeSupplier != null ? outcomeSupplier : () -> HandlerOutcome.DEFAULT;
         this.workerCount = Math.max(1, workerCount);
-        final java.util.concurrent.atomic.AtomicInteger threadNo = new java.util.concurrent.atomic.AtomicInteger();
-        this.workers = Executors.newFixedThreadPool(this.workerCount, r -> {
-            Thread t = new Thread(r, "task-worker-" + threadNo.incrementAndGet());
-            t.setDaemon(true);
-            return t;
-        });
     }
 
     /** Starts the configured number of worker threads. Safe to call once per pool instance. */
     public void start() {
         running = true;
-        for (int i = 0; i < workerCount; i++) {
-            workers.submit(this::runLoop);
-        }
-        log.info("TaskWorkerPool started with " + workerCount + " worker thread(s).");
+        dispatcher = service.Workers.service("task-dispatcher", this::dispatchLoop);
+        log.info("Task dispatcher started; tasks run on the shared worker pool (budget " + workerCount + ").");
     }
 
-    private void runLoop() {
+    /**
+     * The dispatcher: takes the next due event, waits for a free slot in the shared thread budget, then runs the
+     * handler on the shared worker pool (the same threads the tasks' transfer sessions use).
+     */
+    private void dispatchLoop() {
         while (running) {
             try {
                 TaskDueEvent event = queue.take(); // blocks here — zero CPU while idle, no polling
-                activeWorkers.incrementAndGet();
-                LocalDateTime startedAt = LocalDateTime.now();
-                inFlightByThread.put(Thread.currentThread().getId(), new InFlightTask(event.getTaskId(), startedAt, Thread.currentThread().getName()));
-                changed();
-                boolean errored = false;
-                String message = null;
-                boolean suppress = false;
+                service.ThreadBudget.acquireTaskSlot();
+                java.util.concurrent.Future<?> f;
                 try {
-                    handler.accept(event);
-                    HandlerOutcome outcome = outcomeSupplier.get();
-                    errored = outcome.errored();
-                    message = outcome.note();
-                    suppress = outcome.suppress();
-                } catch (Exception e) {
-                    // A failure handling one event must never kill the worker
-                    // thread — it just goes back to take()-ing the next one.
-                    errored = true;
-                    message = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
-                    log.warning("Worker error handling task event " + event + ": " + e.getMessage());
-                } finally {
-                    // cancelTask() interrupts the thread running a task. Clear a leftover flag so it
-                    // cannot make the next take() throw and end this worker for good.
-                    if (running) Thread.interrupted();
-                    activeWorkers.decrementAndGet();
-                    inFlightByThread.remove(Thread.currentThread().getId());
-                    if (!suppress) {
-                        recordActivity(new ActivityEntry(event.getTaskId(), event.getAttempt(),
-                                startedAt, LocalDateTime.now(), errored, message));
-                    }
-                    changed();
+                    f = service.ThreadBudget.pool().submit(() -> handle(event));
+                } catch (RuntimeException e) {
+                    service.ThreadBudget.taskFinished();
+                    throw e;
                 }
+                inFlightFutures.add(f);
+                inFlightFutures.removeIf(java.util.concurrent.Future::isDone);
             } catch (InterruptedException ie) {
                 if (!running) { Thread.currentThread().interrupt(); return; } // pool shutting down
-                // otherwise a task-cancel interrupt landed while idle: keep serving events
+            } catch (RuntimeException e) {
+                log.warning("Dispatcher error: " + e.getMessage());
             }
+        }
+    }
+
+    private void handle(TaskDueEvent event) {
+        activeWorkers.incrementAndGet();
+        LocalDateTime startedAt = LocalDateTime.now();
+        inFlightByThread.put(Thread.currentThread().getId(), new InFlightTask(event.getTaskId(), startedAt, Thread.currentThread().getName()));
+        changed();
+        boolean errored = false;
+        String message = null;
+        boolean suppress = false;
+        try {
+            handler.accept(event);
+            HandlerOutcome outcome = outcomeSupplier.get();
+            errored = outcome.errored();
+            message = outcome.note();
+            suppress = outcome.suppress();
+        } catch (Exception e) {
+            // A failure handling one event must never kill the worker thread.
+            errored = true;
+            message = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
+            log.warning("Worker error handling task event " + event + ": " + e.getMessage());
+        } finally {
+            // cancelTask() interrupts the thread running a task. Clear a leftover flag so the pooled thread
+            // is clean for whatever it runs next.
+            Thread.interrupted();
+            activeWorkers.decrementAndGet();
+            service.ThreadBudget.taskFinished();
+            inFlightByThread.remove(Thread.currentThread().getId());
+            if (!suppress) {
+                recordActivity(new ActivityEntry(event.getTaskId(), event.getAttempt(),
+                        startedAt, LocalDateTime.now(), errored, message));
+            }
+            changed();
         }
     }
 
@@ -186,11 +197,12 @@ public class TaskWorkerPool {
 
     public void stop() {
         running = false;
-        workers.shutdownNow();
+        if (dispatcher != null) dispatcher.interrupt();
+        for (java.util.concurrent.Future<?> f : inFlightFutures) f.cancel(true);
     }
 
-    /** Total configured worker threads (the execution-concurrency ceiling). */
-    public int getWorkerCount() { return workerCount; }
+    /** Size of the shared worker budget (the execution-concurrency ceiling for tasks and their sessions together). */
+    public int getWorkerCount() { return Math.max(workerCount, service.ThreadBudget.limit()); }
 
     /** Workers currently blocked inside handler.accept(), i.e. actively executing a task right now. */
     public int getActiveWorkerCount() { return activeWorkers.get(); }

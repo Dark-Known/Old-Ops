@@ -94,7 +94,7 @@ public class SqliteRunHistory implements RunHistory {
         Connection c = null;
         try {
             Class.forName("org.sqlite.JDBC");
-            c = DriverManager.getConnection("jdbc:sqlite:" + dbFile.getAbsolutePath());
+            c = Db.connect(dbFile);
             try (Statement st = c.createStatement()) {
                 // Same tuning as app.db / background_log.db. This file is written by the Daemon and read by
                 // the GUI at the same time; in the default rollback-journal mode a writer blocks every

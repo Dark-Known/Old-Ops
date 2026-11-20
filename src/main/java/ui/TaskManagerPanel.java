@@ -3,6 +3,7 @@ package ui;
 import service.watch.WatcherBarText;
 import service.schedule.NextRunLabel;
 import persistence.RunHistory;
+import ui.monitor.TaskChangeView;
 import model.ScheduledTask;
 import service.TaskSchedulerService;
 import service.TransferService;
@@ -19,6 +20,7 @@ import java.time.format.DateTimeFormatter;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -66,6 +68,11 @@ public class TaskManagerPanel extends JPanel {
     // Refreshed on selection change AND after every log line (which fires after
     // a run completes and the service may have persisted a new baseline).
     private JLabel lblWatcherFingerprint;
+    private JButton btnBarReset; // only meaningful for watcher tasks; hidden on the strip of other tasks
+    // Small SFTP badge in the baseline strip: sessions open now, or how many the last run used (see SessionBadge).
+    private final PillBadge sessionBadge = new PillBadge("", AppTheme.NEUTRAL_FG, null);
+    private volatile int lastRunSessions = -1, lastRunBatches = -1;
+    private SessionBadge.Look shownBadge;
     private JPanel watcherBar; // kept as a field so refresh() can reach it directly
 
     // taskId -> accumulated in-memory log
@@ -196,6 +203,7 @@ public class TaskManagerPanel extends JPanel {
             boolean wasAtBottom = force || vbar == null
                     || vbar.getValue() + vbar.getVisibleAmount() >= vbar.getMaximum() - 8;
             logArea.setText(v.text());
+            rememberLastRun(v.text());
             if (wasAtBottom) logArea.setCaretPosition(logArea.getDocument().getLength());
         }, e -> System.err.println("Log view load failed: " + e));
     }
@@ -217,6 +225,27 @@ public class TaskManagerPanel extends JPanel {
         return d.snapshot().getActiveSessionCount(taskId);
     }
 
+    /** Remembers the session count of the newest "Transfer summary" line in the log that is shown (for the badge). */
+    private void rememberLastRun(String logText) {
+        int[] run = SessionBadge.lastRun(logText);
+        lastRunSessions = run == null ? -1 : run[0];
+        lastRunBatches = run == null ? -1 : run[1];
+    }
+
+    private void refreshSessionBadge(int openNow) {
+        SessionBadge.Look look = SessionBadge.of(openNow, lastRunSessions, lastRunBatches);
+        if (look.equals(shownBadge)) return;
+        shownBadge = look;
+        sessionBadge.setText(look.text());
+        sessionBadge.setToolTipText(look.tooltip());
+        switch (look.kind()) {
+            case LIVE -> sessionBadge.setColors(AppTheme.RUNNING_FG, AppTheme.RUNNING_BG);
+            case LAST -> sessionBadge.setColors(AppTheme.SUCCESS_FG, AppTheme.SUCCESS_BG);
+            default -> sessionBadge.setColors(AppTheme.NEUTRAL_FG, null);
+        }
+        sessionBadge.revalidate();
+    }
+
     private void refreshActiveSessionLabel() {
         String taskId = getSelectedTaskId();
         if (taskId == null) {
@@ -224,6 +253,7 @@ public class TaskManagerPanel extends JPanel {
             return;
         }
         int count = activeSessionCount(taskId);
+        refreshSessionBadge(count);
         lblActiveSessions.setText(count > 0
                 ? "● " + count + " session" + (count == 1 ? "" : "s") + " open"
                 : " ");
@@ -466,14 +496,18 @@ public class TaskManagerPanel extends JPanel {
         watcherBar.setBorder(BorderFactory.createCompoundBorder(
             BorderFactory.createMatteBorder(1, 0, 1, 0, new Color(0xD9A441)),
             new EmptyBorder(3, 6, 3, 6)));
-        watcherBar.add(lblWatcherFingerprint, BorderLayout.WEST);
+        JPanel fingerprintAndBadge = new JPanel(new FlowLayout(FlowLayout.LEFT, 10, 0));
+        fingerprintAndBadge.setOpaque(false);
+        fingerprintAndBadge.add(lblWatcherFingerprint);
+        fingerprintAndBadge.add(sessionBadge);
+        watcherBar.add(fingerprintAndBadge, BorderLayout.WEST);
+        refreshSessionBadge(0);
         watcherBar.setVisible(false);
 
         // Small "Reset Baseline" link inside the bar so ops can reset without
         // opening the Edit dialog when they spot an amber / stale baseline.
-        JButton btnBarReset = new JButton("Reset Baseline");
+        btnBarReset = new JButton("Reset Baseline");
         btnBarReset.setFont(btnBarReset.getFont().deriveFont(Font.PLAIN, 11f));
-        btnBarReset.setForeground(AppTheme.EARTH_OCHRE);
         btnBarReset.setBorderPainted(false);
         btnBarReset.setContentAreaFilled(false);
         btnBarReset.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
@@ -510,7 +544,7 @@ public class TaskManagerPanel extends JPanel {
         // in five directions at once. Delete keeps a red-tinted label as its
         // only distinguishing mark — enough to read as destructive without a
         // loud color block sitting one click from "Run Now".
-        JButton btnNew        = new GradientButton("New Task");
+        JButton btnNew        = new JButton("New Task");
         JButton btnEdit       = new JButton("Edit");
         JButton btnDelete     = new JButton("Delete");
         JButton btnRunNow     = new JButton("Run Now");
@@ -524,8 +558,6 @@ public class TaskManagerPanel extends JPanel {
         btnRefresh.setToolTipText("Refresh");
         btnRefresh.setMargin(new Insets(2, 8, 2, 8));
 
-        styleBtn(btnNew, AppTheme.EARTH_MOSS);
-        btnDelete.setForeground(AppTheme.EARTH_RUST);
 
         btnNew.addActionListener(e        -> newTask());
         btnEdit.addActionListener(e       -> editTask());
@@ -569,6 +601,28 @@ public class TaskManagerPanel extends JPanel {
      * This is reloaded from storage on every call so it reflects the latest epoch
      * persisted by TransferService after each successful watcher run.
      */
+    /**
+     * File transfers always use SFTP. A backup or folder-watch task uses it when its source (or, for a backup, its
+     * destination) is a remote server; mail tasks never do.
+     */
+    static boolean usesSftp(ScheduledTask t) {
+        if (t == null || t.getTaskType() == null) return false;
+        switch (t.getTaskType()) {
+            case FILE_TRANSFER:
+                return true;
+            case BACKUP:
+                return isSet(t.getBackupSourceUsername()) || isSet(t.getBackupDestinationUsername());
+            case FOLDER_WATCH:
+                return isSet(t.getBackupSourceUsername());
+            default:
+                return false;
+        }
+    }
+
+    private static boolean isSet(String s) {
+        return s != null && !s.trim().isEmpty();
+    }
+
     private void updateWatcherFingerprintBar() {
         String taskId = getSelectedTaskId();
         if (taskId == null) {
@@ -582,10 +636,19 @@ public class TaskManagerPanel extends JPanel {
                 .filter(t -> t.getId().equals(taskId))
                 .findFirst().orElse(null);
 
-        if (task == null
-                || task.getTaskType() != TaskType.FILE_TRANSFER
-                || !task.isWatcherEnabled()) {  // removed direction check — show for both directions
+        if (task == null || !usesSftp(task)) {
             watcherBar.setVisible(false);
+            return;
+        }
+        // Every task that can open SFTP sessions shows the badge; the baseline text and Reset button are for
+        // file-transfer watcher tasks only.
+        boolean watcher = task.getTaskType() == TaskType.FILE_TRANSFER && task.isWatcherEnabled();
+        lblWatcherFingerprint.setVisible(watcher);
+        btnBarReset.setVisible(watcher);
+        if (!watcher) {
+            watcherBar.setVisible(true);
+            watcherBar.revalidate();
+            watcherBar.repaint();
             return;
         }
 
@@ -1384,10 +1447,4 @@ public class TaskManagerPanel extends JPanel {
         return t != null ? t.getId() : null;
     }
 
-    private void styleBtn(JButton b, Color bg) {
-        b.setBackground(bg);
-        b.setForeground(Color.WHITE);
-        b.setFocusPainted(false);
-        b.setBorderPainted(false);
-    }
 }

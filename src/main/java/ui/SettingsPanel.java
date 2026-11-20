@@ -14,6 +14,8 @@ import java.awt.*;
 import java.io.*;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Base64;
+import java.nio.charset.StandardCharsets;
 import java.util.prefs.Preferences;
 
 public class SettingsPanel extends JPanel {
@@ -49,10 +51,8 @@ public class SettingsPanel extends JPanel {
     private JComboBox<String> comboLogLevel;
     private JTextField tfJvmMinHeap;
     private JTextField tfJvmMaxHeap;
-    private javax.swing.JSpinner spinnerBatchTargetSeconds;
-    private javax.swing.JSpinner spinnerBatchThroughputMBps;
+    private javax.swing.JSpinner spinnerBatchMaxMb;
     private javax.swing.JSpinner spinnerBatchIntervalSeconds;
-    private JTextField tfBatchMaxBytesOverride;
     private javax.swing.JSpinner spinnerBatchConcurrency;
     private javax.swing.JSpinner spinnerWatcherFilesPerThread;
     private javax.swing.JSpinner spinnerStaleThresholdMinutes;
@@ -121,8 +121,7 @@ public class SettingsPanel extends JPanel {
 
         // Save button row
         lblStatus = new JLabel(" ");
-        JButton btnSave = new GradientButton("Save Settings");
-        styleBtn(btnSave, AppTheme.EARTH_SIENNA);
+        JButton btnSave = new JButton("Save Settings");
         btnSave.addActionListener(e -> savePrefs());
 
         JPanel saveRow = new JPanel(new FlowLayout(FlowLayout.LEFT));
@@ -174,15 +173,12 @@ public class SettingsPanel extends JPanel {
         lblDaemonStatus = new JLabel("Checking...");
         lblDaemonStatus.setFont(lblDaemonStatus.getFont().deriveFont(Font.BOLD));
 
-        JButton btnRegister     = new GradientButton("Install Service (Admin required)");
-        JButton btnRemove       = new GradientButton("Uninstall Service");
+        JButton btnRegister     = new JButton("Install Service (Admin required)");
+        JButton btnRemove       = new JButton("Uninstall Service");
         JButton btnRunNow       = new JButton("Start Service");
         JButton btnViewLog      = new JButton("View Daemon Log");
         JButton btnRefreshStatus = new JButton("Refresh Status");
 
-        styleBtn(btnRegister, AppTheme.EARTH_SIENNA);
-        styleBtn(btnRemove,   AppTheme.EARTH_RUST);
-        styleBtn(btnRunNow,   new Color(0xF57C00));
 
         btnRegister.addActionListener(e      -> registerDaemon());
         btnRemove.addActionListener(e        -> removeDaemon());
@@ -288,36 +284,58 @@ public class SettingsPanel extends JPanel {
 
         row = addFieldRow(panel, lc, fc, "Log level:", comboLogLevel, row);
 
-        spinnerBatchTargetSeconds = new javax.swing.JSpinner(
-                new javax.swing.SpinnerNumberModel(5, 1, 3600, 1));
-        row = addFieldRow(panel, lc, fc, "Batch target duration (sec):", spinnerBatchTargetSeconds, row);
+        // File transfers: three plain settings. (The older "target duration", "assumed link speed" and "size override in
+        // bytes" settings were only different ways of arriving at the batch size; they are still honoured if set in
+        // app-config.xml but no longer shown.)
+        spinnerBatchConcurrency = new javax.swing.JSpinner(
+                new javax.swing.SpinnerNumberModel(3, 1, 8, 1));
+        spinnerBatchConcurrency.setToolTipText("The most SFTP sessions a transfer may use. It starts with one and adds more only while work is still waiting, never more than one per file. "
+                + "Tasks can override this in their own settings.");
+        row = addFieldRow(panel, lc, fc, "Parallel SFTP sessions:", spinnerBatchConcurrency, row);
 
-        spinnerBatchThroughputMBps = new javax.swing.JSpinner(
-                new javax.swing.SpinnerNumberModel(5, 1, 10000, 1));
-        row = addFieldRow(panel, lc, fc, "Assumed link speed (MB/s):", spinnerBatchThroughputMBps, row);
+        spinnerBatchMaxMb = new javax.swing.JSpinner(
+                new javax.swing.SpinnerNumberModel(25, 1, 10240, 5));
+        spinnerBatchMaxMb.setToolTipText("Most data one SFTP session carries before the next batch starts (MB). Bigger transfers are "
+                + "split into batches of about this size.");
+        row = addFieldRow(panel, lc, fc, "Batch size (MB):", spinnerBatchMaxMb, row);
 
         spinnerBatchIntervalSeconds = new javax.swing.JSpinner(
                 new javax.swing.SpinnerNumberModel(5, 0, 3600, 1));
-        row = addFieldRow(panel, lc, fc, "Interval between batches (sec):", spinnerBatchIntervalSeconds, row);
+        spinnerBatchIntervalSeconds.setToolTipText("Pause between rounds of batches, so a big backlog does not hammer the server.");
+        row = addFieldRow(panel, lc, fc, "Pause between batches (sec):", spinnerBatchIntervalSeconds, row);
 
-        tfBatchMaxBytesOverride = new JTextField(12);
-        row = addFieldRow(panel, lc, fc, "Batch size override (bytes, 0=auto):", tfBatchMaxBytesOverride, row);
-
-        spinnerBatchConcurrency = new javax.swing.JSpinner(
-                new javax.swing.SpinnerNumberModel(1, 1, 50, 1));
-        row = addFieldRow(panel, lc, fc, "Batches/files to run at once:", spinnerBatchConcurrency, row);
-
+        // Rarely changed: hidden behind one toggle so the page stays short.
+        JPanel advanced = new JPanel(new GridBagLayout());
+        advanced.setOpaque(false);
+        advanced.setVisible(false);
+        GridBagConstraints alc = (GridBagConstraints) lc.clone();
+        GridBagConstraints afc = (GridBagConstraints) fc.clone();
+        int arow = 0;
         spinnerWatcherFilesPerThread = new javax.swing.JSpinner(
                 new javax.swing.SpinnerNumberModel(5, 1, 1000, 1));
-        row = addFieldRow(panel, lc, fc, "Watcher files per worker thread:", spinnerWatcherFilesPerThread, row);
-
+        arow = addFieldRow(advanced, alc, afc, "Watcher files per worker thread:", spinnerWatcherFilesPerThread, arow);
         spinnerStaleThresholdMinutes = new javax.swing.JSpinner(
                 new javax.swing.SpinnerNumberModel(30, 1, 1440, 1));
-        row = addFieldRow(panel, lc, fc, "Stale RUNNING task timeout (min):", spinnerStaleThresholdMinutes, row);
-
+        arow = addFieldRow(advanced, alc, afc, "Stale RUNNING task timeout (min):", spinnerStaleThresholdMinutes, arow);
         spinnerMaxConcurrentTaskThreads = new javax.swing.JSpinner(
                 new javax.swing.SpinnerNumberModel(20, 4, 200, 1));
-        row = addFieldRow(panel, lc, fc, "Max concurrent task threads (restart required):", spinnerMaxConcurrentTaskThreads, row);
+        spinnerMaxConcurrentTaskThreads.setToolTipText("One budget for tasks and transfer sessions. Each running task uses one; every extra SFTP session a task opens to go faster uses another.");
+        arow = addFieldRow(advanced, alc, afc, "Worker thread budget: tasks + extra sessions (restart required):", spinnerMaxConcurrentTaskThreads, arow);
+
+        JButton btnAdvanced = new JButton("Advanced settings \u25B8");
+        btnAdvanced.addActionListener(e -> {
+            boolean show = !advanced.isVisible();
+            advanced.setVisible(show);
+            btnAdvanced.setText(show ? "Advanced settings \u25BE" : "Advanced settings \u25B8");
+            panel.revalidate();
+        });
+        GridBagConstraints advBtnC = new GridBagConstraints();
+        advBtnC.gridx = 0; advBtnC.gridy = row++; advBtnC.gridwidth = 3; advBtnC.anchor = GridBagConstraints.WEST;
+        advBtnC.insets = new Insets(6, 0, 2, 0);
+        panel.add(btnAdvanced, advBtnC);
+        GridBagConstraints advC = new GridBagConstraints();
+        advC.gridx = 0; advC.gridy = row++; advC.gridwidth = 3; advC.anchor = GridBagConstraints.WEST;
+        panel.add(advanced, advC);
 
         // JVM heap — stored in the same file for one consistent place to
         // edit everything, but genuinely cannot apply to the already-running
@@ -357,8 +375,7 @@ public class SettingsPanel extends JPanel {
         addRow.add(new JLabel("Folder Name:"));
         tfNewRuleFolder = new JTextField(11);
         addRow.add(tfNewRuleFolder);
-        JButton btnAddRule = new GradientButton("Add");
-        styleBtn(btnAddRule, AppTheme.EARTH_MOSS);
+        JButton btnAddRule = new JButton("Add");
         btnAddRule.addActionListener(e -> addMailRoutingRuleFromFields());
         addRow.add(btnAddRule);
         addRow.setAlignmentX(Component.LEFT_ALIGNMENT);
@@ -486,8 +503,7 @@ public class SettingsPanel extends JPanel {
         leftButtons.add(btnDeleteRow);
 
         JButton btnCancel = new JButton("Cancel");
-        JButton btnSave = new GradientButton("Save");
-        styleBtn(btnSave, AppTheme.EARTH_SIENNA);
+        JButton btnSave = new JButton("Save");
         JPanel rightButtons = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 0));
         rightButtons.add(btnCancel);
         rightButtons.add(btnSave);
@@ -949,10 +965,8 @@ public class SettingsPanel extends JPanel {
         comboLogLevel.setSelectedItem(AppSettings.getLogLevel());
         tfJvmMinHeap.setText(AppSettings.getJvmMinHeap());
         tfJvmMaxHeap.setText(AppSettings.getJvmMaxHeap());
-        spinnerBatchTargetSeconds.setValue(AppSettings.getTransferBatchTargetSeconds());
-        spinnerBatchThroughputMBps.setValue(AppSettings.getTransferAssumedThroughputMBps());
         spinnerBatchIntervalSeconds.setValue(AppSettings.getTransferBatchIntervalSeconds());
-        tfBatchMaxBytesOverride.setText(AppSettings.get(AppSettings.KEY_TRANSFER_BATCH_MAX_BYTES));
+        spinnerBatchMaxMb.setValue((int) Math.max(1, Math.min(10240, AppSettings.getTransferBatchMaxBytes() / (1024L * 1024L))));
         spinnerBatchConcurrency.setValue(AppSettings.getTransferBatchConcurrency());
         spinnerWatcherFilesPerThread.setValue(AppSettings.getWatcherFilesPerWorkerThread());
         spinnerStaleThresholdMinutes.setValue(AppSettings.getStaleRunningThresholdMinutes());
@@ -1014,19 +1028,12 @@ public class SettingsPanel extends JPanel {
             live.put(AppSettings.KEY_LOG_LEVEL, String.valueOf(comboLogLevel.getSelectedItem()));
             live.put(AppSettings.KEY_JVM_MIN_HEAP, tfJvmMinHeap.getText().trim());
             live.put(AppSettings.KEY_JVM_MAX_HEAP, tfJvmMaxHeap.getText().trim());
-            live.put(AppSettings.KEY_TRANSFER_BATCH_TARGET_SECONDS,
-                    String.valueOf((Integer) spinnerBatchTargetSeconds.getValue()));
-            live.put(AppSettings.KEY_TRANSFER_ASSUMED_THROUGHPUT_MBPS,
-                    String.valueOf((Integer) spinnerBatchThroughputMBps.getValue()));
             live.put(AppSettings.KEY_TRANSFER_BATCH_INTERVAL_SECONDS,
                     String.valueOf((Integer) spinnerBatchIntervalSeconds.getValue()));
-            Long maxBytes = service.SettingsInput.parseBatchMaxBytes(tfBatchMaxBytesOverride.getText());
-            if (maxBytes == null) {
-                lblStatus.setText("Batch size override must be a whole number of bytes.");
-                lblStatus.setForeground(Color.RED);
-                return;
-            }
-            live.put(AppSettings.KEY_TRANSFER_BATCH_MAX_BYTES, String.valueOf(maxBytes));
+            // Written only when changed, so an install that sizes batches by the old target/speed settings keeps doing so.
+            int shownMb = (int) Math.max(1, Math.min(10240, AppSettings.getTransferBatchMaxBytes() / (1024L * 1024L)));
+            int chosenMb = (Integer) spinnerBatchMaxMb.getValue();
+            if (chosenMb != shownMb) live.put(AppSettings.KEY_TRANSFER_BATCH_MAX_BYTES, String.valueOf(chosenMb * 1024L * 1024L));
             live.put(AppSettings.KEY_TRANSFER_BATCH_CONCURRENCY,
                     String.valueOf((Integer) spinnerBatchConcurrency.getValue()));
             live.put(AppSettings.KEY_WATCHER_FILES_PER_WORKER_THREAD,
@@ -1166,8 +1173,4 @@ public class SettingsPanel extends JPanel {
     private void showInfo(String msg)  { JOptionPane.showMessageDialog(this, msg, "Info",  JOptionPane.INFORMATION_MESSAGE); }
     private void showError(String msg) { JOptionPane.showMessageDialog(this, msg, "Error", JOptionPane.ERROR_MESSAGE); }
 
-    private void styleBtn(JButton b, Color bg) {
-        b.setBackground(bg); b.setForeground(Color.WHITE);
-        b.setFocusPainted(false); b.setBorderPainted(false);
-    }
 }

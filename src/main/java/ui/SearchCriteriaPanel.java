@@ -1,5 +1,6 @@
 package ui;
 
+import util.ImapSearchCriteria;
 import util.ImapSearchCriteria.*;
 
 import javax.swing.*;

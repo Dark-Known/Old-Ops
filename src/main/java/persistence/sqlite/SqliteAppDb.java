@@ -5,7 +5,6 @@ import persistence.AppDb;
 import java.io.File;
 import java.io.IOException;
 import java.sql.Connection;
-import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
@@ -26,7 +25,7 @@ public final class SqliteAppDb implements AppDb {
     private Connection open() throws SQLException {
         try { Class.forName("org.sqlite.JDBC"); } catch (ClassNotFoundException e) { throw new SQLException(e); }
         dataDir.mkdirs();
-        Connection c = DriverManager.getConnection("jdbc:sqlite:" + new File(dataDir, "app.db").getAbsolutePath());
+        Connection c = Db.connect(new File(dataDir, "app.db"));
         try (Statement st = c.createStatement()) {
             st.execute("PRAGMA journal_mode=WAL");
             st.execute("PRAGMA synchronous=NORMAL");

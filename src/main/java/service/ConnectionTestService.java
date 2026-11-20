@@ -21,8 +21,8 @@ public final class ConnectionTestService {
     private ConnectionTestService() {}
 
     private static final int DEFAULT_PORT = 22;
-    private static final int CONNECT_TIMEOUT_MS = 8_000;
-    private static final int CHANNEL_TIMEOUT_MS = 6_000;
+    private static int CONNECT_TIMEOUT_MS() { return util.Timers.msInt("timerSftpConnectTimeoutMs", 8_000); }
+    private static int CHANNEL_TIMEOUT_MS() { return util.Timers.msInt("timerSftpChannelTimeoutMs", 6_000); }
 
     /** Outcome of a single test attempt. */
     public static final class Result {
@@ -56,7 +56,7 @@ public final class ConnectionTestService {
         long openedAt = 0;
         try {
             client = JschSftpClient.connect(host.trim(), username.trim(), password,
-                    ConnectOptions.of(port, CONNECT_TIMEOUT_MS, CHANNEL_TIMEOUT_MS));
+                    ConnectOptions.of(port, CONNECT_TIMEOUT_MS(), CHANNEL_TIMEOUT_MS()));
             opened = true;
             openedAt = System.currentTimeMillis();
             SshSessionEvents.uiOpened("Test connection", host.trim(), username.trim());

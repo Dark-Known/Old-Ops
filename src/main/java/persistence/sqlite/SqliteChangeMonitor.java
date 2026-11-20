@@ -48,7 +48,7 @@ import java.util.logging.Logger;
 public final class SqliteChangeMonitor implements ChangeSignals {
 
     private static final Logger log = Logger.getLogger(SqliteChangeMonitor.class.getName());
-    private static final long POLL_MS = 500;
+    private static long pollMs() { return util.Timers.ms("timerDbChangePollMs", 500); }
 
     private static final ConcurrentHashMap<String, SqliteChangeMonitor> INSTANCES = new ConcurrentHashMap<>();
 
@@ -101,8 +101,15 @@ public final class SqliteChangeMonitor implements ChangeSignals {
             t.setDaemon(true);
             return t;
         });
-        ticker.scheduleWithFixedDelay(this::pollOnce, 0, POLL_MS, TimeUnit.MILLISECONDS);
+        ticker.schedule(this::tick, 0, TimeUnit.MILLISECONDS);
         return this;
+    }
+
+    /** One poll, then the next after the current (hot-reloaded) interval. */
+    private void tick() {
+        try { pollOnce(); } catch (RuntimeException ignored) { }
+        try { ticker.schedule(this::tick, pollMs(), TimeUnit.MILLISECONDS); }
+        catch (java.util.concurrent.RejectedExecutionException ignored) { }
     }
 
     // ------------------------------------------------------------------ public API

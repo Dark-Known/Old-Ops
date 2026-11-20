@@ -18,8 +18,6 @@ public final class TaskInputValidator {
 
         // file transfer: the server (every file transfer needs one; local to local is not supported)
         public String targetHost = "", targetUser = "", targetPass = "";
-        /** The task uses the built-in "Local (this computer)" credential: no server, so no host, login or password to check. */
-        public boolean targetIsLocal;
         public String sourcePath = "", targetFolder = "", transferMode = "";
 
         // mail
@@ -44,7 +42,7 @@ public final class TaskInputValidator {
         boolean watch = "FOLDER_WATCH".equals(in.taskType);
         boolean transfer = "FILE_TRANSFER".equals(in.taskType);
 
-        if (!mail && !backup && !watch && !in.targetIsLocal) {
+        if (!mail && !backup && !watch) {
             if (blank(in.targetHost)) return "Target hostname / IP is required.";
             if (blank(in.targetUser)) return "Target username is required.";
             if (in.targetPass == null || in.targetPass.isEmpty()) return "Target password is required.";

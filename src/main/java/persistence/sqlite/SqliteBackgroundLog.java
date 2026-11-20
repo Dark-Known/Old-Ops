@@ -8,7 +8,6 @@ import model.TaskRunRecord;
 
 import java.io.File;
 import java.sql.Connection;
-import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
@@ -54,7 +53,7 @@ public class SqliteBackgroundLog implements BackgroundLog {
         Connection c = null;
         try {
             Class.forName("org.sqlite.JDBC");
-            c = DriverManager.getConnection("jdbc:sqlite:" + dbFile.getAbsolutePath());
+            c = Db.connect(dbFile);
             try (Statement st = c.createStatement()) {
                 st.execute("PRAGMA busy_timeout=5000");
                 st.execute("PRAGMA journal_mode=WAL");

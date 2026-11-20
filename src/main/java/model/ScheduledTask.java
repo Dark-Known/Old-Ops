@@ -113,6 +113,10 @@ public class ScheduledTask {
     private String lastRunResult;
     private LocalDateTime createdAt;
     private int retryCount;
+    /** Per-task batch cap in MB for SFTP/WinSCP transfers; 0 = use the Settings value. */
+    private int transferBatchMaxMb;
+    /** Per-task number of parallel SFTP sessions; 0 = use the Settings value. */
+    private int transferConcurrency;
 
     public ScheduledTask() {
         this.createdAt = LocalDateTime.now();
@@ -315,6 +319,10 @@ public class ScheduledTask {
     public void          setCreatedAt(LocalDateTime d){ this.createdAt = d; }
     public int getRetryCount()                 { return retryCount; }
     public void setRetryCount(int count)       { this.retryCount = count; }
+    public int getTransferBatchMaxMb()         { return transferBatchMaxMb; }
+    public void setTransferBatchMaxMb(int mb)  { this.transferBatchMaxMb = Math.max(0, mb); }
+    public int getTransferConcurrency()        { return transferConcurrency; }
+    public void setTransferConcurrency(int n)  { this.transferConcurrency = Math.max(0, n); }
 
     @Override public String toString()           { return name; }
 
